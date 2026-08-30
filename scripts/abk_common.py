@@ -1,17 +1,16 @@
 """Shared low-level helpers for the abk_5_15_backport child scripts.
 
-Conventions (mirrors ABK_ABI_PATCH_SUITE):
+Conventions:
 - Every write snapshots the original file to ``<file>.abk-orig`` exactly once;
   ``scripts/abk_rollback.sh`` restores from those snapshots.
-- All graft content carries a distinctive ``ABK stable_515_backport`` marker so
-  idempotency checks never confuse this module's edits with the sibling
-  modules' edits (ABK_ABI_PATCH_SUITE uses ``ABK feature_porting:`` /
-  ``ABK security_update_backport:``, ABK_F2FS_FIX_MODULE uses git apply).
+- All graft content carries a distinctive ``ABK stable_515_backport`` marker
+  that doubles as the idempotency anchor and keeps this module's edits
+  distinguishable from any other module's edits in the same tree.
 
-EOL handling: developer checkouts on Windows may surface CRLF while the blobs
-(and CI checkouts on Linux) are LF.  Every read normalizes the text to LF for
-matching and remembers the file's dominant EOL; every write restores that
-style so diffs stay minimal and byte-faithful.
+EOL handling: checkouts of the same tree can surface LF on Linux CI or CRLF
+on Windows.  Block matching tries both line-ending forms and the replacement
+is emitted with whichever form matched, so edits stay byte-faithful to their
+surrounding region.
 """
 
 from __future__ import annotations

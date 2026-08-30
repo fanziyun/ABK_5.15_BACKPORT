@@ -6,10 +6,13 @@ change (5.15.202), the cpuset insane-config early bail-out (5.15.191), the
 percpu_pagelist_high_fraction lock-free read (5.15.200), the cgroup root_list
 RCU conversion (5.15.168), and the cgroup destroy-workqueue split (5.15.194).
 
-Composition contract: run this child *after* ABK_F2FS_FIX_MODULE and *before*
-ABK_ABI_PATCH_SUITE.  The fd-table group is hard: on a tree whose fs/file.c
-matches neither the pristine monthly shape, the upstream shape, nor a
-suite-processed shape it aborts the build instead of half-patching.
+The fd-table group is hard: on a tree whose fs/file.c matches neither the
+pristine monthly shape, the upstream shape, nor an already-processed shape
+it aborts the build instead of half-patching.
+
+Coexistence: standalone by default; if storage-rollback or other feature-
+graft modules are injected in the same build, keep this child between them
+(injection order in docs/porting_policy.md).
 """
 
 from __future__ import annotations

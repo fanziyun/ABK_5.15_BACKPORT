@@ -3,16 +3,16 @@
 A *patch group* is one registered backport unit (usually one upstream 5.15.y
 commit or a tightly coupled series).  Each group declares the tree shapes it
 accepts and performs bounded ``replace_once``/``ensure_after`` edits through
-:class:`GraftContext`.  Groups never expand into sibling-module territory:
+:class:`GraftContext`.  Groups never expand beyond their declared regions:
 whenever an anchor is absent the group degrades to a reported status instead
 of half-patching the tree.
 
-Status vocabulary (superset of ABK_ABI_PATCH_SUITE's):
+Status vocabulary:
     applied                  rewritten now (or would-write under dry-run)
     partial                  some hunks applied, some degraded (see detail)
     already_present          graft content already in the tree
-    skip_suite_processed     ABK_ABI_PATCH_SUITE already rewrote this region
-    skip_f2fs_rolled_back    ABK_F2FS_FIX_MODULE changed the expected shape
+    skip_suite_processed     another graft module already rewrote this region
+    skip_f2fs_rolled_back    a storage-rollback module changed the shape
     report_only              deliberately recorded, no edit performed
     blocked_by_missing_anchor  anchor absent from this tree
     blocked_by_shape         tree shape not covered by any accepted variant

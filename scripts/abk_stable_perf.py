@@ -11,10 +11,13 @@ ANDROID_KABI_RESERVE(8) slot instead of growing the struct, and the PSI group
 only removes a bitfield member whose word is force-aligned by ``unsigned :0``
 (upstream-verified no-op for struct layout).
 
-Composition contract: run this child *after* ABK_F2FS_FIX_MODULE and *before*
-ABK_ABI_PATCH_SUITE.  Every group degrades to a reported status when its
-anchor shape is absent; none of the anchors overlap the ABI suite's
-sched_entity/request_queue rewrite regions.
+Every group degrades to a reported status when its anchor shape is absent.
+KMI slots claimed by other graft modules (sched_entity 1-4, request_queue 1)
+are never touched by this child.
+
+Coexistence: standalone by default; if storage-rollback or other feature-
+graft modules are injected in the same build, keep this child between them
+(injection order in docs/porting_policy.md).
 """
 
 from __future__ import annotations

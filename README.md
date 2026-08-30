@@ -1,12 +1,17 @@
 # ABK 5.15 LTS Backport
 
-ABK external `module_set` that grafts **feature / optimization / structural**
-commits from the upstream `5.15.y` LTS stream (v5.15.167..v5.15.218) onto the
-`android13-5.15` GKI baseline (5.15.167, `android13-5.15-2024-11`). Pure
-security fixes are out of scope. Implemented entirely as bounded anchor
-grafts (Python + `replace_once`), in the same style as
-[ABK_ABI_PATCH_SUITE](https://github.com/fanziyun/ABK_ABI_PATCH_SUITE) —
-no `.patch` payloads.
+An ABK external `module_set` that grafts **feature / optimization /
+structural** commits from the upstream `5.15.y` LTS stream
+(v5.15.167..v5.15.218) onto the `android13-5.15` GKI baseline (5.15.167,
+`android13-5.15-2024-11`). Pure security fixes are out of scope.
+
+Every graft is a **bounded anchor script**: each group declares the tree
+shapes it accepts, rewrites only exact-match regions through transactional
+`replace_once` steps, and degrades to a reported status (`blocked_by_shape`,
+`already_present`, …) when an anchor is absent — the kernel tree is never
+half-patched. There are no `.patch` payloads to review or keep in sync; the
+Python registry *is* the patch set, and every edit carries an
+`ABK stable_515_backport:` marker that doubles as its idempotency anchor.
 
 ## Children
 
@@ -15,33 +20,42 @@ no `.patch` payloads.
 | `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard), page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194) |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198) |
 
-Every group degrades to a reported status (`blocked_by_shape`,
-`skip_suite_processed`, …) when its anchor is absent — the build is never
-half-patched. See `docs/survey_5_15_168_218.md` for the full candidate
-analysis and `plan.md` for the living backlog.
+KMI red lines are built in: new exported-struct fields only ever reuse free
+`ANDROID_KABI_RESERVE` slots (this module uses `task_struct` slot 8), and
+every group reports instead of forcing when the tree does not match. See
+`docs/survey_5_15_168_218.md` for the candidate analysis and `plan.md` for
+the living backlog.
 
-## Composition with sibling modules
-
-Canonical `custom_external_modules` input (order matters; CI executes in
-input order, all at `after_patch`):
-
-```
-set:https://github.com/xingguangcuican6666/ABK_F2FS_FIX_MODULE.git#storage_ufs_rollback;after_patch|set:https://github.com/xingguangcuican6666/ABK_F2FS_FIX_MODULE.git#storage_block_rollback;after_patch|set:https://github.com/xingguangcuican6666/ABK_F2FS_FIX_MODULE.git#storage_f2fs_rollback;after_patch|set:https://github.com/xingguangcuican6666/ABK_F2FS_FIX_MODULE.git#storage_common_fixups;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch|set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#display_release_spoof;after_patch|set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#abi_bridge;after_patch|set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#security_backport;after_patch|set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#feature_porting_core;after_patch|set:https://github.com/fanziyun/ABK_ABI_PATCH_SUITE.git#feature_porting_backlog;after_patch
-```
-
-Ordering rationale: the F2FS suite's `git apply --reverse` storage rollback
-must see the pristine monthly tree; this module grafts forward on the
-settled baseline; the ABI suite runs last — its `fd_alloc_hotpath` probe
-detects the upstream fdtable shape this module lands (slots_wanted /
-roundup_pow_of_two / ERR_PTR conventions) and adapts instead of double-
-rewriting. Details and the KMI red lines: `docs/porting_policy.md`.
-
-## CI usage (ABK)
+## Injection (ABK CI)
 
 Trigger `kernel-a13-5-15.yml` with `sub_level: 167` (os_patch_level
-`2024-11`) and paste the module string above into `custom_external_modules`.
+`2024-11`) and put the module into `custom_external_modules`:
+
+```
+set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch
+```
+
 The children read `KERNEL_ROOT`, `DEFCONFIG`,
-`CUSTOM_EXTERNAL_MODULE_STAGE`, `ABK_BUILD_*` from the ABK environment.
+`CUSTOM_EXTERNAL_MODULE_STAGE` and `ABK_BUILD_*` from the ABK environment.
+Both children are idempotent; running them is safe at any point after the
+kernel patches are applied.
+
+## Coexistence with other ABK modules
+
+The module is self-contained and injectable on its own. If the same build
+also carries storage-rollback or feature-graft modules, keep this order
+(CI executes `custom_external_modules` entries in input order, all at
+`after_patch`):
+
+1. storage rollback children first (their reverse-apply must see the
+   pristine monthly tree),
+2. this module second (forward grafts onto the settled baseline),
+3. other feature-graft modules last — their fd-table probes detect the
+   upstream shape this module lands and adapt instead of double-rewriting.
+
+The full input string for the F2FS + ABI-suite combination, the shape
+registry and the KMI compatibility matrix are documented in
+`docs/porting_policy.md`.
 
 ## Local verification
 
