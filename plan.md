@@ -15,7 +15,7 @@
 - [x] `sched_nohz_idle_balance_series`（perf）— 5.15.174 四连
 - [x] `sched_psi_flags_migration`（perf）— 5.15.179 psi_flags 差量
 - [x] `sched_rt_optimizations`（perf）— 5.15.202/.202 RT 扫描自跳 + RT_PUSH_IPI 默认关
-- [x] `randomize_kstack_pertask`（perf）— 5.15.210 每任务偏移（KABI 槽 8）
+- [x] `randomize_kstack_pertask`（perf）— 5.15.210 每任务偏移（KABI 槽 8；CI 修正：ABK 的 Kernel 特定补丁会把槽 6/7/8 改造成 SysVIPC 形态，该形态自动改用仍空闲的槽 5，并带 task_struct 范围硬校验）
 - [x] `release_sock_cond_resched`（perf）— 5.15.197 __release_sock 每 16 包让出
 - [x] `semaphore_wake_q`（perf）— 5.15.180 唤醒移出临界区
 - [x] `blk_mq_suspend_wakeup_abort`（perf）— 5.15.198 挂起遇 wakeup 中止

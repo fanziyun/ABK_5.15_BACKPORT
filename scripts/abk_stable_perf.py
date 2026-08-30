@@ -238,16 +238,54 @@ def _rt_optimizations_apply(ctx):
 # Per-task kstack randomization offset (5.15.210) - KMI-safe via KABI slot 8
 # ---------------------------------------------------------------------------
 
+def _sched_h_kstack_step(text):
+    """Pick the KABI slot for kstack_offset based on the tree shape.
+
+    ABK's kernel-specific patch step rewrites task_struct's slots 6/7/8 into
+    the CONFIG_SYSVIPC sysvsem/sysvshm restoration (an #ifdef/#else block).
+    In that shape slots 7/8 only exist inside the dead #else branch, so a
+    first-occurrence RESERVE(8) replacement lands in dead code and the struct
+    silently loses the member.  Use the still-free slot 5 there, and the
+    anchored slots 1..8 run otherwise.
+    """
+    marker = "/* ABK stable_515_backport: per-task kstack randomization offset (5.15.210) mapped onto the KABI reserve slot. */"
+    if "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" in text:
+        return (
+            "include/linux/sched.h",
+            "\tANDROID_KABI_RESERVE(5);",
+            "\t" + marker + "\n"
+            "\tANDROID_KABI_USE(5, u32\t\t\tkstack_offset);",
+            T,
+        )
+    run_old = "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(1, 9))
+    run_new = (
+        "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(1, 8))
+        + "\t" + marker + "\n"
+        + "\tANDROID_KABI_USE(8, u32\t\t\tkstack_offset);\n"
+    )
+    return ("include/linux/sched.h", run_old, run_new, T)
+
+
+def _verify_kstack_member(ctx):
+    """Fail loudly when the kstack_offset member is not inside task_struct."""
+    text = ctx.read("include/linux/sched.h")
+    if "kstack_offset" not in text:
+        raise ValueError("kstack_offset member missing from include/linux/sched.h")
+    start = text.index("struct task_struct {")
+    end = text.index("\n};", start)
+    if "kstack_offset" not in text[start:end]:
+        raise ValueError(
+            "kstack_offset KABI slot landed outside struct task_struct; "
+            "sched.h shape not covered"
+        )
+
+
 def _kstack_pertask_apply(ctx):
     text = ctx.read("include/linux/sched.h")
-    if "ANDROID_KABI_USE(8," in text or "kstack_offset;" in text:
-        pass  # fall through to per-file idempotency checks below
-    steps = [
-        ("include/linux/sched.h",
-         "\tANDROID_KABI_RESERVE(8);",
-         "\t/* ABK stable_515_backport: per-task kstack randomization offset (5.15.210) mapped onto the KABI reserve slot. */\n"
-         "\tANDROID_KABI_USE(8, u32\t\t\tkstack_offset);",
-         T),
+    steps = []
+    if "kstack_offset;" not in text:
+        steps.append(_sched_h_kstack_step(text))
+    steps.extend([
         ("include/linux/randomize_kstack.h",
          "\t\t\t randomize_kstack_offset);\nDECLARE_PER_CPU(u32, kstack_offset);\n",
          "\t\t\t randomize_kstack_offset);\n",
@@ -341,10 +379,12 @@ def _kstack_pertask_apply(ctx):
          "\tstackleak_task_init(p);",
          "\trandom_kstack_task_init(p);\n\tstackleak_task_init(p);",
          T),
-    ]
+    ])
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
         return "blocked_by_shape", detail
+    if status in ("applied", "partial"):
+        _verify_kstack_member(ctx)
     return status, detail
 
 

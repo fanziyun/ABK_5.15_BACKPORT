@@ -251,6 +251,23 @@ def test_kabi_slot_policy():
         check("suite slots untouched", "ANDROID_KABI_USE(1" not in text)
 
 
+def test_kstack_slot_shape_selection():
+    print("kstack KABI slot shape selection")
+    import abk_stable_perf as perf
+    pristine = "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(1, 9))
+    step = perf._sched_h_kstack_step(pristine)
+    check("pristine -> slot 8 run anchor", "RESERVE(1);" in step[1] and "USE(8" in step[2])
+    sysv = (
+        "\tANDROID_KABI_RESERVE(5);\n#ifdef CONFIG_SYSVIPC\n"
+        "\tANDROID_KABI_USE(6, struct sysv_sem sysvsem);\n"
+        "\t_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);\n"
+        "#else\n\tANDROID_KABI_RESERVE(6);\n\tANDROID_KABI_RESERVE(7);\n\tANDROID_KABI_RESERVE(8);\n#endif\n"
+    )
+    step2 = perf._sched_h_kstack_step(sysv)
+    check("sysv-patched -> slot 5", "RESERVE(5);" in step2[1] and "USE(5" in step2[2])
+    check("slot-5 anchor hits patched tail", step2[1] in sysv)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -263,6 +280,7 @@ def main():
     test_fdtable_shapes()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
+    test_kstack_slot_shape_selection()
 
     print()
     if FAILURES:
