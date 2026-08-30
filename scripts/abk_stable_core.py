@@ -655,11 +655,6 @@ def _highatomic_reserve_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-    status, _results, detail = apply_steps(ctx, steps)
-    if status is None:
-        return "blocked_by_shape", detail
-    return status, detail
-
 
 # ---------------------------------------------------------------------------
 # THP __GFP_THISNODE: compact only, never reclaim (5.15.202, 0eac511c7657)
@@ -977,6 +972,242 @@ def _cgroup_wq_split_apply(ctx):
     return status, detail
 
 
+# ---------------------------------------------------------------------------
+# memcg memory.reclaim: per-memcg proactive reclaim (android14-6.1, 6.1.y)
+# ---------------------------------------------------------------------------
+
+def _memcg_reclaim_apply(ctx):
+    steps = [
+        # swap.h: reclaim option bits next to the try_to_free prototypes
+        ("include/linux/swap.h",
+         "extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,\n"
+         "\t\t\t\t\tgfp_t gfp_mask, nodemask_t *mask);\n"
+         "extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
+         "\t\t\t\t\t\t  unsigned long nr_pages,\n"
+         "\t\t\t\t\t\t  gfp_t gfp_mask,\n"
+         "\t\t\t\t\t\t  bool may_swap);",
+         "extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,\n"
+         "\t\t\t\t\tgfp_t gfp_mask, nodemask_t *mask);\n"
+         "\n"
+         "/* ABK stable_515_backport: per-memcg proactive reclaim options (android14-6.1). */\n"
+         "#define MEMCG_RECLAIM_MAY_SWAP (1 << 1)\n"
+         "#define MEMCG_RECLAIM_PROACTIVE (1 << 2)\n"
+         "extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
+         "\t\t\t\t\t\t  unsigned long nr_pages,\n"
+         "\t\t\t\t\t\t  gfp_t gfp_mask,\n"
+         "\t\t\t\t\t\t  unsigned int reclaim_options);",
+         T),
+        # vmscan.c: scan_control learns the proactive bit
+        ("mm/vmscan.c",
+         "\t/* Can pages be swapped as part of reclaim? */\n"
+         "\tunsigned int may_swap:1;\n",
+         "\t/* Can pages be swapped as part of reclaim? */\n"
+         "\tunsigned int may_swap:1;\n"
+         "\n"
+         "\t/* ABK stable_515_backport: set for proactive memory.reclaim requests. */\n"
+         "\tunsigned int proactive:1;\n",
+         T),
+        # vmscan.c: try_to_free_mem_cgroup_pages() takes reclaim options
+        ("mm/vmscan.c",
+         "unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
+         "\t\t\t\t\t   unsigned long nr_pages,\n"
+         "\t\t\t\t\t   gfp_t gfp_mask,\n"
+         "\t\t\t\t\t   bool may_swap)\n"
+         "{\n"
+         "\tunsigned long nr_reclaimed;\n"
+         "\tunsigned int noreclaim_flag;\n"
+         "\tstruct scan_control sc = {\n"
+         "\t\t.nr_to_reclaim = max(nr_pages, SWAP_CLUSTER_MAX),\n"
+         "\t\t.gfp_mask = (current_gfp_context(gfp_mask) & GFP_RECLAIM_MASK) |\n"
+         "\t\t\t\t(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK),\n"
+         "\t\t.reclaim_idx = MAX_NR_ZONES - 1,\n"
+         "\t\t.target_mem_cgroup = memcg,\n"
+         "\t\t.priority = DEF_PRIORITY,\n"
+         "\t\t.may_writepage = !laptop_mode,\n"
+         "\t\t.may_unmap = 1,\n"
+         "\t\t.may_swap = may_swap,\n"
+         "\t};",
+         "unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
+         "\t\t\t\t\t   unsigned long nr_pages,\n"
+         "\t\t\t\t\t   gfp_t gfp_mask,\n"
+         "\t\t\t\t\t   unsigned int reclaim_options)\n"
+         "{\n"
+         "\tunsigned long nr_reclaimed;\n"
+         "\tunsigned int noreclaim_flag;\n"
+         "\tstruct scan_control sc = {\n"
+         "\t\t.nr_to_reclaim = max(nr_pages, SWAP_CLUSTER_MAX),\n"
+         "\t\t.gfp_mask = (current_gfp_context(gfp_mask) & GFP_RECLAIM_MASK) |\n"
+         "\t\t\t\t(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK),\n"
+         "\t\t.reclaim_idx = MAX_NR_ZONES - 1,\n"
+         "\t\t.target_mem_cgroup = memcg,\n"
+         "\t\t.priority = DEF_PRIORITY,\n"
+         "\t\t.may_writepage = !laptop_mode,\n"
+         "\t\t.may_unmap = 1,\n"
+         "\t\t.may_swap = !!(reclaim_options & MEMCG_RECLAIM_MAY_SWAP),\n"
+         "\t\t.proactive = !!(reclaim_options & MEMCG_RECLAIM_PROACTIVE),\n"
+         "\t};",
+         T),
+        # vmscan.c: proactive reclaim does not pollute vmpressure (optional)
+        ("mm/vmscan.c",
+         "\t\t/* Record the group's reclaim efficiency */\n"
+         "\t\tvmpressure(sc->gfp_mask, memcg, false,\n"
+         "\t\t\t   sc->nr_scanned - scanned,\n"
+         "\t\t\t   sc->nr_reclaimed - reclaimed);",
+         "\t\t/* Record the group's reclaim efficiency */\n"
+         "\t\tif (!sc->proactive)\n"
+         "\t\t\tvmpressure(sc->gfp_mask, memcg, false,\n"
+         "\t\t\t\t   sc->nr_scanned - scanned,\n"
+         "\t\t\t\t   sc->nr_reclaimed - reclaimed);",
+         F),
+        ("mm/vmscan.c",
+         "\t/* Record the subtree's reclaim efficiency */\n"
+         "\tvmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,\n"
+         "\t\t   sc->nr_scanned - nr_scanned,\n"
+         "\t\t   sc->nr_reclaimed - nr_reclaimed);",
+         "\t/* Record the subtree's reclaim efficiency */\n"
+         "\tif (!sc->proactive)\n"
+         "\t\tvmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,\n"
+         "\t\t\t   sc->nr_scanned - nr_scanned,\n"
+         "\t\t\t   sc->nr_reclaimed - nr_reclaimed);",
+         F),
+        ("mm/vmscan.c",
+         "\tdo {\n"
+         "\t\tvmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,\n"
+         "\t\t\t\tsc->priority);\n"
+         "\t\tsc->nr_scanned = 0;",
+         "\tdo {\n"
+         "\t\tif (!sc->proactive)\n"
+         "\t\t\tvmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,\n"
+         "\t\t\t\t\tsc->priority);\n"
+         "\t\tsc->nr_scanned = 0;",
+         F),
+        # memcontrol.c: charge locals carry reclaim options instead of may_swap
+        ("mm/memcontrol.c",
+         "\tbool passed_oom = false;\n"
+         "\tbool may_swap = true;\n"
+         "\tbool drained = false;",
+         "\tbool passed_oom = false;\n"
+         "\tunsigned int reclaim_options = MEMCG_RECLAIM_MAY_SWAP;\n"
+         "\tbool drained = false;",
+         T),
+        ("mm/memcontrol.c",
+         "\t} else {\n"
+         "\t\tmem_over_limit = mem_cgroup_from_counter(counter, memsw);\n"
+         "\t\tmay_swap = false;\n"
+         "\t}",
+         "\t} else {\n"
+         "\t\tmem_over_limit = mem_cgroup_from_counter(counter, memsw);\n"
+         "\t\treclaim_options &= ~MEMCG_RECLAIM_MAY_SWAP;\n"
+         "\t}",
+         T),
+        ("mm/memcontrol.c",
+         "\t\tpsi_memstall_enter(&pflags);\n"
+         "\t\tnr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,\n"
+         "\t\t\t\t\t\t\t     gfp_mask, true);\n"
+         "\t\tpsi_memstall_leave(&pflags);",
+         "\t\tpsi_memstall_enter(&pflags);\n"
+         "\t\tnr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,\n"
+         "\t\t\t\t\t\t\t     gfp_mask,\n"
+         "\t\t\t\t\t\t\t     MEMCG_RECLAIM_MAY_SWAP);\n"
+         "\t\tpsi_memstall_leave(&pflags);",
+         T),
+        ("mm/memcontrol.c",
+         "\tpsi_memstall_enter(&pflags);\n"
+         "\tnr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,\n"
+         "\t\t\t\t\t\t    gfp_mask, may_swap);\n"
+         "\tpsi_memstall_leave(&pflags);",
+         "\tpsi_memstall_enter(&pflags);\n"
+         "\tnr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,\n"
+         "\t\t\t\t\t\t    gfp_mask, reclaim_options);\n"
+         "\tpsi_memstall_leave(&pflags);",
+         T),
+        ("mm/memcontrol.c",
+         "\t\tif (!try_to_free_mem_cgroup_pages(memcg, 1,\n"
+         "\t\t\t\t\tGFP_KERNEL, !memsw)) {\n"
+         "\t\t\tret = -EBUSY;\n"
+         "\t\t\tbreak;",
+         "\t\tif (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,\n"
+         "\t\t\t\t\tmemsw ? 0 : MEMCG_RECLAIM_MAY_SWAP)) {\n"
+         "\t\t\tret = -EBUSY;\n"
+         "\t\t\tbreak;",
+         T),
+        # memcontrol.c: the memory.reclaim write handler (android14-6.1 form)
+        ("mm/memcontrol.c",
+         "static struct cftype memory_files[] = {",
+         "/* ABK stable_515_backport: per-memcg proactive reclaim (android14-6.1 memory.reclaim). */\n"
+         "static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,\n"
+         "\t\t\t      size_t nbytes, loff_t off)\n"
+         "{\n"
+         "\tstruct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));\n"
+         "\tunsigned int nr_retries = MAX_RECLAIM_RETRIES;\n"
+         "\tunsigned long nr_to_reclaim, nr_reclaimed = 0;\n"
+         "\tunsigned int reclaim_options;\n"
+         "\tint err;\n"
+         "\n"
+         "\tbuf = strstrip(buf);\n"
+         "\terr = page_counter_memparse(buf, \"\", &nr_to_reclaim);\n"
+         "\tif (err)\n"
+         "\t\treturn err;\n"
+         "\n"
+         "\treclaim_options\t= MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE;\n"
+         "\twhile (nr_reclaimed < nr_to_reclaim) {\n"
+         "\t\tunsigned long reclaimed;\n"
+         "\n"
+         "\t\tif (signal_pending(current))\n"
+         "\t\t\treturn -EINTR;\n"
+         "\n"
+         "\t\t/*\n"
+         "\t\t * This is the final attempt, drain percpu lru caches in the\n"
+         "\t\t * hope of introducing more evictable pages for\n"
+         "\t\t * try_to_free_mem_cgroup_pages().\n"
+         "\t\t */\n"
+         "\t\tif (!nr_retries)\n"
+         "\t\t\tlru_add_drain_all();\n"
+         "\n"
+         "\t\treclaimed = try_to_free_mem_cgroup_pages(memcg,\n"
+         "\t\t\t\t\t\tnr_to_reclaim - nr_reclaimed,\n"
+         "\t\t\t\t\t\tGFP_KERNEL, reclaim_options);\n"
+         "\n"
+         "\t\tif (!reclaimed && !nr_retries--)\n"
+         "\t\t\treturn -EAGAIN;\n"
+         "\n"
+         "\t\tnr_reclaimed += reclaimed;\n"
+         "\t}\n"
+         "\n"
+         "\treturn nbytes;\n"
+         "}\n"
+         "\n"
+         "static struct cftype memory_files[] = {",
+         T),
+        # memcontrol.c: the memory.reclaim cgroup-v2 file entry
+        ("mm/memcontrol.c",
+         "\t{\n"
+         "\t\t.name = \"oom.group\",\n"
+         "\t\t.flags = CFTYPE_NOT_ON_ROOT | CFTYPE_NS_DELEGATABLE,\n"
+         "\t\t.seq_show = memory_oom_group_show,\n"
+         "\t\t.write = memory_oom_group_write,\n"
+         "\t},\n"
+         "\t{ }\t/* terminate */",
+         "\t{\n"
+         "\t\t.name = \"oom.group\",\n"
+         "\t\t.flags = CFTYPE_NOT_ON_ROOT | CFTYPE_NS_DELEGATABLE,\n"
+         "\t\t.seq_show = memory_oom_group_show,\n"
+         "\t\t.write = memory_oom_group_write,\n"
+         "\t},\n"
+         "\t{\n"
+         "\t\t.name = \"reclaim\",\n"
+         "\t\t.flags = CFTYPE_NS_DELEGATABLE,\n"
+         "\t\t.write = memory_reclaim,\n"
+         "\t},\n"
+         "\t{ }\t/* terminate */",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 PATCH_GROUPS = [
     PatchGroup(
         "fdtable_alloc_conventions",
@@ -1041,6 +1272,13 @@ PATCH_GROUPS = [
         ["f2795d1b9250 (5.15.194)"],
         ["kernel/cgroup/cgroup.c"],
         _cgroup_wq_split_apply,
+    ),
+    PatchGroup(
+        "memcg_memory_reclaim",
+        "per-memcg proactive reclaim via memory.reclaim, with reclaim options replacing may_swap (android14-6.1 / 6.1.y)",
+        ["memory.reclaim series (android14-6.1; mainline proactive reclaim)"],
+        ["include/linux/swap.h", "mm/vmscan.c", "mm/memcontrol.c"],
+        _memcg_reclaim_apply,
     ),
 ]
 

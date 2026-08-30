@@ -4,12 +4,17 @@ Carries the NOHZ idle-balance optimization series (5.15.174), the PSI
 migration flags micro-optimization (5.15.179), the RT scan optimizations
 (5.15.202/.212), per-task kstack randomization (5.15.210), the
 __release_sock() cond_resched reduction (5.15.197), the semaphore wake_q
-offload (5.15.180), and the blk-mq suspend wakeup abort (5.15.198).
+offload (5.15.180), the blk-mq suspend wakeup abort (5.15.198), and the
+android14-6.1 line (lazy preemption + mutex/rwsem wakeup vendor hooks,
+PSI IRQ pressure tracking, PSI trigger kernfs polling).
 
 KMI notes: the per-task kstack offset reuses task_struct's
 ANDROID_KABI_RESERVE(8) slot instead of growing the struct, and the PSI group
 only removes a bitfield member whose word is force-aligned by ``unsigned :0``
-(upstream-verified no-op for struct layout).
+(upstream-verified no-op for struct layout).  The android14-6.1 groups only
+add vendor tracepoints and heap-internal struct members, so the stable KMI is
+preserved; the ACK 6.1 psi_group pointer/parent rework is deliberately NOT
+ported (it changes struct cgroup layout).
 
 Every group degrades to a reported status when its anchor shape is absent.
 KMI slots claimed by other graft modules (sched_entity 1-4, request_queue 1)
@@ -558,6 +563,832 @@ def _blk_mq_suspend_apply(ctx):
     return status, detail
 
 
+# ---------------------------------------------------------------------------
+# android14-6.1 line: lazy preemption via vendor hooks (ACK 969cb3d family)
+# ---------------------------------------------------------------------------
+
+def _lazy_preempt_hooks_apply(ctx):
+    steps = []
+    # dtask.h: the set_tsk_need_resched_lazy hook exists only on the newer
+    # 5.15 ACK lineage; the 2024-11 baseline needs the whole block added.
+    # The marker doubles as the idempotency probe: once grafted, no dtask
+    # step runs and the remaining steps all report already_present.
+    dtext = ctx.read("include/trace/hooks/dtask.h")
+    if "ABK stable_515_backport: lazy preemption scheduling hooks" not in dtext:
+        if "android_vh_set_tsk_need_resched_lazy" not in dtext:
+            steps.append((
+                "include/trace/hooks/dtask.h",
+                "DECLARE_HOOK(android_vh_freeze_whether_wake,\n"
+                "\tTP_PROTO(struct task_struct *t, bool *wake),\n"
+                "\tTP_ARGS(t, wake));\n"
+                "\n"
+                "#endif /* _TRACE_HOOK_DTASK_H */",
+                "DECLARE_HOOK(android_vh_freeze_whether_wake,\n"
+                "\tTP_PROTO(struct task_struct *t, bool *wake),\n"
+                "\tTP_ARGS(t, wake));\n"
+                "\n"
+                "/* ABK stable_515_backport: lazy preemption scheduling hooks (android14-6.1). */\n"
+                "DECLARE_HOOK(android_vh_set_tsk_need_resched_lazy,\n"
+                "\tTP_PROTO(struct task_struct *p, struct rq *rq, int *need_lazy),\n"
+                "\tTP_ARGS(p, rq, need_lazy));\n"
+                "\n"
+                "DECLARE_HOOK(android_vh_resched_curr_lazy,\n"
+                "\tTP_PROTO(struct rq *rq, bool *skip_preempt),\n"
+                "\tTP_ARGS(rq, skip_preempt));\n"
+                "\n"
+                "DECLARE_HOOK(android_vh_clear_curr_lazy,\n"
+                "\tTP_PROTO(struct task_struct *tsk),\n"
+                "\tTP_ARGS(tsk));\n"
+                "\n"
+                "DECLARE_HOOK(android_vh_lock_delay_schedule,\n"
+                "\tTP_PROTO(struct task_struct *prev, int sched_mode, bool *ext_slice),\n"
+                "\tTP_ARGS(prev, sched_mode, ext_slice));\n"
+                "#endif /* _TRACE_HOOK_DTASK_H */",
+                T,
+            ))
+        else:
+            steps.append((
+                "include/trace/hooks/dtask.h",
+                "DECLARE_HOOK(android_vh_set_tsk_need_resched_lazy,\n"
+                "\tTP_PROTO(struct task_struct *p, struct rq *rq, int *need_lazy),\n"
+                "\tTP_ARGS(p, rq, need_lazy));\n"
+                "#endif /* _TRACE_HOOK_DTASK_H */",
+                "DECLARE_HOOK(android_vh_set_tsk_need_resched_lazy,\n"
+                "\tTP_PROTO(struct task_struct *p, struct rq *rq, int *need_lazy),\n"
+                "\tTP_ARGS(p, rq, need_lazy));\n"
+                "\n"
+                "/* ABK stable_515_backport: lazy preemption scheduling hooks (android14-6.1). */\n"
+                "DECLARE_HOOK(android_vh_resched_curr_lazy,\n"
+                "\tTP_PROTO(struct rq *rq, bool *skip_preempt),\n"
+                "\tTP_ARGS(rq, skip_preempt));\n"
+                "\n"
+                "DECLARE_HOOK(android_vh_clear_curr_lazy,\n"
+                "\tTP_PROTO(struct task_struct *tsk),\n"
+                "\tTP_ARGS(tsk));\n"
+                "\n"
+                "DECLARE_HOOK(android_vh_lock_delay_schedule,\n"
+                "\tTP_PROTO(struct task_struct *prev, int sched_mode, bool *ext_slice),\n"
+                "\tTP_ARGS(prev, sched_mode, ext_slice));\n"
+                "#endif /* _TRACE_HOOK_DTASK_H */",
+                T,
+            ))
+    # core.c: resched_curr() gains the lazy gate on the 2024-11 baseline
+    ctext = ctx.read("kernel/sched/core.c")
+    if "trace_android_vh_set_tsk_need_resched_lazy" not in ctext:
+        steps.append((
+            "kernel/sched/core.c",
+            "void resched_curr(struct rq *rq)\n"
+            "{\n"
+            "\tstruct task_struct *curr = rq->curr;\n"
+            "\tint cpu;\n"
+            "\n"
+            "\tlockdep_assert_rq_held(rq);\n"
+            "\n"
+            "\tif (test_tsk_need_resched(curr))\n"
+            "\t\treturn;\n"
+            "\n"
+            "\tcpu = cpu_of(rq);",
+            "void resched_curr(struct rq *rq)\n"
+            "{\n"
+            "\tstruct task_struct *curr = rq->curr;\n"
+            "\tint cpu, need_lazy = 0;\n"
+            "\n"
+            "\tlockdep_assert_rq_held(rq);\n"
+            "\n"
+            "\tif (test_tsk_need_resched(curr))\n"
+            "\t\treturn;\n"
+            "\n"
+            "\t/* ABK stable_515_backport: lazy preemption resched gate (android14-6.1). */\n"
+            "\ttrace_android_vh_set_tsk_need_resched_lazy(curr, rq, &need_lazy);\n"
+            "\tif (need_lazy)\n"
+            "\t\treturn;\n"
+            "\n"
+            "\tcpu = cpu_of(rq);",
+            T,
+        ))
+    steps.extend([
+        # core.c: __schedule() may skip this schedule() call entirely
+        ("kernel/sched/core.c",
+         "\tstruct task_struct *prev, *next;\n"
+         "\tunsigned long *switch_count;\n"
+         "\tunsigned long prev_state;\n"
+         "\tstruct rq_flags rf;\n"
+         "\tstruct rq *rq;\n"
+         "\tint cpu;\n"
+         "\n"
+         "\tcpu = smp_processor_id();",
+         "\tstruct task_struct *prev, *next;\n"
+         "\tunsigned long *switch_count;\n"
+         "\tunsigned long prev_state;\n"
+         "\tstruct rq_flags rf;\n"
+         "\tstruct rq *rq;\n"
+         "\tint cpu;\n"
+         "\t/* ABK stable_515_backport: bounded schedule deferral (android14-6.1). */\n"
+         "\tbool skip_schedule = false;\n"
+         "\n"
+         "\tcpu = smp_processor_id();",
+         T),
+        ("kernel/sched/core.c",
+         "\tschedule_debug(prev, !!sched_mode);\n"
+         "\n"
+         "\tif (sched_feat(HRTICK) || sched_feat(HRTICK_DL))",
+         "\tschedule_debug(prev, !!sched_mode);\n"
+         "\n"
+         "\ttrace_android_vh_lock_delay_schedule(prev, sched_mode, &skip_schedule);\n"
+         "\n"
+         "\tif (skip_schedule)\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tif (sched_feat(HRTICK) || sched_feat(HRTICK_DL))",
+         T),
+        # core.c: lazy state is cleared once the next task is picked
+        ("kernel/sched/core.c",
+         "\tnext = pick_next_task(rq, prev, &rf);\n"
+         "\tclear_tsk_need_resched(prev);\n"
+         "\tclear_preempt_need_resched();",
+         "\tnext = pick_next_task(rq, prev, &rf);\n"
+         "\tclear_tsk_need_resched(prev);\n"
+         "\tclear_preempt_need_resched();\n"
+         "\ttrace_android_vh_clear_curr_lazy(prev);",
+         T),
+        # fair.c: check_preempt_tick() can defer the resched
+        ("kernel/sched/fair.c",
+         "\tif (delta_exec > ideal_runtime) {\n"
+         "\t\tresched_curr(rq_of(cfs_rq));\n"
+         "\t\t/*\n"
+         "\t\t * The current task ran long enough, ensure it doesn't get",
+         "\tif (delta_exec > ideal_runtime) {\n"
+         "\t\ttrace_android_vh_resched_curr_lazy(rq_of(cfs_rq), &skip_preempt);\n"
+         "\n"
+         "\t\tif (skip_preempt)\n"
+         "\t\t\treturn;\n"
+         "\n"
+         "\t\tresched_curr(rq_of(cfs_rq));\n"
+         "\t\t/*\n"
+         "\t\t * The current task ran long enough, ensure it doesn't get",
+         T),
+        # fair.c: entity_tick() HRTICK branch can defer the resched
+        ("kernel/sched/fair.c",
+         "\tif (queued) {\n"
+         "\t\tresched_curr(rq_of(cfs_rq));\n"
+         "\t\treturn;\n"
+         "\t}",
+         "\tif (queued) {\n"
+         "\t\tbool skip_preempt = false;\n"
+         "\n"
+         "\t\ttrace_android_vh_resched_curr_lazy(rq_of(cfs_rq), &skip_preempt);\n"
+         "\n"
+         "\t\tif (skip_preempt)\n"
+         "\t\t\treturn;\n"
+         "\n"
+         "\t\tresched_curr(rq_of(cfs_rq));\n"
+         "\t\treturn;\n"
+         "\t}",
+         T),
+        # fair.c: wakeup preemption can defer the resched
+        ("kernel/sched/fair.c",
+         "preempt:\n"
+         "\tresched_curr(rq);\n"
+         "\t/*\n"
+         "\t * Only set the backward buddy when the current task is still",
+         "preempt:\n"
+         "\ttrace_android_vh_resched_curr_lazy(rq_of(cfs_rq), &ignore);\n"
+         "\n"
+         "\tif (ignore)\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tresched_curr(rq);\n"
+         "\t/*\n"
+         "\t * Only set the backward buddy when the current task is still",
+         T),
+    ])
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# android14-6.1 line: mutex/rwsem wakeup patch vendor hooks (ACK dfdcb1d)
+# ---------------------------------------------------------------------------
+
+def _locking_wakeup_patch_apply(ctx):
+    steps = [
+        ("include/trace/hooks/dtask.h",
+         "DECLARE_HOOK(android_vh_mutex_unlock_slowpath,\n"
+         "\tTP_PROTO(struct mutex *lock),\n"
+         "\tTP_ARGS(lock));\n"
+         "DECLARE_HOOK(android_vh_record_mutex_lock_starttime,",
+         "DECLARE_HOOK(android_vh_mutex_unlock_slowpath,\n"
+         "\tTP_PROTO(struct mutex *lock),\n"
+         "\tTP_ARGS(lock));\n"
+         "\n"
+         "/* ABK stable_515_backport: post-wakeup fixup hook (android14-6.1). */\n"
+         "DECLARE_HOOK(android_vh_mutex_wakeup_patch,\n"
+         "\tTP_PROTO(struct mutex *lock),\n"
+         "\tTP_ARGS(lock));\n"
+         "DECLARE_HOOK(android_vh_record_mutex_lock_starttime,",
+         T),
+        ("include/trace/hooks/rwsem.h",
+         "DECLARE_HOOK(android_vh_rwsem_wake_finish,\n"
+         "\tTP_PROTO(struct rw_semaphore *sem),\n"
+         "\tTP_ARGS(sem));\n"
+         "DECLARE_HOOK(android_vh_rwsem_downgrade_wake_finish,",
+         "DECLARE_HOOK(android_vh_rwsem_wake_finish,\n"
+         "\tTP_PROTO(struct rw_semaphore *sem),\n"
+         "\tTP_ARGS(sem));\n"
+         "\n"
+         "/* ABK stable_515_backport: post-wakeup fixup hook (android14-6.1). */\n"
+         "DECLARE_HOOK(android_vh_rwsem_wakeup_patch,\n"
+         "\tTP_PROTO(struct rw_semaphore *sem),\n"
+         "\tTP_ARGS(sem));\n"
+         "DECLARE_HOOK(android_vh_rwsem_downgrade_wake_finish,",
+         T),
+        ("kernel/locking/mutex.c",
+         "\traw_spin_unlock(&lock->wait_lock);\n"
+         "\n"
+         "\twake_up_q(&wake_q);\n"
+         "}",
+         "\traw_spin_unlock(&lock->wait_lock);\n"
+         "\n"
+         "\twake_up_q(&wake_q);\n"
+         "\n"
+         "\t/* ABK stable_515_backport: post-wakeup fixup point (android14-6.1). */\n"
+         "\ttrace_android_vh_mutex_wakeup_patch(lock);\n"
+         "}",
+         T),
+        ("kernel/locking/rwsem.c",
+         "\ttrace_android_vh_rwsem_wake_finish(sem);\n"
+         "\n"
+         "\traw_spin_unlock_irqrestore(&sem->wait_lock, flags);\n"
+         "\twake_up_q(&wake_q);\n"
+         "\n"
+         "\treturn sem;\n"
+         "}",
+         "\ttrace_android_vh_rwsem_wake_finish(sem);\n"
+         "\n"
+         "\traw_spin_unlock_irqrestore(&sem->wait_lock, flags);\n"
+         "\twake_up_q(&wake_q);\n"
+         "\n"
+         "\t/* ABK stable_515_backport: post-wakeup fixup point (android14-6.1). */\n"
+         "\ttrace_android_vh_rwsem_wakeup_patch(sem);\n"
+         "\n"
+         "\treturn sem;\n"
+         "}",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# android14-6.1 line: PSI IRQ pressure accounting (mainline 6.1 52b1364,
+# adapted to the 5.15 iterate_groups walk and embedded psi_group)
+# ---------------------------------------------------------------------------
+
+def _psi_irq_tracking_apply(ctx):
+    steps = [
+        # psi_types.h: PSI_IRQ resource and state, gated like the ACK tree
+        ("include/linux/psi_types.h",
+         "enum psi_res {\n"
+         "\tPSI_IO,\n"
+         "\tPSI_MEM,\n"
+         "\tPSI_CPU,\n"
+         "\tNR_PSI_RESOURCES = 3,\n"
+         "};",
+         "enum psi_res {\n"
+         "\tPSI_IO,\n"
+         "\tPSI_MEM,\n"
+         "\tPSI_CPU,\n"
+         "/* ABK stable_515_backport: IRQ pressure resource (android14-6.1). */\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "\tPSI_IRQ,\n"
+         "#endif\n"
+         "\tNR_PSI_RESOURCES,\n"
+         "};",
+         T),
+        ("include/linux/psi_types.h",
+         "\tPSI_CPU_SOME,\n"
+         "\tPSI_CPU_FULL,\n"
+         "\t/* Only per-CPU, to weigh the CPU in the global average: */\n"
+         "\tPSI_NONIDLE,\n"
+         "\tNR_PSI_STATES = 7,\n"
+         "};",
+         "\tPSI_CPU_SOME,\n"
+         "\tPSI_CPU_FULL,\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "\tPSI_IRQ_FULL,\n"
+         "#endif\n"
+         "\t/* Only per-CPU, to weigh the CPU in the global average: */\n"
+         "\tPSI_NONIDLE,\n"
+         "\tNR_PSI_STATES,\n"
+         "};",
+         T),
+        # stats.h: declaration and compile-out stubs
+        ("kernel/sched/stats.h",
+         "#ifdef CONFIG_PSI\n"
+         "/*\n"
+         " * PSI tracks state that persists across sleeps, such as iowaits and",
+         "#ifdef CONFIG_PSI\n"
+         "\n"
+         "/* ABK stable_515_backport: PSI IRQ pressure accounting (android14-6.1). */\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_struct *prev);\n"
+         "#else\n"
+         "static inline void psi_account_irqtime(struct rq *rq, struct task_struct *curr,\n"
+         "\t\t\t\t       struct task_struct *prev) {}\n"
+         "#endif /* CONFIG_IRQ_TIME_ACCOUNTING */\n"
+         "\n"
+         "/*\n"
+         " * PSI tracks state that persists across sleeps, such as iowaits and",
+         T),
+        ("kernel/sched/stats.h",
+         "static inline void psi_sched_switch(struct task_struct *prev,\n"
+         "\t\t\t\t    struct task_struct *next,\n"
+         "\t\t\t\t    bool sleep) {}\n"
+         "#endif /* CONFIG_PSI */",
+         "static inline void psi_sched_switch(struct task_struct *prev,\n"
+         "\t\t\t\t    struct task_struct *next,\n"
+         "\t\t\t\t    bool sleep) {}\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "static inline void psi_account_irqtime(struct rq *rq, struct task_struct *curr,\n"
+         "\t\t\t\t       struct task_struct *prev) {}\n"
+         "#endif /* CONFIG_IRQ_TIME_ACCOUNTING */\n"
+         "#endif /* CONFIG_PSI */",
+         T),
+        # psi.c: the accounting function, walking the 5.15 iterate_groups chain
+        ("kernel/sched/psi.c",
+         "/**\n"
+         " * psi_memstall_enter - mark the beginning of a memory stall section\n"
+         " * @flags: flags to handle nested sections",
+         "/* ABK stable_515_backport: PSI IRQ pressure accounting, grafted from the\n"
+         " * android14-6.1 ACK shape onto the 5.15 iterate_groups walk.\n"
+         " */\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "static DEFINE_PER_CPU(u64, psi_irq_time);\n"
+         "void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_struct *prev)\n"
+         "{\n"
+         "\tint cpu = task_cpu(curr);\n"
+         "\tstruct psi_group *group;\n"
+         "\tstruct psi_group_cpu *groupc;\n"
+         "\tvoid *iter = NULL;\n"
+         "\tu64 *psi_time;\n"
+         "\ts64 delta;\n"
+         "\tu64 irq;\n"
+         "\n"
+         "\tif (!curr->pid)\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tlockdep_assert_rq_held(rq);\n"
+         "\tif (prev) {\n"
+         "\t\tvoid *prev_iter = NULL;\n"
+         "\n"
+         "\t\tif (iterate_groups(prev, &prev_iter) == iterate_groups(curr, &iter))\n"
+         "\t\t\treturn;\n"
+         "\t\titer = NULL;\n"
+         "\t}\n"
+         "\n"
+         "\tirq = irq_time_read(cpu);\n"
+         "\tpsi_time = &per_cpu(psi_irq_time, cpu);\n"
+         "\tdelta = (s64)(irq - *psi_time);\n"
+         "\tif (delta < 0)\n"
+         "\t\treturn;\n"
+         "\t*psi_time = irq;\n"
+         "\n"
+         "\twhile ((group = iterate_groups(curr, &iter))) {\n"
+         "\t\tu64 now;\n"
+         "\n"
+         "\t\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n"
+         "\n"
+         "\t\twrite_seqcount_begin(&groupc->seq);\n"
+         "\t\tnow = cpu_clock(cpu);\n"
+         "\n"
+         "\t\trecord_times(groupc, now);\n"
+         "\t\tgroupc->times[PSI_IRQ_FULL] += delta;\n"
+         "\n"
+         "\t\twrite_seqcount_end(&groupc->seq);\n"
+         "\n"
+         "\t\tif (group->poll_states & (1 << PSI_IRQ_FULL))\n"
+         "\t\t\tpsi_schedule_poll_work(group, 1, false);\n"
+         "\t}\n"
+         "}\n"
+         "#endif /* CONFIG_IRQ_TIME_ACCOUNTING */\n"
+         "\n"
+         "/**\n"
+         " * psi_memstall_enter - mark the beginning of a memory stall section\n"
+         " * @flags: flags to handle nested sections",
+         T),
+        # psi.c: psi_show() renders the irq resource as a single full line
+        ("kernel/sched/psi.c",
+         "int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)\n"
+         "{\n"
+         "\tint full;\n"
+         "\tu64 now;",
+         "int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)\n"
+         "{\n"
+         "\tbool only_full = false;\n"
+         "\tint full;\n"
+         "\tu64 now;",
+         T),
+        ("kernel/sched/psi.c",
+         "\tmutex_unlock(&group->avgs_lock);\n"
+         "\n"
+         "\tfor (full = 0; full < 2; full++) {",
+         "\tmutex_unlock(&group->avgs_lock);\n"
+         "\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "\tonly_full = res == PSI_IRQ;\n"
+         "#endif\n"
+         "\n"
+         "\tfor (full = 0; full < 2 - only_full; full++) {",
+         T),
+        ("kernel/sched/psi.c",
+         "\t\t\t   full ? \"full\" : \"some\",",
+         "\t\t\t   full || only_full ? \"full\" : \"some\",",
+         T),
+        # psi.c: psi_trigger_create() must reject some/ only for the irq resource
+        ("kernel/sched/psi.c",
+         "\telse\n"
+         "\t\treturn ERR_PTR(-EINVAL);\n"
+         "\n"
+         "\tif (state >= PSI_NONIDLE)\n"
+         "\t\treturn ERR_PTR(-EINVAL);",
+         "\telse\n"
+         "\t\treturn ERR_PTR(-EINVAL);\n"
+         "\n"
+         "/* ABK stable_515_backport: irq pressure only supports full triggers (android14-6.1). */\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "\tif (res == PSI_IRQ && --state != PSI_IRQ_FULL)\n"
+         "\t\treturn ERR_PTR(-EINVAL);\n"
+         "#endif\n"
+         "\n"
+         "\tif (state >= PSI_NONIDLE)\n"
+         "\t\treturn ERR_PTR(-EINVAL);",
+         T),
+        # psi.c: /proc/pressure/irq surface
+        ("kernel/sched/psi.c",
+         "\nstatic int __init psi_proc_init(void)\n",
+         "\n"
+         "/* ABK stable_515_backport: /proc/pressure/irq (android14-6.1). */\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "static int psi_irq_show(struct seq_file *m, void *v)\n"
+         "{\n"
+         "\treturn psi_show(m, &psi_system, PSI_IRQ);\n"
+         "}\n"
+         "\n"
+         "static int psi_irq_open(struct inode *inode, struct file *file)\n"
+         "{\n"
+         "\treturn single_open(file, psi_irq_show, NULL);\n"
+         "}\n"
+         "\n"
+         "static ssize_t psi_irq_write(struct file *file, const char __user *user_buf,\n"
+         "\t\t\t     size_t nbytes, loff_t *ppos)\n"
+         "{\n"
+         "\treturn psi_write(file, user_buf, nbytes, PSI_IRQ);\n"
+         "}\n"
+         "\n"
+         "static const struct proc_ops psi_irq_proc_ops = {\n"
+         "\t.proc_open\t= psi_irq_open,\n"
+         "\t.proc_read\t= seq_read,\n"
+         "\t.proc_lseek\t= seq_lseek,\n"
+         "\t.proc_write\t= psi_irq_write,\n"
+         "\t.proc_poll\t= psi_fop_poll,\n"
+         "\t.proc_release\t= psi_fop_release,\n"
+         "};\n"
+         "#endif\n"
+         "\n"
+         "static int __init psi_proc_init(void)\n",
+         T),
+        ("kernel/sched/psi.c",
+         "\t\tproc_create(\"pressure/cpu\", 0, NULL, &psi_cpu_proc_ops);\n"
+         "\t}",
+         "\t\tproc_create(\"pressure/cpu\", 0, NULL, &psi_cpu_proc_ops);\n"
+         "#ifdef CONFIG_IRQ_TIME_ACCOUNTING\n"
+         "\t\tproc_create(\"pressure/irq\", 0, NULL, &psi_irq_proc_ops);\n"
+         "#endif\n"
+         "\t}",
+         T),
+        # core.c: account irq time at tick and before the context switch
+        ("kernel/sched/core.c",
+         "\trq_lock(rq, &rf);\n"
+         "\n"
+         "\tupdate_rq_clock(rq);\n"
+         "\ttrace_android_rvh_tick_entry(rq);",
+         "\trq_lock(rq, &rf);\n"
+         "\n"
+         "\t/* ABK stable_515_backport: PSI IRQ pressure accounting (android14-6.1). */\n"
+         "\tpsi_account_irqtime(rq, curr, NULL);\n"
+         "\n"
+         "\tupdate_rq_clock(rq);\n"
+         "\ttrace_android_rvh_tick_entry(rq);",
+         T),
+        ("kernel/sched/core.c",
+         "\t\tmigrate_disable_switch(rq, prev);\n"
+         "\t\tpsi_sched_switch(prev, next, !task_on_rq_queued(prev));",
+         "\t\tmigrate_disable_switch(rq, prev);\n"
+         "\t\tpsi_account_irqtime(rq, prev, next);\n"
+         "\t\tpsi_sched_switch(prev, next, !task_on_rq_queued(prev));",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# android14-6.1 line: PSI trigger kernfs polling (ACK 6.1 backport of the
+# kernfs polling rework; psi_trigger is heap-only so the KMI is untouched)
+# ---------------------------------------------------------------------------
+
+def _psi_kernfs_polling_apply(ctx):
+    steps = [
+        # psi_types.h: deferred-event flag and the kernfs wrapper struct
+        ("include/linux/psi_types.h",
+         "\t/*\n"
+         "\t * Time last event was generated. Used for rate-limiting\n"
+         "\t * events to one per window\n"
+         "\t */\n"
+         "\tu64 last_event_time;\n"
+         "};",
+         "\t/*\n"
+         "\t * Time last event was generated. Used for rate-limiting\n"
+         "\t * events to one per window\n"
+         "\t */\n"
+         "\tu64 last_event_time;\n"
+         "\n"
+         "\t/* ABK stable_515_backport: deferred event(s) from the previous ratelimit window (android14-6.1). */\n"
+         "\tbool pending_event;\n"
+         "};",
+         T),
+        ("include/linux/psi_types.h",
+         "enum poll_wakeup_bits {\n"
+         "\tPOLL_WAKEUP\t= 0,\n"
+         "\tPOLL_SCHEDULED\t= 1,\n"
+         "};",
+         "enum poll_wakeup_bits {\n"
+         "\tPOLL_WAKEUP\t= 0,\n"
+         "\tPOLL_SCHEDULED\t= 1,\n"
+         "};\n"
+         "\n"
+         "/* ABK stable_515_backport: kernfs polling wrapper for cgroup triggers (android14-6.1). */\n"
+         "struct psi_trigger_ext {\n"
+         "\tstruct psi_trigger trigger;\n"
+         "\n"
+         "\t/* Kernfs file for cgroup triggers */\n"
+         "\tstruct kernfs_open_file *of;\n"
+         "};",
+         T),
+        # psi.h: trigger creation carries the file/kernfs identity
+        ("include/linux/psi.h",
+         "struct psi_trigger *psi_trigger_create(struct psi_group *group,\n"
+         "\t\t\tchar *buf, size_t nbytes, enum psi_res res);",
+         "/* ABK stable_515_backport: kernfs-aware trigger creation (android14-6.1). */\n"
+         "struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,\n"
+         "\t\t\t\t       enum psi_res res, struct file *file,\n"
+         "\t\t\t\t       struct kernfs_open_file *of);",
+         T),
+        # psi.c: short windows are no longer floored at 500ms
+        ("kernel/sched/psi.c",
+         "/* PSI trigger definitions */\n"
+         "#define WINDOW_MIN_US 500000\t/* Min window size is 500ms */\n"
+         "#define WINDOW_MAX_US 10000000\t/* Max window size is 10s */",
+         "/* PSI trigger definitions */\n"
+         "/* ABK stable_515_backport: windows may start at 1us (android14-6.1). */\n"
+         "#define WINDOW_MAX_US 10000000\t/* Max window size is 10s */",
+         T),
+        ("kernel/sched/psi.c",
+         "\tif (window_us < WINDOW_MIN_US ||\n"
+         "\t\twindow_us > WINDOW_MAX_US)\n"
+         "\t\treturn ERR_PTR(-EINVAL);",
+         "\tif (window_us == 0 || window_us > WINDOW_MAX_US)\n"
+         "\t\treturn ERR_PTR(-EINVAL);",
+         T),
+        # psi.c: trigger_create() allocates the ext wrapper and seeds the window
+        ("kernel/sched/psi.c",
+         "struct psi_trigger *psi_trigger_create(struct psi_group *group,\n"
+         "\t\t\tchar *buf, size_t nbytes, enum psi_res res)\n"
+         "{\n"
+         "\tstruct psi_trigger *t;",
+         "struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,\n"
+         "\t\t\t\t       enum psi_res res, struct file *file,\n"
+         "\t\t\t\t       struct kernfs_open_file *of)\n"
+         "{\n"
+         "\tstruct psi_trigger_ext *t_ext;\n"
+         "\tstruct psi_trigger *t;",
+         T),
+        ("kernel/sched/psi.c",
+         "\tt = kmalloc(sizeof(*t), GFP_KERNEL);\n"
+         "\tif (!t)\n"
+         "\t\treturn ERR_PTR(-ENOMEM);",
+         "\tt_ext = kmalloc(sizeof(*t_ext), GFP_KERNEL);\n"
+         "\tif (!t_ext)\n"
+         "\t\treturn ERR_PTR(-ENOMEM);\n"
+         "\tt = &t_ext->trigger;",
+         T),
+        ("kernel/sched/psi.c",
+         "\twindow_reset(&t->win, 0, 0, 0);\n"
+         "\n"
+         "\tt->event = 0;\n"
+         "\tt->last_event_time = 0;\n"
+         "\tinit_waitqueue_head(&t->event_wait);",
+         "\twindow_reset(&t->win, sched_clock(),\n"
+         "\t\t\tgroup->total[PSI_POLL][t->state], 0);\n"
+         "\n"
+         "\tt->event = 0;\n"
+         "\tt->last_event_time = 0;\n"
+         "\tt_ext->of = of;\n"
+         "\tif (!of)\n"
+         "\t\tinit_waitqueue_head(&t->event_wait);\n"
+         "\tt->pending_event = false;",
+         T),
+        ("kernel/sched/psi.c",
+         "\t\ttask = kthread_create(psi_poll_worker, group, \"psimon\");\n"
+         "\t\tif (IS_ERR(task)) {\n"
+         "\t\t\tkfree(t);\n"
+         "\t\t\tmutex_unlock(&group->trigger_lock);",
+         "\t\ttask = kthread_create(psi_poll_worker, group, \"psimon\");\n"
+         "\t\tif (IS_ERR(task)) {\n"
+         "\t\t\tkfree(t_ext);\n"
+         "\t\t\tmutex_unlock(&group->trigger_lock);",
+         T),
+        # psi.c: update_triggers() ratelimits without dropping events and
+        # signals cgroup triggers through kernfs
+        ("kernel/sched/psi.c",
+         "static u64 update_triggers(struct psi_group *group, u64 now)\n"
+         "{\n"
+         "\tstruct psi_trigger *t;\n"
+         "\tbool new_stall = false;\n"
+         "\tu64 *total = group->total[PSI_POLL];",
+         "static u64 update_triggers(struct psi_group *group, u64 now)\n"
+         "{\n"
+         "\tstruct psi_trigger *t;\n"
+         "\tbool update_total = false;\n"
+         "\tu64 *total = group->total[PSI_POLL];",
+         T),
+        ("kernel/sched/psi.c",
+         "\tlist_for_each_entry(t, &group->triggers, node) {\n"
+         "\t\tu64 growth;\n"
+         "\n"
+         "\t\t/* Check for stall activity */\n"
+         "\t\tif (group->polling_total[t->state] == total[t->state])\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\t/*\n"
+         "\t\t * Multiple triggers might be looking at the same state,\n"
+         "\t\t * remember to update group->polling_total[] once we've\n"
+         "\t\t * been through all of them. Also remember to extend the\n"
+         "\t\t * polling time if we see new stall activity.\n"
+         "\t\t */\n"
+         "\t\tnew_stall = true;\n"
+         "\n"
+         "\t\t/* Calculate growth since last update */\n"
+         "\t\tgrowth = window_update(&t->win, now, total[t->state]);\n"
+         "\t\tif (growth < t->threshold)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\t/* Limit event signaling to once per window */\n"
+         "\t\tif (now < t->last_event_time + t->win.size)\n"
+         "\t\t\tcontinue;",
+         "\tlist_for_each_entry(t, &group->triggers, node) {\n"
+         "\t\tu64 growth;\n"
+         "\t\tbool new_stall;\n"
+         "\n"
+         "\t\tnew_stall = group->polling_total[t->state] != total[t->state];\n"
+         "\n"
+         "\t\t/* Check for stall activity or a previous threshold breach */\n"
+         "\t\tif (!new_stall && !t->pending_event)\n"
+         "\t\t\tcontinue;\n"
+         "\t\t/*\n"
+         "\t\t * Check for new stall activity, as well as deferred\n"
+         "\t\t * events that occurred in the last window after the\n"
+         "\t\t * trigger had already fired (we want to ratelimit\n"
+         "\t\t * events without dropping any).\n"
+         "\t\t */\n"
+         "\t\tif (new_stall) {\n"
+         "\t\t\t/*\n"
+         "\t\t\t * Multiple triggers might be looking at the same state,\n"
+         "\t\t\t * remember to update group->polling_total[] once we've\n"
+         "\t\t\t * been through all of them. Also remember to extend the\n"
+         "\t\t\t * polling time if we see new stall activity.\n"
+         "\t\t\t */\n"
+         "\t\t\tupdate_total = true;\n"
+         "\n"
+         "\t\t\t/* Calculate growth since last update */\n"
+         "\t\t\tgrowth = window_update(&t->win, now, total[t->state]);\n"
+         "\t\t\tif (!t->pending_event) {\n"
+         "\t\t\t\tif (growth < t->threshold)\n"
+         "\t\t\t\t\tcontinue;\n"
+         "\n"
+         "\t\t\t\tt->pending_event = true;\n"
+         "\t\t\t}\n"
+         "\t\t}\n"
+         "\t\t/* Limit event signaling to once per window */\n"
+         "\t\tif (now < t->last_event_time + t->win.size)\n"
+         "\t\t\tcontinue;",
+         T),
+        ("kernel/sched/psi.c",
+         "\t\t/* Generate an event */\n"
+         "\t\tif (cmpxchg(&t->event, 0, 1) == 0)\n"
+         "\t\t\twake_up_interruptible(&t->event_wait);\n"
+         "\t\tt->last_event_time = now;\n"
+         "\t}",
+         "\t\t/* Generate an event */\n"
+         "\t\tif (cmpxchg(&t->event, 0, 1) == 0) {\n"
+         "\t\t\tstruct psi_trigger_ext *t_ext;\n"
+         "\n"
+         "\t\t\tt_ext = container_of(t, struct psi_trigger_ext, trigger);\n"
+         "\t\t\tif (t_ext->of)\n"
+         "\t\t\t\tkernfs_notify(t_ext->of->kn);\n"
+         "\t\t\telse\n"
+         "\t\t\t\twake_up_interruptible(&t->event_wait);\n"
+         "\t\t}\n"
+         "\t\tt->last_event_time = now;\n"
+         "\t\t/* Reset threshold breach flag once event got generated */\n"
+         "\t\tt->pending_event = false;\n"
+         "\t}",
+         T),
+        ("kernel/sched/psi.c",
+         "\tif (new_stall)\n"
+         "\t\tmemcpy(group->polling_total, total,\n"
+         "\t\t\t\tsizeof(group->polling_total));",
+         "\tif (update_total)\n"
+         "\t\tmemcpy(group->polling_total, total,\n"
+         "\t\t\t\tsizeof(group->polling_total));",
+         T),
+        # psi.c: trigger destruction and poll wake cgroup waiters via kernfs
+        ("kernel/sched/psi.c",
+         "void psi_trigger_destroy(struct psi_trigger *t)\n"
+         "{\n"
+         "\tstruct psi_group *group;\n"
+         "\tstruct task_struct *task_to_destroy = NULL;",
+         "void psi_trigger_destroy(struct psi_trigger *t)\n"
+         "{\n"
+         "\tstruct psi_trigger_ext *t_ext;\n"
+         "\tstruct psi_group *group;\n"
+         "\tstruct task_struct *task_to_destroy = NULL;",
+         T),
+        ("kernel/sched/psi.c",
+         "\twake_up_pollfree(&t->event_wait);",
+         "\tt_ext = container_of(t, struct psi_trigger_ext, trigger);\n"
+         "\tif (t_ext->of)\n"
+         "\t\tkernfs_notify(t_ext->of->kn);\n"
+         "\telse\n"
+         "\t\twake_up_interruptible(&t->event_wait);",
+         T),
+        ("kernel/sched/psi.c",
+         "\t\tkthread_stop(task_to_destroy);\n"
+         "\t\tatomic_clear_bit(POLL_SCHEDULED, &group->poll_wakeup);\n"
+         "\t}\n"
+         "\tkfree(t);\n"
+         "}",
+         "\t\tkthread_stop(task_to_destroy);\n"
+         "\t\tatomic_clear_bit(POLL_SCHEDULED, &group->poll_wakeup);\n"
+         "\t}\n"
+         "\tkfree(t_ext);\n"
+         "}",
+         T),
+        ("kernel/sched/psi.c",
+         "\t__poll_t ret = DEFAULT_POLLMASK;\n"
+         "\tstruct psi_trigger *t;",
+         "\t__poll_t ret = DEFAULT_POLLMASK;\n"
+         "\tstruct psi_trigger_ext *t_ext;\n"
+         "\tstruct psi_trigger *t;",
+         T),
+        ("kernel/sched/psi.c",
+         "\tt = smp_load_acquire(trigger_ptr);\n"
+         "\tif (!t)\n"
+         "\t\treturn DEFAULT_POLLMASK | EPOLLERR | EPOLLPRI;\n"
+         "\n"
+         "\tpoll_wait(file, &t->event_wait, wait);",
+         "\tt = smp_load_acquire(trigger_ptr);\n"
+         "\tif (!t)\n"
+         "\t\treturn DEFAULT_POLLMASK | EPOLLERR | EPOLLPRI;\n"
+         "\n"
+         "\tt_ext = container_of(t, struct psi_trigger_ext, trigger);\n"
+         "\tif (t_ext->of)\n"
+         "\t\tkernfs_generic_poll(t_ext->of, wait);\n"
+         "\telse\n"
+         "\t\tpoll_wait(file, &t->event_wait, wait);",
+         T),
+        # psi.c + cgroup.c: callers pass the open file identity through
+        ("kernel/sched/psi.c",
+         "\tnew = psi_trigger_create(&psi_system, buf, nbytes, res);",
+         "\tnew = psi_trigger_create(&psi_system, buf, res, file, NULL);",
+         T),
+        ("kernel/cgroup/cgroup.c",
+         "\tnew = psi_trigger_create(psi, buf, nbytes, res);",
+         "\tnew = psi_trigger_create(psi, buf, res, of->file, of);",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 PATCH_GROUPS = [
     PatchGroup(
         "sched_nohz_idle_balance_series",
@@ -614,6 +1445,34 @@ PATCH_GROUPS = [
         ["8fe7de5d1c7f (5.15.198)"],
         ["block/blk-mq.c"],
         _blk_mq_suspend_apply,
+    ),
+    PatchGroup(
+        "sched_lazy_preemption_hooks",
+        "lazy preemption scheduling hooks: bounded resched deferral in tick/wakeup/schedule (android14-6.1)",
+        ["ACK android14-6.1 lazy preemption via hooks (969cb3d family)"],
+        ["include/trace/hooks/dtask.h", "kernel/sched/core.c", "kernel/sched/fair.c"],
+        _lazy_preempt_hooks_apply,
+    ),
+    PatchGroup(
+        "locking_wakeup_patch_hooks",
+        "mutex/rwsem post-wakeup fixup vendor hooks (android14-6.1)",
+        ["ACK android14-6.1 locking wakeup patch hooks (dfdcb1d)"],
+        ["include/trace/hooks/dtask.h", "include/trace/hooks/rwsem.h", "kernel/locking/mutex.c", "kernel/locking/rwsem.c"],
+        _locking_wakeup_patch_apply,
+    ),
+    PatchGroup(
+        "psi_irq_tracking",
+        "PSI_IRQ pressure tracking with /proc/pressure/irq, adapted to the 5.15 group walk (android14-6.1 / 6.1)",
+        ["52b1364 (6.1) + ACK android14-6.1 adaptations"],
+        ["include/linux/psi_types.h", "kernel/sched/psi.c", "kernel/sched/stats.h", "kernel/sched/core.c"],
+        _psi_irq_tracking_apply,
+    ),
+    PatchGroup(
+        "psi_trigger_kernfs_polling",
+        "PSI trigger events delivered via kernfs polling with deferred-event ratelimiting and 1us windows (android14-6.1)",
+        ["ACK android14-6.1 kernfs PSI polling backport (c1496f6 family)"],
+        ["include/linux/psi_types.h", "include/linux/psi.h", "kernel/sched/psi.c", "kernel/cgroup/cgroup.c"],
+        _psi_kernfs_polling_apply,
     ),
 ]
 

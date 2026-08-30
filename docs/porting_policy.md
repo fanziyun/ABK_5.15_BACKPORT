@@ -24,6 +24,35 @@
    build with a precise message (same protection style as the ABI suite's
    `fd_alloc_hotpath`).
 
+## 6.1-origin line (Batch 3+)
+
+The `android14-6.1` ACK branch (the only 6.1 ACK line) is a second feature
+source for this module, in addition to the upstream 5.15.y stream. See
+`docs/survey_6_1_ack.md` for the candidate inventory and the
+suite-preference cross-check.
+
+- **Source form = ACK 6.1 tree text.** Group content mirrors the
+  android14-6.1 shape (including its stable-backports of later mainline
+  features, e.g. the kernfs PSI polling rework), adapted to the 5.15
+  baseline shapes where the ACK form sits on 6.1-only infrastructure.
+- **Suite preference.** For every candidate the ABK_ABI_PATCH_SUITE
+  inventory is checked first; suite-covered optimizations are NOT
+  re-implemented here (build with the suite instead). The exclusion list
+  is recorded in the survey doc.
+- **KMI red lines, extended.** The ACK 6.1 `psi_group` pointer/parent
+  restructure (which rewrites `struct cgroup`) is NOT portable to
+  android13-5.15 — PSI features are grafted onto the embedded-psi_group
+  shapes instead (heap-only `psi_trigger` wrappers, percpu-internal
+  `psi_group_cpu` states, enum additions). Vendor tracepoints are additive
+  and may be introduced; new struct members never grow KMI-visible
+  structs.
+- **Shape probes handle lineage drift.** e.g. the lazy-preemption group
+  detects whether the tree already carries
+  `android_vh_set_tsk_need_resched_lazy` (newer 5.15 ACK snapshots do) and
+  lands the full mechanism on the 2024-11 baseline; the graft marker
+  doubles as the idempotency probe.
+
+
 ## Three-module composition (all after_patch)
 
 CI executes injected modules in input order, so the canonical input is:

@@ -17,8 +17,16 @@ Python registry *is* the patch set, and every edit carries an
 
 | child id | content |
 |---|---|
-| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard), page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194) |
-| `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198) |
+| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard), page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1) |
+| `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
+
+Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
+features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
+PSI IRQ tracking, PSI trigger kernfs polling, and the lazy-preemption /
+lock-wakeup vendor-hook families.  Those groups mirror the ACK 6.1 form
+adapted to the 5.15 baseline shapes, keep the KMI untouched (heap-internal
+wrappers, percpu states, additive tracepoints only), and skip anything the
+ABK_ABI_PATCH_SUITE already covers (see `docs/survey_6_1_ack.md`).
 
 KMI red lines are built in: new exported-struct fields only ever reuse free
 `ANDROID_KABI_RESERVE` slots (this module uses `task_struct` slot 8), and

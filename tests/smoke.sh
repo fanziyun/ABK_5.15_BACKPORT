@@ -32,11 +32,18 @@ SMOKE_FILES=(
   mm/page_alloc.c
   mm/internal.h
   mm/oom_kill.c
+  mm/vmscan.c
+  mm/memcontrol.c
+  include/linux/swap.h
   include/linux/cgroup-defs.h
   include/linux/cpuset.h
   include/linux/mmzone.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
+  include/linux/psi_types.h
+  include/linux/psi.h
+  include/trace/hooks/dtask.h
+  include/trace/hooks/rwsem.h
   kernel/cgroup/cgroup-internal.h
   kernel/cgroup/cgroup.c
   kernel/cgroup/cpuset.c
@@ -49,6 +56,8 @@ SMOKE_FILES=(
   kernel/sched/psi.c
   kernel/fork.c
   kernel/locking/semaphore.c
+  kernel/locking/mutex.c
+  kernel/locking/rwsem.c
   init/main.c
   net/core/sock.c
   block/blk-mq.c
@@ -84,8 +93,10 @@ tail -2 "$WORK/pass2.log"
 echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-grep -q '{"applied": 8}' "$WORK/pass1.log" || fail "pass 1 did not report 8 applied groups per child"
-grep -q '{"already_present": 8}' "$WORK/pass2.log" || fail "pass 2 was not idempotent"
+grep -q '{"applied": 9}' "$WORK/pass1.log" || fail "pass 1 did not report 9 applied groups (core)"
+grep -q '{"applied": 12}' "$WORK/pass1.log" || fail "pass 1 did not report 12 applied groups (perf)"
+grep -q '{"already_present": 9}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (core)"
+grep -q '{"already_present": 12}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (perf)"
 
 for child in stable_backport_core stable_perf_backport; do
   [ -f "$WORK/pass1_reports/$child/${child}_report.json" ] || fail "missing pass1 report for $child"
@@ -94,8 +105,11 @@ for child in stable_backport_core stable_perf_backport; do
 import json, sys
 p1 = json.load(open(sys.argv[1]))
 p2 = json.load(open(sys.argv[2]))
-assert p1["status_summary"] == {"applied": 8}, p1["status_summary"]
-assert p2["status_summary"] == {"already_present": 8}, p2["status_summary"]
+child = p1["child"]
+exp1 = {"applied": 9} if child == "stable_backport_core" else {"applied": 12}
+exp2 = {"already_present": 9} if child == "stable_backport_core" else {"already_present": 12}
+assert p1["status_summary"] == exp1, (child, p1["status_summary"])
+assert p2["status_summary"] == exp2, (child, p2["status_summary"])
 PY
 done
 
@@ -109,6 +123,16 @@ grep -q "cgroup_free_wq" "$KERNEL_ROOT/common/kernel/cgroup/cgroup.c" \
   || fail "cgroup wq split marker missing"
 grep -q "__raise_softirq_irqoff(SCHED_SOFTIRQ);" "$KERNEL_ROOT/common/kernel/sched/core.c" \
   || fail "nohz core.c marker missing"
+grep -q '"reclaim",' "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "memory.reclaim cft entry missing"
+grep -q "psi_account_irqtime" "$KERNEL_ROOT/common/kernel/sched/psi.c" \
+  || fail "PSI IRQ accounting missing"
+grep -q "android_vh_resched_curr_lazy" "$KERNEL_ROOT/common/include/trace/hooks/dtask.h" \
+  || fail "lazy preemption hook missing"
+grep -q "android_vh_mutex_wakeup_patch" "$KERNEL_ROOT/common/kernel/locking/mutex.c" \
+  || fail "mutex wakeup patch hook missing"
+grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h" \
+  || fail "kernfs polling trigger wrapper missing"
 
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
