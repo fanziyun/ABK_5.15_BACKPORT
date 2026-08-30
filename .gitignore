@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+tests/out/
+*.ko
+*.img
+*.bin
+research/hunks_dump.txt
+.idea/
+.zcode/
