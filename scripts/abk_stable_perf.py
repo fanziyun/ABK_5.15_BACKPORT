@@ -667,6 +667,13 @@ def _lazy_preempt_hooks_apply(ctx):
             T,
         ))
     steps.extend([
+        # fair.c: the lazy hooks live in dtask.h; mirror the 6.1 include pair
+        # so the tracepoint macros are visible in this translation unit.
+        ("kernel/sched/fair.c",
+         "#include <trace/hooks/sched.h>",
+         "#include <trace/hooks/sched.h>\n"
+         "#include <trace/hooks/dtask.h>",
+         T),
         # core.c: __schedule() may skip this schedule() call entirely
         ("kernel/sched/core.c",
          "\tstruct task_struct *prev, *next;\n"
