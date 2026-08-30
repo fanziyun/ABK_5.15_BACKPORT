@@ -170,6 +170,64 @@ def audit_child(name, module, pristine_root, work):
     print(f"  {name}: {len(steps)} steps audited, second pass idempotent")
 
 
+def audit_fdtable_on_suite_shape(module, source, work):
+    """Audit the fdtable group's composed variant over the suite-first shape.
+
+    Builds ABK_ABI_PATCH_SUITE's fallback alloc_fdtable() on top of the real
+    reference fs/file.c (same deltas as the unit-test fixture), then runs the
+    group: every step must be ``applied``, the replacement blocks must not
+    pre-exist, comment balance must hold, and a second pass must be a
+    byte-identical no-op.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from stable_5_15_test import SUITE_HELPER_TAIL, suite_fallback_deltas
+
+    tree = work / "suite_first"
+    (tree / "fs").mkdir(parents=True, exist_ok=True)
+    pristine_text = common.read_text(source / "fs" / "file.c")
+    suite_text = suite_fallback_deltas(pristine_text) + SUITE_HELPER_TAIL
+    for marker in (
+        "unsigned int slots_wanted = abk_fdtable_slots_wanted(nr);",
+        "nr = ALIGN(slots_wanted, BITS_PER_LONG);",
+        "if (unlikely(nr > INT_MAX / sizeof(struct file *)))\n\t\treturn NULL;",
+    ):
+        if marker not in suite_text:
+            fail(f"suite-fallback delta did not land on the real fs/file.c: {marker!r}")
+    (tree / "fs" / "file.c").write_bytes(suite_text.encode("utf-8"))
+    suite_balance = comment_delta(suite_text)
+
+    steps = []
+    original = record_steps(module, steps)
+    try:
+        ctx = new_ctx(tree)
+        group = next(g for g in module.PATCH_GROUPS if g.key == "fdtable_alloc_conventions")
+        result = group.run(ctx)
+        if result["status"] != "applied":
+            fail(f"fdtable composed variant degraded on the suite shape: "
+                 f"{result['status']} ({result['detail']})")
+    finally:
+        module.apply_steps = original
+
+    for rel, old, new, _required in steps:
+        if rel != "fs/file.c":
+            continue
+        if contains_block(suite_text, new):
+            fail("fdtable composed variant: replacement block already exists in the "
+                 f"suite-shaped file:\n{new[:120]!r}")
+    after_text = common.read_text(tree / "fs" / "file.c")
+    if comment_delta(after_text) != suite_balance:
+        fail("fdtable composed variant: comment balance changed on fs/file.c")
+
+    patched_bytes = (tree / "fs" / "file.c").read_bytes()
+    ctx2 = new_ctx(tree)
+    result2 = group.run(ctx2)
+    if result2["status"] != "already_present":
+        fail(f"fdtable composed variant not idempotent: {result2['status']}")
+    if (tree / "fs" / "file.c").read_bytes() != patched_bytes:
+        fail("fdtable composed variant: second pass rewrote fs/file.c")
+    print(f"  fdtable-on-suite-shape: {len(steps)} steps audited, second pass idempotent")
+
+
 def main():
     import os
 
@@ -190,6 +248,7 @@ def main():
               f"against {source}")
         for name, module in CHILD_MODULES:
             audit_child(name, module, pristine, work)
+        audit_fdtable_on_suite_shape(abk_stable_core, source, work)
     print("STEP AUDIT OK")
 
 

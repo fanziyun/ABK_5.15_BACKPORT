@@ -43,15 +43,21 @@ kernel patches are applied.
 ## Coexistence with other ABK modules
 
 The module is self-contained and injectable on its own. If the same build
-also carries storage-rollback or feature-graft modules, keep this order
-(CI executes `custom_external_modules` entries in input order, all at
-`after_patch`):
+also carries storage-rollback or feature-graft modules, this order is still
+recommended (CI executes `custom_external_modules` entries in input order,
+all at `after_patch`):
 
 1. storage rollback children first (their reverse-apply must see the
    pristine monthly tree),
 2. this module second (forward grafts onto the settled baseline),
 3. other feature-graft modules last — their fd-table probes detect the
    upstream shape this module lands and adapt instead of double-rewriting.
+
+The order is no longer a hard requirement: when ABK_ABI_PATCH_SUITE runs
+first anyway, this module's fd-table group recognizes the suite's fallback
+`alloc_fdtable()` and composes the upstream 5.15.191 conventions on top of
+it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
+place), so all 14 groups land in either injection order.
 
 The full input string for the F2FS + ABI-suite combination, the shape
 registry and the KMI compatibility matrix are documented in

@@ -108,13 +108,64 @@ FD_PRISTINE = (
     "\treturn do_dup2(files, file, fd, flags);\n"
     "}\n"
 )
-FD_SUITE_FALLBACK = FD_PRISTINE.replace(
-    "alloc_fdtable(unsigned int nr)",
-    "alloc_fdtable(unsigned int slots_wanted)",
-).replace(
-    "\tnr /= (1024 / sizeof(struct file *));",
-    "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n\tnr /= (1024 / sizeof(struct file *));",
-) + "/* ABK feature_porting: fd allocation hotpath helper graft. */\n"
+# Faithful reproduction of ABK_ABI_PATCH_SUITE's fallback alloc_fdtable()
+# (scripts/abk_feature_porting.py patch_fd_alloc_hotpath): helper local in the
+# body, ALIGN capacity line with its comment, round-up clamp plus an
+# INT_MAX -> return NULL guard.  Shared with tests/step_audit.py so the audit
+# can build the suite-first shape over the real reference tree as well.
+def suite_fallback_deltas(text):
+    return (
+        text
+        .replace(
+            "static struct fdtable * alloc_fdtable(unsigned int nr)\n"
+            "{\n"
+            "\tstruct fdtable *fdt;\n"
+            "\tvoid *data;\n",
+            "static struct fdtable * alloc_fdtable(unsigned int nr)\n"
+            "{\n"
+            "\tstruct fdtable *fdt;\n"
+            "\tunsigned int slots_wanted = abk_fdtable_slots_wanted(nr);\n"
+            "\tvoid *data;\n",
+        )
+        .replace(
+            "\tnr /= (1024 / sizeof(struct file *));\n"
+            "\tnr = roundup_pow_of_two(nr + 1);\n"
+            "\tnr *= (1024 / sizeof(struct file *));\n"
+            "\tnr = ALIGN(nr, BITS_PER_LONG);\n",
+            "\t/*\n"
+            "\t * Keep the legacy file-local interface shape, but derive capacity from\n"
+            "\t * the requested slot count before dropping into the allocator.\n"
+            "\t */\n"
+            "\tnr = ALIGN(slots_wanted, BITS_PER_LONG);\n",
+        )
+        .replace(
+            "\tif (unlikely(nr > sysctl_nr_open))\n"
+            "\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n",
+            "\tif (unlikely(nr > sysctl_nr_open))\n"
+            "\t\tnr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;\n"
+            "\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))\n"
+            "\t\treturn NULL;\n",
+        )
+    )
+
+
+SUITE_HELPER_TAIL = (
+    "/* ABK feature_porting: fd allocation hotpath slot-count helper. */\n"
+    "static inline unsigned int abk_fdtable_slots_wanted(unsigned int nr)\n"
+    "{\n"
+    "\tunsigned int slots_wanted;\n\n\tslots_wanted = nr + 1;\n"
+    "\tif (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)\n"
+    "\t\treturn 256;\n"
+    "\treturn roundup_pow_of_two(slots_wanted);\n"
+    "}\n"
+    "/* ABK feature_porting: fd allocation hotpath helper graft. */\n"
+    "static inline bool abk_expand_files_needed(const struct fdtable *fdt, unsigned int nr)\n"
+    "{\n"
+    "\treturn nr >= fdt->max_fds;\n"
+    "}\n"
+)
+
+FD_SUITE_FALLBACK = suite_fallback_deltas(FD_PRISTINE) + SUITE_HELPER_TAIL
 FD_UPSTREAM = (
     "static struct fdtable *alloc_fdtable(unsigned int slots_wanted)\n"
     "{\n"
@@ -213,8 +264,22 @@ def test_fdtable_shapes():
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"fs/file.c": FD_SUITE_FALLBACK})
         status, detail = core._fdtable_apply(ctx)
-        check("suite-processed shape skips gracefully",
-              status == "skip_suite_processed", f"{status}: {detail}")
+        check("suite fallback shape composes", status == "applied", f"{status}: {detail}")
+        composed = ctx.read("fs/file.c")
+        check("composed tree reaches upstream signature",
+              "static struct fdtable *alloc_fdtable(unsigned int slots_wanted)" in composed)
+        check("composed tree uses roundup capacity",
+              "nr = roundup_pow_of_two(slots_wanted);" in composed)
+        check("suite ALIGN capacity line gone", "ALIGN(slots_wanted, BITS_PER_LONG)" not in composed)
+        check("suite return-NULL INT_MAX guard replaced",
+              composed.count("INT_MAX / sizeof(struct file *)") == 1
+              and "return ERR_PTR(-EMFILE)" in composed)
+        check("composed tail reports ERR_PTR(-ENOMEM)", "return ERR_PTR(-ENOMEM);" in composed)
+        check("suite helpers retained", "abk_fdtable_slots_wanted" in composed
+              and "abk_expand_files_needed" in composed)
+        check("upstream probe satisfied after composition", ctx.fdtable_upstream_shape())
+        status2, _ = core._fdtable_apply(ctx)
+        check("composed tree idempotent", status2 == "already_present", status2)
 
     # Hard-group semantics: an unknown shape must abort the build.
     with tempfile.TemporaryDirectory() as tmp:

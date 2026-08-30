@@ -210,23 +210,121 @@ _FD_REPLACE_FD_NEW = """	err = do_dup2(files, file, fd, flags);
 	return 0;
 """
 
+# Suite-fallback variants: when ABK_ABI_PATCH_SUITE ran first, alloc_fdtable()
+# carries its "fd allocation hotpath" fallback (legacy nr parameter, helper
+# local, ALIGN capacity, round-up clamp, INT_MAX -> return NULL).  These steps
+# convert that body onto the same upstream 5.15.191 target as the pristine
+# variant; the suite's helpers and expand_files()/alloc_fd() prechecks stay in
+# place and keep working (the slot-count helper simply becomes unused).
+_FD_SUITE_DOC_TAIL_OLD = """ * The ALIGN(nr, BITS_PER_LONG) here is for clarity: since we just multiplied
+ * by that "1024/sizeof(ptr)" before, we already know there are sufficient
+ * clear low bits. Clang seems to realize that, gcc ends up being confused.
+ *
+ * On a 128-bit machine, the ALIGN() would actually matter. In the meantime,
+ * let's consider it documentation (and maybe a test-case for gcc to improve
+ * its code generation ;)
+ */
+static struct fdtable * alloc_fdtable(unsigned int nr)
+{
+	struct fdtable *fdt;
+	unsigned int slots_wanted = abk_fdtable_slots_wanted(nr);
+	void *data;
+"""
+
+_FD_SUITE_SIZE_MATH_OLD = """	/*
+	 * Keep the legacy file-local interface shape, but derive capacity from
+	 * the requested slot count before dropping into the allocator.
+	 */
+	nr = ALIGN(slots_wanted, BITS_PER_LONG);
+"""
+
+_FD_SUITE_SIZE_MATH_NEW = """	/*
+	 * Figure out how many fds we actually want to support in this fdtable.
+	 * Allocation steps are keyed to the size of the fdarray, since it
+	 * grows far faster than any of the other dynamic data. We try to fit
+	 * the fdarray into page-tuned chunks: starting at 1024B and growing in
+	 * powers of two from there on.
+	 */
+	if (IS_ENABLED(CONFIG_32BIT) && slots_wanted < 256)
+		nr = 256;
+	else
+		nr = roundup_pow_of_two(slots_wanted);
+"""
+
+_FD_SUITE_CLAMP_OLD = """	 * Note that this can drive nr *below* what we had passed if sysctl_nr_open
+	 * had been set lower between the check in expand_files() and here.  Deal
+	 * with that in caller, it's cheaper that way.
+	 *
+	 * We make sure that nr remains a multiple of BITS_PER_LONG - otherwise
+	 * bitmaps handling below becomes unpleasant, to put it mildly...
+	 */
+	if (unlikely(nr > sysctl_nr_open))
+		nr = ((sysctl_nr_open - 1) | (BITS_PER_LONG - 1)) + 1;
+	if (unlikely(nr > INT_MAX / sizeof(struct file *)))
+		return NULL;
+"""
+
+
+def _suite_fallback_shape(text):
+    """True for the suite's fallback alloc_fdtable() body we can compose onto."""
+    return (
+        "alloc_fdtable(unsigned int nr)" in text
+        and "unsigned int slots_wanted = abk_fdtable_slots_wanted(nr);" in text
+        and common.SUITE_FD_FALLBACK_ALIGN in text
+    )
+
+
+def _suite_composed_steps(dup_fd_aosp):
+    label_step = (
+        ("fs/file.c", _FD_DUPFD_LABEL_OLD, _FD_DUPFD_LABEL_NEW, T)
+        if dup_fd_aosp
+        else (
+            "fs/file.c",
+            "out_release:\n\tkmem_cache_free(files_cachep, newf);\n\treturn ERR_PTR(error);\n}\n",
+            "}\n",
+            T,
+        )
+    )
+    return [
+        ("fs/file.c", _FD_SUITE_DOC_TAIL_OLD, _FD_DOC_TAIL_NEW, T),
+        ("fs/file.c", _FD_SUITE_SIZE_MATH_OLD, _FD_SUITE_SIZE_MATH_NEW, T),
+        ("fs/file.c", _FD_SUITE_CLAMP_OLD, _FD_CLAMP_NEW, T),
+        ("fs/file.c", _FD_TAIL_OLD, _FD_TAIL_NEW, T),
+        ("fs/file.c", _FD_EXPAND_CALL_OLD, _FD_EXPAND_CALL_NEW, T),
+        ("fs/file.c", _FD_EXPAND_CHECK_OLD, _FD_EXPAND_CHECK_NEW, T),
+        ("fs/file.c", _FD_DUPFD_AOSP_OLD, _FD_DUPFD_AOSP_NEW, T)
+        if dup_fd_aosp
+        else ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T),
+        label_step,
+        ("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, F),
+    ]
+
 
 def _fdtable_apply(ctx):
-    # Suite detection first: its fallback rewrite shares the upstream
-    # signature, so marker presence decides before shape probing.
-    if ctx.suite_fdtable_fallback():
-        return (
-            "skip_suite_processed",
-            "ABK_ABI_PATCH_SUITE rewrote alloc_fdtable() with its fallback shape; "
-            "inject this module before the suite to land the upstream conventions",
+    # Order matters: the composed-after-suite check must see the upstream
+    # shape through the suite's leftover (unused) helper, so it comes first.
+    if ctx.fdtable_upstream_shape():
+        return "already_present", "upstream fdtable conventions already present"
+    text_probe = ctx.read("fs/file.c")
+    if _suite_fallback_shape(text_probe):
+        # Suite ran first: compose the upstream conventions over its fallback.
+        dup_fd_aosp = "sane_fdtable_size(old_fdt, max_fds)" in text_probe
+        status, _results, detail = apply_steps(
+            ctx, _suite_composed_steps(dup_fd_aosp)
         )
+        if status is None:
+            # Suite text drifted from the shape we compose against; yield
+            # gracefully instead of aborting the user's build.
+            return (
+                "skip_suite_processed",
+                "suite fallback shape not recognized for composition; " + detail,
+            )
+        return status, detail
     if ctx.suite_touched("fs/file.c"):
         return (
             "skip_suite_processed",
             "fs/file.c already carries ABK_ABI_PATCH_SUITE markers",
         )
-    if ctx.fdtable_upstream_shape():
-        return "already_present", "upstream fdtable conventions already present"
 
     steps = [
         ("fs/file.c", _FD_DOC_TAIL_OLD, _FD_DOC_TAIL_NEW, T),
@@ -240,7 +338,6 @@ def _fdtable_apply(ctx):
         ("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, F),
     ]
     # Vanilla punch_hole dup_fd variant: accepted in place of the AOSP one.
-    text_probe = ctx.read("fs/file.c")
     if "sane_fdtable_size(old_fdt, max_fds)" not in text_probe:
         steps[6] = ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T)
         steps[7] = ("fs/file.c", "out_release:\n\tkmem_cache_free(files_cachep, newf);\n\treturn ERR_PTR(error);\n}\n",

@@ -93,13 +93,16 @@ class GraftContext:
     def fdtable_upstream_shape(self):
         """True only for the genuine upstream 5.15.191 conventions.
 
-        The suite's fallback rewrite shares the ``slots_wanted`` signature, so
-        the ALIGN line / suite helper are treated as disqualifying markers.
+        The suite's fallback rewrite shares the ``slots_wanted`` sizing, so the
+        suite's ALIGN capacity line disqualifies the tree.  The suite's
+        ``abk_fdtable_slots_wanted`` helper may remain defined-but-unused after
+        this module composed the upstream conventions over the suite's
+        fallback, so the helper alone does not disqualify.
         """
         text = self.read("fs/file.c")
         if "alloc_fdtable(unsigned int slots_wanted)" not in text:
             return False
-        if common.SUITE_FD_FALLBACK_ALIGN in text or common.SUITE_FD_HELPER in text:
+        if common.SUITE_FD_FALLBACK_ALIGN in text:
             return False
         return "roundup_pow_of_two(slots_wanted)" in text
 
