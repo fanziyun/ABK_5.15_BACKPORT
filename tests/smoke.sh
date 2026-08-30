@@ -61,6 +61,11 @@ SMOKE_FILES=(
   init/main.c
   net/core/sock.c
   block/blk-mq.c
+  drivers/block/zram/Kconfig
+  drivers/block/zram/zram_drv.h
+  drivers/block/zram/zram_drv.c
+  mm/zsmalloc.c
+  include/linux/zsmalloc.h
   arch/arm64/configs/gki_defconfig
 )
 
@@ -93,9 +98,9 @@ tail -2 "$WORK/pass2.log"
 echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-grep -q '{"applied": 9}' "$WORK/pass1.log" || fail "pass 1 did not report 9 applied groups (core)"
+grep -q '{"applied": 10}' "$WORK/pass1.log" || fail "pass 1 did not report 10 applied groups (core)"
 grep -q '{"applied": 12}' "$WORK/pass1.log" || fail "pass 1 did not report 12 applied groups (perf)"
-grep -q '{"already_present": 9}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (core)"
+grep -q '{"already_present": 10}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (core)"
 grep -q '{"already_present": 12}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (perf)"
 
 for child in stable_backport_core stable_perf_backport; do
@@ -106,8 +111,8 @@ import json, sys
 p1 = json.load(open(sys.argv[1]))
 p2 = json.load(open(sys.argv[2]))
 child = p1["child"]
-exp1 = {"applied": 9} if child == "stable_backport_core" else {"applied": 12}
-exp2 = {"already_present": 9} if child == "stable_backport_core" else {"already_present": 12}
+exp1 = {"applied": 10} if child == "stable_backport_core" else {"applied": 12}
+exp2 = {"already_present": 10} if child == "stable_backport_core" else {"already_present": 12}
 assert p1["status_summary"] == exp1, (child, p1["status_summary"])
 assert p2["status_summary"] == exp2, (child, p2["status_summary"])
 PY

@@ -79,6 +79,11 @@ AUDIT_FILES = [
     "init/main.c",
     "net/core/sock.c",
     "block/blk-mq.c",
+    "drivers/block/zram/Kconfig",
+    "drivers/block/zram/zram_drv.h",
+    "drivers/block/zram/zram_drv.c",
+    "mm/zsmalloc.c",
+    "include/linux/zsmalloc.h",
 ]
 
 CHILD_MODULES = [

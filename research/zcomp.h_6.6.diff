@@ -1,0 +1,13 @@
+diff --git a/home/fanziyun/abk_verify/common-5.15-2024-11/drivers/block/zram/zcomp.h b/home/fanziyun/abk_verify/common-6.6-src/drivers/block/zram/zcomp.h
+index 40f6420..cdefdef 100644
+--- a/home/fanziyun/abk_verify/common-5.15-2024-11/drivers/block/zram/zcomp.h
++++ b/home/fanziyun/abk_verify/common-6.6-src/drivers/block/zram/zcomp.h
+@@ -27,7 +27,7 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node);
+ ssize_t zcomp_available_show(const char *comp, char *buf);
+ bool zcomp_available_algorithm(const char *comp);
+ 
+-struct zcomp *zcomp_create(const char *comp);
++struct zcomp *zcomp_create(const char *alg);
+ void zcomp_destroy(struct zcomp *comp);
+ 
+ struct zcomp_strm *zcomp_stream_get(struct zcomp *comp);
