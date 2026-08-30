@@ -240,6 +240,26 @@ def _rt_optimizations_apply(ctx):
 
 
 # ---------------------------------------------------------------------------
+# update_sg_wakeup_stats(): only count CPUs the waking task may use (5.15.212)
+# ---------------------------------------------------------------------------
+
+def _dst_group_allowed_stats_apply(ctx):
+    status, _results, detail = apply_steps(ctx, [
+        ("kernel/sched/fair.c",
+         "\tfor_each_cpu(i, sched_group_span(group)) {\n"
+         "\t\tstruct rq *rq = cpu_rq(i);\n"
+         "\t\tunsigned int local;\n",
+         "\tfor_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {\n"
+         "\t\tstruct rq *rq = cpu_rq(i);\n"
+         "\t\tunsigned int local;\n",
+         T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
 # Per-task kstack randomization offset (5.15.210) - KMI-safe via KABI slot 8
 # ---------------------------------------------------------------------------
 
@@ -559,6 +579,13 @@ PATCH_GROUPS = [
         ["3b3c672a66db (5.15.202)", "d8312a56d9a1 (5.15.212)"],
         ["kernel/sched/rt.c", "kernel/sched/features.h"],
         _rt_optimizations_apply,
+    ),
+    PatchGroup(
+        "sched_dst_group_allowed_stats",
+        "update_sg_wakeup_stats counts only CPUs allowed for p, fixing wake imbalance for affinity-restricted forks (5.15.212)",
+        ["d99f14f8b142 (5.15.212)"],
+        ["kernel/sched/fair.c"],
+        _dst_group_allowed_stats_apply,
     ),
     PatchGroup(
         "randomize_kstack_pertask",

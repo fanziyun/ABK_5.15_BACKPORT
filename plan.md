@@ -22,8 +22,8 @@
 
 ## Batch 2 候选（延后，见 survey 的 Deferred 节）
 
-- [~] Gorman 深水区：ca8527f25736（rmqueue_buddy 拆分）→ c1b8856c5a7d → 17dedfd6de69 → 85f58ee33c6c → 4c4e238d3ada → 735457683e23（.171–.194 ALLOC_HIGHATOMIC/OOM 预备语义）
-- [~] d99f14f8b142（.212）sched/fair dst-group 统计跳过
+- [x] Gorman 深水区：ca8527f25736（AOSP 已自带拆分）→ c1b8856c5a7d → 17dedfd6de69 → 85f58ee33c6c → 4c4e238d3ada → 735457683e23 → `pagealloc_highatomic_reserve_semantics`（12 步，vendor CMA 块与 trace 保留）
+- [x] d99f14f8b142（.212）sched/fair dst-group 统计跳过 → `sched_dst_group_allowed_stats`（AOSP fair.c 锚点无漂移）
 - [~] 9646443f28f3（.209）blk-mq quiesced elevator 切换
 - [ ] 56135262c1f9（.179）steal time 追赶封顶（虚拟化场景才有收益）
 - [ ] 64d9b734b6fe（.210）带宽比值 u64 化

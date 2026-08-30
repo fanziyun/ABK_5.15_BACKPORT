@@ -387,6 +387,276 @@ def _min_reserve_apply(ctx):
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
+        # The high-atomic reserve chain (pagealloc_highatomic_reserve_semantics)
+        # restructures this group's __zone_watermark_ok() hunk onto the final
+        # 5.15.218 form; recognize that superseding shape as our own end state.
+        if "ALLOC_RESERVES" in ctx.read("mm/internal.h"):
+            return "already_present", "superseded by pagealloc_highatomic_reserve_semantics"
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# High-atomic / min-reserve semantics, complete form
+# (5.15.188-.218: ca8527f25736 + c1b8856c5a7d + 17dedfd6de69 + 85f58ee33c6c
+#  + 4c4e238d3ada + 735457683e23)
+#
+# Runs after pagealloc_min_reserve_semantics, whose ALLOC_HIGH ->
+# ALLOC_MIN_RESERVE rename this chain builds on.  The AOSP tree already
+# carries the rmqueue_buddy() split (ca8527f) plus vendor traces, so only
+# the flag-semantics hunks are grafted; the vendor CMA-first block and
+# trace_mm_page_alloc_zone_locked() inside rmqueue_buddy() are preserved.
+# ---------------------------------------------------------------------------
+
+_ALLOC_CONT = "\t\t\t\t       "
+
+
+def _highatomic_reserve_apply(ctx):
+    steps = [
+        # mm/internal.h: ALLOC_HARDER -> ALLOC_NON_BLOCK, aligned comments.
+        ("mm/internal.h",
+         "#define ALLOC_HARDER\t\t 0x10 /* try to alloc harder */\n"
+         "#define ALLOC_MIN_RESERVE\t 0x20 /* __GFP_HIGH set. Allow access to 50%\n"
+         "\t\t\t\t       * of the min watermark.\n"
+         "\t\t\t\t       */",
+         "#define ALLOC_NON_BLOCK\t\t 0x10 /* Caller cannot block. Allow access\n"
+         + _ALLOC_CONT + "* to 25% of the min watermark or\n"
+         + _ALLOC_CONT + "* 62.5% if __GFP_HIGH is set.\n"
+         + _ALLOC_CONT + "*/\n"
+         "#define ALLOC_MIN_RESERVE\t 0x20 /* __GFP_HIGH set. Allow access to 50%\n"
+         + _ALLOC_CONT + "* of the min watermark.\n"
+         + _ALLOC_CONT + "*/",
+         T),
+        # mm/internal.h: ALLOC_HIGHATOMIC + the below-min-watermark set.
+        ("mm/internal.h",
+         "#define ALLOC_KSWAPD\t\t0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */",
+         "#define ALLOC_HIGHATOMIC\t0x200 /* Allows access to MIGRATE_HIGHATOMIC */\n"
+         "#define ALLOC_KSWAPD\t\t0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */\n"
+         "\n"
+         "/* Flags that allow allocations below the min watermark. */\n"
+         "#define ALLOC_RESERVES (ALLOC_NON_BLOCK|ALLOC_MIN_RESERVE|ALLOC_HIGHATOMIC|ALLOC_OOM)",
+         T),
+        # __zone_watermark_unusable_free(): reserves set, not just harder.
+        ("mm/page_alloc.c",
+         "\tconst bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));\n"
+         "\tlong unusable_free = (1 << order) - 1;\n"
+         "\n"
+         "\t/*\n"
+         "\t * If the caller does not have rights to ALLOC_HARDER then subtract\n"
+         "\t * the high-atomic reserves. This will over-estimate the size of the\n"
+         "\t * atomic reserve but it avoids a search.\n"
+         "\t */\n"
+         "\tif (likely(!alloc_harder))\n"
+         "\t\tunusable_free += z->nr_reserved_highatomic;",
+         "\tlong unusable_free = (1 << order) - 1;\n"
+         "\n"
+         "\t/*\n"
+         "\t * If the caller does not have rights to reserves below the min\n"
+         "\t * watermark then subtract the high-atomic reserves. This will\n"
+         "\t * over-estimate the size of the atomic reserve but it avoids a search.\n"
+         "\t */\n"
+         "\tif (likely(!(alloc_flags & ALLOC_RESERVES)))\n"
+         "\t\tunusable_free += z->nr_reserved_highatomic;",
+         T),
+        # __zone_watermark_ok(): reserve rights restructured.
+        ("mm/page_alloc.c",
+         "\tlong min = mark;\n"
+         "\tint o;\n"
+         "\tconst bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));\n"
+         "\n"
+         "\t/* free_pages may go negative - that's OK */\n"
+         "\tfree_pages -= __zone_watermark_unusable_free(z, order, alloc_flags);\n"
+         "\n"
+         "\tif (alloc_flags & ALLOC_MIN_RESERVE)\n"
+         "\t\tmin -= min / 2;\n"
+         "\n"
+         "\tif (unlikely(alloc_harder)) {\n"
+         "\t\t/*\n"
+         "\t\t * OOM victims can try even harder than normal ALLOC_HARDER\n"
+         "\t\t * users on the grounds that it's definitely going to be in\n"
+         "\t\t * the exit path shortly and free memory. Any allocation it\n"
+         "\t\t * makes during the free path will be small and short-lived.\n"
+         "\t\t */\n"
+         "\t\tif (alloc_flags & ALLOC_OOM)\n"
+         "\t\t\tmin -= min / 2;\n"
+         "\t\telse\n"
+         "\t\t\tmin -= min / 4;\n"
+         "\t}",
+         "\tlong min = mark;\n"
+         "\tint o;\n"
+         "\n"
+         "\t/* free_pages may go negative - that's OK */\n"
+         "\tfree_pages -= __zone_watermark_unusable_free(z, order, alloc_flags);\n"
+         "\n"
+         "\tif (unlikely(alloc_flags & ALLOC_RESERVES)) {\n"
+         "\t\t/*\n"
+         "\t\t * __GFP_HIGH allows access to 50% of the min reserve as well\n"
+         "\t\t * as OOM.\n"
+         "\t\t */\n"
+         "\t\tif (alloc_flags & ALLOC_MIN_RESERVE) {\n"
+         "\t\t\tmin -= min / 2;\n"
+         "\n"
+         "\t\t\t/*\n"
+         "\t\t\t * Non-blocking allocations (e.g. GFP_ATOMIC) can\n"
+         "\t\t\t * access more reserves than just __GFP_HIGH. Other\n"
+         "\t\t\t * non-blocking allocations requests such as GFP_NOWAIT\n"
+         "\t\t\t * or (GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) do not get\n"
+         "\t\t\t * access to the min reserve.\n"
+         "\t\t\t */\n"
+         "\t\t\tif (alloc_flags & ALLOC_NON_BLOCK)\n"
+         "\t\t\t\tmin -= min / 4;\n"
+         "\t\t}\n"
+         "\n"
+         "\t\t/*\n"
+         "\t\t * OOM victims can try even harder than the normal reserve\n"
+         "\t\t * users on the grounds that it's definitely going to be in\n"
+         "\t\t * the exit path shortly and free memory. Any allocation it\n"
+         "\t\t * makes during the free path will be small and short-lived.\n"
+         "\t\t */\n"
+         "\t\tif (alloc_flags & ALLOC_OOM)\n"
+         "\t\t\tmin -= min / 2;\n"
+         "\t}",
+         T),
+        # __zone_watermark_ok(): HIGHATOMIC/OOM may use the highatomic area.
+        ("mm/page_alloc.c",
+         "\t\tif (alloc_harder && !free_area_empty(area, MIGRATE_HIGHATOMIC))\n"
+         "\t\t\treturn true;\n"
+         "\t}",
+         "\t\tif ((alloc_flags & (ALLOC_HIGHATOMIC|ALLOC_OOM)) &&\n"
+         "\t\t    !free_area_empty(area, MIGRATE_HIGHATOMIC)) {\n"
+         "\t\t\treturn true;\n"
+         "\t\t}\n"
+         "\t}",
+         T),
+        # get_page_from_freelist(): reserve highatomic only for HIGHATOMIC.
+        ("mm/page_alloc.c",
+         "\t\t\tif (unlikely(order && (alloc_flags & ALLOC_HARDER)))\n"
+         "\t\t\t\treserve_highatomic_pageblock(page, zone, order);",
+         "\t\t\tif (unlikely(alloc_flags & ALLOC_HIGHATOMIC))\n"
+         "\t\t\t\treserve_highatomic_pageblock(page, zone, order);",
+         T),
+        # rmqueue_buddy(): HIGHATOMIC flag gates the highatomic steal
+        # (AOSP's trace_mm_page_alloc_zone_locked stays).
+        ("mm/page_alloc.c",
+         "\t\tif (order > 0 && alloc_flags & ALLOC_HARDER) {\n"
+         "\t\t\tpage = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);\n"
+         "\t\t\tif (page)\n"
+         "\t\t\t\ttrace_mm_page_alloc_zone_locked(page, order, migratetype);\n"
+         "\t\t}",
+         "\t\tif (alloc_flags & ALLOC_HIGHATOMIC) {\n"
+         "\t\t\tpage = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);\n"
+         "\t\t\tif (page)\n"
+         "\t\t\t\ttrace_mm_page_alloc_zone_locked(page, order, migratetype);\n"
+         "\t\t}",
+         T),
+        # rmqueue_buddy(): OOM and non-blocking failures may fall back to
+        # the highatomic area before giving up.
+        ("mm/page_alloc.c",
+         "\t\t\tif (!page)\n"
+         "\t\t\t\tpage = __rmqueue(zone, order, migratetype,\n"
+         "\t\t\t\t\t\talloc_flags);\n"
+         "\t\t}",
+         "\t\t\tif (!page) {\n"
+         "\t\t\t\tpage = __rmqueue(zone, order, migratetype,\n"
+         "\t\t\t\t\t\talloc_flags);\n"
+         "\n"
+         "\t\t\t\t/*\n"
+         "\t\t\t\t * If the allocation fails, allow OOM handling and\n"
+         "\t\t\t\t * order-0 (atomic) allocs access to HIGHATOMIC\n"
+         "\t\t\t\t * reserves as failing now is worse than failing a\n"
+         "\t\t\t\t * high-order atomic allocation in the future.\n"
+         "\t\t\t\t */\n"
+         "\t\t\t\tif (!page && (alloc_flags & (ALLOC_OOM|ALLOC_NON_BLOCK)))\n"
+         "\t\t\t\t\tpage = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);\n"
+         "\t\t\t}\n"
+         "\t\t}",
+         T),
+        # gfp_to_alloc_flags(): order parameter for the HIGHATOMIC decision.
+        ("mm/page_alloc.c",
+         "gfp_to_alloc_flags(gfp_t gfp_mask)\n"
+         "{\n"
+         "\tunsigned int alloc_flags = ALLOC_WMARK_MIN | ALLOC_CPUSET;",
+         "gfp_to_alloc_flags(gfp_t gfp_mask, unsigned int order)\n"
+         "{\n"
+         "\tunsigned int alloc_flags = ALLOC_WMARK_MIN | ALLOC_CPUSET;",
+         T),
+        ("mm/page_alloc.c",
+         "\talloc_flags = gfp_to_alloc_flags(gfp_mask);",
+         "\talloc_flags = gfp_to_alloc_flags(gfp_mask, order);",
+         T),
+        # gfp_to_alloc_flags(): non-blocking means !__GFP_DIRECT_RECLAIM;
+        # HIGHATOMIC only for __GFP_HIGH; cpuset bypass only with reserves.
+        ("mm/page_alloc.c",
+         "\t * policy or is asking for __GFP_HIGH memory.  GFP_ATOMIC requests will\n"
+         "\t * set both ALLOC_HARDER (__GFP_ATOMIC) and ALLOC_MIN_RESERVE(__GFP_HIGH).\n"
+         "\t */\n"
+         "\talloc_flags |= (__force int)\n"
+         "\t\t(gfp_mask & (__GFP_HIGH | __GFP_KSWAPD_RECLAIM));\n"
+         "\n"
+         "\tif (gfp_mask & __GFP_ATOMIC) {\n"
+         "\t\t/*\n"
+         "\t\t * Not worth trying to allocate harder for __GFP_NOMEMALLOC even\n"
+         "\t\t * if it can't schedule.\n"
+         "\t\t */\n"
+         "\t\tif (!(gfp_mask & __GFP_NOMEMALLOC))\n"
+         "\t\t\talloc_flags |= ALLOC_HARDER;\n"
+         "\t\t/*\n"
+         "\t\t * Ignore cpuset mems for GFP_ATOMIC rather than fail, see the\n"
+         "\t\t * comment for __cpuset_node_allowed().\n"
+         "\t\t */\n"
+         "\t\talloc_flags &= ~ALLOC_CPUSET;",
+         "\t * policy or is asking for __GFP_HIGH memory.  GFP_ATOMIC requests will\n"
+         "\t * set both ALLOC_NON_BLOCK and ALLOC_MIN_RESERVE(__GFP_HIGH).\n"
+         "\t */\n"
+         "\talloc_flags |= (__force int)\n"
+         "\t\t(gfp_mask & (__GFP_HIGH | __GFP_KSWAPD_RECLAIM));\n"
+         "\n"
+         "\tif (!(gfp_mask & __GFP_DIRECT_RECLAIM)) {\n"
+         "\t\t/*\n"
+         "\t\t * Not worth trying to allocate harder for __GFP_NOMEMALLOC even\n"
+         "\t\t * if it can't schedule.\n"
+         "\t\t */\n"
+         "\t\tif (!(gfp_mask & __GFP_NOMEMALLOC)) {\n"
+         "\t\t\talloc_flags |= ALLOC_NON_BLOCK;\n"
+         "\n"
+         "\t\t\tif (order > 0 && (alloc_flags & ALLOC_MIN_RESERVE))\n"
+         "\t\t\t\talloc_flags |= ALLOC_HIGHATOMIC;\n"
+         "\t\t}\n"
+         "\n"
+         "\t\t/*\n"
+         "\t\t * Ignore cpuset mems for non-blocking __GFP_HIGH (probably\n"
+         "\t\t * GFP_ATOMIC) rather than fail, see the comment for\n"
+         "\t\t * __cpuset_node_allowed().\n"
+         "\t\t */\n"
+         "\t\tif (alloc_flags & ALLOC_MIN_RESERVE)\n"
+         "\t\t\talloc_flags &= ~ALLOC_CPUSET;",
+         T),
+        # slowpath: non-failing allocations get reserve access, not harder.
+        ("mm/page_alloc.c",
+         "\t\t/*\n"
+         "\t\t * Help non-failing allocations by giving them access to memory\n"
+         "\t\t * reserves but do not use ALLOC_NO_WATERMARKS because this\n"
+         "\t\t * could deplete whole memory reserves which would just make\n"
+         "\t\t * the situation worse\n"
+         "\t\t */\n"
+         "\t\tpage = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_HARDER, ac);",
+         "\t\t/*\n"
+         "\t\t * Help non-failing allocations by giving some access to memory\n"
+         "\t\t * reserves normally used for high priority non-blocking\n"
+         "\t\t * allocations but do not use ALLOC_NO_WATERMARKS because this\n"
+         "\t\t * could deplete whole memory reserves which would just make\n"
+         "\t\t * the situation worse.\n"
+         "\t\t */\n"
+         "\t\tpage = __alloc_pages_cpuset_fallback(gfp_mask, order, ALLOC_MIN_RESERVE, ac);",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
         return "blocked_by_shape", detail
     return status, detail
 
@@ -722,6 +992,20 @@ PATCH_GROUPS = [
         ["92e52ff398b5 (5.15.171)", "9da195a2d35b (5.15.171)"],
         ["mm/internal.h", "mm/page_alloc.c"],
         _min_reserve_apply,
+    ),
+    PatchGroup(
+        "pagealloc_highatomic_reserve_semantics",
+        "high-atomic reserve semantics: ALLOC_NON_BLOCK/ALLOC_HIGHATOMIC/ALLOC_RESERVES with explicit watermark access rules (5.15.188-.218)",
+        [
+            "ca8527f25736 (5.15.188, base already in AOSP)",
+            "c1b8856c5a7d (5.15.189)",
+            "17dedfd6de69 (5.15.190)",
+            "85f58ee33c6c (5.15.191)",
+            "4c4e238d3ada (5.15.199)",
+            "735457683e23 (5.15.218)",
+        ],
+        ["mm/internal.h", "mm/page_alloc.c"],
+        _highatomic_reserve_apply,
     ),
     PatchGroup(
         "pagealloc_thisnode_thp_noreclaim",

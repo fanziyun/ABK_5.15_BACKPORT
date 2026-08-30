@@ -49,6 +49,13 @@ CI executes injected modules in input order, so the canonical input is:
 | sched.h SysVIPC tail | `ANDROID_KABI_USE(6, struct sysv_sem sysvsem)` present (ABK's kernel-specific patch reuses task_struct slots 6/7/8 for sysvsem/sysvshm behind `#ifdef CONFIG_SYSVIPC`) | kstack group moves to the still-free slot 5; a `kstack_offset inside task_struct` range check then fails the group loudly on any uncovered shape |
 | `block_rolled_back` | the F2FS suite's block rollback already removed its monthly sentinel from blk-mq.c | informational; records the composition in reports |
 
+Group chaining: `pagealloc_highatomic_reserve_semantics` (5.15.188-.218)
+builds on `pagealloc_min_reserve_semantics` (5.15.171) output and rewrites its
+`__zone_watermark_ok()` hunk onto the final form.  The earlier group therefore
+recognizes the superseding shape (`ALLOC_RESERVES` in mm/internal.h) and
+reports `already_present` on re-runs - both orders of "only one of the two
+applied" stay idempotent.
+
 Footprint disjointness (verified against the F2FS suite script and its
 `android13-5.15-2024-11_r14` patches): the F2FS suite touches
 `drivers/scsi/ufs/`, `block/` (one hunk in `blk_mq_delay_run_hw_queues()`),

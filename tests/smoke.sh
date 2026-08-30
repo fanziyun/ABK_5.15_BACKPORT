@@ -84,8 +84,8 @@ tail -2 "$WORK/pass2.log"
 echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-grep -q '{"applied": 7}' "$WORK/pass1.log" || fail "pass 1 did not report 7 applied groups per child"
-grep -q '{"already_present": 7}' "$WORK/pass2.log" || fail "pass 2 was not idempotent"
+grep -q '{"applied": 8}' "$WORK/pass1.log" || fail "pass 1 did not report 8 applied groups per child"
+grep -q '{"already_present": 8}' "$WORK/pass2.log" || fail "pass 2 was not idempotent"
 
 for child in stable_backport_core stable_perf_backport; do
   [ -f "$WORK/pass1_reports/$child/${child}_report.json" ] || fail "missing pass1 report for $child"
@@ -94,8 +94,8 @@ for child in stable_backport_core stable_perf_backport; do
 import json, sys
 p1 = json.load(open(sys.argv[1]))
 p2 = json.load(open(sys.argv[2]))
-assert p1["status_summary"] == {"applied": 7}, p1["status_summary"]
-assert p2["status_summary"] == {"already_present": 7}, p2["status_summary"]
+assert p1["status_summary"] == {"applied": 8}, p1["status_summary"]
+assert p2["status_summary"] == {"already_present": 8}, p2["status_summary"]
 PY
 done
 
