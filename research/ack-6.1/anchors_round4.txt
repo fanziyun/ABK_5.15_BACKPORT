@@ -1,0 +1,136 @@
+##### A. 515 scheduler_tick head
+ */
+void scheduler_tick(void)
+{
+	int cpu = smp_processor_id();
+	struct rq *rq = cpu_rq(cpu);
+	struct task_struct *curr = rq->curr;
+	struct rq_flags rf;
+	unsigned long thermal_pressure;
+	u64 resched_latency;
+
+	arch_scale_freq_tick();
+	sched_clock_tick();
+
+	rq_lock(rq, &rf);
+
+	update_rq_clock(rq);
+	trace_android_rvh_tick_entry(rq);
+
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
+	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
+	curr->sched_class->task_tick(rq, curr, 0);
+##### B. 515 vmpressure_prio site
+6279-	if (!cgroup_reclaim(sc))
+6280-		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+6281-
+6282-	do {
+6283:		vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
+6284-				sc->priority);
+6285-		sc->nr_scanned = 0;
+6286-		shrink_zones(zonelist, sc);
+6287-
+##### C. 61 stats.h irq decl region
+
+#ifdef CONFIG_PSI
+void psi_task_change(struct task_struct *task, int clear, int set);
+void psi_task_switch(struct task_struct *prev, struct task_struct *next,
+		     bool sleep);
+#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_struct *prev);
+#else
+static inline void psi_account_irqtime(struct rq *rq, struct task_struct *curr,
+				       struct task_struct *prev) {}
+#endif /*CONFIG_IRQ_TIME_ACCOUNTING */
+/*
+ * PSI tracks state that persists across sleeps, such as iowaits and
+ * memory stalls. As a result, it has to distinguish between sleeps,
+ * where a task's runnable state changes, and requeues, where a task
+ * and its state are being moved between CPUs and runqueues.
+ */
+static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+##### D. 61 stats.h stub region
+
+#else /* CONFIG_PSI */
+static inline void psi_enqueue(struct task_struct *p, bool wakeup) {}
+static inline void psi_dequeue(struct task_struct *p, bool sleep) {}
+static inline void psi_ttwu_dequeue(struct task_struct *p) {}
+static inline void psi_sched_switch(struct task_struct *prev,
+				    struct task_struct *next,
+				    bool sleep) {}
+static inline void psi_account_irqtime(struct rq *rq, struct task_struct *curr,
+				       struct task_struct *prev) {}
+#endif /* CONFIG_PSI */
+
+#ifdef CONFIG_SCHED_INFO
+/*
+ * We are interested in knowing how long it was from the *first* time a
+ * task was queued to the time that it finally hit a CPU, we call this routine
+##### E. 61 vmpressure_prio site
+6977-		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+6978-
+6979-	do {
+6980-		if (!sc->proactive)
+6981:			vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
+6982-					sc->priority);
+6983-		sc->nr_scanned = 0;
+6984-		shrink_zones(zonelist, sc);
+6985-
+##### F. 515 shrink_lruvec vmpressure ctx
+
+		reclaimed = sc->nr_reclaimed;
+		scanned = sc->nr_scanned;
+
+		shrink_lruvec(lruvec, sc);
+
+		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+			    sc->priority);
+
+		/* Record the group's reclaim efficiency */
+		vmpressure(sc->gfp_mask, memcg, false,
+			   sc->nr_scanned - scanned,
+			   sc->nr_reclaimed - reclaimed);
+
+	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
+##### G. 515 psi.c WINDOW_MIN define
+177-
+178-/* PSI trigger definitions */
+179:#define WINDOW_MIN_US 500000	/* Min window size is 500ms */
+180-#define WINDOW_MAX_US 10000000	/* Max window size is 10s */
+181-#define UPDATES_PER_WINDOW 10	/* 10 updates per window */
+--
+1177-		return ERR_PTR(-EINVAL);
+1178-
+1179:	if (window_us < WINDOW_MIN_US ||
+1180-		window_us > WINDOW_MAX_US)
+1181-		return ERR_PTR(-EINVAL);
+##### H. 515 psi.c poll_wakeup uses
+229:	atomic_set(&group->poll_wakeup, 0);
+608:	if (atomic_fetch_and_set_bit(POLL_SCHEDULED, &group->poll_wakeup) &&
+622:		atomic_clear_bit(POLL_SCHEDULED, &group->poll_wakeup);
+647:		atomic_clear_bit(POLL_SCHEDULED, &group->poll_wakeup);
+714:				atomic_fetch_and_clear_bit(POLL_WAKEUP, &group->poll_wakeup) ||
+728:	atomic_set_bit(POLL_WAKEUP, &group->poll_wakeup);
+1212:		atomic_clear_bit(POLL_WAKEUP, &group->poll_wakeup);
+1292:		atomic_clear_bit(POLL_SCHEDULED, &group->poll_wakeup);
+##### I. 61 psi.c PSI_IRQ parse check ctx
+1224-	mutex_unlock(&group->avgs_lock);
+1225-
+1226-#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+1227:	only_full = res == PSI_IRQ;
+1228-#endif
+1229-
+1230-	for (full = 0; full < 2 - only_full; full++) {
+1231-		unsigned long avg[3] = { 0, };
+1232-		u64 total = 0;
+1233-		int w;
+--
+1272-		return ERR_PTR(-EINVAL);
+1273-
+1274-#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+1275:	if (res == PSI_IRQ && --state != PSI_IRQ_FULL)
+1276-		return ERR_PTR(-EINVAL);
+1277-#endif
+1278-
+1279-	if (state >= PSI_NONIDLE)
+1280-		return ERR_PTR(-EINVAL);

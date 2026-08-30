@@ -1,0 +1,457 @@
+##### A. 515 fair.c entity_tick hrtick block
+4804-	 * queued ticks are scheduled to match the slice, so don't bother
+4805-	 * validating it and just reschedule.
+4806-	 */
+4807:	if (queued) {
+4808-		resched_curr(rq_of(cfs_rq));
+4809-		return;
+4810-	}
+4811-	/*
+4812-	 * don't let the period tick interfere with the hrtick preemption
+4813-	 */
+4814-	if (!sched_feat(DOUBLE_TICK) &&
+4815-			hrtimer_active(&rq_of(cfs_rq)->hrtick_timer))
+##### B. 515 check_preempt_wakeup decls
+7441:static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
+7442-{
+7443-	struct task_struct *curr = rq->curr;
+7444-	struct sched_entity *se = &curr->se, *pse = &p->se;
+7445-	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
+7446-	int scale = cfs_rq->nr_running >= sched_nr_latency;
+7447-	int next_buddy_marked = 0;
+7448-	int cse_is_idle, pse_is_idle;
+7449-	bool ignore = false;
+7450-	bool preempt = false;
+7451-
+7452-	if (unlikely(se == pse))
+7453-		return;
+7454-	trace_android_rvh_check_preempt_wakeup_ignore(curr, &ignore);
+7455-	if (ignore)
+##### C. 515 scheduler_tick curr region
+990:	struct task_struct *curr = rq->curr;
+991-	int cpu, need_lazy = 0;
+992-
+993-	lockdep_assert_rq_held(rq);
+994-
+995-	if (test_tsk_need_resched(curr))
+996-		return;
+--
+5443:	struct task_struct *curr = rq->curr;
+5444-	struct rq_flags rf;
+5445-	unsigned long thermal_pressure;
+5446-	u64 resched_latency;
+5447-
+5448-	arch_scale_freq_tick();
+5449-	sched_clock_tick();
+--
+5537:	curr = rq->curr;
+5538-	if (cpu_is_offline(cpu))
+5539-		goto out_unlock;
+5540-
+##### D. 515 psi_sched_switch call
+/home/fanziyun/abk_verify/common-5.15/kernel/sched/core.c:6533:		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+/home/fanziyun/abk_verify/common-5.15/kernel/sched/stats.h:136:static inline void psi_sched_switch(struct task_struct *prev,
+/home/fanziyun/abk_verify/common-5.15/kernel/sched/stats.h:150:static inline void psi_sched_switch(struct task_struct *prev,
+##### E. 515 stats.h psi section
+# define   schedstat_val_or_zero(var)	0
+#endif /* CONFIG_SCHEDSTATS */
+
+#ifdef CONFIG_PSI
+/*
+ * PSI tracks state that persists across sleeps, such as iowaits and
+ * memory stalls. As a result, it has to distinguish between sleeps,
+ * where a task's runnable state changes, and requeues, where a task
+ * and its state are being moved between CPUs and runqueues.
+ */
+static inline void psi_enqueue(struct task_struct *p, bool wakeup)
+{
+	int clear = 0, set = TSK_RUNNING;
+
+	if (static_branch_likely(&psi_disabled))
+		return;
+
+	if (p->in_memstall)
+		set |= TSK_MEMSTALL_RUNNING;
+
+	if (!wakeup || p->sched_psi_wake_requeue) {
+		if (p->in_memstall)
+			set |= TSK_MEMSTALL;
+		if (p->sched_psi_wake_requeue)
+			p->sched_psi_wake_requeue = 0;
+	} else {
+		if (p->in_iowait)
+			clear |= TSK_IOWAIT;
+	}
+
+	psi_task_change(p, clear, set);
+}
+
+static inline void psi_dequeue(struct task_struct *p, bool sleep)
+{
+	int clear = TSK_RUNNING;
+
+	if (static_branch_likely(&psi_disabled))
+		return;
+
+	/*
+	 * A voluntary sleep is a dequeue followed by a task switch. To
+	 * avoid walking all ancestors twice, psi_task_switch() handles
+	 * TSK_RUNNING and TSK_IOWAIT for us when it moves TSK_ONCPU.
+	 * Do nothing here.
+	 */
+	if (sleep)
+		return;
+
+	if (p->in_memstall)
+		clear |= (TSK_MEMSTALL | TSK_MEMSTALL_RUNNING);
+
+	psi_task_change(p, clear, 0);
+}
+
+static inline void psi_ttwu_dequeue(struct task_struct *p)
+{
+	if (static_branch_likely(&psi_disabled))
+		return;
+	/*
+	 * Is the task being migrated during a wakeup? Make sure to
+	 * deregister its sleep-persistent psi states from the old
+	 * queue, and let psi_enqueue() know it has to requeue.
+	 */
+	if (unlikely(p->in_iowait || p->in_memstall)) {
+		struct rq_flags rf;
+		struct rq *rq;
+		int clear = 0;
+
+		if (p->in_iowait)
+			clear |= TSK_IOWAIT;
+		if (p->in_memstall)
+			clear |= TSK_MEMSTALL;
+
+		rq = __task_rq_lock(p, &rf);
+		psi_task_change(p, clear, 0);
+		p->sched_psi_wake_requeue = 1;
+		__task_rq_unlock(rq, &rf);
+	}
+}
+
+##### F. 515 stats.h !PSI stubs
+	rq_sched_info_arrive(rq, delta);
+}
+
+/*
+ * This function is only called from enqueue_task(), but also only updates
+ * the timestamp if it is already not set.  It's assumed that
+ * sched_info_dequeue() will clear that stamp when appropriate.
+ */
+static inline void sched_info_enqueue(struct rq *rq, struct task_struct *t)
+{
+	if (!t->sched_info.last_queued)
+		t->sched_info.last_queued = rq_clock(rq);
+}
+
+/*
+ * Called when a process ceases being the active-running process involuntarily
+ * due, typically, to expiring its time slice (this may also be called when
+ * switching to the idle task).  Now we can calculate how long we ran.
+ * Also, if the process is still in the TASK_RUNNING state, call
+ * sched_info_enqueue() to mark that it has now again started waiting on
+ * the runqueue.
+ */
+static inline void sched_info_depart(struct rq *rq, struct task_struct *t)
+{
+	unsigned long long delta = rq_clock(rq) - t->sched_info.last_arrival;
+
+	rq_sched_info_depart(rq, delta);
+
+	if (task_is_running(t))
+		sched_info_enqueue(rq, t);
+}
+##### G. 515 psi_schedule_poll_work full sig
+static void psi_schedule_poll_work(struct psi_group *group, unsigned long delay,
+				   bool force)
+{
+##### H. 515 psi.h trigger prototypes
+/home/fanziyun/abk_verify/common-5.15/include/linux/psi.h:27:struct psi_trigger *psi_trigger_create(struct psi_group *group,
+/home/fanziyun/abk_verify/common-5.15/include/linux/psi.h:29:void psi_trigger_destroy(struct psi_trigger *t);
+/home/fanziyun/abk_verify/common-5.15/include/linux/psi.h:31:__poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
+/home/fanziyun/abk_verify/common-6.1/include/linux/psi.h:26:struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
+/home/fanziyun/abk_verify/common-6.1/include/linux/psi.h:29:void psi_trigger_destroy(struct psi_trigger *t);
+/home/fanziyun/abk_verify/common-6.1/include/linux/psi.h:31:__poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
+##### I. 61 cgroup.c pressure_write
+3898-}
+3899-
+3900:static ssize_t cgroup_pressure_write(struct kernfs_open_file *of,
+3901-				     char *buf, size_t nbytes,
+3902-				     loff_t off)
+3903-{
+3904-	ssize_t ret;
+3905-	int enable;
+3906-	struct cgroup *cgrp;
+3907-	struct psi_group *psi;
+3908-
+3909-	ret = kstrtoint(strstrip(buf), 0, &enable);
+3910-	if (ret)
+3911-		return ret;
+3912-
+3913-	if (enable < 0 || enable > 1)
+3914-		return -ERANGE;
+3915-
+3916-	cgrp = cgroup_kn_lock_live(of->kn, false);
+3917-	if (!cgrp)
+3918-		return -ENOENT;
+3919-
+3920-	psi = cgroup_psi(cgrp);
+3921-	if (psi->enabled != enable) {
+3922-		int i;
+--
+5394-		.name = "cgroup.pressure",
+5395-		.seq_show = cgroup_pressure_show,
+5396:		.write = cgroup_pressure_write,
+5397-	},
+5398-#endif /* CONFIG_PSI */
+5399-	{ }	/* terminate */
+5400-};
+5401-
+5402-/*
+5403- * css destruction is four-stage process.
+5404- *
+5405- * 1. Destruction starts.  Killing of the percpu_ref is initiated.
+5406- *    Implemented in kill_css().
+5407- *
+##### J. 515 cgroup.c pressure_write
+3758-}
+3759-
+3760:static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,
+3761-					  size_t nbytes, enum psi_res res)
+3762-{
+3763-	struct cgroup_file_ctx *ctx = of->priv;
+3764-	struct psi_trigger *new;
+3765-	struct cgroup *cgrp;
+3766-	struct psi_group *psi;
+3767-
+3768-	cgrp = cgroup_kn_lock_live(of->kn, false);
+3769-	if (!cgrp)
+3770-		return -ENODEV;
+3771-
+3772-	cgroup_get(cgrp);
+3773-	cgroup_kn_unlock(of->kn);
+3774-
+3775-	/* Allow only one trigger per file descriptor */
+3776-	if (ctx->psi.trigger) {
+3777-		cgroup_put(cgrp);
+3778-		return -EBUSY;
+3779-	}
+3780-
+3781-	psi = cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi;
+3782-	new = psi_trigger_create(psi, buf, nbytes, res);
+--
+3796-					  loff_t off)
+3797-{
+3798:	return cgroup_pressure_write(of, buf, nbytes, PSI_IO);
+3799-}
+3800-
+3801-static ssize_t cgroup_memory_pressure_write(struct kernfs_open_file *of,
+3802-					  char *buf, size_t nbytes,
+3803-					  loff_t off)
+3804-{
+3805:	return cgroup_pressure_write(of, buf, nbytes, PSI_MEM);
+3806-}
+3807-
+3808-static ssize_t cgroup_cpu_pressure_write(struct kernfs_open_file *of,
+3809-					  char *buf, size_t nbytes,
+##### K. kernfs_generic_poll presence
+/home/fanziyun/abk_verify/common-5.15/fs/kernfs/file.c:2
+/home/fanziyun/abk_verify/common-6.1/fs/kernfs/file.c:2
+/home/fanziyun/abk_verify/common-5.15/include/linux/kernfs.h:1
+/home/fanziyun/abk_verify/common-6.1/include/linux/kernfs.h:2
+##### L. IRQ_TIME_ACCOUNTING defconfigs
+/home/fanziyun/abk_verify/common-5.15/arch/arm64/configs/gki_defconfig:9:CONFIG_IRQ_TIME_ACCOUNTING=y
+/home/fanziyun/abk_verify/common-6.1/arch/arm64/configs/gki_defconfig:11:CONFIG_IRQ_TIME_ACCOUNTING=y
+##### M. 61 swap.h 430-440
+						struct vm_area_struct *vma);
+
+/* linux/mm/vmscan.c */
+extern unsigned long zone_reclaimable_pages(struct zone *zone);
+extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+					gfp_t gfp_mask, nodemask_t *mask);
+
+#define MEMCG_RECLAIM_MAY_SWAP (1 << 1)
+#define MEMCG_RECLAIM_PROACTIVE (1 << 2)
+extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+						  unsigned long nr_pages,
+##### N. 515 swap.h MEMCG_RECLAIM region
+##### O. 61 memcontrol try_to_free callers
+		memcg_memory_event(memcg, MEMCG_HIGH);
+
+		psi_memstall_enter(&pflags);
+		nr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,
+							gfp_mask,
+							MEMCG_RECLAIM_MAY_SWAP);
+		psi_memstall_leave(&pflags);
+	raised_max_event = true;
+
+	psi_memstall_enter(&pflags);
+	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+						    gfp_mask, reclaim_options);
+	psi_memstall_leave(&pflags);
+
+			continue;
+		}
+
+		if (!try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,
+					memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP)) {
+			ret = -EBUSY;
+			break;
+##### P. 515 memcontrol try_to_free callers
+		memcg_memory_event(memcg, MEMCG_HIGH);
+
+		psi_memstall_enter(&pflags);
+		nr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,
+							     gfp_mask, true);
+		psi_memstall_leave(&pflags);
+	} while ((memcg = parent_mem_cgroup(memcg)) &&
+	memcg_memory_event(mem_over_limit, MEMCG_MAX);
+
+	psi_memstall_enter(&pflags);
+	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
+						    gfp_mask, may_swap);
+	psi_memstall_leave(&pflags);
+
+			continue;
+		}
+
+		if (!try_to_free_mem_cgroup_pages(memcg, 1,
+					GFP_KERNEL, !memsw)) {
+			ret = -EBUSY;
+			break;
+##### Q. 61 memory_reclaim tail
+
+		if (!reclaimed && !nr_retries--)
+			return -EAGAIN;
+
+		nr_reclaimed += reclaimed;
+	}
+
+	return nbytes;
+}
+
+static struct cftype memory_files[] = {
+	{
+		.name = "current",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = memory_current_read,
+	},
+	{
+		.name = "peak",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = memory_peak_read,
+	},
+	{
+		.name = "min",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = memory_min_show,
+		.write = memory_min_write,
+	},
+	{
+		.name = "low",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = memory_low_show,
+##### R. 515 oom.group cft entry
+6657-#endif
+6658-	{
+6659:		.name = "oom.group",
+6660-		.flags = CFTYPE_NOT_ON_ROOT | CFTYPE_NS_DELEGATABLE,
+6661-		.seq_show = memory_oom_group_show,
+6662-		.write = memory_oom_group_write,
+6663-	},
+6664-	{ }	/* terminate */
+6665-};
+##### S. 61 vmscan proactive consumers
+
+	success = try_to_shrink_lruvec(lruvec, sc);
+
+	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
+
+	if (!sc->proactive)
+		vmpressure(sc->gfp_mask, memcg, false, sc->nr_scanned - scanned,
+			   sc->nr_reclaimed - reclaimed);
+
+	sc->nr_reclaimed += current->reclaim_state->reclaimed_slab;
+	current->reclaim_state->reclaimed_slab = 0;
+
+	lru_add_drain();
+
+	blk_start_plug(&plug);
+
+	set_mm_walk(NULL, sc->proactive);
+
+	if (try_to_shrink_lruvec(lruvec, sc))
+		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_YOUNG);
+	if (!sc->may_writepage || !sc->may_unmap)
+		goto done;
+
+	lru_add_drain();
+
+	blk_start_plug(&plug);
+
+	set_mm_walk(pgdat, sc->proactive);
+
+	set_initial_priority(pgdat, sc);
+
+	if (current_is_kswapd())
+		sc->nr_reclaimed = 0;
+
+
+		shrink_lruvec(lruvec, sc);
+
+		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+			    sc->priority);
+
+		/* Record the group's reclaim efficiency */
+		if (!sc->proactive)
+			vmpressure(sc->gfp_mask, memcg, false,
+				   sc->nr_scanned - scanned,
+				   sc->nr_reclaimed - reclaimed);
+
+	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
+}
+
+static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+	if (reclaim_state) {
+		sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+		reclaim_state->reclaimed_slab = 0;
+	}
+
+	/* Record the subtree's reclaim efficiency */
+	if (!sc->proactive)
+		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+			   sc->nr_scanned - nr_scanned,
+			   sc->nr_reclaimed - nr_reclaimed);
+
+	if (sc->nr_reclaimed - nr_reclaimed)
+		reclaimable = true;
+
+	if (current_is_kswapd()) {
+		/*
+
+	if (!cgroup_reclaim(sc))
+		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+
+	do {
+		if (!sc->proactive)
+			vmpressure_prio(sc->gfp_mask, sc->target_mem_cgroup,
+					sc->priority);
+		sc->nr_scanned = 0;
+		shrink_zones(zonelist, sc);
+
+		if (sc->nr_reclaimed >= sc->nr_to_reclaim)
+			break;
+
+		if (sc->compaction_ready)
+			break;
+##### T. 515 vmscan reclaim_throttle
+4063:static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat)
+4266:	walk = set_mm_walk(NULL);
+4407:	set_mm_walk(pgdat);
+5053:	set_mm_walk(lruvec_pgdat(lruvec));
+5615:	if (!set_mm_walk(NULL)) {

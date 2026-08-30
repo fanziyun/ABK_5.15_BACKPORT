@@ -1,0 +1,311 @@
+##### A. 515 scan_control struct
+#define DEACTIVATE_FILE 2
+	unsigned int may_deactivate:2;
+	unsigned int force_deactivate:1;
+	unsigned int skipped_deactivate:1;
+
+	/* Writepage batching in laptop mode; RECLAIM_WRITE */
+	unsigned int may_writepage:1;
+
+	/* Can mapped pages be reclaimed? */
+	unsigned int may_unmap:1;
+
+	/* Can pages be swapped as part of reclaim? */
+	unsigned int may_swap:1;
+
+	/*
+	 * Cgroup memory below memory.low is protected as long as we
+	 * don't threaten to OOM. If any cgroup is reclaimed at
+	 * reduced force or passed over entirely due to its memory.low
+	 * setting (memcg_low_skipped), and nothing is reclaimed as a
+	 * result, then go back for one more cycle that reclaims the protected
+	 * memory (memcg_low_reclaim) to avert OOM.
+	 */
+	unsigned int memcg_low_reclaim:1;
+	unsigned int memcg_low_skipped:1;
+
+	unsigned int hibernation_mode:1;
+
+	/* One of the zones is ready for compaction */
+	unsigned int compaction_ready:1;
+
+	/* There is easily reclaimable cold cache in the current node */
+##### B. 515 vmpressure sites
+5995-			    sc->priority);
+5996-
+5997-		/* Record the group's reclaim efficiency */
+5998:		vmpressure(sc->gfp_mask, memcg, false,
+5999-			   sc->nr_scanned - scanned,
+6000-			   sc->nr_reclaimed - reclaimed);
+6001-
+6002-	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
+6003-}
+--
+6027-	}
+6028-
+6029-	/* Record the subtree's reclaim efficiency */
+6030:	vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+6031-		   sc->nr_scanned - nr_scanned,
+6032-		   sc->nr_reclaimed - nr_reclaimed);
+6033-
+6034-	if (sc->nr_reclaimed - nr_reclaimed)
+6035-		reclaimable = true;
+##### C. 515 swap.h try_to_free_pages extern
+385-extern unsigned long zone_reclaimable_pages(struct zone *zone);
+386:extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+387-					gfp_t gfp_mask, nodemask_t *mask);
+388-extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
+389-						  unsigned long nr_pages,
+390-						  gfp_t gfp_mask,
+391-						  bool may_swap);
+392-extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
+##### D. 61 psi_trigger_create parse
+		u64 total = 0;
+		int w;
+
+		/* CPU FULL is undefined at the system level */
+		if (!(group == &psi_system && res == PSI_CPU && full)) {
+			for (w = 0; w < 3; w++)
+				avg[w] = group->avg[res * 2 + full][w];
+			total = div_u64(group->total[PSI_AVGS][res * 2 + full],
+					NSEC_PER_USEC);
+		}
+
+		seq_printf(m, "%s avg10=%lu.%02lu avg60=%lu.%02lu avg300=%lu.%02lu total=%llu\n",
+			   full || only_full ? "full" : "some",
+			   LOAD_INT(avg[0]), LOAD_FRAC(avg[0]),
+			   LOAD_INT(avg[1]), LOAD_FRAC(avg[1]),
+			   LOAD_INT(avg[2]), LOAD_FRAC(avg[2]),
+			   total);
+	}
+
+	return 0;
+}
+
+struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
+				       enum psi_res res, struct file *file,
+				       struct kernfs_open_file *of)
+{
+	struct psi_trigger_ext *t_ext;
+	struct psi_trigger *t;
+	enum psi_states state;
+	u32 threshold_us;
+	u32 window_us;
+
+	if (static_branch_likely(&psi_disabled))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (sscanf(buf, "some %u %u", &threshold_us, &window_us) == 2)
+		state = PSI_IO_SOME + res * 2;
+	else if (sscanf(buf, "full %u %u", &threshold_us, &window_us) == 2)
+		state = PSI_IO_FULL + res * 2;
+	else
+		return ERR_PTR(-EINVAL);
+
+#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+	if (res == PSI_IRQ && --state != PSI_IRQ_FULL)
+##### E. 515 psi_trigger_create full
+	now = sched_clock();
+	collect_percpu_times(group, PSI_AVGS, NULL);
+	if (now >= group->avg_next_update)
+		group->avg_next_update = update_averages(group, now);
+	mutex_unlock(&group->avgs_lock);
+
+	for (full = 0; full < 2; full++) {
+		unsigned long avg[3] = { 0, };
+		u64 total = 0;
+		int w;
+
+		/* CPU FULL is undefined at the system level */
+		if (!(group == &psi_system && res == PSI_CPU && full)) {
+			for (w = 0; w < 3; w++)
+				avg[w] = group->avg[res * 2 + full][w];
+			total = div_u64(group->total[PSI_AVGS][res * 2 + full],
+					NSEC_PER_USEC);
+		}
+
+		seq_printf(m, "%s avg10=%lu.%02lu avg60=%lu.%02lu avg300=%lu.%02lu total=%llu\n",
+			   full ? "full" : "some",
+			   LOAD_INT(avg[0]), LOAD_FRAC(avg[0]),
+			   LOAD_INT(avg[1]), LOAD_FRAC(avg[1]),
+			   LOAD_INT(avg[2]), LOAD_FRAC(avg[2]),
+			   total);
+	}
+
+	return 0;
+}
+
+struct psi_trigger *psi_trigger_create(struct psi_group *group,
+			char *buf, size_t nbytes, enum psi_res res)
+{
+	struct psi_trigger *t;
+	enum psi_states state;
+	u32 threshold_us;
+	u32 window_us;
+
+	if (static_branch_likely(&psi_disabled))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (sscanf(buf, "some %u %u", &threshold_us, &window_us) == 2)
+		state = PSI_IO_SOME + res * 2;
+	else if (sscanf(buf, "full %u %u", &threshold_us, &window_us) == 2)
+		state = PSI_IO_FULL + res * 2;
+	else
+		return ERR_PTR(-EINVAL);
+
+	if (state >= PSI_NONIDLE)
+		return ERR_PTR(-EINVAL);
+
+	if (window_us < WINDOW_MIN_US ||
+		window_us > WINDOW_MAX_US)
+##### F. 515 psi_write caller
+1376-		mutex_unlock(&seq->lock);
+1377-		return -EBUSY;
+1378-	}
+1379-
+1380:	new = psi_trigger_create(&psi_system, buf, nbytes, res);
+1381-	if (IS_ERR(new)) {
+1382-		mutex_unlock(&seq->lock);
+##### G. 515 scheduler_tick body
+
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
+	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
+	curr->sched_class->task_tick(rq, curr, 0);
+	if (sched_feat(LATENCY_WARN))
+		resched_latency = cpu_resched_latency(rq);
+	calc_global_load_tick(rq);
+
+	rq_unlock(rq, &rf);
+
+	if (sched_feat(LATENCY_WARN) && resched_latency)
+		resched_latency_warn(cpu, resched_latency);
+
+	perf_event_task_tick();
+
+#ifdef CONFIG_SMP
+	rq->idle_balance = idle_cpu(cpu);
+	trigger_load_balance(rq);
+#endif
+
+	trace_android_vh_scheduler_tick(rq);
+}
+
+#ifdef CONFIG_NO_HZ_FULL
+
+struct tick_work {
+##### H. 515 mutex.c unlock_slowpath tail
+921-	raw_spin_unlock(&lock->wait_lock);
+922-
+923:	wake_up_q(&wake_q);
+924-}
+925-
+926-#ifndef CONFIG_DEBUG_LOCK_ALLOC
+927-/*
+##### I. 515 rwsem.c rwsem_wake
+1269-	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+1270-
+1271-	if (!list_empty(&sem->wait_list))
+1272-		rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
+1273:	trace_android_vh_rwsem_wake_finish(sem);
+1274-
+1275-	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+1276-	wake_up_q(&wake_q);
+1277-
+1278-	return sem;
+1279-}
+1280-
+1281-/*
+##### J. 515 dtask.h mutex decls
+87-	TP_ARGS(lock, waiter, list, already_on_list));
+88:DECLARE_HOOK(android_vh_mutex_unlock_slowpath,
+89-	TP_PROTO(struct mutex *lock),
+90-	TP_ARGS(lock));
+91-DECLARE_HOOK(android_vh_record_mutex_lock_starttime,
+##### K. 61 cgroup pressure write call
+3840:	new = psi_trigger_create(psi, buf, res, of->file, of);
+##### L. 515 psi.h 24-33
+void psi_memstall_leave(unsigned long *flags);
+
+int psi_show(struct seq_file *s, struct psi_group *group, enum psi_res res);
+struct psi_trigger *psi_trigger_create(struct psi_group *group,
+			char *buf, size_t nbytes, enum psi_res res);
+void psi_trigger_destroy(struct psi_trigger *t);
+
+__poll_t psi_trigger_poll(void **trigger_ptr, struct file *file,
+			poll_table *wait);
+
+##### M. 515 stats.h PSI end/stub start
+	}
+}
+
+static inline void psi_sched_switch(struct task_struct *prev,
+				    struct task_struct *next,
+				    bool sleep)
+{
+	if (static_branch_likely(&psi_disabled))
+		return;
+
+	psi_task_switch(prev, next, sleep);
+}
+
+#else /* CONFIG_PSI */
+static inline void psi_enqueue(struct task_struct *p, bool wakeup) {}
+static inline void psi_dequeue(struct task_struct *p, bool sleep) {}
+static inline void psi_ttwu_dequeue(struct task_struct *p) {}
+static inline void psi_sched_switch(struct task_struct *prev,
+				    struct task_struct *next,
+				    bool sleep) {}
+#endif /* CONFIG_PSI */
+
+#ifdef CONFIG_SCHED_INFO
+/*
+ * We are interested in knowing how long it was from the *first* time a
+ * task was queued to the time that it finally hit a CPU, we call this routine
+ * from dequeue_task() to account for possible rq->clock skew across CPUs. The
+ * delta taken on each CPU would annul the skew.
+##### N. read_lazy_flag callsites in 61
+##### O. 515 psi_types.h last_event region
+
+	/* Wait queue for polling */
+	wait_queue_head_t event_wait;
+
+	/* Pending event flag */
+	int event;
+
+	/* Tracking window */
+	struct psi_window win;
+
+	/*
+	 * Time last event was generated. Used for rate-limiting
+	 * events to one per window
+	 */
+	u64 last_event_time;
+};
+
+enum poll_wakeup_bits {
+	POLL_WAKEUP	= 0,
+	POLL_SCHEDULED	= 1,
+};
+
+struct psi_group {
+##### P. 515 psi_types.h includes
+#ifndef _LINUX_PSI_TYPES_H
+#define _LINUX_PSI_TYPES_H
+
+#include <linux/kthread.h>
+#include <linux/seqlock.h>
+#include <linux/types.h>
+#include <linux/kref.h>
+#include <linux/wait.h>
+
+#ifdef CONFIG_PSI
+
+/* Tracked task states */
+enum psi_task_count {
+	NR_IOWAIT,
+	NR_MEMSTALL,
+	NR_RUNNING,
+	/*
+	 * This can't have values other than 0 or 1 and could be
+	 * implemented as a bit flag. But for now we still have room
+	 * in the first cacheline of psi_group_cpu, and this way we
