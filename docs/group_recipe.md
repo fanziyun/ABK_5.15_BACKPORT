@@ -46,3 +46,23 @@ batch is three steps.
 - Extend `tests/smoke.sh` grep assertions if the group lands a load-bearing
   marker, then tick the `plan.md` checkbox and bump
   `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION` in `module.conf`.
+
+## Step-authoring traps (compile-breaking, hidden at group level)
+
+Both traps slip past group statuses ("applied") and only surface at compile
+time; `tests/step_audit.py` catches them on a pristine tree:
+
+1. **Replacement blocks that pre-exist in the file.** `replace_once` checks
+   the *new* block first (idempotency).  If `new` is a common pattern or a
+   prefix of `old` (line deletions!), the step short-circuits to
+   `already_present` and the real edit never lands.  Fix: re-anchor `old` and
+   `new` with unique surrounding context (e.g. the `return newf;` before the
+   `out_release:` label) so `new` cannot exist before the step runs.
+2. **Comment-structure damage.** A new block that starts with the ` */`
+   terminator closes the enclosing comment and turns the following comment
+   body lines into code (broke the whole `sched/features.h` translation unit
+   in CI).  Comment *additions* must be inserted *before* the closing ` */`.
+
+Both rules are enforced per step by `tests/step_audit.py`: every step must
+report `applied` on the pristine tree (never `already_present`), and the
+`/*`/`*/` balance of each touched file must be unchanged.

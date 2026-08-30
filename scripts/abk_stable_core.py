@@ -163,14 +163,20 @@ _FD_DUPFD_AOSP_NEW = """		/* ABK stable_515_backport: dup_fd keeps the errorp co
 		}
 """
 
-_FD_DUPFD_LABEL_OLD = """out_release:
+_FD_DUPFD_LABEL_OLD = """	return newf;
+
+out_release:
 	kmem_cache_free(files_cachep, newf);
 out:
 	return NULL;
+}
 """
 
-_FD_DUPFD_LABEL_NEW = """out:
+_FD_DUPFD_LABEL_NEW = """	return newf;
+
+out:
 	return NULL;
+}
 """
 
 _FD_DUPFD_VANILLA_OLD = """		new_fdt = alloc_fdtable(open_files - 1);

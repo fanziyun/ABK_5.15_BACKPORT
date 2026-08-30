@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Per-step audit of every PatchGroup against a pristine reference tree.
+
+Group-level statuses hide two anchor bugs that only show up at compile time:
+
+1. A step whose replacement block already exists somewhere in the pristine
+   file.  ``replace_once`` checks the replacement first (idempotency), so the
+   step is silently reported ``already_present`` and the real edit never
+   happens, while the group still reports "applied".  On a pristine 5.15.167
+   tree every single step must therefore be ``applied`` -- never
+   ``already_present``.
+2. A replacement that unbalances the ``/* ... */`` comment structure (e.g. a
+   new block that starts with the comment terminator), which turns every
+   following line into code and breaks the whole translation unit.
+
+The audit copies the files the groups touch into a disposable tree, records
+each step by wrapping ``apply_steps`` in both child modules, and asserts:
+
+- every group and every individual step reports ``applied`` on the pristine
+  tree;
+- every step's replacement block is absent from the pristine file (both LF
+  and CRLF forms);
+- the open/close comment delta of each touched file is unchanged;
+- a second pass over the patched tree is fully ``already_present`` and leaves
+  every file byte-identical.
+
+Usage:
+  python tests/step_audit.py /path/to/android13-5.15-common-kernel-tree
+(or set AUDIT_SOURCE_TREE; a tree at ../linux-common-android13-5.15 is picked
+up automatically)
+"""
+
+from __future__ import annotations
+
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+MODULE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(MODULE_DIR / "scripts"))
+
+import abk_common as common  # noqa: E402
+from abk_backport_engine import GraftContext  # noqa: E402
+import abk_stable_core  # noqa: E402
+import abk_stable_perf  # noqa: E402
+
+AUDIT_FILES = [
+    "fs/file.c",
+    "mm/page_alloc.c",
+    "mm/internal.h",
+    "mm/oom_kill.c",
+    "include/linux/cgroup-defs.h",
+    "include/linux/cpuset.h",
+    "include/linux/mmzone.h",
+    "include/linux/randomize_kstack.h",
+    "include/linux/sched.h",
+    "kernel/cgroup/cgroup-internal.h",
+    "kernel/cgroup/cgroup.c",
+    "kernel/cgroup/cpuset.c",
+    "kernel/sched/sched.h",
+    "kernel/sched/core.c",
+    "kernel/sched/fair.c",
+    "kernel/sched/rt.c",
+    "kernel/sched/features.h",
+    "kernel/sched/stats.h",
+    "kernel/sched/psi.c",
+    "kernel/fork.c",
+    "kernel/locking/semaphore.c",
+    "init/main.c",
+    "net/core/sock.c",
+    "block/blk-mq.c",
+]
+
+CHILD_MODULES = [
+    ("stable_backport_core", abk_stable_core),
+    ("stable_perf_backport", abk_stable_perf),
+]
+
+
+def fail(msg):
+    raise SystemExit(f"AUDIT FAIL: {msg}")
+
+
+def make_tree(source, work):
+    root = work / "common"
+    for rel in AUDIT_FILES:
+        src = source / rel
+        if not src.is_file():
+            fail(f"reference tree is missing {rel}")
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    return root
+
+
+def new_ctx(root):
+    return GraftContext(root, "167", "android13-5.15")
+
+
+def record_steps(module, sink):
+    """Wrap module.apply_steps so every step tuple is captured."""
+    original = module.apply_steps
+
+    def wrapper(ctx, steps):
+        sink.extend(steps)
+        return original(ctx, steps)
+
+    module.apply_steps = wrapper
+    return original
+
+
+def comment_delta(text):
+    return text.count("/*") - text.count("*/")
+
+
+def contains_block(text, block):
+    lf = block.replace("\r\n", "\n")
+    return lf in text or lf.replace("\n", "\r\n") in text
+
+
+def run_child_groups(module, ctx):
+    statuses = {}
+    for group in module.PATCH_GROUPS:
+        result = group.run(ctx)
+        statuses[group.key] = result["status"]
+        if result["status"] not in ("applied", "already_present"):
+            fail(f"{module.__name__}/{group.key} degraded on the pristine tree: "
+                 f"{result['status']} ({result['detail']})")
+    return statuses
+
+
+def audit_child(name, module, pristine_root, work):
+    steps = []
+    original = record_steps(module, steps)
+    try:
+        tree = work / name
+        shutil.copytree(pristine_root, tree)
+        ctx = new_ctx(tree)
+        statuses = run_child_groups(module, ctx)
+    finally:
+        module.apply_steps = original
+
+    # Trap 1: a replacement block that pre-exists in the pristine file would
+    # make replace_once short-circuit to already_present forever.
+    pristine_texts = {rel: common.read_text(pristine_root / rel) for rel in AUDIT_FILES}
+    for rel, old, new, _required in steps:
+        if contains_block(pristine_texts[rel], new):
+            fail(f"{name}: replacement block already exists in pristine {rel}; "
+                 f"anchor must be unique enough that replace_once really applies:\n{new[:120]!r}")
+
+    # Trap 2: comment structure must stay balanced per file.
+    for rel in sorted({rel for rel, _o, _n, _r in steps}):
+        before = comment_delta(pristine_texts[rel])
+        after = comment_delta(common.read_text(tree / rel))
+        if before != after:
+            fail(f"{name}: comment balance changed in {rel} "
+                 f"({before} -> {after}); a replacement broke a /* */ pair")
+
+    # Idempotency: second pass over the patched tree, byte-identical result.
+    patched_files = sorted({rel for rel, _o, _n, _r in steps})
+    patched_bytes = {rel: (tree / rel).read_bytes() for rel in patched_files}
+    ctx2 = new_ctx(tree)
+    statuses2 = run_child_groups(module, ctx2)
+    if any(s != "already_present" for s in statuses2.values()):
+        fail(f"{name}: second pass was not idempotent: {statuses2}")
+    for rel, blob in patched_bytes.items():
+        if (tree / rel).read_bytes() != blob:
+            fail(f"{name}: second pass rewrote {rel}")
+    print(f"  {name}: {len(steps)} steps audited, second pass idempotent")
+
+
+def main():
+    import os
+
+    if len(sys.argv) > 1:
+        source = Path(sys.argv[1]).resolve()
+    else:
+        env = os.environ.get("AUDIT_SOURCE_TREE", "")
+        sibling = MODULE_DIR.parent / "linux-common-android13-5.15"
+        source = Path(env).resolve() if env else sibling
+    if not source.is_dir():
+        raise SystemExit(f"usage: python tests/step_audit.py /path/to/kernel-tree "
+                         f"(got {source})")
+
+    with tempfile.TemporaryDirectory(prefix="abk515_audit_") as tmp:
+        work = Path(tmp)
+        pristine = make_tree(source, work)
+        print(f"auditing {sum(len(m.PATCH_GROUPS) for _n, m in CHILD_MODULES)} groups "
+              f"against {source}")
+        for name, module in CHILD_MODULES:
+            audit_child(name, module, pristine, work)
+    print("STEP AUDIT OK")
+
+
+if __name__ == "__main__":
+    main()

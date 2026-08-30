@@ -96,6 +96,8 @@ FD_PRISTINE = (
     "\t\t\tgoto out_release;\n"
     "\t\t}\n"
     "\t}\n"
+    "\treturn newf;\n"
+    "\n"
     "out_release:\n"
     "\tkmem_cache_free(files_cachep, newf);\n"
     "out:\n"

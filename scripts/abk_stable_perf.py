@@ -165,8 +165,14 @@ def _psi_flags_apply(ctx):
          "\t} else {",
          T),
         ("kernel/sched/stats.h",
-         "\tint clear = TSK_RUNNING;\n\n\tif (static_branch_likely(&psi_disabled))\n\t\treturn;\n",
-         "\tif (static_branch_likely(&psi_disabled))\n\t\treturn;\n",
+         "static inline void psi_dequeue(struct task_struct *p, bool sleep)\n"
+         "{\n"
+         "\tint clear = TSK_RUNNING;\n"
+         "\n"
+         "\tif (static_branch_likely(&psi_disabled))\n",
+         "static inline void psi_dequeue(struct task_struct *p, bool sleep)\n"
+         "{\n"
+         "\tif (static_branch_likely(&psi_disabled))\n",
          T),
         ("kernel/sched/stats.h",
          "\tif (p->in_memstall)\n\t\tclear |= (TSK_MEMSTALL | TSK_MEMSTALL_RUNNING);\n\n\tpsi_task_change(p, clear, 0);\n}",
@@ -220,7 +226,6 @@ def _rt_optimizations_apply(ctx):
          T),
         ("kernel/sched/features.h",
          " */\nSCHED_FEAT(RT_PUSH_IPI, true)\n#endif",
-         " */\n"
          " * This is best for PREEMPT_RT, but for non-RT it can cause issues\n"
          " * when preemption is disabled for long periods of time. Have\n"
          " * it only default enabled for PREEMPT_RT.\n"
@@ -287,8 +292,13 @@ def _kstack_pertask_apply(ctx):
         steps.append(_sched_h_kstack_step(text))
     steps.extend([
         ("include/linux/randomize_kstack.h",
-         "\t\t\t randomize_kstack_offset);\nDECLARE_PER_CPU(u32, kstack_offset);\n",
-         "\t\t\t randomize_kstack_offset);\n",
+         "\t\t\t randomize_kstack_offset);\n"
+         "DECLARE_PER_CPU(u32, kstack_offset);\n"
+         "\n"
+         "/*\n",
+         "\t\t\t randomize_kstack_offset);\n"
+         "\n"
+         "/*\n",
          T),
         ("include/linux/randomize_kstack.h",
          "/*\n * These macros must be used during syscall entry when interrupts and\n * preempt are disabled, and after user registers have been stored to\n * the stack.\n */\n"
@@ -367,9 +377,13 @@ def _kstack_pertask_apply(ctx):
         ("init/main.c",
          "DEFINE_STATIC_KEY_MAYBE_RO(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,\n"
          "\t\t\t   randomize_kstack_offset);\n"
-         "DEFINE_PER_CPU(u32, kstack_offset);\n",
+         "DEFINE_PER_CPU(u32, kstack_offset);\n"
+         "\n"
+         "static int __init early_randomize_kstack_offset(char *buf)\n",
          "DEFINE_STATIC_KEY_MAYBE_RO(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,\n"
-         "\t\t\t   randomize_kstack_offset);\n",
+         "\t\t\t   randomize_kstack_offset);\n"
+         "\n"
+         "static int __init early_randomize_kstack_offset(char *buf)\n",
          T),
         ("kernel/fork.c",
          "#include <linux/kasan.h>\n#include <linux/scs.h>",
