@@ -1,0 +1,9 @@
+4c80a7b1ac07 2026-08-23 net: dst: add four helpers to annotate data-races around dst->dev
+f625c742b33d 2026-08-19 net: remove WARN_ON_ONCE() from sk_mc_loop()
+c655d2167bf0 2026-01-19 net: sock: fix hardened usercopy panic in sock_recv_errqueue
+66bcd6c577d8 2025-12-06 net: call cond_resched() less often in __release_sock()
+38edfa2a5a7a 2025-12-06 net: Call trace_sock_exceed_buf_limit() for memcg failure with SK_MEM_RECV.
+d51e47e2ab6e 2025-10-02 net: Fix null-ptr-deref by sock_lock_init_class_and_name() and rmmod.
+cafc3c567e4e 2025-06-27 sock: Correct error checking condition for (assign|release)_proto_idx()
+58de45f4d663 2025-05-02 net: make sock_inuse_add() available
+579cfa595af1 2025-01-09 net: restrict SO_REUSEPORT to inet sockets

@@ -1,0 +1,17 @@
+0eac511c7657 2026-03-04 mm, page_alloc, thp: prevent reclaim for __GFP_THISNODE THP allocations
+eda99622e6f3 2026-02-06 mm/page_alloc: make percpu_pagelist_high_fraction reads lock-free
+2ef178413183 2025-12-06 mm/mm_init: fix hash table order logging in alloc_large_system_hash()
+735457683e23 2025-10-19 mm/page_alloc: only set ALLOC_HIGHATOMIC for __GPF_HIGH allocations
+c635a42d9b74 2025-08-28 mm/page_alloc: detect allocation forbidden by cpuset and bail out early
+c6da28bc4e1f 2025-06-04 mm/page_alloc.c: avoid infinite retries caused by cpuset race
+955c5a1ddd6e 2025-03-13 mm/page_alloc: fix uninitialized variable
+903d896448c2 2024-12-14 mm: fix NULL pointer dereference in alloc_pages_bulk_noprof
+4c4e238d3ada 2024-11-08 mm/page_alloc: let GFP_ATOMIC order-0 allocs access highatomic reserves
+85f58ee33c6c 2024-11-08 mm/page_alloc: explicitly define how __GFP_HIGH non-blocking allocations accesses reserves
+c1b8856c5a7d 2024-11-08 mm/page_alloc: explicitly define what alloc flags deplete min reserves
+17dedfd6de69 2024-11-08 mm/page_alloc: explicitly record high-order atomic allocations in alloc_flags
+9da195a2d35b 2024-11-08 mm/page_alloc: treat RT tasks similar to __GFP_HIGH
+92e52ff398b5 2024-11-08 mm/page_alloc: rename ALLOC_HIGH to ALLOC_MIN_RESERVE
+ca8527f25736 2024-11-08 mm/page_alloc: split out buddy removal code from rmqueue into separate helper
+28e7a507196f 2024-11-08 mm/page_alloc: fix tracepoint mm_page_alloc_zone_locked()
+6036719c23a9 2024-11-08 mm/page_alloc: call check_new_pages() while zone spinlock is not held

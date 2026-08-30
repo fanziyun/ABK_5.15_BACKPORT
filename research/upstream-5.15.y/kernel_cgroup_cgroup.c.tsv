@@ -1,0 +1,8 @@
+3b95abab7369 2026-04-18 cgroup: fix race between task migration and iteration
+f2795d1b9250 2025-10-02 cgroup: split cgroup_destroy_wq into 3 workqueues
+0b18c3a17bc7 2025-06-04 cgroup: Fix compilation issue due to cgroup_mutex not being exported
+19f3e16bc9f7 2025-03-13 cgroup: fix race between fork and cgroup.kill
+973c859752cb 2024-12-14 cgroup/bpf: only cgroup v2 can be attached by bpf programs
+d4cc5a87c24d 2024-12-14 Revert "cgroup: Fix memory leak caused by missing cgroup_bpf_offline"
+a69d18e8029d 2024-11-08 cgroup: Fix potential overflow issue when checking max_depth
+de77545c72c4 2024-10-17 cgroup: Make operations on the cgroup root_list RCU safe

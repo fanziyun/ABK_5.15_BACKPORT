@@ -1,0 +1,8 @@
+64d9b734b6fe 2026-06-19 sched: Use u64 for bandwidth ratio calculations
+5ce1264b586d 2025-08-28 sched: Add wrapper for get_wchan() to keep task blocked
+64577690e49c 2025-04-10 sched: Clarify wake_up_q()'s write to task->wake_q.next
+288fdb8dcb71 2025-03-13 sched/core: Prevent rescheduling when interrupts are disabled
+56135262c1f9 2025-03-13 sched: Don't try to catch up excess steal time.
+b3a5ff8c4b6e 2025-03-13 sched/psi: Use task->psi_flags to clear in CPU migration
+38a4826f1bdf 2024-12-14 sched/core: Prevent wakeup of ksoftirqd during idle load balance
+25fc82f3a868 2024-12-14 sched/core: Remove the unnecessary need_resched() check in nohz_csd_func()

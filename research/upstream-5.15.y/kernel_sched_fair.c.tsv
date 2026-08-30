@@ -1,0 +1,7 @@
+d99f14f8b142 2026-07-24 sched/fair: Only update stats for allowed CPUs when looking for dst group
+fdccb3adc59d 2025-10-29 sched/fair: Fix pelt lost idle time detection
+15fda76f7a57 2025-10-29 sched/balancing: Rename newidle_balance() => sched_balance_newidle()
+5cb300dcdd27 2025-03-13 sched/fair: Fix potential memory corruption in child_cfs_rq_on_list
+c7971fc03a06 2025-03-13 sched/fair: Fix value reported by hot tasks pulled in /proc/schedstat
+6aeeac48fc1b 2024-12-14 sched/fair: Check idle_cpu() before need_resched() to detect ilb CPU turning busy
+d071dba5ddd2 2024-12-14 sched/fair: Add NOHZ balancer flag for nohz.next_balance updates

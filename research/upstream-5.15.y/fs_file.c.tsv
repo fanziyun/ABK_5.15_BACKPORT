@@ -1,0 +1,5 @@
+ed43bf13a6ac 2025-10-19 fs: always return zero on success from replace_fd()
+77cf363f7667 2025-08-28 alloc_fdtable(): change calling conventions.
+749528086620 2025-08-28 fs: Prevent file descriptor table allocations exceeding INT_MAX
+2d1a5a595bf2 2025-01-23 fs: fix missing declaration of init_files
+7e9d945af0b5 2024-10-17 close_range(): fix the logics in descriptor table trimming
