@@ -3,6 +3,21 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 4（v0.5.0，android15-6.6 来源线，已落地）
+
+来源：android15-6.6 ACK 分支（survey 见 `docs/survey_6_6_ack.md`）。
+ABK_ABI_PATCH_SUITE 覆盖对照：其余候选（EEVDF / io_uring / slab / hugepage / fdtable /
+pid / zram-writeback）均属套件领地，排除；本轮仅落地 zram 重组（套件只覆盖 writeback）。
+
+- [x] `zram_recompression`（core）— android15-6.6 / 6.2 系列：
+  `ZRAM_MULTI_COMP` + `ZRAM_TRACK_ENTRY_ACTIME`，`comps[]`/`comp_algs[]`/
+  `num_active_comps`（保留 `ZRAM_FLAG_SHIFT=24`），`zram_read_from_zspool`、
+  `zram_recompress`、`recompress_store` + sysfs、`mark_idle` 龄期标记、
+  comp_algorithm/recomp_algorithm 多 comp 机制、多 comp 初始化；zsmalloc 新增
+  `zs_lookup_class_index()`
+- [x] 验证：step_audit 通过（91 步 core，幂等）、smoke 计数更新（core 9→10）、
+  py_compile + 单测全绿；CI 编译验证随 run 33309011902（后随 CI 结果更新）
+
 ## Batch 3（v0.4.0，android14-6.1 来源线，已落地）
 
 来源：android14-6.1 ACK 分支（6.1 唯一 ACK 线），survey 见 `docs/survey_6_1_ack.md`。
