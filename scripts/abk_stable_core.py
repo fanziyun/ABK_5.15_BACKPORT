@@ -179,6 +179,42 @@ out:
 }
 """
 
+# Vanilla punch_hole dup_fd tail: the AOSP/vanilla trees carrying
+# `sane_fdtable_size(old_fdt, punch_hole)` end dup_fd() with an
+# out_release: cleanup label and `return ERR_PTR(error);`.  Upstream
+# 5.15.191 merges that path into ERR_CAST early returns, so the whole
+# tail block must be replaced by the plain `return newf;` form.  The old
+# label-only step ("out_release:\n...\n}\n" -> "}\n") was a no-op because
+# replace_once() treats a bare "}\n" as already_present (any closing brace
+# in the file matches), leaving an unused label that -Werror,-Wunused-label
+# rejects.  The old text therefore spans from `return newf;` through the
+# closing brace and the replacement is the target tail verbatim.
+_FD_DUPFD_LABEL_VANILLA_OLD = """	return newf;
+
+out_release:
+	kmem_cache_free(files_cachep, newf);
+	return ERR_PTR(error);
+}
+"""
+_FD_DUPFD_LABEL_VANILLA_NEW = """	return newf;
+}
+"""
+
+# Vanilla punch_hole dup_fd no longer uses `int error;`: the ERR_CAST early
+# returns replace both `error = -ENOMEM; goto out_release;` paths, and the
+# label tail that read `error` is gone.  Upstream 5.15.191 drops the
+# declaration; keep the anchor scoped to the dup_fd header so other
+# functions' `int error;` locals are untouched.
+_FD_DUPFD_ERR_DECL_OLD = """	struct fdtable *old_fdt, *new_fdt;
+	int error;
+
+	newf = kmem_cache_alloc(files_cachep, GFP_KERNEL);
+"""
+_FD_DUPFD_ERR_DECL_NEW = """	struct fdtable *old_fdt, *new_fdt;
+
+	newf = kmem_cache_alloc(files_cachep, GFP_KERNEL);
+"""
+
 _FD_DUPFD_VANILLA_OLD = """		new_fdt = alloc_fdtable(open_files - 1);
 		if (!new_fdt) {
 			error = -ENOMEM;
@@ -278,12 +314,12 @@ def _suite_composed_steps(dup_fd_aosp):
     label_step = (
         ("fs/file.c", _FD_DUPFD_LABEL_OLD, _FD_DUPFD_LABEL_NEW, T)
         if dup_fd_aosp
-        else (
-            "fs/file.c",
-            "out_release:\n\tkmem_cache_free(files_cachep, newf);\n\treturn ERR_PTR(error);\n}\n",
-            "}\n",
-            T,
-        )
+        else ("fs/file.c", _FD_DUPFD_LABEL_VANILLA_OLD, _FD_DUPFD_LABEL_VANILLA_NEW, T)
+    )
+    err_decl_step = (
+        []
+        if dup_fd_aosp
+        else [("fs/file.c", _FD_DUPFD_ERR_DECL_OLD, _FD_DUPFD_ERR_DECL_NEW, T)]
     )
     return [
         ("fs/file.c", _FD_SUITE_DOC_TAIL_OLD, _FD_DOC_TAIL_NEW, T),
@@ -296,6 +332,7 @@ def _suite_composed_steps(dup_fd_aosp):
         if dup_fd_aosp
         else ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T),
         label_step,
+        *err_decl_step,
         ("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, F),
     ]
 
@@ -340,8 +377,8 @@ def _fdtable_apply(ctx):
     # Vanilla punch_hole dup_fd variant: accepted in place of the AOSP one.
     if "sane_fdtable_size(old_fdt, max_fds)" not in text_probe:
         steps[6] = ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T)
-        steps[7] = ("fs/file.c", "out_release:\n\tkmem_cache_free(files_cachep, newf);\n\treturn ERR_PTR(error);\n}\n",
-                    "}\n", T)
+        steps[7] = ("fs/file.c", _FD_DUPFD_LABEL_VANILLA_OLD, _FD_DUPFD_LABEL_VANILLA_NEW, T)
+        steps.insert(8, ("fs/file.c", _FD_DUPFD_ERR_DECL_OLD, _FD_DUPFD_ERR_DECL_NEW, T))
 
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
