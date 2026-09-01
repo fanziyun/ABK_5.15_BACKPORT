@@ -13,8 +13,10 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import abk_common as common  # noqa: E402
+import sublevel_matrix  # noqa: E402
 from abk_backport_engine import GraftContext, PatchGroup, apply_steps, run_child  # noqa: E402
 
 FAILURES = []
@@ -181,17 +183,21 @@ FD_UPSTREAM = (
     "\tif (unlikely(nr > INT_MAX / sizeof(struct file *)))\n"
     "\t\treturn ERR_PTR(-EMFILE);\n"
     "}\n"
+    "int replace_fd(unsigned fd, struct file *file, unsigned flags)\n"
+    "{\n"
+    "\treturn do_dup2(files, file, fd, flags);\n"
+    "}\n"
 )
 
 
-def make_ctx(tmp, files):
+def make_ctx(tmp, files, sub_level=sublevel_matrix.DEFAULT_SUB_LEVEL):
     root = Path(tmp) / "common"
     root.mkdir(parents=True, exist_ok=True)
     for rel, content in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content.encode("utf-8"))
-    ctx = GraftContext(str(root), "167", "android13-5.15")
+    ctx = GraftContext(str(root), sub_level, "android13-5.15")
     ctx.report_dir = str(Path(tmp) / "reports")
     return ctx
 
@@ -291,6 +297,81 @@ def test_fdtable_shapes():
             check("unknown shape aborts hard group", True)
 
 
+def test_replace_fd_errno_group():
+    """The 5.15.195 replace_fd() fix must reach a .191-.194 baseline.
+
+    It used to be an optional step inside the fd-table conventions group, which
+    short-circuits to already_present the moment the tree is in the upstream
+    5.15.191 shape -- so on a 5.15.194 target the hunk was silently skipped.
+    """
+    print("replace_fd errno group (5.15.195)")
+    import abk_stable_core as core
+
+    # Upstream .191-.194 shape: conventions already in, replace_fd not yet.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"fs/file.c": FD_UPSTREAM}, sub_level="194")
+        status, _ = core._fdtable_apply(ctx)
+        check("conventions already_present on .194 shape",
+              status == "already_present", status)
+        status, detail = core._replace_fd_errno_apply(ctx)
+        check("replace_fd fix still applies", status == "applied", f"{status}: {detail}")
+        text = ctx.read("fs/file.c")
+        check("do_dup2 error propagated",
+              "\terr = do_dup2(files, file, fd, flags);\n\tif (err < 0)\n"
+              "\t\treturn err;\n\treturn 0;\n" in text)
+        status2, _ = core._replace_fd_errno_apply(ctx)
+        check("replace_fd group idempotent", status2 == "already_present", status2)
+
+    # Pristine monthly shape: the conventions group runs, the fix still lands.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"fs/file.c": FD_PRISTINE})
+        core._fdtable_apply(ctx)
+        status, detail = core._replace_fd_errno_apply(ctx)
+        check("replace_fd applies after conventions", status == "applied",
+              f"{status}: {detail}")
+
+    # A tree without the anchor degrades softly instead of aborting.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"fs/file.c": "int unrelated;\n"})
+        status, _ = core._replace_fd_errno_apply(ctx)
+        check("missing anchor degrades to blocked_by_shape",
+              status == "blocked_by_shape", status)
+        check("degraded group wrote nothing", ctx.pending_writes() == [],
+              ctx.pending_writes())
+
+
+def test_sublevel_matrix():
+    """The expectation matrix must stay in sync with the registries."""
+    print("sublevel expectation matrix")
+    import abk_stable_core as core
+    import abk_stable_perf as perf
+
+    registries = {
+        "stable_backport_core": core.PATCH_GROUPS,
+        "stable_perf_backport": perf.PATCH_GROUPS,
+    }
+    for child, groups in registries.items():
+        check(f"{child} group count matches registry",
+              sublevel_matrix.GROUP_COUNTS[child] == len(groups),
+              f"{sublevel_matrix.GROUP_COUNTS[child]} != {len(groups)}")
+        keys = {g.key for g in groups}
+        for sub_level in sublevel_matrix.SUPPORTED:
+            unknown = sublevel_matrix.pre_applied(sub_level, child) - keys
+            check(f"{child}@{sub_level} names only real groups",
+                  not unknown, unknown)
+            summary = sublevel_matrix.status_summary(sub_level, child)
+            check(f"{child}@{sub_level} summary totals all groups",
+                  sum(summary.values()) == len(groups), summary)
+
+    # Every sublevel must cover both children, and 167 must be all-applied.
+    for sub_level in sublevel_matrix.SUPPORTED:
+        check(f"{sub_level} covers both children",
+              set(sublevel_matrix.PRE_APPLIED[sub_level]) == set(registries),
+              set(sublevel_matrix.PRE_APPLIED[sub_level]))
+    check("167 is the all-applied baseline",
+          all(not sublevel_matrix.pre_applied("167", c) for c in registries))
+
+
 def test_f2fs_shape_probe():
     print("F2FS rollback shape probe")
     monthly_blk = "void f(void)\n{\n\tdelayed_work_pending(&hctx->run_work);\n}\n"
@@ -345,6 +426,8 @@ def main():
         raised = True
     check("engine raised on tampering", raised)
     test_fdtable_shapes()
+    test_replace_fd_errno_group()
+    test_sublevel_matrix()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

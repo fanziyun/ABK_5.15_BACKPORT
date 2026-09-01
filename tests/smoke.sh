@@ -86,6 +86,16 @@ unset ABK_MODULE_CHILD_ID || true
 
 python_bin="$(command -v python3 || command -v python)"
 
+# The engine gates on text anchors, so a group whose upstream commit the target
+# baseline already carries correctly reports already_present.  Expected counts
+# therefore come from tests/sublevel_matrix.py, keyed by the tree's SUBLEVEL.
+SUB_LEVEL="${ABK_TEST_SUB_LEVEL:-$(awk '$1 == "SUBLEVEL" && $2 == "=" { print $3; exit }' "$SOURCE_TREE/Makefile")}"
+if [ -z "$SUB_LEVEL" ]; then
+  echo "could not determine SUBLEVEL from $SOURCE_TREE/Makefile; set ABK_TEST_SUB_LEVEL" >&2
+  exit 2
+fi
+echo "== target baseline: 5.15.$SUB_LEVEL =="
+
 echo "== pass 1: graft =="
 bash "$MODULE_DIR/setup.sh" >"$WORK/pass1.log" 2>&1 || { cat "$WORK/pass1.log"; exit 1; }
 tail -2 "$WORK/pass1.log"
@@ -98,30 +108,42 @@ tail -2 "$WORK/pass2.log"
 echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-grep -q '{"applied": 10}' "$WORK/pass1.log" || fail "pass 1 did not report 10 applied groups (core)"
-grep -q '{"applied": 12}' "$WORK/pass1.log" || fail "pass 1 did not report 12 applied groups (perf)"
-grep -q '{"already_present": 10}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (core)"
-grep -q '{"already_present": 12}' "$WORK/pass2.log" || fail "pass 2 was not idempotent (perf)"
+if grep -q 'blocked_by_shape' "$WORK/pass1.log"; then
+  fail "pass 1 had a shape-blocked group (see log above)"
+fi
+if grep -q 'blocked_by_shape' "$WORK/pass2.log"; then
+  fail "pass 2 had a shape-blocked group (see log above)"
+fi
 
 for child in stable_backport_core stable_perf_backport; do
   [ -f "$WORK/pass1_reports/$child/${child}_report.json" ] || fail "missing pass1 report for $child"
   [ -f "$KERNEL_ROOT/abk_5_15_backport_reports/$child/${child}_report.json" ] || fail "missing pass2 report for $child"
-  "$python_bin" - "$WORK/pass1_reports/$child/${child}_report.json" "$KERNEL_ROOT/abk_5_15_backport_reports/$child/${child}_report.json" <<'PY'
+  "$python_bin" - "$WORK/pass1_reports/$child/${child}_report.json" \
+      "$KERNEL_ROOT/abk_5_15_backport_reports/$child/${child}_report.json" \
+      "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
 import json, sys
+sys.path.insert(0, sys.argv[3])
+import sublevel_matrix
+
 p1 = json.load(open(sys.argv[1]))
 p2 = json.load(open(sys.argv[2]))
+sub_level = sys.argv[4]
 child = p1["child"]
-exp1 = {"applied": 10} if child == "stable_backport_core" else {"applied": 12}
-exp2 = {"already_present": 10} if child == "stable_backport_core" else {"already_present": 12}
-assert p1["status_summary"] == exp1, (child, p1["status_summary"])
-assert p2["status_summary"] == exp2, (child, p2["status_summary"])
+exp1 = sublevel_matrix.status_summary(sub_level, child)
+exp2 = sublevel_matrix.idempotent_summary(child)
+assert p1["status_summary"] == exp1, (child, sub_level, "pass1", p1["status_summary"], exp1)
+assert p2["status_summary"] == exp2, (child, sub_level, "pass2", p2["status_summary"], exp2)
+degraded = [g["key"] for g in p1["groups"]
+            if g["status"] not in ("applied", "already_present")]
+assert not degraded, (child, sub_level, "degraded groups", degraded)
+print(f"  {child}: pass1={p1['status_summary']} pass2={p2['status_summary']}")
 PY
 done
 
+# Markers that must be present on every supported baseline: either this module
+# grafted them, or the baseline already carried the upstream commit.
 grep -q "alloc_fdtable(unsigned int slots_wanted)" "$KERNEL_ROOT/common/fs/file.c" \
   || fail "fdtable conventions marker missing"
-grep -q "ABK stable_515_backport" "$KERNEL_ROOT/common/fs/file.c" \
-  || fail "module marker missing in fs/file.c"
 grep -q "ANDROID_KABI_USE(8" "$KERNEL_ROOT/common/include/linux/sched.h" \
   || fail "kstack KABI slot marker missing"
 grep -q "cgroup_free_wq" "$KERNEL_ROOT/common/kernel/cgroup/cgroup.c" \
@@ -138,6 +160,23 @@ grep -q "android_vh_mutex_wakeup_patch" "$KERNEL_ROOT/common/kernel/locking/mute
   || fail "mutex wakeup patch hook missing"
 grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h" \
   || fail "kernfs polling trigger wrapper missing"
+
+# The fs/file.c module marker only exists where this module rewrote the file;
+# from 5.15.191 the baseline is already in the upstream shape and the fdtable
+# conventions group correctly reports already_present without touching it.
+if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+sys.exit(0 if sublevel_matrix.applies(sys.argv[2], "stable_backport_core",
+                                      "fdtable_alloc_conventions") else 1)
+PY
+then
+  grep -q "ABK stable_515_backport" "$KERNEL_ROOT/common/fs/file.c" \
+    || fail "module marker missing in fs/file.c"
+else
+  echo "  fs/file.c marker not expected on 5.15.$SUB_LEVEL (baseline already upstream)"
+fi
 
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null

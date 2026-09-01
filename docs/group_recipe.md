@@ -34,22 +34,34 @@ batch is three steps.
 
 ## 3. Prove it
 
-- `python3 -m py_compile scripts/*.py && bash -n setup.sh scripts/*.sh tests/smoke.sh`
+- `python3 -m py_compile scripts/*.py tests/*.py && bash -n setup.sh scripts/*.sh tests/*.sh`
 - `python3 tests/stable_5_15_test.py` (add fixture checks if the group
   introduces a new shape probe).
 - Dry-run against the reference tree:
   `python3 scripts/abk_stable_perf.py --common-dir <tree> --defconfig <tree>/arch/arm64/configs/gki_defconfig --report-dir /tmp/r --sub-level 167 --family android13-5.15 --dry-run`
   — every anchor must report `applied`/`already_present`, never
   `missing_anchor`.
+- Repeat the dry-run on every supported baseline (167/178/194 — see the
+  sublevel matrix in `docs/porting_policy.md`).  Fetch the ones you don't have
+  with `bash tests/fetch_sublevel_tree.sh <branch> <outdir>`.  If the group's
+  upstream commit is already in one of those baselines, record it in
+  `tests/sublevel_matrix.py` `PRE_APPLIED` and bump `GROUP_COUNTS` — the unit
+  test asserts the matrix matches the registry, and `step_audit.py` uses it to
+  decide whether a step is allowed to report `already_present`.
+- Per-step audit on each baseline:
+  `python3 tests/step_audit.py <tree>` (reads SUBLEVEL from the tree's
+  Makefile; `ABK_TEST_SUB_LEVEL` overrides).
 - Full smoke (two-pass idempotency + rollback):
   `bash tests/smoke.sh <tree>`.
 - Extend `tests/smoke.sh` grep assertions if the group lands a load-bearing
-  marker, then tick the `plan.md` checkbox and bump
-  `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION` in `module.conf`.
+  marker — gate the assertion on `sublevel_matrix.applies()` when the marker
+  only exists on baselines where the group really rewrites the file.  Then tick
+  the `plan.md` checkbox and bump `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION`
+  in `module.conf`.
 
 ## Step-authoring traps (compile-breaking, hidden at group level)
 
-Both traps slip past group statuses ("applied") and only surface at compile
+Three traps slip past group statuses ("applied") and only surface at compile
 time; `tests/step_audit.py` catches them on a pristine tree:
 
 1. **Replacement blocks that pre-exist in the file.** `replace_once` checks
@@ -62,7 +74,17 @@ time; `tests/step_audit.py` catches them on a pristine tree:
    terminator closes the enclosing comment and turns the following comment
    body lines into code (broke the whole `sched/features.h` translation unit
    in CI).  Comment *additions* must be inserted *before* the closing ` */`.
+3. **A step stranded behind an early return.** A group whose `_apply` probes
+   a shape and returns `already_present` before calling `apply_steps` will
+   never run *any* of its steps on a tree matching that shape.  If one hunk
+   comes from a later sublevel than the shape probe recognizes, it needs its
+   own group — this is why the 5.15.195 `replace_fd()` fix is
+   `fdtable_replace_fd_errno` rather than a step inside
+   `fdtable_alloc_conventions` (which returns early from 5.15.191 onwards).
 
-Both rules are enforced per step by `tests/step_audit.py`: every step must
-report `applied` on the pristine tree (never `already_present`), and the
-`/*`/`*/` balance of each touched file must be unchanged.
+Traps 1 and 2 are enforced per step by `tests/step_audit.py`: every step of a
+group that must really apply reports `applied` on the pristine tree (never
+`already_present`), and the `/*`/`*/`, `{`/`}` and `#if`/`#endif` balance of
+each touched file is unchanged.  Trap 3 shows up as a group reporting
+`already_present` on a newer baseline while the hunk you expected is missing —
+run the dry-run on all three baselines to catch it.

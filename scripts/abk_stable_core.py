@@ -333,7 +333,6 @@ def _suite_composed_steps(dup_fd_aosp):
         else ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T),
         label_step,
         *err_decl_step,
-        ("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, F),
     ]
 
 
@@ -372,7 +371,6 @@ def _fdtable_apply(ctx):
         ("fs/file.c", _FD_EXPAND_CHECK_OLD, _FD_EXPAND_CHECK_NEW, T),
         ("fs/file.c", _FD_DUPFD_AOSP_OLD, _FD_DUPFD_AOSP_NEW, T),
         ("fs/file.c", _FD_DUPFD_LABEL_OLD, _FD_DUPFD_LABEL_NEW, T),
-        ("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, F),
     ]
     # Vanilla punch_hole dup_fd variant: accepted in place of the AOSP one.
     if "sane_fdtable_size(old_fdt, max_fds)" not in text_probe:
@@ -386,6 +384,26 @@ def _fdtable_apply(ctx):
             "stable_backport_core/fdtable_alloc_conventions: fs/file.c matches no known "
             f"shape (pristine monthly, upstream 5.15.191, or suite-processed); {detail}"
         )
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# replace_fd() propagates do_dup2() errors (5.15.195, ff8ec0dbe0150)
+# ---------------------------------------------------------------------------
+
+def _replace_fd_errno_apply(ctx):
+    """Own group so the fix lands on trees that already carry 5.15.191.
+
+    The fdtable conventions group short-circuits to ``already_present`` the
+    moment ``fdtable_upstream_shape()`` holds, which is true from 5.15.191
+    onwards.  This hunk only appeared in 5.15.195, so as a step inside that
+    group it could never reach a .191-.194 baseline.
+    """
+    status, _results, detail = apply_steps(
+        ctx, [("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, T)]
+    )
+    if status is None:
+        return "blocked_by_shape", detail
     return status, detail
 
 
@@ -805,7 +823,7 @@ def _cpuset_bailout_apply(ctx):
          "{\n"
          "\tif (!cpusets_insane_config() &&\n"
          "\t\tmovable_only_nodes(nodes)) {\n"
-         "\t\tstatic_branch_enable(&cpusets_insane_config_key);\n"
+         "\t\tstatic_branch_enable_cpuslocked(&cpusets_insane_config_key);\n"
          "\t\tpr_info(\"Unsupported (movable nodes only) cpuset configuration detected (nmask=%*pbl)!\\n\"\n"
          "\t\t\t\"Cpuset allocations might fail even with a lot of memory available.\\n\",\n"
          "\t\t\tnodemask_pr_args(nodes));\n"
@@ -1167,6 +1185,28 @@ def _memcg_reclaim_apply(ctx):
          "\t\t\t\t\tmemsw ? 0 : MEMCG_RECLAIM_MAY_SWAP)) {\n"
          "\t\t\tret = -EBUSY;\n"
          "\t\t\tbreak;",
+         T),
+        # memcontrol.c: the three remaining bool call sites.  Left as `true`
+        # they would silently mean "no swap": true converts to 1, while
+        # MEMCG_RECLAIM_MAY_SWAP is (1 << 1), so vmscan's
+        # `!!(reclaim_options & MEMCG_RECLAIM_MAY_SWAP)` evaluates to 0.
+        ("mm/memcontrol.c",
+         "\t\tprogress = try_to_free_mem_cgroup_pages(memcg, 1,\n"
+         "\t\t\t\t\t\t\tGFP_KERNEL, true);\n",
+         "\t\tprogress = try_to_free_mem_cgroup_pages(memcg, 1, GFP_KERNEL,\n"
+         "\t\t\t\t\t\t\tMEMCG_RECLAIM_MAY_SWAP);\n",
+         T),
+        ("mm/memcontrol.c",
+         "\t\treclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,\n"
+         "\t\t\t\t\t\t\t GFP_KERNEL, true);\n",
+         "\t\treclaimed = try_to_free_mem_cgroup_pages(memcg, nr_pages - high,\n"
+         "\t\t\t\t\tGFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP);\n",
+         T),
+        ("mm/memcontrol.c",
+         "\t\t\tif (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,\n"
+         "\t\t\t\t\t\t\t  GFP_KERNEL, true))\n",
+         "\t\t\tif (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,\n"
+         "\t\t\t\t\tGFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP))\n",
          T),
         # memcontrol.c: the memory.reclaim write handler (android14-6.1 form)
         ("mm/memcontrol.c",
@@ -2030,10 +2070,17 @@ PATCH_GROUPS = [
     PatchGroup(
         "fdtable_alloc_conventions",
         "alloc_fdtable() slots_wanted/ERR_PTR conventions + INT_MAX guard (5.15.191)",
-        ["04a2c4b4511d (5.15.191)", "1d3b4bec3ce5 (5.15.191)", "ff8ec0dbe0150 (5.15.195)"],
+        ["04a2c4b4511d (5.15.191)", "1d3b4bec3ce5 (5.15.191)"],
         ["fs/file.c"],
         _fdtable_apply,
         hard=True,
+    ),
+    PatchGroup(
+        "fdtable_replace_fd_errno",
+        "replace_fd() returns 0 instead of do_dup2()'s positive fd (5.15.195)",
+        ["ff8ec0dbe0150 (5.15.195)"],
+        ["fs/file.c"],
+        _replace_fd_errno_apply,
     ),
     PatchGroup(
         "pagealloc_min_reserve_semantics",

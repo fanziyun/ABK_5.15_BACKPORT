@@ -53,6 +53,41 @@ suite-preference cross-check.
   doubles as the idempotency probe.
 
 
+## Supported baselines (sublevel matrix)
+
+The engine gates purely on **text anchors**; `ctx.sub_level` reaches the report
+and nothing else (it is never compared). A group whose upstream commit the
+target baseline already carries therefore reports `already_present` — that is a
+success, not a degradation. All three android13-5.15 combinations CI accepts
+(`build.yml` `KNOWN_KERNEL_PAIRS`) are supported by the same injection string:
+
+| sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
+|---|---|---|---|---|
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 11 applied | 12 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 11 applied | 11 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 8 applied + 3 present | 10 applied + 2 present |
+
+A second pass is `already_present` for every group on all three. Groups the
+baseline pre-empts:
+
+- **178** — `sched_nohz_idle_balance_series` (5.15.174).
+- **194** — the 178 set plus `fdtable_alloc_conventions` (5.15.191),
+  `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194)
+  and `semaphore_wake_q` (5.15.180).
+
+The expectations live in `tests/sublevel_matrix.py`, which both `tests/smoke.sh`
+and `tests/step_audit.py` read (keyed by the tree's Makefile `SUBLEVEL`, or
+`ABK_TEST_SUB_LEVEL`). Fetch a reference tree for any of them with
+`bash tests/fetch_sublevel_tree.sh <branch> <outdir>` — it pulls only the ~40
+files the groups touch, so no kernel clone is needed. Adding a baseline means
+adding a matrix entry; it does not mean adding version gating.
+
+Note that `fdtable_alloc_conventions` reporting `already_present` on 194 means
+`fs/file.c` carries **no** module marker there — the 5.15.195 `replace_fd()`
+hunk therefore lives in its own group (`fdtable_replace_fd_errno`) rather than
+as a step inside the conventions group, which short-circuits before its steps
+run on any tree at 5.15.191 or newer.
+
 ## Three-module composition (all after_patch)
 
 CI executes injected modules in input order, so the canonical input is:
@@ -84,6 +119,14 @@ builds on `pagealloc_min_reserve_semantics` (5.15.171) output and rewrites its
 recognizes the superseding shape (`ALLOC_RESERVES` in mm/internal.h) and
 reports `already_present` on re-runs - both orders of "only one of the two
 applied" stay idempotent.
+
+The AOSP android13-5.15 line never took the upstream 5.15.171 Gorman rework:
+167, 178, 194 and the current `android13-5.15-lts` (.211) all still carry
+`ALLOC_HARDER 0x10` / `ALLOC_HIGH 0x20` in `mm/internal.h` and the
+single-argument `gfp_to_alloc_flags(gfp_t gfp_mask)`.  Both page_alloc groups
+therefore report `applied` on every supported sublevel; the "high version
+sensitivity" of that region applies to upstream vanilla trees, not to this
+baseline family.
 
 Footprint disjointness (verified against the F2FS suite script and its
 `android13-5.15-2024-11_r14` patches): the F2FS suite touches

@@ -3,6 +3,49 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 5（v0.6.0，多 sublevel 兼容 167/.178/.194，已落地）
+
+目标：一条注入串同时覆盖 CI `build.yml` 里 android13-5.15 的三个合法组合
+（167/2024-11、178/2025-03、194/2025-12）。结论是**不需要 sublevel 门控**：
+引擎的判定全在文本锚点，`ctx.sub_level` 只进报告；22 组里 21 组开箱即兼容。
+真实 AOSP 树（三个分支各 40 个文件）实测缺口只有四个：
+
+- [x] `pagealloc_cpuset_bailout` 的 `static_branch_enable` 改为上游一致的
+  `static_branch_enable_cpuslocked`。194/.211 基线已带 .191 的 cpuset 改造，
+  仅这一个 token 导致第 5 步 `missing_anchor` → 整组 `blocked_by_shape`；
+  另外 `cpuset_write_resmask()` 路径已持 `cpu_hotplug_lock`，`_cpuslocked`
+  才是正确变体
+- [x] 拆出 `fdtable_replace_fd_errno`（`ff8ec0dbe0150`, 5.15.195）独立成组。
+  原先是 fdtable 组的 optional 第 9 步，而该组在
+  `fdtable_upstream_shape()` 为真时（.191 起）立即 `already_present` 返回，
+  这个 .195 才有的 hunk 在 .191–.194 目标上永远落不下去
+- [x] `memcg_memory_reclaim` 补 3 个调用点：`mem_cgroup_force_empty()` /
+  `memory_high_write()` / `memory_max_write()` 仍传 `true`（=1），而
+  `MEMCG_RECLAIM_MAY_SWAP` 是 `(1 << 1)`，`vmscan` 里
+  `!!(reclaim_options & MEMCG_RECLAIM_MAY_SWAP)` 得 0 → **这三条回收路径
+  静默丢掉换页**。与 sublevel 无关，167 生产基线同样中招
+- [x] 测试设施参数化：新增 `tests/sublevel_matrix.py`（期望矩阵）与
+  `tests/fetch_sublevel_tree.sh`（gitiles 只拉 40 个目标文件）；
+  `smoke.sh` / `step_audit.py` 按被测树 Makefile 的 `SUBLEVEL` 取期望
+  （`ABK_TEST_SUB_LEVEL` 可覆盖）。`step_audit.py` 的 trap-1 断言改为
+  跳过"基线已自带"的组，并新增大括号与 `#if/#endif` 配平检查
+- [x] 验证：三棵树 step_audit 全绿（core 94/95/86 步，perf 81/81/80 步）、
+  smoke 双跑幂等 + 回滚、单测 +12 项新检查、结构配平（注释/括号/ifdef）
+  在三棵树上均保持；CI 三次编译待跑
+
+顺带修正文档中的一处误判：AOSP android13-5.15 线**从未收上游 .171 的 Gorman
+ALLOC_HARDER→ALLOC_MIN_RESERVE 改造**（167/.178/.194/.211 四棵树
+`mm/internal.h` 都还是 `ALLOC_HARDER 0x10`、`gfp_to_alloc_flags` 单参数），
+所以两个 page_alloc 组在本基线族全线 `applied`，不随 sublevel 漂移。
+
+### .211（android13-5.15-lts）遗留阻塞（后续批次）
+
+- [ ] `randomize_kstack_pertask` — .211 已占用 `ANDROID_KABI_RESERVE(1)`
+  （`user_dumpable` 位域），8 连 RESERVE 锚点失配，需补该形态的槽位分支
+- [ ] `blk_mq_suspend_wakeup_abort` — .211 已自带
+  `#ifndef __GENKSYMS__ #include <linux/suspend.h> #endif` 与
+  `pm_wakeup_pending()` 逻辑，需补 `already_present` 探针
+
 ## Batch 4（v0.5.0，android15-6.6 来源线，已落地）
 
 来源：android15-6.6 ACK 分支（survey 见 `docs/survey_6_6_ack.md`）。

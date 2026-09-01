@@ -2,8 +2,9 @@
 
 An ABK external `module_set` that grafts **feature / optimization /
 structural** commits from the upstream `5.15.y` LTS stream
-(v5.15.167..v5.15.218) onto the `android13-5.15` GKI baseline (5.15.167,
-`android13-5.15-2024-11`). Pure security fixes are out of scope.
+(v5.15.167..v5.15.218) onto the `android13-5.15` GKI baselines 5.15.167
+(`android13-5.15-2024-11`), 5.15.178 (`-2025-03`) and 5.15.194 (`-2025-12`).
+Pure security fixes are out of scope.
 
 Every graft is a **bounded anchor script**: each group declares the tree
 shapes it accepts, rewrites only exact-match regions through transactional
@@ -17,7 +18,7 @@ Python registry *is* the patch set, and every edit carries an
 
 | child id | content |
 |---|---|
-| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard), page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1) |
+| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1) |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
@@ -36,12 +37,26 @@ the living backlog.
 
 ## Injection (ABK CI)
 
-Trigger `kernel-a13-5-15.yml` with `sub_level: 167` (os_patch_level
-`2024-11`) and put the module into `custom_external_modules`:
+Trigger `kernel-a13-5-15.yml` with any of the three supported android13-5.15
+combinations and put the module into `custom_external_modules`:
+
+| `sub_level` | `os_patch_level` | AOSP branch |
+|---|---|---|
+| 167 | 2024-11 | `deprecated/android13-5.15-2024-11` |
+| 178 | 2025-03 | `deprecated/android13-5.15-2025-03` |
+| 194 | 2025-12 | `android13-5.15-2025-12` |
 
 ```
 set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch
 ```
+
+One injection string covers all three: the engine gates on text anchors, never
+on the sublevel, so a group whose upstream commit the baseline already carries
+reports `already_present` instead of `applied`. On 5.15.178 that is one group
+(the 5.15.174 NOHZ series); on 5.15.194 it is five (fd-table conventions,
+cpuset bail-out, cgroup destroy-wq split, NOHZ series, semaphore wake_q). The
+per-sublevel expectations are in `tests/sublevel_matrix.py` and
+`docs/porting_policy.md`.
 
 The children read `KERNEL_ROOT`, `DEFCONFIG`,
 `CUSTOM_EXTERNAL_MODULE_STAGE` and `ABK_BUILD_*` from the ABK environment.
@@ -74,7 +89,7 @@ registry and the KMI compatibility matrix are documented in
 ## Local verification
 
 ```bash
-python3 -m py_compile scripts/*.py tests/stable_5_15_test.py
+python3 -m py_compile scripts/*.py tests/*.py
 bash -n setup.sh scripts/*.sh tests/*.sh
 python3 tests/stable_5_15_test.py
 bash tests/smoke.sh /path/to/android13-5.15-common-kernel-tree
@@ -82,13 +97,30 @@ bash tests/smoke.sh /path/to/android13-5.15-common-kernel-tree
 
 `tests/smoke.sh` builds a disposable KERNEL_ROOT from the given tree, runs
 `setup.sh` for both children twice, asserts the report statuses and in-tree
-markers, then exercises the rollback path.
+markers, then exercises the rollback path. Expected statuses come from
+`tests/sublevel_matrix.py`, keyed by the tree's Makefile `SUBLEVEL` (override
+with `ABK_TEST_SUB_LEVEL`).
+
+To verify a baseline you don't have checked out, fetch just the ~40 files the
+groups touch:
+
+```bash
+bash tests/fetch_sublevel_tree.sh android13-5.15-2025-12 /tmp/tree194
+```
+
+Then run the per-step audit (every step `applied` unless the baseline already
+carries the group, comment/brace/`#ifdef` balance preserved, second pass a
+byte-identical no-op) and the end-to-end smoke:
+
+```bash
+python3 tests/step_audit.py /tmp/tree194
+```
 
 Dry-run (statuses only, no writes):
 
 ```bash
 python3 scripts/abk_stable_core.py --common-dir <tree> --defconfig <tree>/arch/arm64/configs/gki_defconfig \
-  --report-dir /tmp/r --sub-level 167 --family android13-5.15 --dry-run
+  --report-dir /tmp/r --sub-level 194 --family android13-5.15 --dry-run
 ```
 
 Rollback: `bash scripts/abk_rollback.sh <kernel-common-dir> --list` then
