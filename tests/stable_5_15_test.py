@@ -528,6 +528,76 @@ def test_batch6_registration():
                   key in perf_keys, key)
 
 
+def test_madvise_collapse_step_independence():
+    """No step of a group may pre-create a later step's replacement text.
+
+    ``replace_once`` checks the replacement before the anchor (idempotency), so
+    a step whose ``new`` text is contained in an earlier step's ``new`` text is
+    silently reported ``already_present`` while the group still says "applied".
+    That is how the MADV_COLLAPSE ``khugepaged_scan_file()`` signature reached
+    CI: the CONFIG_SHMEM-off stub was built by string-concatenating the very
+    signature the following step was supposed to install, so the real
+    CONFIG_SHMEM=y definition stayed at four parameters while its body and all
+    of its callers moved to five.
+    """
+    print("madvise_collapse step independence (silent-skip trap)")
+    import abk_stable_core as core
+
+    check("stub replacement does not contain the signature replacement",
+          core._MC_FILE_SIG_NEW not in core._MC_FILE_STUB_NEW,
+          "the stub embeds _MC_FILE_SIG_NEW verbatim")
+    check("stub replacement really is the 5-parameter form",
+          "int *res)" in core._MC_FILE_STUB_NEW
+          and "BUILD_BUG();" in core._MC_FILE_STUB_NEW)
+
+    # Same invariant, generically, over every _MC_*_NEW pair.
+    new_blocks = {n: getattr(core, n) for n in dir(core)
+                  if n.startswith("_MC_") and n.endswith("_NEW")
+                  and isinstance(getattr(core, n), str)}
+    nested = [(a, b) for a in new_blocks for b in new_blocks
+              if a != b and new_blocks[b].replace("\r\n", "\n")
+              in new_blocks[a].replace("\r\n", "\n")]
+    check("no _MC_ replacement contains another", not nested, nested)
+
+    # End-to-end on a two-definition fixture: both signatures must move.
+    fixture = (
+        "#ifdef CONFIG_SHMEM\n"
+        + core._MC_FILE_SIG_OLD + "\n{\n\tint result = SCAN_SUCCEED;\n}\n"
+        "#else\n" + core._MC_FILE_STUB_OLD + "\n#endif\n"
+    )
+    text = fixture
+    for old, new in ((core._MC_FILE_STUB_OLD, core._MC_FILE_STUB_NEW),
+                     (core._MC_FILE_SIG_OLD, core._MC_FILE_SIG_NEW)):
+        text, status = common.replace_once(text, old, new)
+        check(f"step applied ({old.splitlines()[0][:38]}...)",
+              status == "applied", status)
+    check("no 4-parameter definition left behind",
+          core._MC_FILE_SIG_OLD not in text)
+    check("both definitions carry int *res",
+          text.count("int *res)") == 2, text.count("int *res)"))
+
+
+def test_madvise_collapse_revalidate_convention():
+    """The graft must use the 5.15 hugepage_vma_revalidate() return convention.
+
+    5.15 returns 0 on success and a scan code otherwise; 6.1 returns
+    SCAN_SUCCEED, which is 1 in this enum.  Copying the 6.1
+    ``!= SCAN_SUCCEED`` test makes every successful revalidation look like a
+    failure, so any multi-PMD MADV_COLLAPSE that dropped mmap_lock returns
+    -EINVAL.  It compiles either way, so only this assertion catches it.
+    """
+    print("madvise_collapse revalidate return convention")
+    import abk_stable_core as core
+
+    body = core._MC_IMPL_D
+    check("revalidate result tested as a plain scan code",
+          "result = hugepage_vma_revalidate(mm, addr, &vma);\n"
+          "\t\t\tif (result) {" in body,
+          "graft does not use the 5.15 `if (result)` convention")
+    check("no 6.1-style SCAN_SUCCEED comparison on revalidate",
+          "if (result != SCAN_SUCCEED) {" not in body)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -543,6 +613,8 @@ def main():
     test_family_gate()
     test_apply_steps_noop_blocked()
     test_batch6_registration()
+    test_madvise_collapse_step_independence()
+    test_madvise_collapse_revalidate_convention()
     test_sublevel_matrix()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()

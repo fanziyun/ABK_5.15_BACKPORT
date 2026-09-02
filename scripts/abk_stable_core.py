@@ -2418,9 +2418,20 @@ _MC_PMD_OUT_NEW = ('\t\t\t\t     none_or_zero, result, unmapped);\n'
                    '\treturn ret;\n'
                    '}')
 
-# Both khugepaged_scan_file() definitions move to the new signature; the
-# CONFIG_SHMEM-off stub is rewritten first so that the remaining occurrence of
-# the old two-line signature is unique for the step that follows.
+# Both khugepaged_scan_file() definitions move to the new signature.  The
+# CONFIG_SHMEM-off stub goes first because its old block (signature plus the
+# BUILD_BUG() body) is unique, which leaves the bare two-line signature unique
+# for the step that follows -- neither step depends on which occurrence
+# str.replace() happens to hit.
+#
+# The stub's replacement must not contain _MC_FILE_SIG_NEW verbatim.  It is
+# written first and replace_once() checks the *replacement* before the anchor
+# (idempotency), so a stub carrying the next step's exact text makes that step
+# short-circuit to already_present: the real CONFIG_SHMEM=y definition stays at
+# four parameters while its body and every caller move to five, which is a
+# compile error the group-level status cannot see (it did reach CI once).
+# Hence the deliberately different line wrapping below -- same C signature,
+# text that cannot collide with the step that follows.
 _MC_FILE_STUB_OLD = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
                      '\t\tstruct file *file, pgoff_t start, struct page **hpage)\n'
                      '{\n'
@@ -2431,7 +2442,8 @@ _MC_FILE_SIG_OLD = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
 _MC_FILE_SIG_NEW = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
                     '\t\tstruct file *file, pgoff_t start, struct page **hpage,\n'
                     '\t\tint *res)')
-_MC_FILE_STUB_NEW = (_MC_FILE_SIG_NEW + '\n'
+_MC_FILE_STUB_NEW = ('static void khugepaged_scan_file(struct mm_struct *mm, struct file *file,\n'
+                     '\t\tpgoff_t start, struct page **hpage, int *res)\n'
                      '{\n'
                      '\tBUILD_BUG();\n'
                      '}')
@@ -2562,8 +2574,14 @@ _MC_IMPL_D = (
     '\t\t\tcond_resched();\n'
     '\t\t\tmmap_read_lock(mm);\n'
     '\t\t\tmmap_locked = true;\n'
+    '\t\t\t/*\n'
+    '\t\t\t * ABK stable_515_backport: on this baseline\n'
+    '\t\t\t * hugepage_vma_revalidate() returns 0 on success and a\n'
+    '\t\t\t * scan code otherwise (6.1 returns SCAN_SUCCEED, which is\n'
+    '\t\t\t * 1 here), so test it the way its other callers do.\n'
+    '\t\t\t */\n'
     '\t\t\tresult = hugepage_vma_revalidate(mm, addr, &vma);\n'
-    '\t\t\tif (result != SCAN_SUCCEED) {\n'
+    '\t\t\tif (result) {\n'
     '\t\t\t\tlast_fail = result;\n'
     '\t\t\t\tgoto out_nolock;\n'
     '\t\t\t}\n'

@@ -173,6 +173,17 @@ grep -q "MADV_COLLAPSE" "$KERNEL_ROOT/common/include/uapi/asm-generic/mman-commo
   || fail "MADV_COLLAPSE UAPI missing"
 grep -q "madvise_collapse" "$KERNEL_ROOT/common/mm/khugepaged.c" \
   || fail "madvise_collapse implementation missing"
+# Both khugepaged_scan_file() definitions (CONFIG_SHMEM on and off) must carry
+# the new out-parameter.  A single one left at four parameters still greps as
+# "madvise_collapse present" but does not compile -- that is exactly what the
+# stub/signature step collision produced.
+if grep -q "struct file \*file, pgoff_t start, struct page \*\*hpage)$" \
+     "$KERNEL_ROOT/common/mm/khugepaged.c"; then
+  fail "a 4-parameter khugepaged_scan_file() definition survived the graft"
+fi
+scan_file_defs="$(grep -c "^static void khugepaged_scan_file" "$KERNEL_ROOT/common/mm/khugepaged.c")"
+[ "$scan_file_defs" = "2" ] \
+  || fail "expected 2 khugepaged_scan_file() definitions, found $scan_file_defs"
 grep -qE "^CONFIG_ZRAM_MULTI_COMP=y" "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
   || fail "defconfig lane did not enable ZRAM_MULTI_COMP"
 

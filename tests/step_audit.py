@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-step audit of every PatchGroup against a pristine reference tree.
 
-Group-level statuses hide two anchor bugs that only show up at compile time:
+Group-level statuses hide three anchor bugs that only show up at compile time:
 
 1. A step whose replacement block already exists somewhere in the pristine
    file.  ``replace_once`` checks the replacement first (idempotency), so the
@@ -11,7 +11,12 @@ Group-level statuses hide two anchor bugs that only show up at compile time:
    ``applied`` -- never ``already_present``.  Groups whose upstream commit the
    baseline already carries are exempt (see ``tests/sublevel_matrix.py``): for
    those, ``already_present`` is the correct answer, not a trap.
-2. A replacement that unbalances the ``/* ... */`` comment structure (e.g. a
+2. The same short-circuit created *inside* the group: an earlier step whose
+   replacement text contains a later step's replacement text.  Checking the
+   pristine file cannot catch it, so the audit consumes the per-step statuses
+   ``apply_steps`` returns and fails on any ``already_present`` step of a
+   must-apply group.
+3. A replacement that unbalances the ``/* ... */`` comment structure (e.g. a
    new block that starts with the comment terminator), which turns every
    following line into code and breaks the whole translation unit.
 
@@ -24,6 +29,7 @@ each step by wrapping ``apply_steps`` in both child modules, and asserts:
   ``already_present``;
 - every step's replacement block is absent from the pristine file (both LF
   and CRLF forms) -- checked only for groups that must really apply;
+- no step of a must-apply group reports ``already_present`` at run time;
 - the open/close comment, brace and ``#if``/``#endif`` delta of each touched
   file is unchanged;
 - a second pass over the patched tree is fully ``already_present`` and leaves
@@ -148,13 +154,24 @@ def new_ctx(root):
                         defconfig=str(root / "arch/arm64/configs/gki_defconfig"))
 
 
-def record_steps(module, sink):
-    """Wrap module.apply_steps so every step tuple is captured per group."""
+def record_steps(module, sink, status_sink=None):
+    """Wrap module.apply_steps so every step tuple is captured per group.
+
+    ``status_sink`` additionally collects the per-step ``(rel, status)`` pairs
+    ``apply_steps`` returned, which is what trap 1b is asserted against.
+    """
     original = module.apply_steps
 
     def wrapper(ctx, steps):
         sink.extend(steps)
-        return original(ctx, steps)
+        status, results, detail = original(ctx, steps)
+        if status_sink is not None:
+            status_sink.extend(
+                (rel, step_status)
+                for (rel, _old, _new, _required), (_rel, step_status)
+                in zip(steps, results)
+            )
+        return status, results, detail
 
     module.apply_steps = wrapper
     return original
@@ -211,12 +228,21 @@ def run_child_groups(module, ctx, child_id, pass_name):
 
 def audit_child(name, module, pristine_root, work):
     group_steps = {}
+    group_statuses = {}
     current_group = [None]
     original = module.apply_steps
 
     def wrapper(ctx, steps, _o=original):
+        status, results, detail = _o(ctx, steps)
         group_steps.setdefault(current_group[0], []).extend(steps)
-        return _o(ctx, steps)
+        # apply_steps returns one (rel, status) per evaluated step, in order,
+        # and stops early on a required miss -- zip truncates to what ran.
+        group_statuses.setdefault(current_group[0], []).extend(
+            (rel, step_status)
+            for (rel, _old, _new, _required), (_rel, step_status)
+            in zip(steps, results)
+        )
+        return status, results, detail
 
     module.apply_steps = wrapper
     pre_applied = sublevel_matrix.pre_applied(SUB_LEVEL, name)
@@ -252,6 +278,25 @@ def audit_child(name, module, pristine_root, work):
                 fail(f"{name}/{key}: replacement block already exists in pristine "
                      f"{rel}; anchor must be unique enough that replace_once really "
                      f"applies:\n{new[:120]!r}")
+
+    # Trap 1b: the same short-circuit, but created *during* the group by an
+    # earlier step whose replacement contains a later step's replacement text.
+    # Trap 1 cannot see it -- it only inspects the pristine file -- so this
+    # consumes the per-step statuses apply_steps actually returned.  A step of
+    # a must-apply group that reports already_present means the real edit never
+    # landed while the group still reported "applied" (the MADV_COLLAPSE
+    # khugepaged_scan_file() signature reached CI that way).
+    for key, key_statuses in group_statuses.items():
+        if key in pre_applied or key in debts:
+            continue
+        skipped = [rel for rel, status in key_statuses
+                   if status == "already_present"]
+        if skipped:
+            fail(f"{name}/{key}: {len(skipped)} step(s) reported already_present on "
+                 f"the pristine 5.15.{SUB_LEVEL} tree ({sorted(set(skipped))}); the "
+                 "group still reports applied, so the edit was silently skipped -- "
+                 "check whether an earlier step's replacement text contains this "
+                 "step's replacement text")
 
     # Trap 2: comment, brace and #ifdef structure must stay balanced per file.
     for rel in sorted({rel for rel, _o, _n, _r in steps}):
@@ -319,7 +364,8 @@ def audit_fdtable_on_suite_shape(module, source, work):
     (tree / "fs" / "file.c").write_bytes(suite_text.encode("utf-8"))
 
     steps = []
-    original = record_steps(module, steps)
+    step_statuses = []
+    original = record_steps(module, steps, step_statuses)
     try:
         ctx = new_ctx(tree)
         group = next(g for g in module.PATCH_GROUPS if g.key == "fdtable_alloc_conventions")
@@ -344,6 +390,11 @@ def audit_fdtable_on_suite_shape(module, source, work):
         if contains_block(suite_text, new):
             fail("fdtable composed variant: replacement block already exists in the "
                  f"suite-shaped file:\n{new[:120]!r}")
+    skipped = [rel for rel, status in step_statuses if status == "already_present"]
+    if skipped:
+        fail(f"fdtable composed variant: {len(skipped)} step(s) reported "
+             f"already_present on the suite-shaped tree ({sorted(set(skipped))}); "
+             "the group still reports applied, so the edit was silently skipped")
     after_text = common.read_text(tree / "fs" / "file.c")
     for label, delta, why in STRUCTURE_CHECKS:
         if delta(suite_text) != delta(after_text):

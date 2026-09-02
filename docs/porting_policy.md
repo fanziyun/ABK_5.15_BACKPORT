@@ -110,8 +110,10 @@ adding a matrix entry; it does not mean adding version gating.
 The android13-5.15-lts tree (5.15.211) is a fourth fixture only: `step_audit.py`
 audits it against a matrix row whose two known debts are recorded
 (`randomize_kstack_pertask` and `blk_mq_suspend_wakeup_abort`, both
-`blocked_by_shape`), plus `sched_rt_optimizations` tracked as a documented
-partial-apply drift. lts is not a CI combination and nothing gates on it.
+`blocked_by_shape`). lts is not a CI combination and nothing gates on it. It is
+a rolling branch, so re-check its `PRE_APPLIED` row when re-fetching the tree —
+`sched_rt_optimizations` (5.15.202) and `sched_dst_group_allowed_stats` (5.15.212)
+have since landed there and moved from drift to pre-applied.
 
 Note that `fdtable_alloc_conventions` reporting `already_present` on 194 means
 `fs/file.c` carries **no** module marker there — the 5.15.195 `replace_fd()`

@@ -123,9 +123,10 @@ bash tests/smoke.sh /path/to/android13-5.15-common-kernel-tree
 ```
 
 `tests/implementation_audit.py` then asserts the graft content is real (no
-"applied with zero edits" phantom groups, feature symbols actually present),
-and `tests/smoke.sh` builds a disposable KERNEL_ROOT from the given tree, runs
-`setup.sh` for both children twice, asserts the report statuses and in-tree
+"applied with zero edits" phantom groups, feature symbols actually present, and
+the 5.15-specific calling conventions a 6.x-sourced graft has to be rewritten
+to), and `tests/smoke.sh` builds a disposable KERNEL_ROOT from the given tree,
+runs `setup.sh` for both children twice, asserts the report statuses and in-tree
 markers, then exercises the rollback path. Expected statuses come from
 `tests/sublevel_matrix.py`, keyed by the tree's Makefile `SUBLEVEL` (override
 with `ABK_TEST_SUB_LEVEL`).
@@ -138,8 +139,9 @@ bash tests/fetch_sublevel_tree.sh android13-5.15-2025-12 /tmp/tree194
 ```
 
 Then run the per-step audit (every step `applied` unless the baseline already
-carries the group, comment/brace/`#ifdef` balance preserved, second pass a
-byte-identical no-op) and the end-to-end smoke:
+carries the group — including steps skipped because an earlier step in the same
+group pre-created their replacement text — comment/brace/`#ifdef` balance
+preserved, second pass a byte-identical no-op) and the end-to-end smoke:
 
 ```bash
 python3 tests/step_audit.py /tmp/tree194

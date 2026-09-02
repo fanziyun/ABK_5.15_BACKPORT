@@ -3,6 +3,41 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 6.1（v0.7.1，修 Batch 6 的 MADV_COLLAPSE 半应用，已落地）
+
+CI run 33582771814 在「编译内核」步骤挂在 `mm/khugepaged.c` 4 个错误上
+（`use of undeclared identifier 'res'`、`too many arguments to function call,
+expected 4, have 5`）。组状态是 `applied`、10 步里 9 applied + 1
+already_present，所以三档 step_audit / smoke 全绿也没拦住。
+
+- [x] 根因：`_MC_FILE_STUB_NEW` 由 `_MC_FILE_SIG_NEW` 字符串拼出，桩函数先写
+  之后文件里已字面包含下一步的替换文本，`replace_once` 的幂等前置检查
+  （`abk_common.py:80-82`）直接返回 `already_present` → `CONFIG_SHMEM=y` 下真正
+  生效的 `khugepaged_scan_file()` 定义留在 4 参数，函数体的 `*res = result`
+  与两个调用点却已按 5 参数落地。**调换步序无效**（`replace_once` 无论如何都
+  先看替换文本）；改成两种不同折行的同一 C 签名，文本不再可能撞车
+- [x] 顺带修一个能编译但逻辑错的移植：5.15 的 `hugepage_vma_revalidate()`
+  成功返回 0，6.1 返回 `SCAN_SUCCEED`（本枚举 = 1）。移植进来的
+  `if (result != SCAN_SUCCEED)` 让每次释放 `mmap_lock` 后的重校验即使成功也
+  退出 → 跨 PMD 区间的 `MADV_COLLAPSE` 几乎必然返回 `-EINVAL`。改为与同文件
+  其它调用者一致的 `if (result)`；隔离编译 A/B 实测：旧式 3-PMD 返回 -22，
+  新式返回 0
+- [x] CI 拦截能力补齐（这次是编译当第一道真检查，不能再有第二次）：
+  - `step_audit.py` 新增 trap-1b：消费 `apply_steps` 的逐步返回值，必须真正
+    应用的组里任何一步报 `already_present` 直接失败（trap-1 只看原始文件，
+    看不见同组前一步现场造出来的冲突）；`record_steps()` 同步支持
+  - `stable_5_15_test.py` +11 项：`_MC_*_NEW` 两两不得互相包含、双定义夹具
+    端到端两步都必须 `applied`、revalidate 约定断言
+  - `implementation_audit.py` 的 `REQUIRED_CONTENT` 增加两个 scan_file 签名与
+    revalidate 的 5.15 约定串（唯一能抓「编译过但按源内核语义跑」的机制）
+  - `smoke.sh` 断言 4 参数定义零残留、`khugepaged_scan_file` 定义恰好 2 处
+- [x] `.211` 矩阵刷新：lts 是滚动分支，已自带 5.15.202 的三个 RT hunk 与
+  5.15.212 的 dst-group 统计修正，`sched_rt_optimizations` /
+  `sched_dst_group_allowed_stats` 从「漂移债务」改记为 `PRE_APPLIED`
+- [x] 验证：四档 step_audit 全绿（core 108/109/100/100，perf 81/81/80/80）、
+  四档 implementation_audit OK、167/.178/.194 三档 smoke 双跑幂等 + 回滚、
+  单测全绿；三处回归注入实测能被拦下
+
 ## Batch 6（v0.7.0，审查收口 + 6.1/6.6 三新组，已落地）
 
 先把审查发现的三处"承诺没兑现"收口，再落三个新组；core 从 11 组到 14 组。

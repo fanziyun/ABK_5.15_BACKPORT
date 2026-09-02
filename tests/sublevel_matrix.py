@@ -52,9 +52,11 @@ PRE_APPLIED = {
     },
     # android13-5.15-lts: not a CI combination yet, but tracked so the local
     # .211 tree can be audited and drift surfaces before the baseline ships.
-    # The two perf groups are known debts from plan.md: the lts branch already
-    # occupies the kstack KABI slot 1 shape, and its blk-mq suspend path was
-    # rewritten upstream-first, so both report blocked_by_shape until Batch 7.
+    # This is a rolling branch, so re-check these two sets when re-fetching it.
+    # The two remaining perf debts are known blockers from plan.md: the lts
+    # branch already occupies the kstack KABI slot 1 shape, and its blk-mq
+    # suspend path was rewritten upstream-first, so both report
+    # blocked_by_shape until Batch 7.
     "211": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
@@ -68,6 +70,11 @@ PRE_APPLIED = {
             "sched_nohz_idle_balance_series",
             "release_sock_cond_resched",
             "semaphore_wake_q",
+            # The lts branch now carries all three 5.15.202 RT hunks (the
+            # rto_next_cpu self-IPI skip and the PREEMPT_RT-only RT_PUSH_IPI
+            # default) and the .212 dst-group stats fix.
+            "sched_rt_optimizations",
+            "sched_dst_group_allowed_stats",
         },
     },
 }
@@ -81,12 +88,6 @@ KNOWN_DEBT = {
         "stable_perf_backport": {
             "randomize_kstack_pertask": "blocked_by_shape",
             "blk_mq_suspend_wakeup_abort": "blocked_by_shape",
-            # Mixed drift, not a clean apply: some 5.15.202 RT-scan steps
-            # already exist in the lts branch, the RT_PUSH_IPI default-off
-            # step still lands, so the group reports applied on pass 1 and
-            # already_present on pass 2.  Tracked so the .211 fixture audits
-            # without mis-reading it as a silent no-op.
-            "sched_rt_optimizations": "applied",
         },
     },
 }

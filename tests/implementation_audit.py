@@ -49,6 +49,16 @@ REQUIRED_CONTENT = {
     "core:madvise_collapse": [
         "madvise_collapse", "MADV_COLLAPSE",
         "khugepaged_scan_pmd(mm, vma, addr, &hpage, &result)",
+        "khugepaged_scan_file(mm, file, pgoff, &hpage, &result)",
+        # Both scan_file definitions must have moved to the out-parameter form;
+        # the CONFIG_SHMEM-off stub is deliberately wrapped differently so it
+        # cannot pre-create this text (see abk_stable_core.py).
+        "struct file *file, pgoff_t start, struct page **hpage,\n\t\tint *res)",
+        "pgoff_t start, struct page **hpage, int *res)",
+        # 5.15 hugepage_vma_revalidate() returns 0 on success, so the graft must
+        # test it as a plain scan code, not with 6.1's `!= SCAN_SUCCEED`
+        # (SCAN_SUCCEED is 1 here, so that inverts the success test).
+        "result = hugepage_vma_revalidate(mm, addr, &vma);\n\t\t\tif (result) {",
     ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
