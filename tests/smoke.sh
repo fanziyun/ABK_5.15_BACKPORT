@@ -67,6 +67,11 @@ SMOKE_FILES=(
   mm/zsmalloc.c
   include/linux/zsmalloc.h
   arch/arm64/configs/gki_defconfig
+  mm/Kconfig
+  mm/khugepaged.c
+  mm/madvise.c
+  include/linux/huge_mm.h
+  include/uapi/asm-generic/mman-common.h
 )
 
 WORK="$(mktemp -d)"
@@ -130,11 +135,13 @@ p2 = json.load(open(sys.argv[2]))
 sub_level = sys.argv[4]
 child = p1["child"]
 exp1 = sublevel_matrix.status_summary(sub_level, child)
-exp2 = sublevel_matrix.idempotent_summary(child)
+exp2 = sublevel_matrix.idempotent_summary(sub_level, child)
 assert p1["status_summary"] == exp1, (child, sub_level, "pass1", p1["status_summary"], exp1)
 assert p2["status_summary"] == exp2, (child, sub_level, "pass2", p2["status_summary"], exp2)
+debts = sublevel_matrix.debt(sub_level, child)
 degraded = [g["key"] for g in p1["groups"]
-            if g["status"] not in ("applied", "already_present")]
+            if g["status"] not in ("applied", "already_present")
+            and debts.get(g["key"]) != g["status"]]
 assert not degraded, (child, sub_level, "degraded groups", degraded)
 print(f"  {child}: pass1={p1['status_summary']} pass2={p2['status_summary']}")
 PY
@@ -160,6 +167,14 @@ grep -q "android_vh_mutex_wakeup_patch" "$KERNEL_ROOT/common/kernel/locking/mute
   || fail "mutex wakeup patch hook missing"
 grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h" \
   || fail "kernfs polling trigger wrapper missing"
+grep -q "calculate_zspage_chain_size" "$KERNEL_ROOT/common/mm/zsmalloc.c" \
+  || fail "zsmalloc chain sizing missing"
+grep -q "MADV_COLLAPSE" "$KERNEL_ROOT/common/include/uapi/asm-generic/mman-common.h" \
+  || fail "MADV_COLLAPSE UAPI missing"
+grep -q "madvise_collapse" "$KERNEL_ROOT/common/mm/khugepaged.c" \
+  || fail "madvise_collapse implementation missing"
+grep -qE "^CONFIG_ZRAM_MULTI_COMP=y" "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
+  || fail "defconfig lane did not enable ZRAM_MULTI_COMP"
 
 # The fs/file.c module marker only exists where this module rewrote the file;
 # from 5.15.191 the baseline is already in the upstream shape and the fdtable
@@ -182,6 +197,9 @@ fi
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
 [ -z "$(find "$KERNEL_ROOT/common" -name '*.abk-orig')" ] || fail "rollback left .abk-orig files behind"
+if grep -qE "^CONFIG_ZRAM_MULTI_COMP=y" "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig"; then
+  fail "rollback left the defconfig lane's config enablement behind"
+fi
 if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/fs/file.c" "$KERNEL_ROOT/common/fs/file.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for fs/file.c"

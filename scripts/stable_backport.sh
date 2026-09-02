@@ -88,15 +88,20 @@ abk_stable_backport_preflight_perf() {
 abk_stable_backport_apply_child() {
   local child_id="$1"
   local script report_dir sub_level family
+  local unsupported_flag
 
   script="$(abk_stable_backport_python_script "$child_id")" || {
     abk_die "unknown child id for abk_5_15_backport: $child_id (public children: $ABK_515_BACKPORT_PUBLIC_CHILDREN)"
   }
 
   family="$(abk_stable_backport_target_family)" || {
-    abk_warn "target family is not android13-5.15; groups degrade to report-only status"
+    abk_warn "target family is not android13-5.15; every group reports report_only and nothing is written (set ABK_515_ALLOW_UNSUPPORTED=1 to override)"
     family="unsupported"
   }
+  unsupported_flag=""
+  if [ "${ABK_515_ALLOW_UNSUPPORTED:-0}" = "1" ]; then
+    unsupported_flag="--allow-unsupported"
+  fi
   sub_level="$(abk_stable_backport_sub_level)"
   report_dir="$(abk_stable_backport_report_dir "$child_id")"
   mkdir -p "$report_dir"
@@ -107,7 +112,7 @@ abk_stable_backport_apply_child() {
     --defconfig "$DEFCONFIG" \
     --report-dir "$report_dir" \
     --sub-level "$sub_level" \
-    --family "$family"
+    --family "$family" ${unsupported_flag:+"$unsupported_flag"}
 }
 
 abk_stable_backport_apply_selected() {

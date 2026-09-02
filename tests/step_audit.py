@@ -96,6 +96,13 @@ AUDIT_FILES = [
     "drivers/block/zram/zram_drv.c",
     "mm/zsmalloc.c",
     "include/linux/zsmalloc.h",
+    # Batch 6: the defconfig lane plus the zsmalloc and MADV_COLLAPSE grafts.
+    "arch/arm64/configs/gki_defconfig",
+    "mm/Kconfig",
+    "mm/khugepaged.c",
+    "mm/madvise.c",
+    "include/linux/huge_mm.h",
+    "include/uapi/asm-generic/mman-common.h",
 ]
 
 CHILD_MODULES = [
@@ -120,8 +127,25 @@ def make_tree(source, work):
     return root
 
 
+def check_fixture_coverage():
+    """Every file a group declares must be part of the audit fixture.
+
+    Otherwise the group runs against a missing file, degrades to a shape error
+    and the failure reads like an anchor problem instead of the fixture gap it
+    actually is.
+    """
+    for name, module in CHILD_MODULES:
+        for group in module.PATCH_GROUPS:
+            for rel in group.files:
+                if rel not in AUDIT_FILES:
+                    fail(f"{name}/{group.key} touches {rel}, which is not in "
+                         "AUDIT_FILES; add it here and to "
+                         "tests/fetch_sublevel_tree.sh FETCH_FILES")
+
+
 def new_ctx(root):
-    return GraftContext(root, SUB_LEVEL, "android13-5.15")
+    return GraftContext(root, SUB_LEVEL, "android13-5.15",
+                        defconfig=str(root / "arch/arm64/configs/gki_defconfig"))
 
 
 def record_steps(module, sink):
@@ -165,19 +189,23 @@ def contains_block(text, block):
 def run_child_groups(module, ctx, child_id, pass_name):
     """Run every group, asserting each landed the status the baseline implies."""
     pre_applied = sublevel_matrix.pre_applied(SUB_LEVEL, child_id)
+    debts = sublevel_matrix.debt(SUB_LEVEL, child_id)
     statuses = {}
     for group in module.PATCH_GROUPS:
         result = group.run(ctx)
         statuses[group.key] = result["status"]
-        if result["status"] not in ("applied", "already_present"):
-            fail(f"{child_id}/{group.key} degraded on the {pass_name} tree "
-                 f"(5.15.{SUB_LEVEL}): {result['status']} ({result['detail']})")
         if pass_name == "pristine":
-            expected = "already_present" if group.key in pre_applied else "applied"
-            if result["status"] != expected:
-                fail(f"{child_id}/{group.key} reported {result['status']} on the "
-                     f"pristine 5.15.{SUB_LEVEL} tree, expected {expected}; either "
-                     f"the anchors drifted or tests/sublevel_matrix.py is stale")
+            expected = debts.get(group.key) or (
+                "already_present" if group.key in pre_applied else "applied")
+        else:
+            # An "applied"-valued debt (a partial-apply drift) becomes
+            # already_present on the second pass.  True degradations stay.
+            want = debts.get(group.key)
+            expected = "already_present" if want in (None, "applied") else want
+        if result["status"] != expected:
+            fail(f"{child_id}/{group.key} reported {result['status']} on the "
+                 f"{pass_name} 5.15.{SUB_LEVEL} tree, expected {expected}; either "
+                 f"the anchors drifted or tests/sublevel_matrix.py is stale")
     return statuses
 
 
@@ -192,6 +220,7 @@ def audit_child(name, module, pristine_root, work):
 
     module.apply_steps = wrapper
     pre_applied = sublevel_matrix.pre_applied(SUB_LEVEL, name)
+    debts = sublevel_matrix.debt(SUB_LEVEL, name)
     try:
         tree = work / name
         shutil.copytree(pristine_root, tree)
@@ -199,10 +228,8 @@ def audit_child(name, module, pristine_root, work):
         for group in module.PATCH_GROUPS:
             current_group[0] = group.key
             result = group.run(ctx)
-            if result["status"] not in ("applied", "already_present"):
-                fail(f"{name}/{group.key} degraded on the pristine 5.15.{SUB_LEVEL} "
-                     f"tree: {result['status']} ({result['detail']})")
-            expected = "already_present" if group.key in pre_applied else "applied"
+            expected = debts.get(group.key) or (
+                "already_present" if group.key in pre_applied else "applied")
             if result["status"] != expected:
                 fail(f"{name}/{group.key} reported {result['status']} on the pristine "
                      f"5.15.{SUB_LEVEL} tree, expected {expected}; either the anchors "
@@ -218,7 +245,7 @@ def audit_child(name, module, pristine_root, work):
     # the ones that are supposed to really apply.
     pristine_texts = {rel: common.read_text(pristine_root / rel) for rel in AUDIT_FILES}
     for key, key_steps in group_steps.items():
-        if key in pre_applied:
+        if key in pre_applied or key in debts:
             continue
         for rel, _old, new, _required in key_steps:
             if contains_block(pristine_texts[rel], new):
@@ -241,8 +268,14 @@ def audit_child(name, module, pristine_root, work):
     patched_bytes = {rel: (tree / rel).read_bytes() for rel in patched_files}
     ctx2 = new_ctx(tree)
     statuses2 = run_child_groups(module, ctx2, name, "patched")
-    if any(s != "already_present" for s in statuses2.values()):
-        fail(f"{name}: second pass was not idempotent: {statuses2}")
+    debts = sublevel_matrix.debt(SUB_LEVEL, name)
+    non_idempotent = [
+        k for k, s in statuses2.items()
+        if s != "already_present" and debts.get(k) != s
+    ]
+    if non_idempotent:
+        fail(f"{name}: second pass was not idempotent: "
+             f"{[k + '=' + statuses2[k] for k in non_idempotent]}")
     for rel, blob in patched_bytes.items():
         if (tree / rel).read_bytes() != blob:
             fail(f"{name}: second pass rewrote {rel}")
@@ -372,6 +405,7 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="abk515_audit_") as tmp:
         work = Path(tmp)
+        check_fixture_coverage()
         pristine = make_tree(source, work)
         print(f"auditing {sum(len(m.PATCH_GROUPS) for _n, m in CHILD_MODULES)} groups "
               f"against {source} (5.15.{SUB_LEVEL})")

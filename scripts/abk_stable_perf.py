@@ -1487,10 +1487,13 @@ PATCH_GROUPS = [
 def main():
     args = parse_args("stable_perf_backport: 5.15.y scheduler/net/locking/block optimization grafts")
     ctx = make_context(args)
-    if ctx.family != "android13-5.15":
+    enabled = ctx.family == "android13-5.15" or args.allow_unsupported
+    if not enabled:
         print(f"[ABK stable_515_backport] unsupported family {ctx.family}; "
-              "all groups stay report-only")
-    run_child("stable_perf_backport", PATCH_GROUPS, ctx, args)
+              "every group reports report_only and nothing is written "
+              "(pass --allow-unsupported to override)")
+    run_child("stable_perf_backport", PATCH_GROUPS, ctx, args,
+              enabled=enabled)
 
 
 if __name__ == "__main__":

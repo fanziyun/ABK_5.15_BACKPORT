@@ -56,8 +56,6 @@ def write_text(path, text, eol=None, backup=True):
     target.write_bytes(text.encode("utf-8"))
 
 
-def count_needles(text, needles):
-    return {needle: text.count(needle) for needle in needles}
 
 
 def _eol_variants(block):

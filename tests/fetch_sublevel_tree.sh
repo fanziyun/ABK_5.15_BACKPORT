@@ -68,6 +68,11 @@ FETCH_FILES=(
   drivers/block/zram/Kconfig
   drivers/block/zram/zram_drv.h
   drivers/block/zram/zram_drv.c
+  mm/Kconfig
+  mm/khugepaged.c
+  mm/madvise.c
+  include/linux/huge_mm.h
+  include/uapi/asm-generic/mman-common.h
 )
 
 decode() {

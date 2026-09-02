@@ -359,6 +359,13 @@ def test_sublevel_matrix():
             unknown = sublevel_matrix.pre_applied(sub_level, child) - keys
             check(f"{child}@{sub_level} names only real groups",
                   not unknown, unknown)
+            unknown_debt = set(sublevel_matrix.debt(sub_level, child)) - keys
+            check(f"{child}@{sub_level} debts are real groups",
+                  not unknown_debt, unknown_debt)
+            surf = (sublevel_matrix.pre_applied(sub_level, child)
+                    & set(sublevel_matrix.debt(sub_level, child)))
+            check(f"{child}@{sub_level} debts disjoint from pre-applied",
+                  not surf, surf)
             summary = sublevel_matrix.status_summary(sub_level, child)
             check(f"{child}@{sub_level} summary totals all groups",
                   sum(summary.values()) == len(groups), summary)
@@ -416,6 +423,111 @@ def test_kstack_slot_shape_selection():
     check("slot-5 anchor hits patched tail", step2[1] in sysv)
 
 
+def test_defconfig_lane():
+    print("defconfig lane: three forms, idempotency, scope guard")
+    import abk_stable_core as core
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "common"
+        (root / "arch/arm64/configs").mkdir(parents=True)
+        defconfig = root / "arch/arm64/configs/gki_defconfig"
+        defconfig.write_text(
+            "CONFIG_A=y\n"
+            "# CONFIG_B is not set\n"
+            "CONFIG_C=n\n"
+        )
+        ctx = GraftContext(str(root), "167", "android13-5.15",
+                           defconfig=str(defconfig))
+        status, detail = ctx.enable_configs([
+            ("B", "y"), ("C", "y"), ("A", "y"), ("NEW", "y"),
+        ])
+        check("defconfig applied", status == "applied", status)
+        text = defconfig.read_text()
+        check("disabled symbol rewritten",
+              "CONFIG_B=y" in text and "# CONFIG_B is not set" not in text, text)
+        check("other-value symbol rewritten", "CONFIG_C=y" in text, text)
+        check("already-target untouched once", text.count("CONFIG_A=y") == 1, text)
+        check("new symbol appended + one marker",
+              "CONFIG_NEW=y" in text
+              and text.count("ABK stable_515_backport: config_enablement") == 1,
+              text)
+
+        ctx2 = GraftContext(str(root), "167", "android13-5.15",
+                            defconfig=str(defconfig))
+        status2, _d = ctx2.enable_configs([("B", "y")])
+        check("defconfig idempotent", status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "common"
+        root.mkdir()
+        outside = Path(tmp) / "gki_defconfig"
+        outside.write_text("# bare\n")
+        ctx = GraftContext(str(root), "167", "android13-5.15",
+                           defconfig=str(outside))
+        status, detail = ctx.enable_configs([("A", "y")])
+        check("defconfig outside KERNEL_ROOT refused",
+              status == "report_only" and "outside" in detail,
+              (status, detail))
+
+
+def test_family_gate():
+    print("family gate: unsupported lineage is report-only")
+    def would_write(ctx):
+        ctx.write("mm/x.c", "boom\n")
+        return "applied", "wrote"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/x.c": "pristine\n"})
+        ctx.family = "android15-6.6"
+        groups = [PatchGroup("g", "", [], ["mm/x.c"], would_write)]
+        report = run_child("unit", groups, ctx, None, enabled=False)
+        check("zero writes under gate", ctx.pending_writes() == [],
+              ctx.pending_writes())
+        check("all report_only",
+              [g["status"] for g in report["groups"]] == ["report_only"],
+              [g["status"] for g in report["groups"]])
+
+
+def test_apply_steps_noop_blocked():
+    print("apply_steps empty step list is blocked, not already_present")
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/x.c": "x\n"})
+        status, _res, detail = apply_steps(ctx, [])
+        check("empty steps blocked",
+              status == "blocked_by_missing_anchor" and "empty step list" in detail,
+              (status, detail))
+
+
+def test_batch6_registration():
+    print("Batch 6 registry: keys, counts, debt-consistency")
+    import abk_stable_core as core
+    import abk_stable_perf as perf
+    keys = {g.key for g in core.PATCH_GROUPS}
+    perf_keys = {g.key for g in perf.PATCH_GROUPS}
+    need = {"config_enablement", "zsmalloc_chain_size", "madvise_collapse"}
+    check("batch6 groups registered", need <= keys, need - keys)
+    # The no-op path must not regress: a graft that cannot find any anchor on
+    # an empty tree degrades instead of silently succeeding.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "mm/Kconfig": "config ZSMALLOC\n\ttristate\n",
+            "include/uapi/asm-generic/mman-common.h": "#define MADV_POPULATE_WRITE 23\n",
+            "include/linux/khugepaged.h": "extern void collapse_pte_mapped_thp(void);\n",
+            "mm/madvise.c": "static int f(void) { return 1; }\n",
+            "mm/khugepaged.c": "static void khugepaged_scan_mm_slot(void) {}\n",
+        })
+        status, _ = core._zsmalloc_chain_size_apply(ctx)
+        status2, _ = core._madvise_collapse_apply(ctx)
+        check("zsmalloc degrades cleanly",
+              status == "blocked_by_shape", status)
+        check("madvise degrades cleanly",
+              status2 == "blocked_by_shape", status2)
+    for sub_level, child in (("211", "stable_perf_backport"),):
+        for key, want in sublevel_matrix.debt(sub_level, child).items():
+            check(f"debt {sub_level}/{key} is a real group",
+                  key in perf_keys, key)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -427,6 +539,10 @@ def main():
     check("engine raised on tampering", raised)
     test_fdtable_shapes()
     test_replace_fd_errno_group()
+    test_defconfig_lane()
+    test_family_gate()
+    test_apply_steps_noop_blocked()
+    test_batch6_registration()
     test_sublevel_matrix()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()

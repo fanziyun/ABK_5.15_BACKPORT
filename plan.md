@@ -3,6 +3,66 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 6（v0.7.0，审查收口 + 6.1/6.6 三新组，已落地）
+
+先把审查发现的三处"承诺没兑现"收口，再落三个新组；core 从 11 组到 14 组。
+逐步审计步数：core 108/109/100/100（167/.178/.194/.211），perf 81/81/80/80；
+四档 step_audit 全绿，167/.178/.194 三档 smoke 双跑幂等 + defconfig 回滚通过。
+
+审查收口：
+
+- [x] `--defconfig` 真正启用：`enable_configs()` 支持三种形态（已是目标值 /
+  `# CONFIG_x is not set` 或异值改写 / 缺失追加），只写 `KERNEL_ROOT` 内的
+  defconfig，越界 `report_only`，`.abk-orig` 快照可回滚
+- [x] family 真门控：非 android13-5.15 时全部 `report_only` 且零读零写；
+  `ABK_515_ALLOW_UNSUPPORTED=1` / `--allow-unsupported` 显式放行
+- [x] 静默 no-op 双方向堵塞：`apply_steps()` 空 steps/全未命中返回
+  `blocked_by_missing_anchor`；`run_child()` 同时拒绝"降级却写盘"与
+  "报 applied 却没改任何文件"
+- [x] 死代码/状态词收口：删 `count_needles` / `snapshot_original`，
+  `skip_f2fs_rolled_back` 从状态词表移除，`block_rolled_back` 标注 informational，
+  `report_only` 有了真实生产者
+
+新组：
+
+- [x] `config_enablement`（core）— 默认开 `ZRAM_TRACK_ENTRY_ACTIME=y` +
+  `ZRAM_MULTI_COMP=y`（Batch 4 终于不是"代码在、开关没有"）；对齐档
+  `ABK_515_DEFCONFIG_ALIGN=1` 追加 6.6 GKI 的 6 项（LRU_GEN_ENABLED / BBR /
+  BLK_WBT / BLK_DEV_THROTTLING / TASK_DELAY_ACCT）
+- [x] `zsmalloc_chain_size`（core，android15-6.6 来源）— 6.2 的 zspage chain
+  定界重做：`CONFIG_ZSMALLOC_CHAIN_SIZE`（default 8 / range 4 16）+ 最小绝对
+  浪费的 `calculate_zspage_chain_size()`；6.1.176 实测没有，5.15 四档基线
+  `ZS_MAX_PAGES_PER_ZSPAGE`/`get_pages_per_zspage` 同形，单锚点集全兼容
+- [x] `madvise_collapse`（core，android14-6.1 来源）— UAPI `MADV_COLLAPSE 25` +
+  `madvise_behavior_valid()`/`madvise_need_mmap_write()`/`madvise_vma_behavior()`
+  三处接线 + 5.15 形状的 `madvise_collapse()`/`madvise_collapse_errno()`
+  （`khugepaged_scan_pmd/scan_file` 增加可选 `res` 出参，kthread 传 NULL，
+  行为逐字节不变）；不引入 folio_walk，复用 5.15 既有 helper
+  。声明点用上游同一位置 `include/linux/huge_mm.h`（`mm/madvise.c` 经
+  `linux/mm.h` 已可见该头，无需再 graft include；这也是本轮审查补上的
+  P0 —— 原先声明放在 `include/linux/khugepaged.h`，而 5.15 的 madvise.c
+  并不 include 它，会撞 implicit-function-declaration）
+
+多版本兼容底座（本轮实测）：
+
+- `mm/zsmalloc.c` 167/178/194/211 只差 11–15 行、`ZS_MAX_ZSPAGE_ORDER` 每档
+  3 命中；`mm/khugepaged.c` 178↔194 差 17 行、collapse helper 每档 6 命中
+- 8 个 defconfig 符号四档全缺 → 追加分支三档一致；`TRANSPARENT_HUGEPAGE=y`
+  四档都有，MADV_COLLAPSE 不会空转
+- `.211` 成为第四夹具：matrix 记录两个已知债务（`randomize_kstack_pertask` /
+  `blk_mq_suspend_wakeup_abort` = blocked_by_shape）与
+  `sched_rt_optimizations` 的部分预置漂移，step_audit 可跑可预期
+
+本轮实测排除（写进两份 survey，不再重议）：
+
+- [x] `RT_SOFTIRQ_AWARE_SCHED`：基线已有，仅改名成
+  `CONFIG_RT_SOFTINT_OPTIMIZATION` / `task_may_not_preempt()`
+- [x] MGLRU 6.1 代际改进：167 与 6.1.176 的 `mm/vmscan.c` 同代
+- [x] ACK 厂商特性 warp / cpu.exstat / taskhint / memory.async_fork /
+  cpu.identity / id_boost / dl_server：6.1 与 6.6 两线都不存在
+- [x] DAMON SYSFS/LRU_SORT：需要 6.1 core 长大（`core.c` 27→46KB，sysfs 系列
+  约 10 万字节），维持延后
+
 ## Batch 5（v0.6.0，多 sublevel 兼容 167/.178/.194，已落地）
 
 目标：一条注入串同时覆盖 CI `build.yml` 里 android13-5.15 的三个合法组合
@@ -109,9 +169,11 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 
 - [ ] per-VMA locks（android14-6.1 全量移植；5.15 需 RCU VMA 生命周期 + fault 路径改造 + vma KABI 槽位，参照 rbtree 时代 RFC 设计）
 - [ ] per-cgroup PSI 开关（cgroup.pressure enable/disable）— 被 psi_group 指针/父链重构（cgroup KMI 红线）卡住
-- [ ] DAMON sysfs 控制面（中等体量、价值一般）
-- [ ] MADV_COLLAPSE（UAPI-only，THP 开启才有价值）
-- [ ] zram recompression（6.2 来源，6.1.y 未收）
+- [~] DAMON sysfs 控制面（实测需要 6.1 core 长大：`core.c` 27→46KB + sysfs
+  约 10 万字节，不再是"中等体量"，价值一般）
+- [x] MADV_COLLAPSE（Batch 6 已落地，按 5.15 helper 重写，非 UAPI-only）
+- [x] zram recompression（Batch 4 落地）+ zsmalloc chain-size（Batch 6 落地；
+  6.2 来源、6.1.y 未收，来源线取 android15-6.6）
 - [ ] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）— 与 KMI 卡点纠缠
 
 ## 禁区清单（与两个 sibling 模块的硬边界）

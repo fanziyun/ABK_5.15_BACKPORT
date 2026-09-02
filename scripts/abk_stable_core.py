@@ -17,6 +17,7 @@ graft modules are injected in the same build, keep this child between them
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -2066,6 +2067,45 @@ def _zram_recompression_apply(ctx):
     return status, detail
 
 
+# ---------------------------------------------------------------------------
+# build config enablement (config lane)
+#
+# Everything before this batch shipped code and Kconfig symbols that nothing
+# ever turned on: the defconfig was parsed off the command line and never
+# written.  Default tier enables only what this module itself introduces; the
+# wider android15-6.6 GKI config picture is opt-in so a plain injection never
+# silently changes device behaviour.
+# ---------------------------------------------------------------------------
+
+_MODULE_CONFIGS = [
+    # zram recompression (Batch 4): ZRAM_MULTI_COMP depends on the age tracking
+    # symbol, and Kconfig leaves both off by default.
+    ("ZRAM_TRACK_ENTRY_ACTIME", "y"),
+    ("ZRAM_MULTI_COMP", "y"),
+]
+
+_ALIGN_CONFIGS = [
+    # Enabled in the android15-6.6 GKI defconfig, absent from every
+    # android13-5.15 baseline, and the code already exists in 5.15 for all of
+    
+    # them -- config-only deltas, so they change runtime behaviour.
+    ("LRU_GEN_ENABLED", "y"),        # MGLRU on by default
+    ("TCP_CONG_ADVANCED", "y"),      # prerequisite for BBR
+    ("TCP_CONG_BBR", "y"),
+    ("BLK_WBT", "y"),                # writeback throttling
+    ("BLK_DEV_THROTTLING", "y"),     # cgroup io throttling
+    ("TASK_DELAY_ACCT", "y"),        # delay accounting
+]
+
+
+def _config_enablement_apply(ctx):
+    align = os.environ.get("ABK_515_DEFCONFIG_ALIGN", "").strip() == "1"
+    configs = list(_MODULE_CONFIGS) + (list(_ALIGN_CONFIGS) if align else [])
+    status, detail = ctx.enable_configs(configs)
+    tier = "6.6 GKI align" if align else "module-owned symbols only"
+    return status, f"{detail} [{tier}]"
+
+
 PATCH_GROUPS = [
     PatchGroup(
         "fdtable_alloc_conventions",
@@ -2159,11 +2199,529 @@ PATCH_GROUPS = [
 def main():
     args = parse_args("stable_backport_core: 5.15.y fd/mm/cgroup feature grafts")
     ctx = make_context(args)
-    if ctx.family != "android13-5.15":
+    enabled = ctx.family == "android13-5.15" or args.allow_unsupported
+    if not enabled:
         print(f"[ABK stable_515_backport] unsupported family {ctx.family}; "
-              "all groups stay report-only")
-    run_child("stable_backport_core", PATCH_GROUPS, ctx, args)
+              "every group reports report_only and nothing is written "
+              "(pass --allow-unsupported to override)")
+    run_child("stable_backport_core", PATCH_GROUPS, ctx, args,
+              enabled=enabled)
+
+
+# ============================================================================
+# Batch 6 additions.  Kept after the original module body so the diff of the
+# earlier batches stays untouched; they are appended to PATCH_GROUPS at the
+# bottom of the file, before the __main__ guard.
+# ============================================================================
+# ---------------------------------------------------------------------------
+# zsmalloc zspage chain size (android15-6.6; the 6.2 class-sizing rework).
+#
+# The 5.15 baseline fixes a zspage at 2^2 pages and picks the chain length by
+# best-used-percentage; 6.2 made the ceiling a tunable and minimised absolute
+# waste instead, which is what actually shrinks small size classes.  Only the
+# sizing is ported: the 6.3+ fullness rename, zs_page_migrate rework and
+# zs_size_stat growth stay out, so NR_ZS_FULLNESS and the exported API hold.
+# ---------------------------------------------------------------------------
+
+_ZS_KCONFIG_STAT = (
+    "config ZSMALLOC_STAT\n"
+    "\tbool \"Export zsmalloc statistics\"\n"
+    "\tdepends on ZSMALLOC\n"
+    "\tselect DEBUG_FS\n"
+    "\thelp\n"
+    "\t  This option enables code in the zsmalloc to collect various\n"
+    "\t  statistics about what's happening in zsmalloc and exports that\n"
+    "\t  information to userspace via debugfs.\n"
+    "\t  If unsure, say N.\n"
+)
+
+_ZS_KCONFIG_CHAIN = (
+    "\n"
+    "config ZSMALLOC_CHAIN_SIZE\n"
+    "\tint \"Maximum number of physical pages per-zspage\"\n"
+    "\tdefault 8\n"
+    "\trange 4 16\n"
+    "\tdepends on ZSMALLOC\n"
+    "\thelp\n"
+    "\t  This option sets the upper limit on the number of physical pages\n"
+    "\t  that a zmalloc page (zspage) can consist of. The optimal zspage\n"
+    "\t  chain size is calculated for each size class during the\n"
+    "\t  initialization of the pool.\n"
+)
+
+_ZS_MACRO_OLD = (
+    "/*\n"
+    " * A single 'zspage' is composed of up to 2^N discontiguous 0-order (single)\n"
+    " * pages. ZS_MAX_ZSPAGE_ORDER defines upper limit on N.\n"
+    " */\n"
+    "#define ZS_MAX_ZSPAGE_ORDER 2\n"
+    "#define ZS_MAX_PAGES_PER_ZSPAGE (_AC(1, UL) << ZS_MAX_ZSPAGE_ORDER)\n"
+)
+
+_ZS_MACRO_NEW = (
+    "/*\n"
+    " * A single 'zspage' is composed of up to N discontiguous 0-order (single)\n"
+    " * pages.  CONFIG_ZSMALLOC_CHAIN_SIZE bounds N; the class sizing pass picks\n"
+    " * the chain length that wastes the least space per object, so the higher\n"
+    " * ceiling is what pays back internal fragmentation in small classes.\n"
+    " *\n"
+    " * ABK stable_515_backport: zsmalloc chain size (android15-6.6 / 6.2)\n"
+    " */\n"
+    "#define ZS_MAX_PAGES_PER_ZSPAGE\t(_AC(CONFIG_ZSMALLOC_CHAIN_SIZE, UL))\n"
+)
+
+_ZS_SIZING_OLD = (
+    "static int get_pages_per_zspage(int class_size)\n"
+    "{\n"
+    "\tint i, max_usedpc = 0;\n"
+    "\t/* zspage order which gives maximum used size per KB */\n"
+    "\tint max_usedpc_order = 1;\n"
+    "\n"
+    "\tfor (i = 1; i <= ZS_MAX_PAGES_PER_ZSPAGE; i++) {\n"
+    "\t\tint zspage_size;\n"
+    "\t\tint waste, usedpc;\n"
+    "\n"
+    "\t\tzspage_size = i * PAGE_SIZE;\n"
+    "\t\twaste = zspage_size % class_size;\n"
+    "\t\tusedpc = (zspage_size - waste) * 100 / zspage_size;\n"
+    "\n"
+    "\t\tif (usedpc > max_usedpc) {\n"
+    "\t\t\tmax_usedpc = usedpc;\n"
+    "\t\t\tmax_usedpc_order = i;\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\treturn max_usedpc_order;\n"
+    "}\n"
+)
+
+_ZS_SIZING_NEW = (
+    "static int calculate_zspage_chain_size(int class_size)\n"
+    "{\n"
+    "\tint i, min_waste = INT_MAX;\n"
+    "\tint chain_size = 1;\n"
+    "\n"
+    "\t/* ABK stable_515_backport: pick the chain with the least hard waste */\n"
+    "\tif (is_power_of_2(class_size))\n"
+    "\t\treturn chain_size;\n"
+    "\n"
+    "\tfor (i = 1; i <= ZS_MAX_PAGES_PER_ZSPAGE; i++) {\n"
+    "\t\tint waste;\n"
+    "\n"
+    "\t\twaste = (i * PAGE_SIZE) % class_size;\n"
+    "\t\tif (waste < min_waste) {\n"
+    "\t\t\tmin_waste = waste;\n"
+    "\t\t\tchain_size = i;\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\treturn chain_size;\n"
+    "}\n"
+)
+
+
+def _zsmalloc_chain_size_apply(ctx):
+    steps = [
+        ("mm/Kconfig", _ZS_KCONFIG_STAT, _ZS_KCONFIG_STAT + _ZS_KCONFIG_CHAIN, T),
+        ("mm/zsmalloc.c", _ZS_MACRO_OLD, _ZS_MACRO_NEW, T),
+        ("mm/zsmalloc.c", _ZS_SIZING_OLD, _ZS_SIZING_NEW, T),
+        ("mm/zsmalloc.c",
+         "\t\tpages_per_zspage = get_pages_per_zspage(size);\n",
+         "\t\tpages_per_zspage = calculate_zspage_chain_size(size);\n", T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+# ---------------------------------------------------------------------------
+# MADV_COLLAPSE (android14-6.1 / mainline 6.1)
+#
+# Synchronous THP collapse on demand.  The 6.1 form drives the 6.x
+# hpage_collapse_scan_*() helpers with a caller-owned collapse_control; on
+# this baseline those helpers still own the preallocated huge page, so the
+# port drives them the way the khugepaged thread does and lifts the scan
+# verdict through two new out-parameters (the thread passes NULL).
+# ---------------------------------------------------------------------------
+
+_MC_UAPI_ANCHOR = ("#define MADV_POPULATE_WRITE\t23\t"
+                   "/* populate (prefault) page tables writable */")
+# MADV_COLLAPSE keeps the upstream number and comment; the group marker
+# lives with the implementation in mm/khugepaged.c.
+_MC_UAPI_NEW = ("#define MADV_COLLAPSE\t25\t\t"
+                "/* Synchronous hugepage collapse */")
+
+# include/linux/huge_mm.h -- upstream 6.1's own declaration site, right after
+# hugepage_madvise().  That header reaches mm/madvise.c through linux/mm.h, so
+# no include has to be grafted, and mm/khugepaged.c gets the prototype for free
+# (which keeps -Wmissing-prototypes quiet for the new non-static definition).
+# No !THP stub is needed: the switch arm is wrapped in the same ifdef.
+_MC_HEADER_ANCHOR = ("int hugepage_madvise(struct vm_area_struct *vma, unsigned long *vm_flags,\n"
+                     "\t\t     int advice);")
+_MC_HEADER_DECL = ("int madvise_collapse(struct vm_area_struct *vma,\n"
+                   "\t\t     struct vm_area_struct **prev,\n"
+                   "\t\t     unsigned long start, unsigned long end);")
+
+# mm/madvise.c: three switch arms.  Collapse is fine under the read side of
+# the mmap_lock, so it joins the madvise_need_mmap_write() exceptions.
+_MC_NEED_MMAP_OLD = ("\tcase MADV_POPULATE_READ:\n"
+                     "\tcase MADV_POPULATE_WRITE:\n"
+                     "\t\treturn 0;")
+_MC_NEED_MMAP_NEW = ("\tcase MADV_POPULATE_READ:\n"
+                     "\tcase MADV_POPULATE_WRITE:\n"
+                     "\tcase MADV_COLLAPSE:\n"
+                     "\t\treturn 0;")
+
+# The visit itself.  Upstream 6.1 leaves this case unconditional because it
+# ships a !CONFIG_TRANSPARENT_HUGEPAGE stub in the header; on this baseline
+# the ifdef is the cheaper equivalent and keeps THP-off trees untouched.
+_MC_CASE_OLD = ("\tcase MADV_POPULATE_READ:\n"
+                "\tcase MADV_POPULATE_WRITE:\n"
+                "\t\treturn madvise_populate(vma, prev, start, end, behavior);")
+_MC_CASE_NEW = (_MC_CASE_OLD + "\n"
+                "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
+                "\t/* ABK stable_515_backport: MADV_COLLAPSE (android14-6.1) */\n"
+                "\tcase MADV_COLLAPSE:\n"
+                "\t\treturn madvise_collapse(vma, prev, start, end);\n"
+                "#endif")
+
+# Acceptance list.  Deliberately not added to process_madvise_behavior_valid():
+# the 5.15 process_madvise() path does not carry the range bookkeeping the
+# collapse needs, so callers there keep getting -EINVAL.
+_MC_VALID_OLD = ("#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
+                 "\tcase MADV_HUGEPAGE:\n"
+                 "\tcase MADV_NOHUGEPAGE:\n"
+                 "#endif")
+_MC_VALID_NEW = ("#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
+                 "\tcase MADV_HUGEPAGE:\n"
+                 "\tcase MADV_NOHUGEPAGE:\n"
+                 "\tcase MADV_COLLAPSE:\n"
+                 "#endif")
+
+# The scan helpers signatures are unchanged in shape across 167/.178/.194/.211,
+# so every step below is a single anchor set (see docs/porting_policy.md).
+_MC_PMD_SIG_OLD = ("static int khugepaged_scan_pmd(struct mm_struct *mm,\n"
+                   "\t\t\t       struct vm_area_struct *vma,\n"
+                   "\t\t\t       unsigned long address,\n"
+                   "\t\t\t       struct page **hpage)")
+_MC_PMD_SIG_NEW = ("static int khugepaged_scan_pmd(struct mm_struct *mm,\n"
+                   "\t\t\t       struct vm_area_struct *vma,\n"
+                   "\t\t\t       unsigned long address,\n"
+                   "\t\t\t       struct page **hpage, int *res)")
+_MC_PMD_OUT_OLD = ('\t\t\t\t     none_or_zero, result, unmapped);\n'
+                   '\treturn ret;\n'
+                   '}')
+_MC_PMD_OUT_NEW = ('\t\t\t\t     none_or_zero, result, unmapped);\n'
+                   '\t/* ABK stable_515_backport: MADV_COLLAPSE needs the verdict, '
+                   'not just the flag that the kthread cares about. */\n'
+                   '\tif (res)\n'
+                   '\t\t*res = result;\n'
+                   '\treturn ret;\n'
+                   '}')
+
+# Both khugepaged_scan_file() definitions move to the new signature; the
+# CONFIG_SHMEM-off stub is rewritten first so that the remaining occurrence of
+# the old two-line signature is unique for the step that follows.
+_MC_FILE_STUB_OLD = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
+                     '\t\tstruct file *file, pgoff_t start, struct page **hpage)\n'
+                     '{\n'
+                     '\tBUILD_BUG();\n'
+                     '}')
+_MC_FILE_SIG_OLD = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
+                    '\t\tstruct file *file, pgoff_t start, struct page **hpage)')
+_MC_FILE_SIG_NEW = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
+                    '\t\tstruct file *file, pgoff_t start, struct page **hpage,\n'
+                    '\t\tint *res)')
+_MC_FILE_STUB_NEW = (_MC_FILE_SIG_NEW + '\n'
+                     '{\n'
+                     '\tBUILD_BUG();\n'
+                     '}')
+
+# Verdict for the file/shmem path.  collapse_file() is void on this baseline,
+# so only the pre-scan verdict is actionable; a range that passes every check
+# is reported as collapsed, which is exactly what the kthread assumes too.
+_MC_FILE_OUT_OLD = ('\t\t\tcollapse_file(mm, file, start, hpage, node);\n'
+                    '\t\t}\n'
+                    '\t}\n'
+                    '\n'
+                    '\t/* TODO: tracepoints */\n'
+                    '}')
+_MC_FILE_OUT_NEW = ('\t\t\tcollapse_file(mm, file, start, hpage, node);\n'
+                    '\t\t}\n'
+                    '\t}\n'
+                    '\n'
+                    '\tif (res)\n'
+                    '\t\t*res = result;\n'
+                    '\n'
+                    '\t/* TODO: tracepoints */\n'
+                    '}')
+
+# The khugepaged thread itself passes NULL for both new out-parameters.
+_MC_CALLER_OLD = ('\t\t\t\tkhugepaged_scan_file(mm, file, pgoff, hpage);\n'
+                  '\t\t\t\tfput(file);\n'
+                  '\t\t\t} else {\n'
+                  '\t\t\t\tret = khugepaged_scan_pmd(mm, vma,\n'
+                  '\t\t\t\t\t\tkhugepaged_scan.address,\n'
+                  '\t\t\t\t\t\thpage);\n'
+                  '\t\t\t}')
+_MC_CALLER_NEW = ('\t\t\t\tkhugepaged_scan_file(mm, file, pgoff, hpage,\n'
+                  '\t\t\t\t\t      NULL);\n'
+                  '\t\t\t\tfput(file);\n'
+                  '\t\t\t} else {\n'
+                  '\t\t\t\tret = khugepaged_scan_pmd(mm, vma,\n'
+                  '\t\t\t\t\t\tkhugepaged_scan.address,\n'
+                  '\t\t\t\t\t\thpage, NULL);\n'
+                  '\t\t\t}')
+
+# madvise_collapse() itself, inserted right before khugepaged_scan_mm_slot().
+# Split into line tuples so the C text stays readable and diffable; the
+# semantics follow mainline 6.1: iterate PMD-aligned addresses, tolerate the
+# whitelisted scan results, and map the last failure to an errno.
+_MC_IMPL_A = (
+    '/*\n'
+    ' * ABK stable_515_backport: MADV_COLLAPSE (android14-6.1 / mainline 6.1)\n'
+    ' *\n'
+    ' * Synchronously collapse every PMD-aligned chunk of [start, end) into a\n'
+    ' * huge page, regardless of the THP defrag setting of the process.\n'
+    ' *\n'
+    ' * On the 6.1 form the scan helpers take a caller-owned collapse_control;\n'
+    ' * here they still own the preallocated huge page and the shared\n'
+    ' * khugepaged_node_load[] scratch, so this drives them exactly the way\n'
+    ' * the khugepaged thread does: hold mmap_lock for reading, and re-take it\n'
+    ' * after a helper dropped it.\n'
+    ' */\n'
+    'static int madvise_collapse_errno(int r)\n'
+    '{\n'
+    '\t/*\n'
+    '\t * MADV_COLLAPSE breaks from existing madvise(2) conventions to provide\n'
+    '\t * actionable feedback to caller, so they may take an appropriate\n'
+    '\t * fallback measure depending on the nature of the failure.\n'
+    '\t */\n'
+)
+
+_MC_IMPL_B = (
+    '\tswitch (r) {\n'
+    '\tcase SCAN_ALLOC_HUGE_PAGE_FAIL:\n'
+    '\t\treturn -ENOMEM;\n'
+    '\tcase SCAN_CGROUP_CHARGE_FAIL:\n'
+    '\t\treturn -EBUSY;\n'
+    '\t/* Resource temporary unavailable - trying again might succeed */\n'
+    '\tcase SCAN_PAGE_COUNT:\n'
+    '\tcase SCAN_PAGE_LOCK:\n'
+    '\tcase SCAN_PAGE_LRU:\n'
+    '\tcase SCAN_DEL_PAGE_LRU:\n'
+    '\tcase SCAN_SCAN_ABORT:\n'
+    '\t\t/*\n'
+    '\t\t * SCAN_SCAN_ABORT is not in the 6.1 list because that tree dropped\n'
+    '\t\t * the shared node-load scratch; on this baseline it can also be a\n'
+    '\t\t * transient effect of a concurrent kthread scan, so it is retryable.\n'
+    '\t\t */\n'
+    '\t\treturn -EAGAIN;\n'
+    '\t/*\n'
+    '\t * Other: retrying is unlikely to help; the error is intrinsic to the\n'
+    '\t * specified memory range, and khugepaged will not be able to collapse\n'
+    '\t * it either.\n'
+    '\t */\n'
+    '\tdefault:\n'
+    '\t\treturn -EINVAL;\n'
+    '\t}\n'
+    '}\n'
+)
+
+_MC_IMPL_C = (
+    '\n'
+    'int madvise_collapse(struct vm_area_struct *vma, struct vm_area_struct **prev,\n'
+    '\t\t     unsigned long start, unsigned long end)\n'
+    '{\n'
+    '\tstruct mm_struct *mm = vma->vm_mm;\n'
+    '\tstruct page *hpage = NULL;\n'
+    '\tunsigned long hstart, hend, addr;\n'
+    '\tbool wait = true, mmap_locked = true;\n'
+    '\tint thps = 0, last_fail = SCAN_FAIL;\n'
+    '\n'
+    '\tBUG_ON(vma->vm_start > start);\n'
+    '\tBUG_ON(vma->vm_end < end);\n'
+    '\n'
+    '\t*prev = vma;\n'
+    '\n'
+    '\tif (!hugepage_vma_check(vma, vma->vm_flags))\n'
+    '\t\treturn -EINVAL;\n'
+    '\n'
+    '\tmmgrab(mm);\n'
+    '\tlru_add_drain_all();\n'
+    '\n'
+    '\thstart = (start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;\n'
+    '\thend = end & HPAGE_PMD_MASK;\n'
+)
+
+_MC_IMPL_D = (
+    '\n'
+    '\tfor (addr = hstart; addr < hend; addr += HPAGE_PMD_SIZE) {\n'
+    '\t\tint result = SCAN_FAIL;\n'
+    '\n'
+    '\t\tif (!mmap_locked) {\n'
+    '\t\t\tcond_resched();\n'
+    '\t\t\tmmap_read_lock(mm);\n'
+    '\t\t\tmmap_locked = true;\n'
+    '\t\t\tresult = hugepage_vma_revalidate(mm, addr, &vma);\n'
+    '\t\t\tif (result != SCAN_SUCCEED) {\n'
+    '\t\t\t\tlast_fail = result;\n'
+    '\t\t\t\tgoto out_nolock;\n'
+    '\t\t\t}\n'
+    '\n'
+    '\t\t\thend = min(hend, vma->vm_end & HPAGE_PMD_MASK);\n'
+    '\t\t}\n'
+    '\n'
+    '\t\tif (!khugepaged_prealloc_page(&hpage, &wait)) {\n'
+    '\t\t\tlast_fail = SCAN_ALLOC_HUGE_PAGE_FAIL;\n'
+    '\t\t\tgoto out_maybelock;\n'
+    '\t\t}\n'
+    '\n'
+    '\t\tcond_resched();\n'
+    '\n'
+    '\t\tif (IS_ENABLED(CONFIG_SHMEM) && vma->vm_file) {\n'
+    '\t\t\tstruct file *file = get_file(vma->vm_file);\n'
+    '\t\t\tpgoff_t pgoff = linear_page_index(vma, addr);\n'
+    '\n'
+    '\t\t\tmmap_read_unlock(mm);\n'
+    '\t\t\tmmap_locked = false;\n'
+    '\t\t\tkhugepaged_scan_file(mm, file, pgoff, &hpage, &result);\n'
+    '\t\t\tfput(file);\n'
+    '\t\t} else {\n'
+    '\t\t\tif (khugepaged_scan_pmd(mm, vma, addr, &hpage, &result))\n'
+    '\t\t\t\tmmap_locked = false;\n'
+    '\t\t}\n'
+    '\n'
+    '\t\tif (!mmap_locked)\n'
+    '\t\t\t*prev = NULL;\t/* tell caller we dropped mmap_lock */\n'
+)
+
+_MC_IMPL_E = (
+    '\n'
+    '\t\tswitch (result) {\n'
+    '\t\tcase SCAN_SUCCEED:\n'
+    '\t\t\t++thps;\n'
+    '\t\t\tbreak;\n'
+    '\t\t/* Whitelisted set of results where continuing OK */\n'
+    '\t\tcase SCAN_PMD_NULL:\n'
+    '\t\tcase SCAN_EXCEED_NONE_PTE:\n'
+    '\t\tcase SCAN_EXCEED_SWAP_PTE:\n'
+    '\t\tcase SCAN_EXCEED_SHARED_PTE:\n'
+    '\t\tcase SCAN_PTE_NON_PRESENT:\n'
+    '\t\tcase SCAN_PTE_UFFD_WP:\n'
+    '\t\tcase SCAN_PAGE_RO:\n'
+    '\t\tcase SCAN_LACK_REFERENCED_PAGE:\n'
+    '\t\tcase SCAN_PAGE_NULL:\n'
+    '\t\tcase SCAN_PAGE_ANON:\n'
+    '\t\tcase SCAN_PAGE_COMPOUND:\n'
+    '\t\tcase SCAN_PAGE_HAS_PRIVATE:\n'
+    '\t\tcase SCAN_SWAP_CACHE_PAGE:\n'
+    '\t\tcase SCAN_PAGE_COUNT:\n'
+    '\t\tcase SCAN_PAGE_LOCK:\n'
+    '\t\tcase SCAN_PAGE_LRU:\n'
+    '\t\tcase SCAN_DEL_PAGE_LRU:\n'
+    '\t\tcase SCAN_SCAN_ABORT:\n'
+    '\t\t\tlast_fail = result;\n'
+    '\t\t\tbreak;\n'
+    '\t\tdefault:\n'
+    '\t\t\tlast_fail = result;\n'
+    '\t\t\t/* Other error, exit */\n'
+    '\t\t\tgoto out_maybelock;\n'
+    '\t\t}\n'
+    '\t}\n'
+)
+
+_MC_IMPL_F = (
+    '\n'
+    'out_maybelock:\n'
+    '\t/* Caller expects us to hold mmap_lock on return */\n'
+    '\tif (!mmap_locked)\n'
+    '\t\tmmap_read_lock(mm);\n'
+    'out_nolock:\n'
+    '\tmmap_assert_locked(mm);\n'
+    '\tif (!IS_ERR_OR_NULL(hpage))\n'
+    '\t\tput_page(hpage);\n'
+    '\tmmdrop(mm);\n'
+    '\n'
+    '\treturn thps == ((hend - hstart) >> HPAGE_PMD_SHIFT) ? 0\n'
+    '\t\t\t: madvise_collapse_errno(last_fail);\n'
+    '}\n'
+    '\n'
+)
+
+_MC_SCAN_SLOT_SIG = ('static unsigned int khugepaged_scan_mm_slot(unsigned int pages,\n'
+                     '\t\t\t\t\t    struct page **hpage)')
+_MC_IMPL_OLD = _MC_SCAN_SLOT_SIG
+_MC_IMPL_NEW = (_MC_IMPL_A + _MC_IMPL_B + _MC_IMPL_C + _MC_IMPL_D +
+                _MC_IMPL_E + _MC_IMPL_F + _MC_SCAN_SLOT_SIG)
+
+
+def _madvise_collapse_apply(ctx):
+    # UAPI number and the extern declaration are single lines behind unique
+    # anchors, which is what common.ensure_after() is for; both are required,
+    # because a switch arm without the define would not compile.
+    singles = (
+        ("include/uapi/asm-generic/mman-common.h", _MC_UAPI_ANCHOR, _MC_UAPI_NEW),
+        ("include/linux/huge_mm.h", _MC_HEADER_ANCHOR, _MC_HEADER_DECL),
+    )
+    staged = {}
+    for rel, anchor, snippet in singles:
+        text, status = common.ensure_after(ctx.read(rel), anchor, snippet)
+        if status == "missing_anchor":
+            return "blocked_by_shape", f"{rel}: no anchor for {snippet.splitlines()[0]}"
+        if status == "applied":
+            staged[rel] = text
+
+    steps = [
+        ("mm/madvise.c", _MC_NEED_MMAP_OLD, _MC_NEED_MMAP_NEW, T),
+        ("mm/madvise.c", _MC_CASE_OLD, _MC_CASE_NEW, T),
+        ("mm/madvise.c", _MC_VALID_OLD, _MC_VALID_NEW, T),
+        ("mm/khugepaged.c", _MC_FILE_STUB_OLD, _MC_FILE_STUB_NEW, T),
+        ("mm/khugepaged.c", _MC_FILE_SIG_OLD, _MC_FILE_SIG_NEW, T),
+        ("mm/khugepaged.c", _MC_FILE_OUT_OLD, _MC_FILE_OUT_NEW, T),
+        ("mm/khugepaged.c", _MC_PMD_SIG_OLD, _MC_PMD_SIG_NEW, T),
+        ("mm/khugepaged.c", _MC_PMD_OUT_OLD, _MC_PMD_OUT_NEW, T),
+        ("mm/khugepaged.c", _MC_CALLER_OLD, _MC_CALLER_NEW, T),
+        ("mm/khugepaged.c", _MC_IMPL_OLD, _MC_IMPL_NEW, T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+
+    for rel, text in staged.items():
+        ctx.write(rel, text)
+    if staged and status == "already_present":
+        status = "applied"
+    return status, detail
+
+
+# Batch 6 groups.  Registered last so the graft order inside the child stays
+# "code first, then the config that makes it reachable".
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "config_enablement",
+        "enable the module-owned zram recompression symbols in the build defconfig, optionally aligning with the android15-6.6 GKI config",
+        ["ABK config lane: android15-6.6 gki_defconfig symbols absent from every android13-5.15 baseline"],
+        ["arch/arm64/configs/gki_defconfig"],
+        _config_enablement_apply,
+    ),
+    PatchGroup(
+        "zsmalloc_chain_size",
+        "make the zspage chain length a CONFIG_ZSMALLOC_CHAIN_SIZE bound chosen for minimal absolute waste (android15-6.6 / 6.2 class sizing)",
+        ["ACK android15-6.6 zsmalloc chain size (6.2 series; not in android14-6.1)"],
+        ["mm/Kconfig", "mm/zsmalloc.c"],
+        _zsmalloc_chain_size_apply,
+    ),
+    PatchGroup(
+        "madvise_collapse",
+        "synchronous THP collapse via MADV_COLLAPSE (android14-6.1), driven by the existing 5.15 khugepaged scan helpers",
+        ["MADV_COLLAPSE series (android14-6.1 / mainline 6.1)", "ACK android15-6.6 same form"],
+        ["include/uapi/asm-generic/mman-common.h", "include/linux/huge_mm.h",
+         "mm/madvise.c", "mm/khugepaged.c"],
+        _madvise_collapse_apply,
+    ),
+]
 
 
 if __name__ == "__main__":
     main()
+

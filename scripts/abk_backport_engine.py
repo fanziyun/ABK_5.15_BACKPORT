@@ -12,8 +12,9 @@ Status vocabulary:
     partial                  some hunks applied, some degraded (see detail)
     already_present          graft content already in the tree
     skip_suite_processed     another graft module already rewrote this region
-    skip_f2fs_rolled_back    a storage-rollback module changed the shape
     report_only              deliberately recorded, no edit performed
+                             (family gate, or a target file this tree cannot
+                             carry: still reported, never written)
     blocked_by_missing_anchor  anchor absent from this tree
     blocked_by_shape         tree shape not covered by any accepted variant
 """
@@ -32,14 +33,16 @@ import abk_common as common  # noqa: E402
 
 
 class GraftContext:
-    def __init__(self, common_dir, sub_level, family, dry_run=False):
+    def __init__(self, common_dir, sub_level, family, defconfig=None, dry_run=False):
         self.common_dir = Path(common_dir)
         self.sub_level = sub_level
         self.family = family
         self.dry_run = dry_run
+        self.defconfig = Path(defconfig) if defconfig else None
         self._texts = {}
         self._dirty = set()
         self._shape_cache = {}
+        self._defconfig_rel = self._resolve_defconfig()
 
     # -- file access -----------------------------------------------------
     def path(self, rel):
@@ -59,15 +62,72 @@ class GraftContext:
     def pending_writes(self):
         return sorted(self._dirty)
 
-    def snapshot_original(self, rel):
-        """Record the pristine bytes of ``rel`` before any group edits it.
+    # -- defconfig access --------------------------------------------------
+    def _resolve_defconfig(self):
+        """Return the defconfig path relative to the common dir, or None.
 
-        Normally :func:`abk_common.write_text` snapshots implicitly; this
-        exists for groups that want the backup taken even under dry-run.
+        A defconfig outside the common dir is refused rather than written:
+        rollback restores ``<file>.abk-orig`` snapshots found under the kernel
+        tree, so an edit outside it could never be undone.
         """
-        backup = Path(str(self.path(rel)) + common.BACKUP_SUFFIX)
-        if not backup.exists() and not self.dry_run:
-            backup.write_bytes(self.path(rel).read_bytes())
+        if self.defconfig is None:
+            return None
+        try:
+            return str(
+                self.defconfig.resolve().relative_to(self.common_dir.resolve())
+            )
+        except (ValueError, OSError):
+            return None
+
+    def defconfig_rel(self):
+        return self._defconfig_rel
+
+    def enable_configs(self, configs):
+        """Force ``CONFIG_<name>=<value>`` lines in the build defconfig.
+
+        Accepts the three shapes a defconfig may hold a symbol in: already at
+        the target value (no-op), present with a different value or as
+        ``# CONFIG_x is not set`` (rewritten in place), or absent entirely
+        (appended under one marker comment).  Line-based, so it is idempotent
+        whatever order the tree's own defconfig happens to be in.
+        """
+        rel = self.defconfig_rel()
+        if rel is None:
+            reason = ("no defconfig passed" if self.defconfig is None
+                      else "defconfig outside KERNEL_ROOT")
+            return "report_only", reason
+
+        text = self.read(rel)
+        joiner = "\r\n" if "\r\n" in text else "\n"
+        marker = "# " + common.MODULE_MARKER + " config_enablement"
+        appended = rewritten = 0
+
+        for name, value in configs:
+            target = f"CONFIG_{name}={value}"
+            lines = text.split(joiner)
+            if target in lines:
+                continue
+            for index, line in enumerate(lines):
+                if line == f"# CONFIG_{name} is not set" or (
+                        line.startswith(f"CONFIG_{name}=") and line != target):
+                    lines[index] = target
+                    rewritten += 1
+                    break
+            else:
+                if marker not in lines:
+                    lines.extend(["", marker])
+                lines.append(target)
+                appended += 1
+            text = joiner.join(lines)
+
+        if not appended and not rewritten:
+            return ("already_present",
+                    f"{len(configs)} symbol(s) already set in {rel}")
+        if not text.endswith(joiner):
+            text += joiner
+        self.write(rel, text)
+        return ("applied",
+                f"{appended} appended, {rewritten} rewritten in {rel}")
 
     # -- compatibility shape probes --------------------------------------
     def suite_touched(self, rel):
@@ -137,21 +197,59 @@ class PatchGroup:
         }
 
 
-def run_child(child_name, groups, ctx, args):
-    """Run every registered group and write the child report pair."""
+def shape_report(ctx):
+    """Tree-shape probes recorded by every run so composition can be audited.
+
+    ``block_rolled_back`` is informational: it records that the F2FS suite's
+    block rollback already ran, it gates nothing.
+    """
+    return {
+        "fdtable_upstream_shape": ctx.fdtable_upstream_shape(),
+        "suite_fdtable_fallback": ctx.suite_fdtable_fallback(),
+        "block_rolled_back": ctx.block_rolled_back(),
+    }
+
+
+def run_child(child_name, groups, ctx, args, enabled=True):
+    """Run every registered group and write the child report pair.
+
+    ``enabled`` is the family gate: on an unsupported family no group runs, the
+    report still lists them all, and nothing is read or written.
+    """
     results = []
     for group in groups:
-        before = set(ctx.pending_writes())
+        if not enabled:
+            results.append({
+                "key": group.key,
+                "summary": group.summary,
+                "commits": group.commits,
+                "files": group.files,
+                "status": "report_only",
+                "detail": f"family {ctx.family} is not android13-5.15; "
+                          "nothing read or written",
+            })
+            continue
+        before = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
         results.append(group.run(ctx))
-        after = set(ctx.pending_writes())
-        # Safety net: a degraded group must never have touched the tree.
-        if results[-1]["status"] not in ("applied", "partial", "already_present"):
-            leaked = after - before
-            if leaked:
+        changed = [rel for rel in ctx.pending_writes()
+                   if ctx.read(rel) != before.get(rel, None)]
+        status = results[-1]["status"]
+        # Safety nets: a degraded group must never have touched the tree, and
+        # a group claiming an edit must have changed at least one file.  The
+        # second catches a graft whose anchors all stopped matching but which
+        # still reports success.  Compare content, not path sets, so a group
+        # that rewrites a file another group already touched is a real edit.
+        if status not in ("applied", "partial", "already_present"):
+            if changed:
                 raise SystemExit(
                     f"group {group.key} degraded to {results[-1]['status']} "
-                    f"but already wrote {sorted(leaked)}; refusing to continue"
+                    f"but already wrote {sorted(changed)}; refusing to continue"
                 )
+        elif status in ("applied", "partial") and not changed:
+            raise SystemExit(
+                f"group {group.key} reported {status} without writing any "
+                "file; refusing to report a no-op as an edit"
+            )
 
     applied = [r["key"] for r in results if r["status"] in ("applied", "partial", "already_present")]
     summary = {}
@@ -165,11 +263,9 @@ def run_child(child_name, groups, ctx, args):
         "family": ctx.family,
         "sub_level": ctx.sub_level,
         "dry_run": ctx.dry_run,
-        "shapes": {
-            "fdtable_upstream_shape": ctx.fdtable_upstream_shape(),
-            "suite_fdtable_fallback": ctx.suite_fdtable_fallback(),
-            "block_rolled_back": ctx.block_rolled_back(),
-        },
+        "defconfig": str(ctx.defconfig) if ctx.defconfig else None,
+        "defconfig_writable": ctx.defconfig_rel() is not None,
+        "shapes": shape_report(ctx) if enabled else {},
         "pending_writes": ctx.pending_writes(),
         "applied_groups": applied,
         "status_summary": summary,
@@ -231,11 +327,15 @@ def parse_args(description):
     parser.add_argument("--family", required=True)
     parser.add_argument("--dry-run", action="store_true",
                         help="compute statuses without writing any kernel file")
+    parser.add_argument("--allow-unsupported", action="store_true",
+                        help="apply groups even when --family is not "
+                             "android13-5.15 (default: report_only only)")
     return parser.parse_args()
 
 
 def make_context(args):
-    ctx = GraftContext(args.common_dir, args.sub_level, args.family, dry_run=args.dry_run)
+    ctx = GraftContext(args.common_dir, args.sub_level, args.family,
+                       defconfig=args.defconfig, dry_run=args.dry_run)
     ctx.report_dir = args.report_dir
     return ctx
 
@@ -255,7 +355,16 @@ def apply_steps(ctx, steps):
     pending = {}
     results = []
     for rel, old, new, required in steps:
-        text = pending.get(rel, ctx.read(rel))
+        try:
+            text = pending.get(rel, ctx.read(rel))
+        except FileNotFoundError:
+            # A fixture or a real tree that never gained this file is a missing
+            # anchor, not a crash.
+            if required:
+                detail = f"{rel}: file absent"
+                return None, results, detail
+            results.append((rel, "missing_anchor"))
+            continue
         text, status = common.replace_once(text, old, new)
         results.append((rel, status))
         if status == "missing_anchor":
@@ -271,6 +380,13 @@ def apply_steps(ctx, steps):
             wrote.append(rel)
     applied = sum(1 for _r, s in results if s == "applied")
     present = sum(1 for _r, s in results if s == "already_present")
+    if applied == 0 and present == 0:
+        # Nothing matched at all -- including the empty step list.  Calling
+        # that already_present is the classic silent no-op: the graft never
+        # landed but the run still looked green.
+        missing = "; ".join(f"{r}:{s}" for r, s in results)
+        return ("blocked_by_missing_anchor", results,
+                "no step anchor matched (" + (missing or "empty step list") + ")")
     if applied == 0 and present == len(results):
         return "already_present", results, "all anchors already in the upstream form"
     detail = f"{applied} hunk(s) applied, {present} already present"

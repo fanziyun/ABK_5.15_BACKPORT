@@ -52,6 +52,31 @@ suite-preference cross-check.
   lands the full mechanism on the 2024-11 baseline; the graft marker
   doubles as the idempotency probe.
 
+## Batch 6: config lane, family gate, marker policy
+
+- **Config lane.** The children always received `--defconfig` but never used
+  it. `GraftContext.enable_configs()` now rewrites the three possible shapes
+  of a symbol (target value, `# CONFIG_x is not set`, another value, or
+  absent), snapshots through `.abk-orig`, and refuses to write a defconfig
+  outside `KERNEL_ROOT` (`report_only` with the reason). `config_enablement`
+  turns on the module's own symbols (`ZRAM_TRACK_ENTRY_ACTIME`,
+  `ZRAM_MULTI_COMP`) by default; `ABK_515_DEFCONFIG_ALIGN=1` additionally
+  aligns six 6.6-GKI defaults whose 5.15 code exists. CI's
+  `custom_kernel_options` still owns one-off config input; the module only
+  owns its own feature gates.
+- **Family gate.** A non-`android13-5.15` family now produces `report_only`
+  for every group without reading files; `--allow-unsupported` (shell:
+  `ABK_515_ALLOW_UNSUPPORTED=1`) is the explicit escape hatch. The old
+  message-only warning is gone.
+- **Marker policy.** New lines introduced by this module carry
+  `ABK stable_515_backport:`. Upstream-shape rewrites stay byte-faithful
+  (target form is the idempotency probe) so a baseline that already carries
+  the commit is never touched just to add a comment.
+- **No-op guard.** `apply_steps()` treats an empty or fully-unmatched step
+  list as `blocked_by_missing_anchor`, and `run_child()` now refuses both
+  directions: degraded groups that wrote, and groups that claim an edit
+  without changing any file content.
+
 
 ## Supported baselines (sublevel matrix)
 
@@ -63,9 +88,9 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 11 applied | 12 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 11 applied | 11 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 8 applied + 3 present | 10 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 14 applied | 12 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 14 applied | 11 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 11 applied + 3 present | 10 applied + 2 present |
 
 A second pass is `already_present` for every group on all three. Groups the
 baseline pre-empts:
@@ -78,9 +103,15 @@ baseline pre-empts:
 The expectations live in `tests/sublevel_matrix.py`, which both `tests/smoke.sh`
 and `tests/step_audit.py` read (keyed by the tree's Makefile `SUBLEVEL`, or
 `ABK_TEST_SUB_LEVEL`). Fetch a reference tree for any of them with
-`bash tests/fetch_sublevel_tree.sh <branch> <outdir>` — it pulls only the ~40
+`bash tests/fetch_sublevel_tree.sh <branch> <outdir>` — it pulls only the ~44
 files the groups touch, so no kernel clone is needed. Adding a baseline means
 adding a matrix entry; it does not mean adding version gating.
+
+The android13-5.15-lts tree (5.15.211) is a fourth fixture only: `step_audit.py`
+audits it against a matrix row whose two known debts are recorded
+(`randomize_kstack_pertask` and `blk_mq_suspend_wakeup_abort`, both
+`blocked_by_shape`), plus `sched_rt_optimizations` tracked as a documented
+partial-apply drift. lts is not a CI combination and nothing gates on it.
 
 Note that `fdtable_alloc_conventions` reporting `already_present` on 194 means
 `fs/file.c` carries **no** module marker there — the 5.15.195 `replace_fd()`
@@ -141,8 +172,11 @@ hunk and the ABI suite's blk-mq regions.
 Each child writes `<report_dir>/<child>_report.json` + `.md` (default
 `$KERNEL_ROOT/abk_5_15_backport_reports/<child>/`) with per-group status:
 `applied / partial / already_present / skip_suite_processed /
-skip_f2fs_rolled_back / report_only / blocked_by_missing_anchor /
-blocked_by_shape`. Reports are also `.abk-orig`-snapshotted across runs.
+report_only / blocked_by_missing_anchor / blocked_by_shape`. `report_only` is
+produced by the family gate (any non-android13-5.15 lineage) and by groups
+whose target file is outside the kernel tree (the defconfig lane refuses to
+write beyond KERNEL_ROOT so rollback can always restore it). Reports are also
+`.abk-orig`-snapshotted across runs.
 
 ## Backups and rollback
 
