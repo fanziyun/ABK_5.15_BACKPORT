@@ -42,6 +42,9 @@ REQUIRED_CONTENT = {
     "core:zram_recompression": [
         "zram_recompress", "recompress_store", "mark_idle",
         "num_active_comps", "zs_lookup_class_index",
+        # Semantic checks to prevent empty implementation regression:
+        "for (prio = 0; prio < ZRAM_MAX_COMPS; prio++)",  # disksize_store loop
+        "zram_set_priority(zram, index, 0)",  # zram_free_page priority reset
     ],
     "core:memcg_memory_reclaim": ["memory.reclaim", "MEMCG_RECLAIM_MAY_SWAP"],
     "core:zsmalloc_chain_size": [
@@ -74,6 +77,81 @@ REQUIRED_ABSENT = {
         "drm_atomic_check_valid_clones(state, crtc)",
     ],
 }
+
+# Function-scoped assertions.  REQUIRED_CONTENT above is whole-file substring
+# matching, which cannot tell *which* function a graft landed in -- a swapped
+# pair of anchors satisfies it perfectly.  These entries slice out one function
+# body and assert on that slice, so a hunk landing in the neighbouring function
+# fails the audit.  Keyed as "child:group" -> list of
+# (rel, function_name, must_contain, must_not_contain).
+REQUIRED_IN_FUNCTION = {
+    "core:zram_recompression": [
+        # The read path must delegate to the shared helper, not carry its own
+        # copy of the decompress logic (two copies is how the get/put anchors
+        # got swapped in the first place).
+        ("drivers/block/zram/zram_drv.c", "__zram_bvec_read",
+         ["zram_read_from_zspool(zram, page, index)"],
+         ["zcomp_decompress", "zcomp_stream_get"]),
+        # The helper selects the comp by the slot's stored priority.
+        ("drivers/block/zram/zram_drv.c", "zram_read_from_zspool",
+         ["prio = zram_get_priority(zram, index)",
+          "zcomp_stream_get(zram->comps[prio])",
+          "zcomp_stream_put(zram->comps[prio])"],
+         ["zram->comp)"]),
+        # The write path always compresses with the primary comp.
+        ("drivers/block/zram/zram_drv.c", "__zram_bvec_write",
+         ["zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP])"],
+         ["zram_get_priority", "zram->comp)"]),
+        # Secondary comps must actually be created, or every recompress path
+        # short-circuits on a NULL comps[prio] and the group is a no-op.
+        ("drivers/block/zram/zram_drv.c", "disksize_store",
+         ["for (prio = 0; prio < ZRAM_MAX_COMPS; prio++)",
+          "zram->comps[prio] = comp", "zram->num_active_comps++",
+          "out_free_comps"],
+         []),
+        # A reused slot must not keep a stale comp priority: the next write
+        # compresses with the primary comp, so a stale priority would decompress
+        # through the wrong algorithm.
+        ("drivers/block/zram/zram_drv.c", "zram_free_page",
+         ["zram_set_priority(zram, index, 0)",
+          "zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE)"],
+         []),
+    ],
+}
+
+
+def function_body(text, name):
+    """Return the text of `name`'s definition, or None.
+
+    Matches a line whose last token before '(' is `name` at column 0 (kernel
+    style puts the return type on the same line), then runs to the first
+    line-initial '}'.  Returns every matching definition joined, so a symbol
+    with an #ifdef/#else pair of definitions is checked as a whole.
+    """
+    bodies = []
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith((" ", "\t", "#", "*", "/")) or f"{name}(" not in line:
+            continue
+        head = line.split(f"{name}(")[0]
+        if head and not head.endswith(("*", " ")):
+            continue
+        # Look ahead to find the opening brace (may be several lines after signature)
+        brace_start = None
+        for scan in range(index, min(index + 20, len(lines))):
+            if lines[scan].rstrip().endswith(";"):
+                break  # forward declaration
+            if lines[scan].lstrip().startswith("{"):
+                brace_start = scan
+                break
+        if brace_start is None:
+            continue
+        # Now find the closing brace
+        for end in range(brace_start + 1, len(lines)):
+            if lines[end].startswith(("}", "};")):
+                bodies.append("\n".join(lines[index:end + 1]))
+                break
+    return "\n".join(bodies) if bodies else None
 
 
 def fail(msg):
@@ -134,6 +212,27 @@ def run_tree(source):
                     if present:
                         problems.append(f"{child}/{group.key}: removed "
                                         f"content survived {present}")
+
+                # Function-scoped assertions
+                if key in REQUIRED_IN_FUNCTION and status in ("applied", "partial"):
+                    for rel, fn_name, must_have, must_not_have in REQUIRED_IN_FUNCTION[key]:
+                        if not ctx.path(rel).exists():
+                            continue
+                        text = ctx.read(rel)
+                        body = function_body(text, fn_name)
+                        if not body:
+                            problems.append(f"{child}/{group.key}: function "
+                                            f"{fn_name} not found in {rel}")
+                            continue
+                        for needle in must_have:
+                            if needle not in body:
+                                problems.append(f"{child}/{group.key}: {fn_name} "
+                                                f"missing required text: {needle!r}")
+                        for needle in must_not_have:
+                            if needle in body:
+                                problems.append(f"{child}/{group.key}: {fn_name} "
+                                                f"has forbidden text: {needle!r}")
+
                 if status in ("applied", "partial") and \
                         not any(MARKER in ctx.read(f) for f in changed):
                     print(f"  info: {child}/{group.key}: no module marker "

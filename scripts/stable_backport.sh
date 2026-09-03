@@ -83,7 +83,6 @@ abk_stable_backport_preflight_perf() {
   abk_require_file "$common_dir/net/core/sock.c"
   abk_require_file "$common_dir/kernel/locking/semaphore.c"
   abk_require_file "$common_dir/block/blk-mq.c"
-  abk_require_file "$common_dir/mm/oom_kill.c"
 }
 
 abk_stable_backport_preflight_display() {

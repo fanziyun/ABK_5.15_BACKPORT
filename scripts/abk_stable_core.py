@@ -1427,7 +1427,7 @@ def _zram_recompression_apply(ctx):
          "\tunsigned long flags = zram->table[index].flags >> ZRAM_FLAG_SHIFT;\n\n"
          "\tzram->table[index].flags = (flags << ZRAM_FLAG_SHIFT) | size;\n"
          "}\n\n"
-         "static inline void __maybe_unused zram_set_priority(struct zram *zram, u32 index,\n"
+         "static inline void zram_set_priority(struct zram *zram, u32 index,\n"
          "\t\t\t\t\t u32 prio)\n"
          "{\n"
          "\tprio &= ZRAM_COMP_PRIORITY_MASK;\n"
@@ -1441,20 +1441,127 @@ def _zram_recompression_apply(ctx):
          "\treturn prio & ZRAM_COMP_PRIORITY_MASK;\n"
          "}",
          T),
-        # -- zram_drv.c: read path selects comp by stored priority --
+        # -- zram_drv.c: __zram_bvec_read becomes a thin wrapper over the new
+        #    zram_read_from_zspool() helper (upstream 6.6 shape).  This MUST run
+        #    before the write-path zcomp_stream_put() steps below: those anchors
+        #    are bare `zcomp_stream_put(zram->comp);` lines whose first match in
+        #    file order lives in this function, so rewriting the read path first
+        #    is what keeps them landing in __zram_bvec_write.  It also removes
+        #    the duplicate decompress path and defines the helper that
+        #    zram_recompress() calls. --
         ("drivers/block/zram/zram_drv.c",
-         "\tzstrm = zcomp_stream_get(zram->comp);\n"
-         "\tsrc = kmap_atomic(page);",
-         "\tzstrm = zcomp_stream_get(zram->comps[zram_get_priority(zram, index)]);\n"
-         "\tsrc = kmap_atomic(page);",
-         T),
-        ("drivers/block/zram/zram_drv.c",
-         "\tzcomp_stream_put(zram->comp);",
-         "\tzcomp_stream_put(zram->comps[zram_get_priority(zram, index)]);",
+         "static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,\n"
+         "\t\t\t\tstruct bio *bio, bool partial_io)\n"
+         "{\n"
+         "\tstruct zcomp_strm *zstrm;\n"
+         "\tunsigned long handle;\n"
+         "\tunsigned int size;\n"
+         "\tvoid *src, *dst;\n"
+         "\tint ret;\n\n"
+         "\tzram_slot_lock(zram, index);\n"
+         "\tif (zram_test_flag(zram, index, ZRAM_WB)) {\n"
+         "\t\tstruct bio_vec bvec;\n\n"
+         "\t\tzram_slot_unlock(zram, index);\n\n"
+         "\t\tbvec.bv_page = page;\n"
+         "\t\tbvec.bv_len = PAGE_SIZE;\n"
+         "\t\tbvec.bv_offset = 0;\n"
+         "\t\treturn read_from_bdev(zram, &bvec,\n"
+         "\t\t\t\tzram_get_element(zram, index),\n"
+         "\t\t\t\tbio, partial_io);\n"
+         "\t}\n\n"
+         "\thandle = zram_get_handle(zram, index);\n"
+         "\tif (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {\n"
+         "\t\tunsigned long value;\n"
+         "\t\tvoid *mem;\n\n"
+         "\t\tvalue = handle ? zram_get_element(zram, index) : 0;\n"
+         "\t\tmem = kmap_atomic(page);\n"
+         "\t\tzram_fill_page(mem, PAGE_SIZE, value);\n"
+         "\t\tkunmap_atomic(mem);\n"
+         "\t\tzram_slot_unlock(zram, index);\n"
+         "\t\treturn 0;\n"
+         "\t}\n\n"
+         "\tsize = zram_get_obj_size(zram, index);\n\n"
+         "\tif (size != PAGE_SIZE)\n"
+         "\t\tzstrm = zcomp_stream_get(zram->comp);\n\n"
+         "\tsrc = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);\n"
+         "\tif (size == PAGE_SIZE) {\n"
+         "\t\tdst = kmap_atomic(page);\n"
+         "\t\tmemcpy(dst, src, PAGE_SIZE);\n"
+         "\t\tkunmap_atomic(dst);\n"
+         "\t\tret = 0;\n"
+         "\t} else {\n"
+         "\t\tdst = kmap_atomic(page);\n"
+         "\t\tret = zcomp_decompress(zstrm, src, size, dst);\n"
+         "\t\tkunmap_atomic(dst);\n"
+         "\t\tzcomp_stream_put(zram->comp);\n"
+         "\t}\n"
+         "\tzs_unmap_object(zram->mem_pool, handle);\n"
+         "\tzram_slot_unlock(zram, index);",
+         "/*\n"
+         " * Reads (decompresses if needed) a page from zspool (zsmalloc).\n"
+         " * Corresponding ZRAM slot should be locked.\n"
+         " */\n"
+         "static int zram_read_from_zspool(struct zram *zram, struct page *page,\n"
+         "\t\t\t\t u32 index)\n"
+         "{\n"
+         "\tstruct zcomp_strm *zstrm;\n"
+         "\tunsigned long handle;\n"
+         "\tunsigned int size;\n"
+         "\tvoid *src, *dst;\n"
+         "\tu32 prio;\n"
+         "\tint ret;\n\n"
+         "\thandle = zram_get_handle(zram, index);\n"
+         "\tif (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {\n"
+         "\t\tunsigned long value;\n"
+         "\t\tvoid *mem;\n\n"
+         "\t\tvalue = handle ? zram_get_element(zram, index) : 0;\n"
+         "\t\tmem = kmap_atomic(page);\n"
+         "\t\tzram_fill_page(mem, PAGE_SIZE, value);\n"
+         "\t\tkunmap_atomic(mem);\n"
+         "\t\treturn 0;\n"
+         "\t}\n\n"
+         "\tsize = zram_get_obj_size(zram, index);\n\n"
+         "\tprio = zram_get_priority(zram, index);\n"
+         "\tif (size != PAGE_SIZE)\n"
+         "\t\tzstrm = zcomp_stream_get(zram->comps[prio]);\n\n"
+         "\tsrc = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);\n"
+         "\tif (size == PAGE_SIZE) {\n"
+         "\t\tdst = kmap_atomic(page);\n"
+         "\t\tmemcpy(dst, src, PAGE_SIZE);\n"
+         "\t\tkunmap_atomic(dst);\n"
+         "\t\tret = 0;\n"
+         "\t} else {\n"
+         "\t\tdst = kmap_atomic(page);\n"
+         "\t\tret = zcomp_decompress(zstrm, src, size, dst);\n"
+         "\t\tkunmap_atomic(dst);\n"
+         "\t\tzcomp_stream_put(zram->comps[prio]);\n"
+         "\t}\n"
+         "\tzs_unmap_object(zram->mem_pool, handle);\n"
+         "\treturn ret;\n"
+         "}\n\n"
+         "static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,\n"
+         "\t\t\t\tstruct bio *bio, bool partial_io)\n"
+         "{\n"
+         "\tint ret;\n\n"
+         "\tzram_slot_lock(zram, index);\n"
+         "\tif (zram_test_flag(zram, index, ZRAM_WB)) {\n"
+         "\t\tstruct bio_vec bvec;\n\n"
+         "\t\tzram_slot_unlock(zram, index);\n\n"
+         "\t\tbvec.bv_page = page;\n"
+         "\t\tbvec.bv_len = PAGE_SIZE;\n"
+         "\t\tbvec.bv_offset = 0;\n"
+         "\t\treturn read_from_bdev(zram, &bvec,\n"
+         "\t\t\t\tzram_get_element(zram, index),\n"
+         "\t\t\t\tbio, partial_io);\n"
+         "\t}\n\n"
+         "\tret = zram_read_from_zspool(zram, page, index);\n"
+         "\tzram_slot_unlock(zram, index);",
          T),
         # -- zram_drv.c: __zram_bvec_write uses primary comp --
         ("drivers/block/zram/zram_drv.c",
+         "compress_again:\n"
          "\tzstrm = zcomp_stream_get(zram->comp);",
+         "compress_again:\n"
          "\tzstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);",
          T),
         # -- zram_drv.c: write-path stream puts use primary comp (4 sites) --
@@ -1482,6 +1589,90 @@ def _zram_recompression_apply(ctx):
          "\tzcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);\n"
          "\tzs_unmap_object(zram->mem_pool, handle);",
          T),
+        # -- zram_drv.c: zram_free_page resets priority + INCOMPRESSIBLE so a
+        #    reused slot is never decompressed with a stale comp priority.  The
+        #    trailing WARN_ON_ONCE mask needs no change: the reset runs before
+        #    the `out:` label, so every path reaching the WARN has priority 0
+        #    (this is why upstream 6.6 leaves that mask alone). --
+        ("drivers/block/zram/zram_drv.c",
+         "\tif (zram_test_flag(zram, index, ZRAM_HUGE)) {\n"
+         "\t\tzram_clear_flag(zram, index, ZRAM_HUGE);\n"
+         "\t\tatomic64_dec(&zram->stats.huge_pages);\n"
+         "\t}\n\n"
+         "\tif (zram_test_flag(zram, index, ZRAM_WB)) {",
+         "\tif (zram_test_flag(zram, index, ZRAM_HUGE)) {\n"
+         "\t\tzram_clear_flag(zram, index, ZRAM_HUGE);\n"
+         "\t\tatomic64_dec(&zram->stats.huge_pages);\n"
+         "\t}\n\n"
+         "\tif (zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))\n"
+         "\t\tzram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE);\n\n"
+         "\tzram_set_priority(zram, index, 0);\n\n"
+         "\tif (zram_test_flag(zram, index, ZRAM_WB)) {",
+         T),
+        # -- zram_drv.c: zram_free_page ac_time reset follows the new guard --
+        ("drivers/block/zram/zram_drv.c",
+         "\tunsigned long handle;\n\n"
+         "#ifdef CONFIG_ZRAM_MEMORY_TRACKING\n"
+         "\tzram->table[index].ac_time = 0;\n"
+         "#endif",
+         "\tunsigned long handle;\n\n"
+         "#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME\n"
+         "\tzram->table[index].ac_time = 0;\n"
+         "#endif",
+         T),
+        # -- zram_drv.c: zram_accessed must write ac_time whenever the new
+        #    ZRAM_TRACK_ENTRY_ACTIME guard is set.  The 5.15 baseline keeps two
+        #    definitions (debugfs on / off) and only the debugfs-on one writes
+        #    ac_time, so with MEMORY_TRACKING off (the GKI default) the field
+        #    would be read by mark_idle() and never written -- every page then
+        #    looks infinitely old.  Both definitions are rewritten in place;
+        #    upstream 6.6 instead collapses them, but a pure deletion cannot be
+        #    expressed as a replace_once step (the replacement would be a
+        #    subset of the anchor and short-circuit to already_present). --
+        ("drivers/block/zram/zram_drv.c",
+         "static void zram_accessed(struct zram *zram, u32 index)\n"
+         "{\n"
+         "\tzram_clear_flag(zram, index, ZRAM_IDLE);\n"
+         "\tzram->table[index].ac_time = ktime_get_boottime();\n"
+         "}",
+         "static void zram_accessed(struct zram *zram, u32 index)\n"
+         "{\n"
+         "\tzram_clear_flag(zram, index, ZRAM_IDLE);\n"
+         "#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME\n"
+         "\tzram->table[index].ac_time = ktime_get_boottime();\n"
+         "#endif\n"
+         "}",
+         T),
+        ("drivers/block/zram/zram_drv.c",
+         "static void zram_accessed(struct zram *zram, u32 index)\n"
+         "{\n"
+         "\tzram_clear_flag(zram, index, ZRAM_IDLE);\n"
+         "};",
+         "static void zram_accessed(struct zram *zram, u32 index)\n"
+         "{\n"
+         "\tzram_clear_flag(zram, index, ZRAM_IDLE);\n"
+         "#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME\n"
+         "\tzram->table[index].ac_time = ktime_get_boottime();\n"
+         "#endif\n"
+         "};",
+         T),
+        # -- zram_drv.c: zram_destroy_comps helper tears down every active comp --
+        ("drivers/block/zram/zram_drv.c",
+         "static void zram_reset_device(struct zram *zram)",
+         "static void zram_destroy_comps(struct zram *zram)\n"
+         "{\n"
+         "\tu32 prio;\n\n"
+         "\tfor (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {\n"
+         "\t\tstruct zcomp *comp = zram->comps[prio];\n\n"
+         "\t\tzram->comps[prio] = NULL;\n"
+         "\t\tif (!comp)\n"
+         "\t\t\tcontinue;\n"
+         "\t\tzcomp_destroy(comp);\n"
+         "\t\tzram->num_active_comps--;\n"
+         "\t}\n"
+         "}\n\n"
+         "static void zram_reset_device(struct zram *zram)",
+         T),
         # -- zram_drv.c: zram_reset_device destroys all comps --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_reset_device(struct zram *zram)\n"
@@ -1508,16 +1699,13 @@ def _zram_recompression_apply(ctx):
          "}",
          "static void zram_reset_device(struct zram *zram)\n"
          "{\n"
-         "\tstruct zcomp *comp;\n"
-         "\tu64 disksize;\n"
-         "\tu32 prio;\n\n"
+         "\tu64 disksize;\n\n"
          "\tdown_write(&zram->init_lock);\n\n"
          "\tzram->limit_pages = 0;\n\n"
          "\tif (!init_done(zram)) {\n"
          "\t\tup_write(&zram->init_lock);\n"
          "\t\treturn;\n"
          "\t}\n\n"
-         "\tzram->num_active_comps = 0;\n"
          "\tdisksize = zram->disksize;\n"
          "\tzram->disksize = 0;\n\n"
          "\tset_capacity_and_notify(zram->disk, 0);\n"
@@ -1526,61 +1714,14 @@ def _zram_recompression_apply(ctx):
          "\t/* I/O operation under all of CPU are done so let's free */\n"
          "\tzram_meta_free(zram, disksize);\n"
          "\tmemset(&zram->stats, 0, sizeof(zram->stats));\n"
-         "\tfor (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {\n"
-         "\t\tcomp = zram->comps[prio];\n"
-         "\t\tif (comp)\n"
-         "\t\t\tzcomp_destroy(comp);\n"
-         "\t\tzram->comps[prio] = NULL;\n"
-         "\t}\n"
+         "\tzram_destroy_comps(zram);\n"
          "\treset_bdev(zram);\n"
          "}",
          T),
-        # -- zram_drv.c: zram_read_from_zspool + recompression machinery --
+        # -- zram_drv.c: recompression machinery (needs zram_read_from_zspool,
+        #    which the read-path rewrite above defines earlier in the file) --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_bio_discard(struct zram *zram, u32 index,",
-         "/*\n"
-         " * Reads (decompresses if needed) a page from zspool (zsmalloc).\n"
-         " * Corresponding ZRAM slot should be locked.\n"
-         " */\n"
-         "static int __maybe_unused zram_read_from_zspool(struct zram *zram, struct page *page,\n"
-         "\t\t\t\t u32 index)\n"
-         "{\n"
-         "\tstruct zcomp_strm *zstrm;\n"
-         "\tunsigned long handle;\n"
-         "\tunsigned int size;\n"
-         "\tvoid *src, *dst;\n"
-         "\tu32 prio;\n"
-         "\tint ret;\n\n"
-         "\thandle = zram_get_handle(zram, index);\n"
-         "\tif (!handle || zram_test_flag(zram, index, ZRAM_SAME)) {\n"
-         "\t\tunsigned long value;\n"
-         "\t\tvoid *mem;\n\n"
-         "\t\tvalue = handle ? zram_get_element(zram, index) : 0;\n"
-         "\t\tmem = kmap_atomic(page);\n"
-         "\t\tzram_fill_page(mem, PAGE_SIZE, value);\n"
-         "\t\tkunmap_atomic(mem);\n"
-         "\t\treturn 0;\n"
-         "\t}\n\n"
-         "\tsize = zram_get_obj_size(zram, index);\n\n"
-         "\tif (size != PAGE_SIZE) {\n"
-         "\t\tprio = zram_get_priority(zram, index);\n"
-         "\t\tzstrm = zcomp_stream_get(zram->comps[prio]);\n"
-         "\t}\n\n"
-         "\tsrc = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);\n"
-         "\tif (size == PAGE_SIZE) {\n"
-         "\t\tdst = kmap_atomic(page);\n"
-         "\t\tmemcpy(dst, src, PAGE_SIZE);\n"
-         "\t\tkunmap_atomic(dst);\n"
-         "\t\tret = 0;\n"
-         "\t} else {\n"
-         "\t\tdst = kmap_atomic(page);\n"
-         "\t\tret = zcomp_decompress(zstrm, src, size, dst);\n"
-         "\t\tkunmap_atomic(dst);\n"
-         "\t\tzcomp_stream_put(zram->comps[prio]);\n"
-         "\t}\n"
-         "\tzs_unmap_object(zram->mem_pool, handle);\n"
-         "\treturn ret;\n"
-         "}\n\n"
          "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
          "/*\n"
          " * Decompress (unless it's ZRAM_HUGE) the page and attempt to compress\n"
@@ -2011,6 +2152,7 @@ def _zram_recompression_apply(ctx):
          "}",
          T),
         # -- zram_drv.c: disksize_store creates primary comp into comps[0] --
+        # -- zram_drv.c: disksize_store creates every configured comp --
         ("drivers/block/zram/zram_drv.c",
          "\tcomp = zcomp_create(zram->compressor);\n"
          "\tif (IS_ERR(comp)) {\n"
@@ -2021,15 +2163,42 @@ def _zram_recompression_apply(ctx):
          "\t}\n\n"
          "\tzram->comp = comp;\n"
          "\tzram->disksize = disksize;",
-         "\tcomp = zcomp_create(zram->comp_algs[ZRAM_PRIMARY_COMP]);\n"
-         "\tif (IS_ERR(comp)) {\n"
-         "\t\tpr_err(\"Cannot initialise %s compressing backend\\n\",\n"
-         "\t\t\t\tzram->comp_algs[ZRAM_PRIMARY_COMP]);\n"
-         "\t\terr = PTR_ERR(comp);\n"
-         "\t\tgoto out_free_meta;\n"
-         "\t}\n\n"
-         "\tzram->comps[ZRAM_PRIMARY_COMP] = comp;\n"
+         "\tfor (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {\n"
+         "\t\tif (!zram->comp_algs[prio])\n"
+         "\t\t\tcontinue;\n\n"
+         "\t\tcomp = zcomp_create(zram->comp_algs[prio]);\n"
+         "\t\tif (IS_ERR(comp)) {\n"
+         "\t\t\tpr_err(\"Cannot initialise %s compressing backend\\n\",\n"
+         "\t\t\t       zram->comp_algs[prio]);\n"
+         "\t\t\terr = PTR_ERR(comp);\n"
+         "\t\t\tgoto out_free_comps;\n"
+         "\t\t}\n\n"
+         "\t\tzram->comps[prio] = comp;\n"
+         "\t\tzram->num_active_comps++;\n"
+         "\t}\n"
          "\tzram->disksize = disksize;",
+         T),
+        # -- zram_drv.c: disksize_store gains the prio loop variable --
+        ("drivers/block/zram/zram_drv.c",
+         "\tu64 disksize;\n"
+         "\tstruct zcomp *comp;\n"
+         "\tstruct zram *zram = dev_to_zram(dev);\n"
+         "\tint err;\n",
+         "\tu64 disksize;\n"
+         "\tstruct zcomp *comp;\n"
+         "\tstruct zram *zram = dev_to_zram(dev);\n"
+         "\tint err;\n"
+         "\tu32 prio;\n",
+         T),
+        # -- zram_drv.c: disksize_store error path frees every comp --
+        ("drivers/block/zram/zram_drv.c",
+         "out_free_meta:\n"
+         "\tzram_meta_free(zram, disksize);\n"
+         "out_unlock:",
+         "out_free_comps:\n"
+         "\tzram_destroy_comps(zram);\n"
+         "\tzram_meta_free(zram, disksize);\n"
+         "out_unlock:",
          T),
         # -- zram_drv.c: zram_add sets default primary comp --
         ("drivers/block/zram/zram_drv.c",
