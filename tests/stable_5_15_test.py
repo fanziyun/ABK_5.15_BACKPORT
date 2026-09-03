@@ -340,15 +340,57 @@ def test_replace_fd_errno_group():
               ctx.pending_writes())
 
 
+def test_display_valid_clones_revert():
+    """The 5.15.185 valid-clones revert must apply on check-carrying trees,
+    report already_present on pre-185 trees, and never half-patch a shape it
+    does not recognize."""
+    print("display valid-clones revert")
+    import abk_stable_display as display
+
+    group = next(g for g in display.PATCH_GROUPS if g.key == "drm_valid_clones_revert")
+    rel = "drivers/gpu/drm/drm_atomic_helper.c"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 5.15.185+ shape: function and call site both present.
+        ctx = make_ctx(tmp, {rel: display._VC_FN_OLD + "\n" + display._VC_CALL_OLD})
+        status, detail = group.apply_fn(ctx)
+        check("185+ shape reverts", status == "applied", (status, detail))
+        text = ctx.read(rel)
+        check("function removed", "drm_atomic_check_valid_clones" not in text)
+        check("call site removed", "drm_atomic_check_valid_clones(state, crtc)" not in text)
+        status2, _ = group.apply_fn(ctx)
+        check("second pass is already_present", status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Pre-185 shape: the fixed form already exists (167/178 baselines).
+        pre185 = display._VC_FN_NEW + "\n" + display._VC_CALL_NEW
+        ctx = make_ctx(tmp, {rel: pre185})
+        before = ctx.read(rel)
+        status, detail = group.apply_fn(ctx)
+        check("pre-185 shape already fixed",
+              status == "already_present", (status, detail))
+        check("pre-185 tree untouched", ctx.read(rel) == before)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Unrecognized shape: both steps must degrade without writing.
+        ctx = make_ctx(tmp, {rel: "static int unrelated(void) { return 0; }\n"})
+        before = ctx.read(rel)
+        status, detail = group.apply_fn(ctx)
+        check("unknown shape degrades", status == "blocked_by_shape", (status, detail))
+        check("degraded tree untouched", ctx.read(rel) == before)
+
+
 def test_sublevel_matrix():
     """The expectation matrix must stay in sync with the registries."""
     print("sublevel expectation matrix")
     import abk_stable_core as core
     import abk_stable_perf as perf
+    import abk_stable_display as display
 
     registries = {
         "stable_backport_core": core.PATCH_GROUPS,
         "stable_perf_backport": perf.PATCH_GROUPS,
+        "stable_display_fix": display.PATCH_GROUPS,
     }
     for child, groups in registries.items():
         check(f"{child} group count matches registry",
@@ -370,13 +412,17 @@ def test_sublevel_matrix():
             check(f"{child}@{sub_level} summary totals all groups",
                   sum(summary.values()) == len(groups), summary)
 
-    # Every sublevel must cover both children, and 167 must be all-applied.
+    # Every sublevel must cover every child, and 167 must be all-applied for
+    # the forward-graft children.  The display child is a revert: on 167 the
+    # 5.15.185 valid-clones check never existed, so its group is legitimately
+    # already_present there (see sublevel_matrix.PRE_APPLIED).
     for sub_level in sublevel_matrix.SUPPORTED:
-        check(f"{sub_level} covers both children",
+        check(f"{sub_level} covers every child",
               set(sublevel_matrix.PRE_APPLIED[sub_level]) == set(registries),
               set(sublevel_matrix.PRE_APPLIED[sub_level]))
-    check("167 is the all-applied baseline",
-          all(not sublevel_matrix.pre_applied("167", c) for c in registries))
+    check("167 is the all-applied baseline for forward grafts",
+          all(not sublevel_matrix.pre_applied("167", c)
+              for c in registries if c != "stable_display_fix"))
 
 
 def test_f2fs_shape_probe():
@@ -615,6 +661,7 @@ def main():
     test_batch6_registration()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()
+    test_display_valid_clones_revert()
     test_sublevel_matrix()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()

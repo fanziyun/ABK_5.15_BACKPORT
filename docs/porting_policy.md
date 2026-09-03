@@ -130,8 +130,10 @@ CI executes injected modules in input order, so the canonical input is:
    `storage_common_fixups`) — restore the storage baseline first; its
    `git apply --reverse --check` breaks if anything rewrites block//f2fs
    before it.
-2. **This module** (`stable_backport_core`, `stable_perf_backport`) —
-   forward grafts onto the settled baseline.
+2. **This module** (`stable_backport_core`, `stable_perf_backport`,
+   `stable_display_fix`) — forward grafts onto the settled baseline; the
+   display child only touches `drivers/gpu/drm/drm_atomic_helper.c` and is
+   order-independent.
 3. `ABK_ABI_PATCH_SUITE` children — the fdtable probe then detects the
    upstream shape this module landed and takes its adapt branch instead of
    its fallback rewrite.

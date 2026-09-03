@@ -11,6 +11,11 @@ This table records, per sublevel, which groups are expected to arrive
 pre-applied.  Anything not listed must report ``applied`` on a pristine tree;
 nothing may ever report ``blocked_by_shape``.
 
+The display child is a revert: on baselines that never carried the 5.15.185
+valid-clones check (167/178) the tree is already in the fixed form, so its
+group reports ``already_present`` there — recorded in PRE_APPLIED just like a
+forward graft whose upstream commit the baseline already carries.
+
 Verified against the real AOSP branches:
   167 -> deprecated/android13-5.15-2024-11
   178 -> deprecated/android13-5.15-2025-03
@@ -23,6 +28,7 @@ from __future__ import annotations
 GROUP_COUNTS = {
     "stable_backport_core": 14,
     "stable_perf_backport": 12,
+    "stable_display_fix": 1,
 }
 
 # sublevel -> child id -> groups whose upstream commit the baseline already has
@@ -30,11 +36,15 @@ PRE_APPLIED = {
     "167": {
         "stable_backport_core": set(),
         "stable_perf_backport": set(),
+        # The 5.15.185 valid-clones check never existed on 167: the tree is
+        # already in the fixed (pre-185) form.
+        "stable_display_fix": {"drm_valid_clones_revert"},
     },
     "178": {
         "stable_backport_core": set(),
         # 5.15.174 NOHZ series landed in the 2025-03 baseline.
         "stable_perf_backport": {"sched_nohz_idle_balance_series"},
+        "stable_display_fix": {"drm_valid_clones_revert"},
     },
     "194": {
         # 5.15.191 fd-table conventions, 5.15.191 cpuset bail-out and the
@@ -49,6 +59,9 @@ PRE_APPLIED = {
             "sched_nohz_idle_balance_series",
             "semaphore_wake_q",
         },
+        # The 2025-12 baseline carries the 5.15.185 valid-clones check: the
+        # revert really applies here.
+        "stable_display_fix": set(),
     },
     # android13-5.15-lts: not a CI combination yet, but tracked so the local
     # .211 tree can be audited and drift surfaces before the baseline ships.
@@ -56,7 +69,7 @@ PRE_APPLIED = {
     # The two remaining perf debts are known blockers from plan.md: the lts
     # branch already occupies the kstack KABI slot 1 shape, and its blk-mq
     # suspend path was rewritten upstream-first, so both report
-    # blocked_by_shape until Batch 7.
+    # blocked_by_shape until a later batch.
     "211": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
@@ -76,6 +89,8 @@ PRE_APPLIED = {
             "sched_rt_optimizations",
             "sched_dst_group_allowed_stats",
         },
+        # The lts branch carries the valid-clones check; the revert applies.
+        "stable_display_fix": set(),
     },
 }
 

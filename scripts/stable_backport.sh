@@ -7,7 +7,7 @@
 #   3. ABK_ABI_PATCH_SUITE runs last; its fd_alloc_hotpath probe detects the
 #      upstream fdtable shape landed by stable_backport_core and adapts.
 
-ABK_515_BACKPORT_PUBLIC_CHILDREN="stable_backport_core stable_perf_backport"
+ABK_515_BACKPORT_PUBLIC_CHILDREN="stable_backport_core stable_perf_backport stable_display_fix"
 
 abk_stable_backport_common_dir() {
   printf '%s\n' "$(abk_common_dir)"
@@ -53,6 +53,7 @@ abk_stable_backport_python_script() {
   case "$child_id" in
     stable_backport_core) printf '%s/abk_stable_core.py\n' "$script_dir" ;;
     stable_perf_backport) printf '%s/abk_stable_perf.py\n' "$script_dir" ;;
+    stable_display_fix) printf '%s/abk_stable_display.py\n' "$script_dir" ;;
     *) return 1 ;;
   esac
 }
@@ -83,6 +84,14 @@ abk_stable_backport_preflight_perf() {
   abk_require_file "$common_dir/kernel/locking/semaphore.c"
   abk_require_file "$common_dir/block/blk-mq.c"
   abk_require_file "$common_dir/mm/oom_kill.c"
+}
+
+abk_stable_backport_preflight_display() {
+  local common_dir
+  common_dir="$(abk_stable_backport_common_dir)"
+
+  abk_require_file "$common_dir/Makefile"
+  abk_require_file "$common_dir/drivers/gpu/drm/drm_atomic_helper.c"
 }
 
 abk_stable_backport_apply_child() {
@@ -129,16 +138,18 @@ abk_stable_backport_apply_selected() {
     case "$child_id" in
       stable_backport_core) abk_stable_backport_preflight_core ;;
       stable_perf_backport) abk_stable_backport_preflight_perf ;;
+      stable_display_fix) abk_stable_backport_preflight_display ;;
     esac
     abk_stable_backport_apply_child "$child_id"
     return 0
   fi
 
-  abk_log "no ABK_MODULE_CHILD_ID set; running both children in composition order"
+  abk_log "no ABK_MODULE_CHILD_ID set; running all public children in composition order"
   for child_id in $ABK_515_BACKPORT_PUBLIC_CHILDREN; do
     case "$child_id" in
       stable_backport_core) abk_stable_backport_preflight_core ;;
       stable_perf_backport) abk_stable_backport_preflight_perf ;;
+      stable_display_fix) abk_stable_backport_preflight_display ;;
     esac
     abk_stable_backport_apply_child "$child_id"
   done

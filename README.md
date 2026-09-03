@@ -25,6 +25,7 @@ is left byte-identical rather than touched up with a comment.
 |---|---|
 | `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), plus the module's defconfig lane that actually enables the recompression symbols |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
+| `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
@@ -63,8 +64,12 @@ combinations and put the module into `custom_external_modules`:
 | 194 | 2025-12 | `android13-5.15-2025-12` |
 
 ```
-set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch
+set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch
 ```
+
+The display fix child is independently injectable: a build that only needs
+the black-screen fix can carry just
+`set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch`.
 
 One injection string covers all three: the engine gates on text anchors, never
 on the sublevel, so a group whose upstream commit the baseline already carries
@@ -106,7 +111,7 @@ place), so all 14 groups land in either injection order.
 
 The core child now carries 14 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`); the perf
-child carries 12, for 26 groups in total.
+child carries 12; the display child carries 1, for 27 groups in total.
 
 The full input string for the F2FS + ABI-suite combination, the shape
 registry and the KMI compatibility matrix are documented in

@@ -3,6 +3,35 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 7（v0.8.0，display 修复子模块 stable_display_fix，已落地）
+
+上游 5.15.185 合入 `drm: Add valid clones check`（Concurrent Writeback 系列，
+`drivers/gpu/drm/drm_atomic_helper.c` 的 `drm_atomic_check_valid_clones()`）：
+校验 CRTC `encoder_mask` 里每个 encoder 的 `possible_clones` 必须覆盖整个
+mask，否则 `-EINVAL`。vendor `msm_drm`（按 5.15.178 之前 KMI 编译）的双 pipe
+分屏 + CWB 拓扑不满足该校验 → 5.15.185+（2025-07/09/12 月度分支）与 lts
+分支上 `drmModeAtomicCommit` 全部返回 -22，SDM 死循环提交失败，屏幕黑但
+触摸/指纹/系统正常（Xiaomi 13 fuxi / 14 vermeer 实测）。
+
+- [x] 新 child `stable_display_fix`，单组 `drm_valid_clones_revert`：两步
+  required 删除（函数定义 + `drm_atomic_helper_check_modeset()` 内调用点），
+  老块携带前后文使新块非空且唯一（纯空替换会撞 `replace_once` 的幂等前置
+  检查永不生效；另一处 `drm_atomic_add_affected_planes()` 调用在
+  `drm_atomic_helper_disable_all()` 内，锚定后续注释隔离）
+- [x] 基线语义：167/.178 从未带该校验 → 组报 `already_present` 零写入
+  （目标形态即 pre-185 上游形态）；194/lts 真正 `applied`；未知形态
+  `blocked_by_shape` 不半打补丁
+- [x] 逐分支核实 2025-07/09/12 与 lts 的函数/调用点字节一致（md5 相同），
+  2025-05 确认 pre-185 形态与替换文本逐字节吻合
+- [x] 矩阵/测试：GROUP_COUNTS +1，PRE_APPLIED 记录 167/.178 的
+  `drm_valid_clones_revert`，`stable_5_15_test.py` 新增三夹具单测（185+ 形态
+  applied/二次幂等、pre-185 already_present 零写入、未知形态降级零写入），
+  "167 all-applied" 断言对 revert 子模块豁免并注明原因；
+  step_audit/implementation_audit/smoke/fetch 全链路挂上新文件与新 child，
+  `REQUIRED_ABSENT` 断言检查符号零残留
+- [x] 注入方式：`set:...ABK_5.15_backport.git#stable_display_fix;after_patch`
+  可单独注入；README/module.conf 版本与描述同步
+
 ## Batch 6.1（v0.7.1，修 Batch 6 的 MADV_COLLAPSE 半应用，已落地）
 
 CI run 33582771814 在「编译内核」步骤挂在 `mm/khugepaged.c` 4 个错误上

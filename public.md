@@ -4,6 +4,7 @@ Active child ids for `set:<repo>#<child>;stage` injection:
 
 - `stable_backport_core`
 - `stable_perf_backport`
+- `stable_display_fix`
 
 Stage: `after_patch` (recommended and default). `before_build` is accepted
 and is a no-op.

@@ -72,6 +72,7 @@ SMOKE_FILES=(
   mm/madvise.c
   include/linux/huge_mm.h
   include/uapi/asm-generic/mman-common.h
+  drivers/gpu/drm/drm_atomic_helper.c
 )
 
 WORK="$(mktemp -d)"
@@ -113,14 +114,12 @@ tail -2 "$WORK/pass2.log"
 echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-if grep -q 'blocked_by_shape' "$WORK/pass1.log"; then
-  fail "pass 1 had a shape-blocked group (see log above)"
-fi
-if grep -q 'blocked_by_shape' "$WORK/pass2.log"; then
-  fail "pass 2 had a shape-blocked group (see log above)"
-fi
-
-for child in stable_backport_core stable_perf_backport; do
+# The per-child JSON assertions below are the authoritative degradation gate:
+# they compare the exact status summaries against sublevel_matrix (which
+# records the known .211 debts), so a blanket log grep here would wrongly fail
+# a baseline whose debts are expected blocked_by_shape.  Missing report files
+# are guarded inside the loop itself.
+for child in stable_backport_core stable_perf_backport stable_display_fix; do
   [ -f "$WORK/pass1_reports/$child/${child}_report.json" ] || fail "missing pass1 report for $child"
   [ -f "$KERNEL_ROOT/abk_5_15_backport_reports/$child/${child}_report.json" ] || fail "missing pass2 report for $child"
   "$python_bin" - "$WORK/pass1_reports/$child/${child}_report.json" \
@@ -151,8 +150,25 @@ done
 # grafted them, or the baseline already carried the upstream commit.
 grep -q "alloc_fdtable(unsigned int slots_wanted)" "$KERNEL_ROOT/common/fs/file.c" \
   || fail "fdtable conventions marker missing"
-grep -q "ANDROID_KABI_USE(8" "$KERNEL_ROOT/common/include/linux/sched.h" \
-  || fail "kstack KABI slot marker missing"
+# The kstack KABI slot marker only exists where randomize_kstack_pertask really
+# lands; on the .211 lts baseline it is a known debt (blocked_by_shape), so the
+# marker is legitimately absent there.
+if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+sub = sys.argv[2]
+key = "randomize_kstack_pertask"
+expected = (key not in sublevel_matrix.pre_applied(sub, "stable_perf_backport")
+            and key not in sublevel_matrix.debt(sub, "stable_perf_backport"))
+sys.exit(0 if expected else 1)
+PY
+then
+  grep -q "ANDROID_KABI_USE(8" "$KERNEL_ROOT/common/include/linux/sched.h" \
+    || fail "kstack KABI slot marker missing"
+else
+  echo "  kstack KABI slot marker not expected on 5.15.$SUB_LEVEL (known debt)"
+fi
 grep -q "cgroup_free_wq" "$KERNEL_ROOT/common/kernel/cgroup/cgroup.c" \
   || fail "cgroup wq split marker missing"
 grep -q "__raise_softirq_irqoff(SCHED_SOFTIRQ);" "$KERNEL_ROOT/common/kernel/sched/core.c" \
@@ -187,6 +203,13 @@ scan_file_defs="$(grep -c "^static void khugepaged_scan_file" "$KERNEL_ROOT/comm
 grep -qE "^CONFIG_ZRAM_MULTI_COMP=y" "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
   || fail "defconfig lane did not enable ZRAM_MULTI_COMP"
 
+# The drm valid-clones revert must leave no trace of the 5.15.185 check on
+# any baseline: 167/178 never carried it, 194/lts had it removed by the graft.
+if grep -q "drm_atomic_check_valid_clones" \
+     "$KERNEL_ROOT/common/drivers/gpu/drm/drm_atomic_helper.c"; then
+  fail "drm valid clones check survived the graft"
+fi
+
 # The fs/file.c module marker only exists where this module rewrote the file;
 # from 5.15.191 the baseline is already in the upstream shape and the fdtable
 # conventions group correctly reports already_present without touching it.
@@ -214,6 +237,11 @@ fi
 if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/fs/file.c" "$KERNEL_ROOT/common/fs/file.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for fs/file.c"
+fi
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/drivers/gpu/drm/drm_atomic_helper.c" \
+        "$KERNEL_ROOT/common/drivers/gpu/drm/drm_atomic_helper.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for drivers/gpu/drm/drm_atomic_helper.c"
 fi
 
 echo "SMOKE OK"

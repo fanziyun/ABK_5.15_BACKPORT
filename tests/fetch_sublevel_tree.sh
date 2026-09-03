@@ -73,6 +73,7 @@ FETCH_FILES=(
   mm/madvise.c
   include/linux/huge_mm.h
   include/uapi/asm-generic/mman-common.h
+  drivers/gpu/drm/drm_atomic_helper.c
 )
 
 decode() {

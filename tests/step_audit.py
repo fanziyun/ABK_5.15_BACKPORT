@@ -60,6 +60,7 @@ import sublevel_matrix  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
 import abk_stable_core  # noqa: E402
 import abk_stable_perf  # noqa: E402
+import abk_stable_display  # noqa: E402
 
 SUB_LEVEL = sublevel_matrix.DEFAULT_SUB_LEVEL
 
@@ -109,11 +110,14 @@ AUDIT_FILES = [
     "mm/madvise.c",
     "include/linux/huge_mm.h",
     "include/uapi/asm-generic/mman-common.h",
+    # Batch 7: the 5.15.185 drm valid-clones revert.
+    "drivers/gpu/drm/drm_atomic_helper.c",
 ]
 
 CHILD_MODULES = [
     ("stable_backport_core", abk_stable_core),
     ("stable_perf_backport", abk_stable_perf),
+    ("stable_display_fix", abk_stable_display),
 ]
 
 

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import abk_stable_core  # noqa: E402
 import abk_stable_perf  # noqa: E402
+import abk_stable_display  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
 
 MARKER = "ABK stable_515_backport:"
@@ -65,6 +66,15 @@ REQUIRED_CONTENT = {
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
 }
 
+# Removal grafts: content that must NOT survive into the patched text wherever
+# the group reports applied.  Keyed as "child:group".
+REQUIRED_ABSENT = {
+    "display:drm_valid_clones_revert": [
+        "drm_atomic_check_valid_clones",
+        "drm_atomic_check_valid_clones(state, crtc)",
+    ],
+}
+
 
 def fail(msg):
     print(f"AUDIT FAIL: {msg}")
@@ -74,7 +84,7 @@ def fail(msg):
 def run_tree(source):
     src = Path(source)
     groups = list(abk_stable_core.PATCH_GROUPS) + list(
-        abk_stable_perf.PATCH_GROUPS)
+        abk_stable_perf.PATCH_GROUPS) + list(abk_stable_display.PATCH_GROUPS)
     all_files = sorted({f for g in groups for f in g.files})
 
     with tempfile.TemporaryDirectory(prefix="abk_impl_audit_") as tmp:
@@ -89,7 +99,8 @@ def run_tree(source):
 
         problems = []
         for child, module in (("core", abk_stable_core),
-                              ("perf", abk_stable_perf)):
+                              ("perf", abk_stable_perf),
+                              ("display", abk_stable_display)):
             ctx = GraftContext(root, "167", "android13-5.15",
                                defconfig=str(root /
                                              "arch/arm64/configs/gki_defconfig"))
@@ -115,6 +126,14 @@ def run_tree(source):
                     if missing:
                         problems.append(f"{child}/{group.key}: missing "
                                         f"feature content {missing}")
+                if key in REQUIRED_ABSENT and status in ("applied", "partial"):
+                    blob = "".join(ctx.read(f) for f in group.files
+                                   if ctx.path(f).exists())
+                    present = [needle for needle in REQUIRED_ABSENT[key]
+                               if needle in blob]
+                    if present:
+                        problems.append(f"{child}/{group.key}: removed "
+                                        f"content survived {present}")
                 if status in ("applied", "partial") and \
                         not any(MARKER in ctx.read(f) for f in changed):
                     print(f"  info: {child}/{group.key}: no module marker "
