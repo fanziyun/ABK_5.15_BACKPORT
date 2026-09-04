@@ -30,8 +30,6 @@ sibling suite。AutoFDO 仍作为独立构建工程先建立整机基线。
   readahead、THP、rmap/migration 和 mapping order 基础设施后再接文件系统
 - [~] `maple_tree_per_vma_lock`（P3，独立 MM 分支）— 高收益但涉及 VMA 生命周期、
   fault path 和 KABI，当前模块不做 bounded graft
-- [ ] `f2fs_lookup_mode_perf`（P1/P2，F2FS sibling suite）
-- [ ] `ufs_command_priority_rt`（P2，UFS/storage sibling suite）
 - [~] `f2fs_readonly_large_folio` / `erofs_large_folio_zstd`（P2/P3，文件系统
   sibling suite，按镜像格式和 CPU 预算条件启用）
 
