@@ -135,7 +135,7 @@ REQUIRED_IN_FUNCTION = {
     "core:pagealloc_fallback_reuse": [
         ("mm/page_alloc.c", "find_suitable_fallback",
          ["claimable && !can_steal_fallback(order, migratetype)",
-          "for (i = 0; i < MIGRATE_FALLBACKS - 1; i++)"],
+          "for (i = 0; fallbacks[migratetype][i] != MIGRATE_TYPES; i++)"],
          ["bool *can_steal", "only_stealable"]),
         ("mm/page_alloc.c", "__rmqueue",
          ["switch (*mode)", "case RMQUEUE_CLAIM:",

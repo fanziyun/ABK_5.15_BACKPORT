@@ -2983,7 +2983,7 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
 \tif (area->nr_free == 0)
 \t\treturn -1;
 
-\tfor (i = 0; i < MIGRATE_FALLBACKS - 1; i++) {
+\tfor (i = 0; fallbacks[migratetype][i] != MIGRATE_TYPES; i++) {
 \t\tint fallback_mt = fallbacks[migratetype][i];
 
 \t\tif (!free_area_empty(area, fallback_mt))

@@ -3,12 +3,18 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
-## Batch 8（v0.10.0，page_alloc fallback + RCU NOCB 项目已落地）
+## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
 本批次从 android15-6.6 / android16-6.12 筛出的长期项目中，先落地当前模块边界
 内、证据最强的 `mm/page_alloc` fallback 优化和 RCU NOCB opt-in；完整 MGLRU、large folio/mTHP、
 Maple Tree + per-VMA locks 需要独立 MM/VFS rebase；F2FS/UFS/EROFS 项目留在
 sibling suite。AutoFDO 仍作为独立构建工程先建立整机基线。
+
+v0.10.1 修复：`pagealloc_fallback_reuse` 移植的 `find_suitable_fallback()`
+在 5.15 基线（含 android13-5.15-lts 5.15.211）编译失败 —— 上游 6.x 使用
+`MIGRATE_FALLBACKS`，5.15 无此枚举，改为按 5.15 本族的 `MIGRATE_TYPES` 哨兵
+终止 fallback 遍历（`fallbacks[migratetype][i] != MIGRATE_TYPES`），保持组
+`applied` 且幂等/回滚审计通过。
 
 详细来源、收益证据、依赖、验证门槛和排除项见
 [`docs/batch8_long_term.md`](docs/batch8_long_term.md)。
