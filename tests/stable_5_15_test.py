@@ -8,6 +8,8 @@ Runs fully self-contained on synthetic fixtures; no kernel tree required.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -657,6 +659,83 @@ def test_batch8_rcu_nocb_cpu_default_all():
               status2 == "already_present", status2)
 
 
+def test_batch8_autofdo_tool():
+    """The AutoFDO tool is a build-engineering script, not a graft.
+
+    It never edits a kernel tree and never registers a PatchGroup; its only job
+    is to collect a device-specific 5.15 AutoFDO profile and to refuse any
+    profile that does not identify a 5.15 kernel or whose vmlinux hash does not
+    match the recorded build.  These checks exercise only the offline gates
+    (init / validate / build-env); record and convert need a real device, adb
+    and simpleperf/create_llvm_prof, so they are not invoked here.
+    """
+    print("Batch 8 AutoFDO profile tool")
+    tool = Path(__file__).resolve().parent.parent / "tools" / "autofdo_515_profile.sh"
+    check("autofdo tool exists", tool.is_file(), tool)
+
+    def run_tool(args):
+        return subprocess.run(["bash", str(tool)] + args,
+                              capture_output=True, text=True, env=dict(os.environ))
+
+    r = subprocess.run(["bash", "-n", str(tool)], capture_output=True, text=True)
+    check("autofdo tool passes bash -n", r.returncode == 0, r.stderr)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "kernel515"
+        out = Path(tmp) / "ws"
+        root.mkdir()
+        vmlinux = root / "vmlinux"
+        vmlinux.write_bytes(b"fake vmlinux for the 5.15 build")
+        (root / "Makefile").write_text(
+            "VERSION = 5\nPATCHLEVEL = 15\nSUBLEVEL = 167\nEXTRAVERSION =\n")
+
+        r = run_tool(["init", "--kernel-root", str(root),
+                      "--output-dir", str(out), "--vmlinux", str(vmlinux),
+                      "--source-revision", "test-rev", "--toolchain", "test-tc"])
+        check("autofdo init accepts 5.15", r.returncode == 0,
+              r.stdout + r.stderr)
+        manifest = out / "manifest.env"
+        check("autofdo manifest written", manifest.is_file())
+        mtext = manifest.read_text() if manifest.is_file() else ""
+        check("manifest declares the abk-autofdo-515 format",
+              "format=abk-autofdo-515-v1" in mtext)
+        check("manifest records the 5.15 kernel version",
+              "kernel_version=5.15.167" in mtext)
+        check("manifest records a vmlinux hash", "vmlinux_sha256=" in mtext)
+
+        (out / "kernel.autofdo").write_text("branch-list payload")
+        (out / "kernel.llvm_profdata").write_text("llvm extbinary payload")
+        r = run_tool(["validate", "--output-dir", str(out)])
+        check("autofdo validate accepts a matching workspace", r.returncode == 0,
+              r.stdout + r.stderr)
+
+        vmlinux.write_bytes(b"a different build")
+        r = run_tool(["validate", "--output-dir", str(out)])
+        check("autofdo validate rejects a vmlinux mismatch", r.returncode != 0,
+              r.stdout + r.stderr)
+
+        vmlinux.write_bytes(b"fake vmlinux for the 5.15 build")
+        r = run_tool(["build-env", "--output-dir", str(out)])
+        check("autofdo build-env succeeds on a valid workspace",
+              r.returncode == 0, r.stdout + r.stderr)
+        check("build-env emits the autofdo build variables",
+              "CONFIG_AUTOFDO_CLANG=y" in r.stdout
+              and "CLANG_AUTOFDO_PROFILE=" in r.stdout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "kernel66"
+        out = Path(tmp) / "ws66"
+        root.mkdir()
+        vmlinux = root / "vmlinux"
+        vmlinux.write_bytes(b"6.6 vmlinux")
+        (root / "Makefile").write_text(
+            "VERSION = 6\nPATCHLEVEL = 6\nSUBLEVEL = 1\nEXTRAVERSION =\n")
+        r = run_tool(["init", "--kernel-root", str(root),
+                      "--output-dir", str(out), "--vmlinux", str(vmlinux)])
+        check("autofdo init rejects a non-5.15 kernel", r.returncode != 0,
+              r.stdout + r.stderr)
+
+
 def test_madvise_collapse_step_independence():
     """No step of a group may pre-create a later step's replacement text.
 
@@ -744,6 +823,7 @@ def main():
     test_batch6_registration()
     test_batch8_pagealloc_fallback_reuse()
     test_batch8_rcu_nocb_cpu_default_all()
+    test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()
     test_display_valid_clones_revert()

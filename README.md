@@ -132,7 +132,7 @@ registry and the KMI compatibility matrix are documented in
 
 ```bash
 python3 -m py_compile scripts/*.py tests/*.py
-bash -n setup.sh scripts/*.sh tests/*.sh
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh
 python3 tests/stable_5_15_test.py
 python3 tests/implementation_audit.py /path/to/android13-5.15-common-kernel-tree
 bash tests/smoke.sh /path/to/android13-5.15-common-kernel-tree
@@ -172,6 +172,35 @@ python3 scripts/abk_stable_core.py --common-dir <tree> --defconfig <tree>/arch/a
 
 Rollback: `bash scripts/abk_rollback.sh <kernel-common-dir> --list` then
 `--apply`.
+
+## AutoFDO profile tooling
+
+Batch 8's AutoFDO entry is a **build-engineering tool, not a graft**:
+`tools/autofdo_515_profile.sh` collects and validates a device-specific 5.15
+AutoFDO profile and never edits a kernel tree or registers a `PatchGroup`. It
+runs as `init → record → convert → validate → build-env`:
+
+```bash
+tools/autofdo_515_profile.sh init --kernel-root <5.15-tree> --vmlinux <vmlinux> --output-dir <ws>
+tools/autofdo_515_profile.sh record --output-dir <ws> --device <serial>
+tools/autofdo_515_profile.sh convert --output-dir <ws> \
+  --host-simpleperf <simpleperf> --create-llvm-prof <create_llvm_prof> --kallsyms <kernel.kallsyms>
+tools/autofdo_515_profile.sh validate --output-dir <ws>
+tools/autofdo_515_profile.sh build-env --output-dir <ws>
+```
+
+The hard gates are `init` (only a `5.15` kernel identity is accepted) and
+`validate` (the profile binary's `vmlinux` hash must match the recorded build, so
+a 6.6/6.12 profile or a profile from another build is rejected). The tool records
+kernel revision, toolchain and `.config` fingerprints in `manifest.env`, and
+`build-env` prints the `CONFIG_AUTOFDO_CLANG=y` / `CLANG_AUTOFDO_PROFILE=…`
+variables for the exact 5.15 build. If the 5.15 tree lacks
+`scripts/Makefile.autofdo` (and its `Makefile` include), the Android Common
+AutoFDO build integration must be applied separately first — the tool only
+produces the profile, it never patches the tree. The device-side
+`simpleperf record`/`inject` flags are toolchain/SoC-specific and must be
+validated against the target simpleperf before the A/B benchmark (boot, cold/warm
+launch, Binder, power, image size).
 
 ## Reports
 

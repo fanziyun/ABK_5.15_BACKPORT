@@ -53,7 +53,7 @@ only the ~44 files the groups touch). Real branches per baseline are in
 
 ```bash
 python3 -m py_compile scripts/*.py tests/*.py     # syntax gate
-bash -n setup.sh scripts/*.sh tests/*.sh          # shell syntax gate
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh  # shell syntax gate
 python3 tests/stable_5_15_test.py                 # unit tests (no kernel tree needed)
 python3 tests/step_audit.py <tree>                # per-step: anchors land, structure balanced, idempotent
 python3 tests/implementation_audit.py <tree>      # content: no phantom groups, features really present

@@ -34,7 +34,7 @@ batch is three steps.
 
 ## 3. Prove it
 
-- `python3 -m py_compile scripts/*.py tests/*.py && bash -n setup.sh scripts/*.sh tests/*.sh`
+- `python3 -m py_compile scripts/*.py tests/*.py && bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh`
 - `python3 tests/stable_5_15_test.py` (add fixture checks if the group
   introduces a new shape probe).
 - Dry-run against the reference tree:

@@ -22,8 +22,10 @@ sibling suite。AutoFDO 仍作为独立构建工程先建立整机基线。
   `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` 和 5.15 形状的 all-CPU mask 初始化；
   `rcu_nocbs=` / `nohz_full=` 显式参数优先。目标产品是否在 defconfig 开启，仍需
   idle power、callback backlog、wakeup latency 和前后台切换 benchmark
-- [ ] `autofdo_515_profile`（P1，构建工程）— 针对精确 5.15/toolchain/device
-  重新采集，不作为源码 graft
+- [x] `autofdo_515_profile`（P1，构建工程）— 针对精确 5.15/toolchain/device
+  重新采集，不作为源码 graft；`tools/autofdo_515_profile.sh` 已落地（init→record→
+  convert→validate→build-env，5.15 身份 + vmlinux hash 双重硬门，不注册 PatchGroup、
+  不改内核树），真机采集与 A/B 基准仍属设备工程
 - [~] `mglru_612_refresh`（P2，独立 MM 分支）— 先验证 deactivation，再评估完整
   aging/workingset/refault/type-selection 系列
 - [~] `large_folio_mthp_substrate`（P2，独立 MM/VFS 分支）— 完成 page cache、

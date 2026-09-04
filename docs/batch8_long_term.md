@@ -49,7 +49,13 @@ callback backlog、wakeup latency 和前后台切换。
 
 参考：https://lkml.indiana.edu/hypermail/linux/kernel/2206.2/04927.html
 
-### [ ] `autofdo_515_profile` — P1（构建工程，不是源码 graft）
+### [x] `autofdo_515_profile` — P1（构建工程，不是源码 graft）
+
+工具已落地为 `tools/autofdo_515_profile.sh`：`init → record → convert →
+validate → build-env`，`init` 只接受 5.15 内核身份、`validate` 用 manifest 里的
+vmlinux sha256 拒收 6.6/6.12 或另一构建的 profile，产物写用户指定的
+`--output-dir`、不改内核树、不注册 PatchGroup。`record`/`convert` 的设备端
+simpleperf 旗标属工具链/SoC 相关，采集前需对目标 simpleperf 校验。
 
 Android 官方 AutoFDO profile 在 Pixel 的 boot、cold app launch、Binder 等路径
 观察到可见收益。Batch 8 保留该项目，是因为它可能比源码 backport 更快产生整体
@@ -143,11 +149,16 @@ large folio 适合 EROFS 只读读取；ZSTD 则是用 CPU 换压缩率，只有
 
 ## Batch 8 执行顺序
 
-1. AutoFDO 先建立整机收益基线。
+1. AutoFDO 工具已落地（`tools/autofdo_515_profile.sh`）；真机采集与整机 A/B 基准
+   （boot、cold/warm launch、Binder、功耗、镜像体积）属设备工程，在目标 5.15/
+   toolchain/device 上完成。
 2. `pagealloc_fallback_reuse` 和 `rcu_nocb_cpu_default_all` 源码组已落地；RCU
    只在目标设备 benchmark 通过后把 defconfig 开关改为 `y`。
-3. 另开 MM 分支推进 `mglru_612_refresh`，再评估 `large_folio_mthp_substrate`。
+3. 另开独立 MM/VFS 分支推进 `mglru_612_refresh`，再评估
+   `large_folio_mthp_substrate`、`maple_tree_per_vma_lock` —— 不在本模块做
+   bounded anchor graft。
 4. F2FS/UFS/EROFS 项目留在各自 sibling suite，不注册到本模块。
 
-`pagealloc_fallback_reuse` 落地后递增 `ABK_MODULE_VERSION`；后续项目仍遵循
-`docs/group_recipe.md` 的 group、矩阵、幂等、回滚和 CI 编译要求。
+`pagealloc_fallback_reuse` 落地后递增 `ABK_MODULE_VERSION`；后续源码项目仍遵循
+`docs/group_recipe.md` 的 group、矩阵、幂等、回滚和 CI 编译要求。AutoFDO 工具
+是构建工程、不改 graft 注册表，不参与 `ABK_MODULE_VERSION` 递增。
