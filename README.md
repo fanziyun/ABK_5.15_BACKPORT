@@ -23,7 +23,7 @@ is left byte-identical rather than touched up with a comment.
 
 | child id | content |
 |---|---|
-| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), plus the module's defconfig lane that actually enables the recompression symbols |
+| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), Batch 8 page_alloc fallback-mode reuse and claimability cleanup (android15-6.6 / 6.12), opt-in `RCU_NOCB_CPU_DEFAULT_ALL`, plus the module's defconfig lane that actually enables the recompression symbols |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 
@@ -45,6 +45,16 @@ android15-6.6 GKI config deltas whose 5.15 code already exists
 Unsupported lineage is now a real gate too: outside android13-5.15 every group
 reports `report_only` and nothing is written unless `ABK_515_ALLOW_UNSUPPORTED=1`
 is set.
+
+Batch 8 adds `pagealloc_fallback_reuse` and the opt-in
+`rcu_nocb_cpu_default_all` source graft. The 5.15-shaped allocator separates
+fallback claiming from single-page stealing, reuses the successful phase across
+one locked `rmqueue_bulk()` refill, and updates the compaction caller for the
+new `find_suitable_fallback()` result convention. The AOSP page-allocation
+vendor hooks and 5.15 `steal_suitable_fallback()` behavior remain intact. The
+RCU option remains disabled by default until device benchmarks pass. The
+remaining Batch 8 entries are conditional device benchmarks, a separate
+AutoFDO build project, or independent MM/VFS and sibling-suite work.
 
 KMI red lines are built in: new exported-struct fields only ever reuse free
 `ANDROID_KABI_RESERVE` slots (this module uses `task_struct` slot 8), and
@@ -107,11 +117,12 @@ The order is no longer a hard requirement: when ABK_ABI_PATCH_SUITE runs
 first anyway, this module's fd-table group recognizes the suite's fallback
 `alloc_fdtable()` and composes the upstream 5.15.191 conventions on top of
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
-place), so all 14 groups land in either injection order.
+place), so all 16 core groups land in either injection order.
 
-The core child now carries 14 groups (the 11 pre-Batch-6 grafts plus
-`config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`); the perf
-child carries 12; the display child carries 1, for 27 groups in total.
+The core child now carries 16 groups (the 11 pre-Batch-6 grafts plus
+`config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`, and
+`pagealloc_fallback_reuse`, and `rcu_nocb_cpu_default_all`); the perf
+child carries 12; the display child carries 1, for 29 groups in total.
 
 The full input string for the F2FS + ABI-suite combination, the shape
 registry and the KMI compatibility matrix are documented in

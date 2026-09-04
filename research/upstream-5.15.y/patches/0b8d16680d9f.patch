@@ -1,0 +1,118 @@
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 7e0f264..89570cd 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -2279,7 +2279,6 @@ static enum compact_result __compact_finished(struct compact_control *cc)
+ 	ret = COMPACT_NO_SUITABLE_PAGE;
+ 	for (order = cc->order; order < NR_PAGE_ORDERS; order++) {
+ 		struct free_area *area = &cc->zone->free_area[order];
+-		bool claim_block;
+ 
+ 		/* Job done if page is free of the right migratetype */
+ 		if (!free_area_empty(area, migratetype))
+@@ -2295,8 +2294,7 @@ static enum compact_result __compact_finished(struct compact_control *cc)
+ 		 * Job done if allocation would steal freepages from
+ 		 * other migratetype buddy lists.
+ 		 */
+-		if (find_suitable_fallback(area, order, migratetype,
+-						true, &claim_block) != -1)
++		if (find_suitable_fallback(area, order, migratetype, true) >= 0)
+ 			/*
+ 			 * Movable pages are OK in any pageblock. If we are
+ 			 * stealing for a non-movable allocation, make sure
+diff --git a/mm/internal.h b/mm/internal.h
+index 313f6e6..3fb4222 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -815,7 +815,7 @@ void init_cma_reserved_pageblock(struct page *page);
+ #endif /* CONFIG_COMPACTION || CONFIG_CMA */
+ 
+ int find_suitable_fallback(struct free_area *area, unsigned int order,
+-			int migratetype, bool claim_only, bool *claim_block);
++			   int migratetype, bool claimable);
+ 
+ static inline bool free_area_empty(struct free_area *area, int migratetype)
+ {
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 5cffef2..068ea2d 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2081,31 +2081,25 @@ static bool should_try_claim_block(unsigned int order, int start_mt)
+ 
+ /*
+  * Check whether there is a suitable fallback freepage with requested order.
+- * Sets *claim_block to instruct the caller whether it should convert a whole
+- * pageblock to the returned migratetype.
+- * If only_claim is true, this function returns fallback_mt only if
++ * If claimable is true, this function returns fallback_mt only if
+  * we would do this whole-block claiming. This would help to reduce
+  * fragmentation due to mixed migratetype pages in one pageblock.
+  */
+ int find_suitable_fallback(struct free_area *area, unsigned int order,
+-			int migratetype, bool only_claim, bool *claim_block)
++			   int migratetype, bool claimable)
+ {
+ 	int i;
+-	int fallback_mt;
++
++	if (claimable && !should_try_claim_block(order, migratetype))
++		return -2;
+ 
+ 	if (area->nr_free == 0)
+ 		return -1;
+ 
+-	*claim_block = false;
+ 	for (i = 0; i < MIGRATE_FALLBACKS - 1 ; i++) {
+-		fallback_mt = fallbacks[migratetype][i];
+-		if (free_area_empty(area, fallback_mt))
+-			continue;
++		int fallback_mt = fallbacks[migratetype][i];
+ 
+-		if (should_try_claim_block(order, migratetype))
+-			*claim_block = true;
+-
+-		if (*claim_block || !only_claim)
++		if (!free_area_empty(area, fallback_mt))
+ 			return fallback_mt;
+ 	}
+ 
+@@ -2202,7 +2196,6 @@ __rmqueue_claim(struct zone *zone, int order, int start_migratetype,
+ 	int min_order = order;
+ 	struct page *page;
+ 	int fallback_mt;
+-	bool claim_block;
+ 
+ 	/*
+ 	 * Do not steal pages from freelists belonging to other pageblocks
+@@ -2221,11 +2214,14 @@ __rmqueue_claim(struct zone *zone, int order, int start_migratetype,
+ 				--current_order) {
+ 		area = &(zone->free_area[current_order]);
+ 		fallback_mt = find_suitable_fallback(area, current_order,
+-				start_migratetype, false, &claim_block);
++						     start_migratetype, true);
++
++		/* No block in that order */
+ 		if (fallback_mt == -1)
+ 			continue;
+ 
+-		if (!claim_block)
++		/* Advanced into orders too low to claim, abort */
++		if (fallback_mt == -2)
+ 			break;
+ 
+ 		page = get_page_from_free_area(area, fallback_mt);
+@@ -2253,12 +2249,11 @@ __rmqueue_steal(struct zone *zone, int order, int start_migratetype)
+ 	int current_order;
+ 	struct page *page;
+ 	int fallback_mt;
+-	bool claim_block;
+ 
+ 	for (current_order = order; current_order < NR_PAGE_ORDERS; current_order++) {
+ 		area = &(zone->free_area[current_order]);
+ 		fallback_mt = find_suitable_fallback(area, current_order,
+-				start_migratetype, false, &claim_block);
++						     start_migratetype, false);
+ 		if (fallback_mt == -1)
+ 			continue;
+ 
+

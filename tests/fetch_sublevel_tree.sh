@@ -30,9 +30,13 @@ BASE="https://android.googlesource.com/kernel/common/+/refs/heads/$BRANCH"
 FETCH_FILES=(
   Makefile
   arch/arm64/configs/gki_defconfig
+  Documentation/admin-guide/kernel-parameters.txt
   fs/file.c
   mm/page_alloc.c
+  mm/compaction.c
   mm/internal.h
+  kernel/rcu/Kconfig
+  kernel/rcu/tree_nocb.h
   mm/oom_kill.c
   mm/vmscan.c
   mm/memcontrol.c

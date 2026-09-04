@@ -64,6 +64,21 @@ REQUIRED_CONTENT = {
         # (SCAN_SUCCEED is 1 here, so that inverts the success test).
         "result = hugepage_vma_revalidate(mm, addr, &vma);\n\t\t\tif (result) {",
     ],
+    "core:pagealloc_fallback_reuse": [
+        "enum rmqueue_mode",
+        "RMQUEUE_CLAIM",
+        "RMQUEUE_STEAL",
+        "return -2",
+        "find_suitable_fallback(area, order, migratetype,\n"
+        "\t\t\t\t\t\ttrue) >= 0",
+        "__rmqueue(zone, order, migratetype, alloc_flags, &rmqm)",
+    ],
+    "core:rcu_nocb_cpu_default_all": [
+        "config RCU_NOCB_CPU_DEFAULT_ALL",
+        "bool \"Offload RCU callback processing from all CPUs by default\"",
+        "offload_all",
+        "cpumask_setall(rcu_nocb_mask)",
+    ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
@@ -116,6 +131,33 @@ REQUIRED_IN_FUNCTION = {
          ["zram_set_priority(zram, index, 0)",
           "zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE)"],
          []),
+    ],
+    "core:pagealloc_fallback_reuse": [
+        ("mm/page_alloc.c", "find_suitable_fallback",
+         ["claimable && !can_steal_fallback(order, migratetype)",
+          "for (i = 0; i < MIGRATE_FALLBACKS - 1; i++)"],
+         ["bool *can_steal", "only_stealable"]),
+        ("mm/page_alloc.c", "__rmqueue",
+         ["switch (*mode)", "case RMQUEUE_CLAIM:",
+          "*mode = RMQUEUE_STEAL"],
+         ["__rmqueue_fallback"]),
+        ("mm/page_alloc.c", "rmqueue_bulk",
+         ["enum rmqueue_mode rmqm = RMQUEUE_NORMAL",
+          "alloc_flags, &rmqm"],
+         []),
+        ("mm/compaction.c", "__compact_finished",
+         ["find_suitable_fallback(area, order, migratetype,\n"
+          "\t\t\t\t\t\ttrue) >= 0"],
+         ["bool can_steal"]),
+    ],
+    "core:rcu_nocb_cpu_default_all": [
+        ("kernel/rcu/tree_nocb.h", "rcu_init_nohz",
+         ["if (!cpumask_available(rcu_nocb_mask))",
+          "offload_all = true",
+          "offload_all = false",
+          "if (offload_all)",
+          "cpumask_setall(rcu_nocb_mask)"],
+         ["rcu_state.nocb_is_setup"]),
     ],
 }
 

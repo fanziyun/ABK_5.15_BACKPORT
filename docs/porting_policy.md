@@ -88,9 +88,9 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 14 applied | 12 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 14 applied | 11 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 11 applied + 3 present | 10 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 16 applied | 12 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 16 applied | 11 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 13 applied + 3 present | 10 applied + 2 present |
 
 A second pass is `already_present` for every group on all three. Groups the
 baseline pre-empts:
@@ -154,6 +154,20 @@ builds on `pagealloc_min_reserve_semantics` (5.15.171) output and rewrites its
 recognizes the superseding shape (`ALLOC_RESERVES` in mm/internal.h) and
 reports `already_present` on re-runs - both orders of "only one of the two
 applied" stay idempotent.
+
+Batch 8's `pagealloc_fallback_reuse` is a three-file page-allocation chain:
+`mm/internal.h` and `mm/compaction.c` move `find_suitable_fallback()` to the
+claimable/-2 result form, while `mm/page_alloc.c` keeps the 5.15 vendor-hook
+shape and splits the fallback claim and steal phases. `rmqueue_bulk()` carries
+the phase state only while its zone lock is held; `rmqueue_buddy()` starts from
+`RMQUEUE_NORMAL` for each independent allocation.
+
+Batch 8's `rcu_nocb_cpu_default_all` is a three-file opt-in source graft:
+`kernel/rcu/Kconfig` adds the configuration symbol, the kernel-parameter
+documentation records explicit-mask precedence, and `kernel/rcu/tree_nocb.h`
+allocates the 5.15 mask when no boot mask was supplied before setting it to all
+possible CPUs. The option remains `default n`; only a device benchmark may justify
+enabling it in a product defconfig.
 
 The AOSP android13-5.15 line never took the upstream 5.15.171 Gorman rework:
 167, 178, 194 and the current `android13-5.15-lts` (.211) all still carry

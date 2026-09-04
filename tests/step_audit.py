@@ -66,6 +66,9 @@ SUB_LEVEL = sublevel_matrix.DEFAULT_SUB_LEVEL
 
 AUDIT_FILES = [
     "fs/file.c",
+    "Documentation/admin-guide/kernel-parameters.txt",
+    "kernel/rcu/Kconfig",
+    "kernel/rcu/tree_nocb.h",
     "mm/page_alloc.c",
     "mm/internal.h",
     "mm/oom_kill.c",
@@ -103,6 +106,8 @@ AUDIT_FILES = [
     "drivers/block/zram/zram_drv.c",
     "mm/zsmalloc.c",
     "include/linux/zsmalloc.h",
+    # Batch 8: fallback claimability cleanup updates compaction callers.
+    "mm/compaction.c",
     # Batch 6: the defconfig lane plus the zsmalloc and MADV_COLLAPSE grafts.
     "arch/arm64/configs/gki_defconfig",
     "mm/Kconfig",

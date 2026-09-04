@@ -574,6 +574,89 @@ def test_batch6_registration():
                   key in perf_keys, key)
 
 
+def test_batch8_pagealloc_fallback_reuse():
+    print("Batch 8 pagealloc fallback reuse")
+    import abk_stable_core as core
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "pagealloc_fallback_reuse"), None)
+    check("batch8 group registered", group is not None)
+    if group is None:
+        return
+    check("batch8 touches the fallback callers",
+          set(group.files) == {"mm/page_alloc.c", "mm/compaction.c",
+                               "mm/internal.h"}, group.files)
+
+    # Keep this fixture self-contained while still exercising the complete
+    # nine-step transaction and its second-pass shape detection.
+    internal_old = (
+        "int find_suitable_fallback(struct free_area *area, unsigned int order,\n"
+        "\t\t\tint migratetype, bool only_stealable, bool *can_steal);"
+    )
+    compaction_old = core._B8_COMPACTION_DECL_OLD + "\n" + core._B8_COMPACTION_CALL_OLD
+    page_old = (core._B8_FIND_OLD + "\n" + core._B8_RMQUEUE_OLD + "\n" +
+                core._B8_FALLBACK_OLD + "\n" + core._B8_BULK_DECL_OLD + "\n" +
+                core._B8_BULK_CALL_OLD + "\n" + core._B8_BUDDY_CALL_OLD)
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/internal.h": internal_old,
+                             "mm/compaction.c": compaction_old,
+                             "mm/page_alloc.c": page_old})
+        status, detail = core._pagealloc_fallback_reuse_apply(ctx)
+        check("batch8 fixture applies all steps", status == "applied",
+              (status, detail))
+        patched = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
+        check("mode enum is present", "enum rmqueue_mode" in patched["mm/page_alloc.c"])
+        check("find helper has distinct unclaimable result",
+              "return -2" in patched["mm/page_alloc.c"])
+        ctx2 = make_ctx(tmp, patched)
+        status2, _detail2 = core._pagealloc_fallback_reuse_apply(ctx2)
+        check("batch8 fixture is idempotent", status2 == "already_present", status2)
+
+
+def test_batch8_rcu_nocb_cpu_default_all():
+    print("Batch 8 RCU_NOCB_CPU_DEFAULT_ALL")
+    import abk_stable_core as core
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "rcu_nocb_cpu_default_all"), None)
+    check("RCU default-all group registered", group is not None)
+    if group is None:
+        return
+    check("RCU default-all touches its three source files",
+          set(group.files) == {
+              "Documentation/admin-guide/kernel-parameters.txt",
+              "kernel/rcu/Kconfig", "kernel/rcu/tree_nocb.h",
+          }, group.files)
+
+    kconfig = core._B8_RCU_NOCB_KCONFIG_OLD + "\n"
+    params = (core._B8_RCU_NOCB_DOC_NOHZ_OLD + "\n" +
+              core._B8_RCU_NOCB_DOC_PARAM_OLD + "\n")
+    nocb = (core._B8_RCU_NOCB_INIT_OLD + "\n" +
+            core._B8_RCU_NOCB_NOHZ_OLD + "\n" +
+            core._B8_RCU_NOCB_SETALL_OLD + "\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "kernel/rcu/Kconfig": kconfig,
+            "kernel/rcu/tree_nocb.h": nocb,
+            "Documentation/admin-guide/kernel-parameters.txt": params,
+        })
+        status, detail = core._rcu_nocb_cpu_default_all_apply(ctx)
+        check("RCU default-all fixture applies all steps", status == "applied",
+              (status, detail))
+        patched = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
+        check("RCU default-all has opt-in Kconfig",
+              "config RCU_NOCB_CPU_DEFAULT_ALL" in patched["kernel/rcu/Kconfig"])
+        check("RCU default-all materializes the mask",
+              "cpumask_setall(rcu_nocb_mask)" in patched["kernel/rcu/tree_nocb.h"])
+        check("explicit boot masks retain precedence",
+              patched["Documentation/admin-guide/kernel-parameters.txt"].count(
+                  "CONFIG_RCU_NOCB_CPU_DEFAULT_ALL") == 2)
+        ctx2 = make_ctx(tmp, patched)
+        status2, _detail2 = core._rcu_nocb_cpu_default_all_apply(ctx2)
+        check("RCU default-all fixture is idempotent",
+              status2 == "already_present", status2)
+
+
 def test_madvise_collapse_step_independence():
     """No step of a group may pre-create a later step's replacement text.
 
@@ -659,6 +742,8 @@ def main():
     test_family_gate()
     test_apply_steps_noop_blocked()
     test_batch6_registration()
+    test_batch8_pagealloc_fallback_reuse()
+    test_batch8_rcu_nocb_cpu_default_all()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()
     test_display_valid_clones_revert()

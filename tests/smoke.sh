@@ -28,9 +28,13 @@ fi
 
 SMOKE_FILES=(
   Makefile
+  Documentation/admin-guide/kernel-parameters.txt
   fs/file.c
   mm/page_alloc.c
+  mm/compaction.c
   mm/internal.h
+  kernel/rcu/Kconfig
+  kernel/rcu/tree_nocb.h
   mm/oom_kill.c
   mm/vmscan.c
   mm/memcontrol.c
@@ -185,6 +189,12 @@ grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h"
   || fail "kernfs polling trigger wrapper missing"
 grep -q "calculate_zspage_chain_size" "$KERNEL_ROOT/common/mm/zsmalloc.c" \
   || fail "zsmalloc chain sizing missing"
+grep -q "config RCU_NOCB_CPU_DEFAULT_ALL" \
+  "$KERNEL_ROOT/common/kernel/rcu/Kconfig" \
+  || fail "RCU default-all Kconfig option missing"
+grep -q "cpumask_setall(rcu_nocb_mask)" \
+  "$KERNEL_ROOT/common/kernel/rcu/tree_nocb.h" \
+  || fail "RCU default-all mask setup missing"
 grep -q "MADV_COLLAPSE" "$KERNEL_ROOT/common/include/uapi/asm-generic/mman-common.h" \
   || fail "MADV_COLLAPSE UAPI missing"
 grep -q "madvise_collapse" "$KERNEL_ROOT/common/mm/khugepaged.c" \

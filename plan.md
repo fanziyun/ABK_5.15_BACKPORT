@@ -3,6 +3,38 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 8（v0.10.0，page_alloc fallback + RCU NOCB 项目已落地）
+
+本批次从 android15-6.6 / android16-6.12 筛出的长期项目中，先落地当前模块边界
+内、证据最强的 `mm/page_alloc` fallback 优化和 RCU NOCB opt-in；完整 MGLRU、large folio/mTHP、
+Maple Tree + per-VMA locks 需要独立 MM/VFS rebase；F2FS/UFS/EROFS 项目留在
+sibling suite。AutoFDO 仍作为独立构建工程先建立整机基线。
+
+详细来源、收益证据、依赖、验证门槛和排除项见
+[`docs/batch8_long_term.md`](docs/batch8_long_term.md)。
+
+- [x] `pagealloc_fallback_reuse`（P1，当前模块）— `rmqueue_bulk()` fallback
+  mode 复用 + `find_suitable_fallback()` 清理；Android backport 测试报告
+  `vm-scalability` 吞吐约 +31.6%、最坏 zone-lock 约 280ms→8ms；按 5.15
+  AOSP vendor-hook 形状适配，覆盖 `mm/page_alloc.c`、`mm/compaction.c`、
+  `mm/internal.h`，并完成矩阵、幂等、回滚审计
+- [x] `rcu_nocb_cpu_default_all`（P1，源码已落地，默认不启用）— 增加
+  `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` 和 5.15 形状的 all-CPU mask 初始化；
+  `rcu_nocbs=` / `nohz_full=` 显式参数优先。目标产品是否在 defconfig 开启，仍需
+  idle power、callback backlog、wakeup latency 和前后台切换 benchmark
+- [ ] `autofdo_515_profile`（P1，构建工程）— 针对精确 5.15/toolchain/device
+  重新采集，不作为源码 graft
+- [~] `mglru_612_refresh`（P2，独立 MM 分支）— 先验证 deactivation，再评估完整
+  aging/workingset/refault/type-selection 系列
+- [~] `large_folio_mthp_substrate`（P2，独立 MM/VFS 分支）— 完成 page cache、
+  readahead、THP、rmap/migration 和 mapping order 基础设施后再接文件系统
+- [~] `maple_tree_per_vma_lock`（P3，独立 MM 分支）— 高收益但涉及 VMA 生命周期、
+  fault path 和 KABI，当前模块不做 bounded graft
+- [ ] `f2fs_lookup_mode_perf`（P1/P2，F2FS sibling suite）
+- [ ] `ufs_command_priority_rt`（P2，UFS/storage sibling suite）
+- [~] `f2fs_readonly_large_folio` / `erofs_large_folio_zstd`（P2/P3，文件系统
+  sibling suite，按镜像格式和 CPU 预算条件启用）
+
 ## Batch 7（v0.8.0，display 修复子模块 stable_display_fix，已落地）
 
 上游 5.15.185 合入 `drm: Add valid clones check`（Concurrent Writeback 系列，

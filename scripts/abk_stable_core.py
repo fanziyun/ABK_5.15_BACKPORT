@@ -708,6 +708,13 @@ def _highatomic_reserve_apply(ctx):
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
+        # Batch 8 adds the mode argument to the same rmqueue_buddy() call
+        # after this group has installed the highatomic retry block.  Treat
+        # that composed end state as already present on a second pass.
+        page_alloc = ctx.read("mm/page_alloc.c")
+        if ("enum rmqueue_mode rmqm = RMQUEUE_NORMAL" in page_alloc and
+                "If the allocation fails, allow OOM handling" in page_alloc):
+            return "already_present", "superseded by pagealloc_fallback_reuse"
         return "blocked_by_shape", detail
     return status, detail
 
@@ -2909,6 +2916,571 @@ PATCH_GROUPS = PATCH_GROUPS + [
 ]
 
 
+# ===========================================================================
+# Batch 8: page allocator fallback reuse (android15-6.6 / 6.12 series)
+# ===========================================================================
+#
+# The 5.15 allocator has the same fallback policy as the source series, but
+# still folds claiming and single-page stealing into __rmqueue_fallback().
+# Keep the AOSP vendor hooks and 5.15's steal_suitable_fallback() contract,
+# while separating the two modes so rmqueue_bulk() can remember which search
+# phase produced the previous page under one zone lock.
+
+_B8_FIND_OLD = """/*
+ * Check whether there is a suitable fallback freepage with requested order.
+ * If only_stealable is true, this function returns fallback_mt only if
+ * we can steal other freepages all together. This would help to reduce
+ * fragmentation due to mixed migratetype pages in one pageblock.
+ */
+int find_suitable_fallback(struct free_area *area, unsigned int order,
+\t\t\tint migratetype, bool only_stealable, bool *can_steal)
+{
+\tint i;
+\tint fallback_mt;
+
+\tif (area->nr_free == 0)
+\t\treturn -1;
+
+\t*can_steal = false;
+\tfor (i = 0;; i++) {
+\t\tfallback_mt = fallbacks[migratetype][i];
+\t\tif (fallback_mt == MIGRATE_TYPES)
+\t\t\tbreak;
+
+\t\tif (free_area_empty(area, fallback_mt))
+\t\t\tcontinue;
+
+\t\tif (can_steal_fallback(order, migratetype))
+\t\t\t*can_steal = true;
+
+\t\tif (!only_stealable)
+\t\t\treturn fallback_mt;
+
+\t\tif (*can_steal)
+\t\t\treturn fallback_mt;
+\t}
+
+\treturn -1;
+}
+"""
+
+_B8_FIND_NEW = """/*
+ * Check whether there is a suitable fallback freepage with requested order.
+ * If claimable is true, this function returns fallback_mt only if
+ * we would do this whole-block claiming. This would help to reduce
+ * fragmentation due to mixed migratetype pages in one pageblock.
+ */
+int find_suitable_fallback(struct free_area *area, unsigned int order,
+\t\t\tint migratetype, bool claimable)
+{
+\tint i;
+
+\t/* ABK stable_515_backport: distinguish an unclaimable order (-2) from
+\t * an order whose fallback lists are empty (-1). */
+\tif (claimable && !can_steal_fallback(order, migratetype))
+\t\treturn -2;
+
+\tif (area->nr_free == 0)
+\t\treturn -1;
+
+\tfor (i = 0; i < MIGRATE_FALLBACKS - 1; i++) {
+\t\tint fallback_mt = fallbacks[migratetype][i];
+
+\t\tif (!free_area_empty(area, fallback_mt))
+\t\t\treturn fallback_mt;
+\t}
+
+\treturn -1;
+}
+"""
+
+_B8_COMPACTION_DECL_OLD = """\t\tstruct free_area *area = &cc->zone->free_area[order];
+\t\tbool can_steal;
+
+\t\t/* Job done if page is free of the right migratetype */"""
+
+_B8_COMPACTION_DECL_NEW = """\t\tstruct free_area *area = &cc->zone->free_area[order];
+
+\t\t/* Job done if page is free of the right migratetype */"""
+
+_B8_COMPACTION_CALL_OLD = """\t\tif (find_suitable_fallback(area, order, migratetype,
+\t\t\t\t\t\ttrue, &can_steal) != -1) {"""
+
+_B8_COMPACTION_CALL_NEW = """\t\tif (find_suitable_fallback(area, order, migratetype,
+\t\t\t\t\t\ttrue) >= 0) {"""
+
+_B8_FALLBACK_OLD = """/*
+ * Try finding a free buddy page on the fallback list and put it on the free
+ * list of requested migratetype, possibly along with other pages from the same
+ * block, depending on fragmentation avoidance heuristics. Returns true if
+ * fallback was found so that __rmqueue_smallest() can grab it.
+ *
+ * The use of signed ints for order and current_order is a deliberate
+ * deviation from the rest of this file, to make the for loop
+ * condition simpler.
+ */
+static __always_inline bool
+__rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
+\t\t\t\t\t\tunsigned int alloc_flags)
+{
+\tstruct free_area *area;
+\tint current_order;
+\tint min_order = order;
+\tstruct page *page;
+\tint fallback_mt;
+\tbool can_steal;
+
+\t/*
+\t * Do not steal pages from freelists belonging to other pageblocks
+\t * i.e. orders < pageblock_order. If there are no local zones free,
+\t * the zonelists will be reiterated without ALLOC_NOFRAGMENT.
+\t */
+\tif (alloc_flags & ALLOC_NOFRAGMENT)
+\t\tmin_order = pageblock_order;
+
+\t/*
+\t * Find the largest available free page in the other list. This roughly
+\t * approximates finding the pageblock with the most free pages, which
+\t * would be too costly to do exactly.
+\t */
+\tfor (current_order = MAX_ORDER - 1; current_order >= min_order;
+\t\t\t\t--current_order) {
+\t\tarea = &(zone->free_area[current_order]);
+\t\tfallback_mt = find_suitable_fallback(area, current_order,
+\t\t\t\tstart_migratetype, false, &can_steal);
+\t\tif (fallback_mt == -1)
+\t\t\tcontinue;
+
+\t\t/*
+\t\t * We cannot steal all free pages from the pageblock and the
+\t\t * requested migratetype is movable. In that case it's better to
+\t\t * steal and split the smallest available page instead of the
+\t\t * largest available page, because even if the next movable
+\t\t * allocation falls back into a different pageblock than this
+\t\t * one, it won't cause permanent fragmentation.
+\t\t */
+\t\tif (!can_steal && start_migratetype == MIGRATE_MOVABLE
+\t\t\t\t\t&& current_order > order)
+\t\t\tgoto find_smallest;
+
+\t\tgoto do_steal;
+\t}
+
+\treturn false;
+
+find_smallest:
+\tfor (current_order = order; current_order < MAX_ORDER;
+\t\t\t\t\t\t\tcurrent_order++) {
+\t\tarea = &(zone->free_area[current_order]);
+\t\tfallback_mt = find_suitable_fallback(area, current_order,
+\t\t\t\tstart_migratetype, false, &can_steal);
+\t\tif (fallback_mt != -1)
+\t\t\tbreak;
+\t}
+
+\t/*
+\t * This should not happen - we already found a suitable fallback
+\t * when looking for the largest page.
+\t */
+\tVM_BUG_ON(current_order == MAX_ORDER);
+
+do_steal:
+\tpage = get_page_from_free_area(area, fallback_mt);
+
+\tsteal_suitable_fallback(zone, page, alloc_flags, start_migratetype,
+\t\t\t\t\t\t\t\tcan_steal);
+
+\ttrace_mm_page_alloc_extfrag(page, order, current_order,
+\t\tstart_migratetype, fallback_mt);
+
+\treturn true;
+
+}
+"""
+
+_B8_FALLBACK_NEW = """/*
+ * ABK stable_515_backport: split fallback claim and single-page steal phases.
+ * Try to allocate from a fallback migratetype by claiming the entire block,
+ * i.e. converting it to the allocation's start migratetype.
+ *
+ * The use of signed ints for order and current_order is a deliberate
+ * deviation from the rest of this file, to make the for loop
+ * condition simpler.
+ */
+static __always_inline struct page *
+__rmqueue_claim(struct zone *zone, int order, int start_migratetype,
+\t\t\t\t\t\tunsigned int alloc_flags)
+{
+\tstruct free_area *area;
+\tint current_order;
+\tint min_order = order;
+\tstruct page *page;
+\tint fallback_mt;
+
+\t/* ABK stable_515_backport: reuse the claim phase while zone->lock is held. */
+\tif (alloc_flags & ALLOC_NOFRAGMENT)
+\t\tmin_order = pageblock_order;
+
+\tfor (current_order = MAX_ORDER - 1; current_order >= min_order;
+\t\t\t\t--current_order) {
+\t\tarea = &(zone->free_area[current_order]);
+\t\tfallback_mt = find_suitable_fallback(area, current_order,
+\t\t\t\t\t\t\tstart_migratetype, true);
+
+\t\t/* No block in that order. */
+\t\tif (fallback_mt == -1)
+\t\t\tcontinue;
+
+\t\t/* Advanced into orders too low to claim, abort. */
+\t\tif (fallback_mt == -2)
+\t\t\tbreak;
+
+\t\tpage = get_page_from_free_area(area, fallback_mt);
+\t\tsteal_suitable_fallback(zone, page, alloc_flags, start_migratetype,
+\t\t\t\t\t\t\t\t\ttrue);
+\t\tpage = __rmqueue_smallest(zone, order, start_migratetype);
+\t\tif (page) {
+\t\t\ttrace_mm_page_alloc_extfrag(page, order, current_order,
+\t\t\t\t\t\t\t\tstart_migratetype, fallback_mt);
+\t\t\treturn page;
+\t\t}
+\t}
+
+\treturn NULL;
+}
+
+/*
+ * ABK stable_515_backport: keep single-page stealing as a separate mode.
+ * Try to steal a single page from some fallback migratetype. Leave the rest of
+ * the block as its current migratetype, potentially causing fragmentation.
+ */
+static __always_inline struct page *
+__rmqueue_steal(struct zone *zone, int order, int start_migratetype,
+\t\t\t\t\t\tunsigned int alloc_flags)
+{
+\tstruct free_area *area;
+\tint current_order;
+\tstruct page *page;
+\tint fallback_mt;
+
+\tfor (current_order = order; current_order < MAX_ORDER; current_order++) {
+\t\tarea = &(zone->free_area[current_order]);
+\t\tfallback_mt = find_suitable_fallback(area, current_order,
+\t\t\t\t\t\t\tstart_migratetype, false);
+\t\tif (fallback_mt == -1)
+\t\t\tcontinue;
+
+\t\tpage = get_page_from_free_area(area, fallback_mt);
+\t\tsteal_suitable_fallback(zone, page, alloc_flags, start_migratetype,
+\t\t\t\t\t\t\t\t\tfalse);
+\t\tpage = __rmqueue_smallest(zone, order, start_migratetype);
+\t\tif (page) {
+\t\t\ttrace_mm_page_alloc_extfrag(page, order, current_order,
+\t\t\t\t\t\t\t\tstart_migratetype, fallback_mt);
+\t\t\treturn page;
+\t\t}
+\t}
+
+\treturn NULL;
+}
+
+/* ABK stable_515_backport: fallback search phase remembered by rmqueue_bulk. */
+enum rmqueue_mode {
+\tRMQUEUE_NORMAL,
+\tRMQUEUE_CMA,
+\tRMQUEUE_CLAIM,
+\tRMQUEUE_STEAL,
+};
+"""
+
+_B8_RMQUEUE_OLD = """/*
+ * Do the hard work of removing an element from the buddy allocator.
+ * Call me with the zone->lock already held.
+ */
+static __always_inline struct page *
+__rmqueue(struct zone *zone, unsigned int order, int migratetype,
+\t\t\t\t\t\tunsigned int alloc_flags)
+{
+\tstruct page *page = NULL;
+
+\ttrace_android_vh_rmqueue_smallest_bypass(&page, zone, order, migratetype);
+\tif (page)
+\t\treturn page;
+
+retry:
+\tpage = __rmqueue_smallest(zone, order, migratetype);
+
+\t/*
+\t * let normal GFP_MOVABLE has chance to try MIGRATE_CMA
+\t */
+\tif (unlikely(!page) && (migratetype == MIGRATE_MOVABLE)) {
+\t\tbool try_cma = false;
+\t\ttrace_android_vh_rmqueue_cma_fallback(zone, order, &page);
+\t\ttrace_android_vh_try_cma_fallback(zone, order, &try_cma);
+\t\tif (try_cma)
+\t\t\tpage = __rmqueue_cma_fallback(zone, order);
+\t}
+
+\tif (unlikely(!page) && __rmqueue_fallback(zone, order, migratetype,
+\t\t\t\t\t\t  alloc_flags))
+\t\tgoto retry;
+
+\tif (page)
+\t\ttrace_mm_page_alloc_zone_locked(page, order, migratetype);
+\treturn page;
+}
+"""
+
+_B8_RMQUEUE_NEW = """/*
+ * Do the hard work of removing an element from the buddy allocator.
+ * Call me with the zone->lock already held.
+ */
+static __always_inline struct page *
+__rmqueue(struct zone *zone, unsigned int order, int migratetype,
+\t\t\t\t\t\tunsigned int alloc_flags, enum rmqueue_mode *mode)
+{
+\tstruct page *page = NULL;
+
+\ttrace_android_vh_rmqueue_smallest_bypass(&page, zone, order, migratetype);
+\tif (page)
+\t\treturn page;
+
+\t/*
+\t * First try the freelists of the requested migratetype, then try fallback
+\t * modes with increasing levels of fragmentation risk. The fallback logic
+\t * is expensive and rmqueue_bulk() keeps zone->lock held across the loop,
+\t * so remember the successful mode for the next page in that batch.
+\t */
+\tswitch (*mode) {
+\tcase RMQUEUE_NORMAL:
+\t\tpage = __rmqueue_smallest(zone, order, migratetype);
+\t\tif (page)
+\t\t\tgoto out;
+\t\tfallthrough;
+\tcase RMQUEUE_CMA:
+\t\tif (migratetype == MIGRATE_MOVABLE) {
+\t\t\tbool try_cma = false;
+\t\t\tbool from_cma = false;
+
+\t\t\ttrace_android_vh_rmqueue_cma_fallback(zone, order, &page);
+\t\t\ttrace_android_vh_try_cma_fallback(zone, order, &try_cma);
+\t\t\tif (try_cma) {
+\t\t\t\tpage = __rmqueue_cma_fallback(zone, order);
+\t\t\t\tfrom_cma = !!page;
+\t\t\t}
+\t\t\tif (page) {
+\t\t\t\tif (from_cma)
+\t\t\t\t\t*mode = RMQUEUE_CMA;
+\t\t\t\tgoto out;
+\t\t\t}
+\t\t}
+\t\tfallthrough;
+\tcase RMQUEUE_CLAIM:
+\t\tpage = __rmqueue_claim(zone, order, migratetype, alloc_flags);
+\t\tif (page) {
+\t\t\t/* Replenished the preferred freelist, go back to normal mode. */
+\t\t\t*mode = RMQUEUE_NORMAL;
+\t\t\tgoto out;
+\t\t}
+\t\tfallthrough;
+\tcase RMQUEUE_STEAL:
+\t\tif (!(alloc_flags & ALLOC_NOFRAGMENT)) {
+\t\t\tpage = __rmqueue_steal(zone, order, migratetype, alloc_flags);
+\t\t\tif (page) {
+\t\t\t\t*mode = RMQUEUE_STEAL;
+\t\t\t\tgoto out;
+\t\t\t}
+\t\t}
+\t\tbreak;
+\t}
+
+\tpage = NULL;
+out:
+\tif (page)
+\t\ttrace_mm_page_alloc_zone_locked(page, order, migratetype);
+\treturn page;
+}
+"""
+
+_B8_BULK_DECL_OLD = """{
+\tint i, allocated = 0;
+
+\t/* Caller must hold IRQ-safe pcp->lock so IRQs are disabled. */"""
+
+_B8_BULK_DECL_NEW = """{
+\t/* ABK stable_515_backport: reuse the fallback mode for this locked batch. */
+\tenum rmqueue_mode rmqm = RMQUEUE_NORMAL;
+\tint i, allocated = 0;
+
+\t/* Caller must hold IRQ-safe pcp->lock so IRQs are disabled. */"""
+
+_B8_BULK_CALL_OLD = """\t\telse
+\t\t\tpage = __rmqueue(zone, order, migratetype, alloc_flags);"""
+
+_B8_BULK_CALL_NEW = """\t\telse
+\t\t\tpage = __rmqueue(zone, order, migratetype, alloc_flags, &rmqm);"""
+
+_B8_BUDDY_CALL_OLD = """\t\t\t\tif (try_cma)
+\t\t\t\t\tpage = __rmqueue_cma(zone, order, migratetype,
+\t\t\t\t\t\t\talloc_flags);
+\t\t\t}
+\t\t\tif (!page)
+\t\t\t\tpage = __rmqueue(zone, order, migratetype,
+\t\t\t\t\t\talloc_flags);"""
+
+_B8_BUDDY_CALL_NEW = """\t\t\t\tif (try_cma)
+\t\t\t\t\tpage = __rmqueue_cma(zone, order, migratetype,
+\t\t\t\t\t\t\talloc_flags);
+\t\t\t}
+\t\t\tif (!page) {
+\t\t\t\tenum rmqueue_mode rmqm = RMQUEUE_NORMAL;
+
+\t\t\t\tpage = __rmqueue(zone, order, migratetype,
+\t\t\t\t\t\talloc_flags, &rmqm);
+\t\t\t}"""
+
+# The CMA probe itself is nested one level deeper than the following fallback
+# in the 5.15 function.  Build the highatomic variant from the exact compact
+# anchor instead of indenting the whole mixed-scope block.
+_B8_BUDDY_HIGHATOMIC_TAIL_OLD = """\t\t\tif (!page)
+				page = __rmqueue(zone, order, migratetype,
+						alloc_flags);"""
+_B8_BUDDY_HIGHATOMIC_TAIL_NEW = """\t\t\tif (!page) {
+				enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
+
+				page = __rmqueue(zone, order, migratetype,
+						alloc_flags, &rmqm);
+			}"""
+_B8_BUDDY_HIGHATOMIC_RETRY = """\t\t\tif (!page) {
+				page = __rmqueue(zone, order, migratetype,
+						alloc_flags);
+
+				/*
+				 * If the allocation fails, allow OOM handling and
+				 * order-0 (atomic) allocs access to HIGHATOMIC
+				 * reserves as failing now is worse than failing a
+				 * high-order atomic allocation in the future.
+				 */
+				if (!page && (alloc_flags & (ALLOC_OOM|ALLOC_NON_BLOCK)))
+					page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+			}"""
+_B8_BUDDY_HIGHATOMIC_RETRY_NEW = """\t\t\tif (!page) {
+				enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
+
+				page = __rmqueue(zone, order, migratetype,
+						alloc_flags, &rmqm);
+
+				/*
+				 * If the allocation fails, allow OOM handling and
+				 * order-0 (atomic) allocs access to HIGHATOMIC
+				 * reserves as failing now is worse than failing a
+				 * high-order atomic allocation in the future.
+				 */
+				if (!page && (alloc_flags & (ALLOC_OOM|ALLOC_NON_BLOCK)))
+					page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+			}"""
+_B8_BUDDY_CALL_HIGHATOMIC_OLD = _B8_BUDDY_CALL_OLD.replace(
+    _B8_BUDDY_HIGHATOMIC_TAIL_OLD, _B8_BUDDY_HIGHATOMIC_RETRY)
+_B8_BUDDY_CALL_HIGHATOMIC_NEW = _B8_BUDDY_CALL_NEW.replace(
+    _B8_BUDDY_HIGHATOMIC_TAIL_NEW, _B8_BUDDY_HIGHATOMIC_RETRY_NEW)
+
+
+def _pagealloc_fallback_reuse_apply(ctx):
+    page_alloc_probe = ctx.read("mm/page_alloc.c")
+    buddy_call = (_B8_BUDDY_CALL_HIGHATOMIC_OLD,
+                  _B8_BUDDY_CALL_HIGHATOMIC_NEW)
+    if "If the allocation fails, allow OOM handling" not in page_alloc_probe:
+        buddy_call = (_B8_BUDDY_CALL_OLD, _B8_BUDDY_CALL_NEW)
+    steps = [
+        ("mm/internal.h",
+         "int find_suitable_fallback(struct free_area *area, unsigned int order,\n"
+         "\t\t\tint migratetype, bool only_stealable, bool *can_steal);",
+         "int find_suitable_fallback(struct free_area *area, unsigned int order,\n"
+         "\t\t\tint migratetype, bool claimable);",
+         T),
+        ("mm/compaction.c", _B8_COMPACTION_DECL_OLD,
+         _B8_COMPACTION_DECL_NEW, T),
+        ("mm/compaction.c", _B8_COMPACTION_CALL_OLD,
+         _B8_COMPACTION_CALL_NEW, T),
+        ("mm/page_alloc.c", _B8_FIND_OLD, _B8_FIND_NEW, T),
+        ("mm/page_alloc.c", _B8_RMQUEUE_OLD, _B8_RMQUEUE_NEW, T),
+        ("mm/page_alloc.c", _B8_FALLBACK_OLD, _B8_FALLBACK_NEW, T),
+        ("mm/page_alloc.c", _B8_BULK_DECL_OLD, _B8_BULK_DECL_NEW, T),
+        ("mm/page_alloc.c", _B8_BULK_CALL_OLD, _B8_BULK_CALL_NEW, T),
+        ("mm/page_alloc.c", buddy_call[0], buddy_call[1], T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+_B8_RCU_NOCB_KCONFIG_OLD = """\t  Say Y here if you need reduced OS jitter, despite added overhead.\n\t  Say N here if you are unsure.\n\nconfig TASKS_TRACE_RCU_READ_MB"""
+_B8_RCU_NOCB_KCONFIG_NEW = """\t  Say Y here if you need reduced OS jitter, despite added overhead.\n\t  Say N here if you are unsure.\n\n# ABK stable_515_backport: RCU_NOCB_CPU_DEFAULT_ALL option from upstream.\nconfig RCU_NOCB_CPU_DEFAULT_ALL\n\tbool \"Offload RCU callback processing from all CPUs by default\"\n\tdepends on RCU_NOCB_CPU\n\tdefault n\n\thelp\n\t  Use this option to offload callback processing from all CPUs\n\t  by default, in the absence of the rcu_nocbs or nohz_full boot\n\t  parameter. This also avoids the need to use any boot parameters\n\t  to achieve the effect of offloading all CPUs on boot.\n\n\t  Say Y here if you want offload all CPUs by default on boot.\n\t  Say N here if you are unsure.\n\nconfig TASKS_TRACE_RCU_READ_MB"""
+
+_B8_RCU_NOCB_DOC_NOHZ_OLD = """\t\t\tjust as if they had also been called out in the\n\t\t\trcu_nocbs= boot parameter."""
+_B8_RCU_NOCB_DOC_NOHZ_NEW = """\t\t\tjust as if they had also been called out in the\n\t\t\trcu_nocbs= boot parameter.\n\n\t\t\tABK stable_515_backport: This argument takes precedence over\n\t\t\tCONFIG_RCU_NOCB_CPU_DEFAULT_ALL."""
+
+_B8_RCU_NOCB_DOC_PARAM_OLD = """\t\t\twhich can be useful for HPC and real-time\n\t\t\tworkloads.  It can also improve energy efficiency\n\t\t\tfor asymmetric multiprocessors."""
+_B8_RCU_NOCB_DOC_PARAM_NEW = """\t\t\twhich can be useful for HPC and real-time\n\t\t\tworkloads.  It can also improve energy efficiency\n\t\t\tfor asymmetric multiprocessors.\n\n\t\t\tABK stable_515_backport: This argument takes precedence over\n\t\t\tCONFIG_RCU_NOCB_CPU_DEFAULT_ALL."""
+
+_B8_RCU_NOCB_INIT_OLD = """\tint cpu;\n\tbool need_rcu_nocb_mask = false;\n\tstruct rcu_data *rdp;\n\n#if defined(CONFIG_NO_HZ_FULL)"""
+_B8_RCU_NOCB_INIT_NEW = """\tint cpu;\n\tbool need_rcu_nocb_mask = false;\n\t/* ABK stable_515_backport: default-all tracks whether no boot mask was supplied. */\n\tbool offload_all = false;\n\tstruct rcu_data *rdp;\n\n#if defined(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL)\n\tif (!cpumask_available(rcu_nocb_mask)) {\n\t\tneed_rcu_nocb_mask = true;\n\t\toffload_all = true;\n\t}\n#endif /* #if defined(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL) */\n\n#if defined(CONFIG_NO_HZ_FULL)"""
+_B8_RCU_NOCB_NOHZ_OLD = """#if defined(CONFIG_NO_HZ_FULL)\n\tif (tick_nohz_full_running && cpumask_weight(tick_nohz_full_mask))\n\t\tneed_rcu_nocb_mask = true;\n#endif /* #if defined(CONFIG_NO_HZ_FULL) */"""
+_B8_RCU_NOCB_NOHZ_NEW = """#if defined(CONFIG_NO_HZ_FULL)\n\tif (tick_nohz_full_running && cpumask_weight(tick_nohz_full_mask)) {\n\t\tneed_rcu_nocb_mask = true;\n\t\toffload_all = false; /* NO_HZ_FULL has its own mask. */\n\t}\n#endif /* #if defined(CONFIG_NO_HZ_FULL) */"""
+_B8_RCU_NOCB_SETALL_OLD = """#if defined(CONFIG_NO_HZ_FULL)\n\tif (tick_nohz_full_running)\n\t\tcpumask_or(rcu_nocb_mask, rcu_nocb_mask, tick_nohz_full_mask);\n#endif /* #if defined(CONFIG_NO_HZ_FULL) */\n\n\tif (register_shrinker(&lazy_rcu_shrinker))"""
+_B8_RCU_NOCB_SETALL_NEW = """#if defined(CONFIG_NO_HZ_FULL)\n\tif (tick_nohz_full_running)\n\t\tcpumask_or(rcu_nocb_mask, rcu_nocb_mask, tick_nohz_full_mask);\n#endif /* #if defined(CONFIG_NO_HZ_FULL) */\n\n\t/* ABK stable_515_backport: materialize the default all-CPU mask. */\n\tif (offload_all)\n\t\tcpumask_setall(rcu_nocb_mask);\n\n\tif (register_shrinker(&lazy_rcu_shrinker))"""
+
+
+def _rcu_nocb_cpu_default_all_apply(ctx):
+    kconfig = ctx.read("kernel/rcu/Kconfig")
+    nocb = ctx.read("kernel/rcu/tree_nocb.h")
+    params = ctx.read("Documentation/admin-guide/kernel-parameters.txt")
+    if ("config RCU_NOCB_CPU_DEFAULT_ALL" in kconfig
+            and "bool offload_all = false" in nocb
+            and "CONFIG_RCU_NOCB_CPU_DEFAULT_ALL" in params):
+        return "already_present", "RCU_NOCB_CPU_DEFAULT_ALL is already present"
+    steps = [
+        ("kernel/rcu/Kconfig", _B8_RCU_NOCB_KCONFIG_OLD,
+         _B8_RCU_NOCB_KCONFIG_NEW, T),
+        ("Documentation/admin-guide/kernel-parameters.txt",
+        _B8_RCU_NOCB_DOC_NOHZ_OLD, _B8_RCU_NOCB_DOC_NOHZ_NEW, T),
+        ("Documentation/admin-guide/kernel-parameters.txt",
+         _B8_RCU_NOCB_DOC_PARAM_OLD, _B8_RCU_NOCB_DOC_PARAM_NEW, T),
+        ("kernel/rcu/tree_nocb.h", _B8_RCU_NOCB_INIT_OLD,
+         _B8_RCU_NOCB_INIT_NEW, T),
+        ("kernel/rcu/tree_nocb.h", _B8_RCU_NOCB_NOHZ_OLD,
+         _B8_RCU_NOCB_NOHZ_NEW, T),
+        ("kernel/rcu/tree_nocb.h", _B8_RCU_NOCB_SETALL_OLD,
+         _B8_RCU_NOCB_SETALL_NEW, T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "pagealloc_fallback_reuse",
+        "reuse rmqueue fallback modes across rmqueue_bulk() and avoid repeated claimability scans (android15-6.6 / 6.12)",
+        [
+            "e8400a074123 (android15-6.6 rmqueue_bulk fallback mode reuse)",
+            "0b8d16680d9f (android15-6.6 find_suitable_fallback cleanup)",
+        ],
+        ["mm/page_alloc.c", "mm/compaction.c", "mm/internal.h"],
+        _pagealloc_fallback_reuse_apply,
+    ),
+    PatchGroup(
+        "rcu_nocb_cpu_default_all",
+        "add an opt-in default mask that offloads RCU callbacks from every CPU (upstream rcu/nocb)",
+        ["b37a667c6242 (rcu/nocb: add an option to offload all CPUs on boot)"],
+        ["Documentation/admin-guide/kernel-parameters.txt", "kernel/rcu/Kconfig",
+         "kernel/rcu/tree_nocb.h"],
+        _rcu_nocb_cpu_default_all_apply,
+    ),
+]
+
+
 if __name__ == "__main__":
     main()
-
