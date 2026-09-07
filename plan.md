@@ -16,6 +16,16 @@ v0.10.1 修复：`pagealloc_fallback_reuse` 移植的 `find_suitable_fallback()`
 终止 fallback 遍历（`fallbacks[migratetype][i] != MIGRATE_TYPES`），保持组
 `applied` 且幂等/回滚审计通过。
 
+v0.10.2 修复：`zsmalloc_chain_size` 只搬了 sizing，漏搬了 6.2 重做里与之配套的
+`ISOLATED_BITS` 3→5。`struct zspage.isolated` 是 3-bit 位域（max 7），而
+`ZS_MAX_PAGES_PER_ZSPAGE` 改为 `CONFIG_ZSMALLOC_CHAIN_SIZE`（默认 8）后，8 页
+zspage 的第 8 个子页隔离会让 `isolated` 7→0 回绕、`is_zspage_isolated()` 误判，
+内存压缩迁移时 `putback_zspage()` 对已在链表头的 zspage 二次 `list_add` →
+`kernel BUG at lib/list_debug.c:35` panic（红米 K70/vermeer 5.15.211 实测，
+运行 ~4.7h 后 kcompactd 触发）。补第 5 步 `#define ISOLATED_BITS 3`→`5`
+（与 android15-6.6 对齐），`implementation_audit` 的 `REQUIRED_CONTENT`
+增加 `#define ISOLATED_BITS\t5` 断言。
+
 详细来源、收益证据、依赖、验证门槛和排除项见
 [`docs/batch8_long_term.md`](docs/batch8_long_term.md)。
 

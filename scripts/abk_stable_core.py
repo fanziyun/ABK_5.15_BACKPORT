@@ -2394,9 +2394,11 @@ def main():
 #
 # The 5.15 baseline fixes a zspage at 2^2 pages and picks the chain length by
 # best-used-percentage; 6.2 made the ceiling a tunable and minimised absolute
-# waste instead, which is what actually shrinks small size classes.  Only the
-# sizing is ported: the 6.3+ fullness rename, zs_page_migrate rework and
-# zs_size_stat growth stay out, so NR_ZS_FULLNESS and the exported API hold.
+# waste instead, which is what actually shrinks small size classes.  The
+# correlated ISOLATED_BITS widening ships too (a chain-size-8 zspage overflows
+# the 5.15 3-bit `isolated` counter); the 6.3+ fullness rename, zs_page_migrate
+# rework and zs_size_stat growth stay out, so NR_ZS_FULLNESS and the exported
+# API hold.
 # ---------------------------------------------------------------------------
 
 _ZS_KCONFIG_STAT = (
@@ -2496,6 +2498,15 @@ _ZS_SIZING_NEW = (
 )
 
 
+# ISOLATED_BITS accompanies the chain-size ceiling: the 5.15 baseline gives
+# `isolated` 3 bits (max 7), which is enough for a 2^2-page zspage but not for
+# CONFIG_ZSMALLOC_CHAIN_SIZE (default 8).  Without this, an 8-page zspage
+# overflows `isolated`, corrupts the isolate/putback pairing and trips
+# list_add double add in putback_zspage() under memory compaction.
+_ZS_ISOLATED_BITS_OLD = "#define ISOLATED_BITS\t3\n"
+_ZS_ISOLATED_BITS_NEW = "#define ISOLATED_BITS\t5\n"
+
+
 def _zsmalloc_chain_size_apply(ctx):
     steps = [
         ("mm/Kconfig", _ZS_KCONFIG_STAT, _ZS_KCONFIG_STAT + _ZS_KCONFIG_CHAIN, T),
@@ -2504,6 +2515,7 @@ def _zsmalloc_chain_size_apply(ctx):
         ("mm/zsmalloc.c",
          "\t\tpages_per_zspage = get_pages_per_zspage(size);\n",
          "\t\tpages_per_zspage = calculate_zspage_chain_size(size);\n", T),
+        ("mm/zsmalloc.c", _ZS_ISOLATED_BITS_OLD, _ZS_ISOLATED_BITS_NEW, T),
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:

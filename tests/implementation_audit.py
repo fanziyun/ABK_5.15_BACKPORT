@@ -49,6 +49,9 @@ REQUIRED_CONTENT = {
     "core:memcg_memory_reclaim": ["memory.reclaim", "MEMCG_RECLAIM_MAY_SWAP"],
     "core:zsmalloc_chain_size": [
         "calculate_zspage_chain_size", "ZSMALLOC_CHAIN_SIZE", "is_power_of_2",
+        # The chain-size ceiling must also widen the isolated-subpage counter,
+        # or an 8-page zspage overflows it and double-adds on putback.
+        "#define ISOLATED_BITS\t5",
     ],
     "core:madvise_collapse": [
         "madvise_collapse", "MADV_COLLAPSE",
