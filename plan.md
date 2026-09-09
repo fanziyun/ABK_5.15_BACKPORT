@@ -10,8 +10,9 @@
 [`docs/survey_popsicle_w_611.md`](docs/survey_popsicle_w_611.md)，
 diff 工件与源树元数据见 `research/popsicle_w_oss/`。本批次主体仍是调研登记；
 **Batch 9-1 `dynamic_readahead_lowmem` 组已落地**（见下文进度块，代码已入
-registry、三档锚点/幂等/回滚审计全绿，`GROUP_COUNTS` core 16→17；
-`module.conf` 版本待 ABK CI 编译通过后再递增）。其余候选项零落地。
+registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
+`GROUP_COUNTS` core 16→17，`module.conf` 已递增至 v0.11.0）。
+其余候选项零落地。
 
 要点（决定本线的可移植性结论）：
 
@@ -43,7 +44,7 @@ registry、三档锚点/幂等/回滚审计全绿，`GROUP_COUNTS` core 16→17�
   LRPB pipeline / votable / boost），AOSP android13-5.15 GKI 无 WALT，
   无锚点；类 WALT 效果需独立调度器工程，超出模块 bounded-graft 边界
 
-### Batch 9-1 落地进度（dynamic_readahead_lowmem，代码已落地 / 待 ABK CI 编译）
+### Batch 9-1 落地进度（dynamic_readahead_lowmem，已落地 + ABK CI 编译通过）
 
 - [x] 来源实锤：`MiCode/Xiaomi_Kernel_OpenSource` 的
   `xiaomi-modules/mi_dynamic_readahead/dynamic_readahead.c`
@@ -64,8 +65,10 @@ registry、三档锚点/幂等/回滚审计全绿，`GROUP_COUNTS` core 16→17�
   implementation_audit OK（REQUIRED_CONTENT 新增断言，无 xring 残留）；
   smoke OK 三档（167/178/194：pass1 applied、pass2 already_present、
   回滚通过，核心计数 core 16→17）。
-- [ ] 编译验证：待 ABK CI 对三档跑编译（本模块只做锚点审计，不本地编内核）；
-  CI 编译通过后再递增 `module.conf` 版本并把本组标记为 Batch 9 正式落地。
+- [x] 编译验证：ABK CI（`fanziyun/ABK` run
+  <https://github.com/fanziyun/ABK/actions/runs/34407686264>，
+  android13/5.15-X/lts，实际 5.15.215）编译内核 + Boot 打包全绿；
+  已按惯例 bump `module.conf` 至 v0.11.0，本组正式落地。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
