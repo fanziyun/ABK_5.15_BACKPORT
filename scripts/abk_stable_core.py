@@ -1717,6 +1717,10 @@ def _zram_recompression_apply(ctx):
          "\tzram->disksize = 0;\n\n"
          "\tset_capacity_and_notify(zram->disk, 0);\n"
          "\tpart_stat_set_all(zram->disk->part0, 0);\n\n"
+         "\t/* ABK stable_515_backport: Batch 10-1 drains async recompress jobs\n"
+         "\t * before comps/table teardown so queued jobs never see a dead pool.\n"
+         "\t */\n"
+         "\tabk_zram_recomp_drain(zram);\n\n"
          "\tup_write(&zram->init_lock);\n"
          "\t/* I/O operation under all of CPU are done so let's free */\n"
          "\tzram_meta_free(zram, disksize);\n"
@@ -3696,6 +3700,35 @@ PATCH_GROUPS = PATCH_GROUPS + [
         ],
         ["mm/readahead.c", "mm/Kconfig"],
         _dynamic_readahead_apply,
+    ),
+]
+
+# ============================================================================
+# Batch 10-1: zram async recompress (plan A, kcompressd-style soft
+# decoupling).  Steps live in scripts/batch10_core_zram_async.py; the sysfs
+# scan stays synchronous while the recompress work drains on a per-device
+# "zram_recompd" kthread_worker (QPACE generic-queue skeleton, no QTI).
+# ============================================================================
+import batch10_core_zram_async as _b10_zram  # noqa: E402
+
+
+def _zram_async_recompress_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b10_zram.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "zram_async_recompress",
+        "zram async recompress: recompress_store gains async=1; candidate pages drain on a per-device kthread_worker (QPACE soft decoupling, plan A)",
+        [
+            "popsicle-w-oss zram_drv QPACE async skeleton (generic queue part)",
+            "Batch 10-1 plan A design (plan.md)",
+        ],
+        ["drivers/block/zram/zram_drv.c"],
+        _zram_async_recompress_apply,
     ),
 ]
 

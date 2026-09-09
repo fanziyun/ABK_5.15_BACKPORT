@@ -62,6 +62,7 @@ FETCH_FILES=(
   kernel/sched/features.h
   kernel/sched/stats.h
   kernel/sched/psi.c
+  kernel/sched/cpufreq_schedutil.c
   kernel/fork.c
   kernel/locking/semaphore.c
   kernel/locking/mutex.c

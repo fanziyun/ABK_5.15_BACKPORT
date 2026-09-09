@@ -1483,6 +1483,37 @@ PATCH_GROUPS = [
     ),
 ]
 
+# ============================================================================
+# Batch 10-2: schedutil smart-freq policy layer on PELT (inspired by the WALT
+# smart_freq SUSTAINED_HIGH_UTIL reason; see walt_pelt_survey.md).  Steps
+# live in scripts/batch10_perf_sched_policy.py: per-cluster sustained-high
+# util election on the PELT util schedutil already feeds into get_next_freq()
+# (android_vh_map_util_freq_new), floored at cpufreq resolve time
+# (android_vh_cpufreq_resolve_freq).  A from-scratch policy, not a code move.
+# ============================================================================
+import batch10_perf_sched_policy as _b10_sched  # noqa: E402
+
+
+def _sched_smart_policy_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b10_sched.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "schedutil_smart_policy",
+        "schedutil smart-freq policy (PELT): per-cluster sustained-high-util reason election with hysteresis + frequency floor at cpufreq resolve time, via the android_vh hooks (inspired by WALT smart_freq; Batch 10-2)",
+        [
+            "popsicle-w-oss walt smart_freq/pipeline semantics (control-layer subset)",
+            "research/popsicle_w_oss/walt_pelt_survey.md",
+        ],
+        ["kernel/sched/cpufreq_schedutil.c"],
+        _sched_smart_policy_apply,
+    ),
+]
+
 
 def main():
     args = parse_args("stable_perf_backport: 5.15.y scheduler/net/locking/block optimization grafts")

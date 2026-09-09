@@ -94,6 +94,8 @@ AUDIT_FILES = [
     "kernel/sched/features.h",
     "kernel/sched/stats.h",
     "kernel/sched/psi.c",
+    # Batch 10-2: the schedutil smart-freq policy layer appends to this file.
+    "kernel/sched/cpufreq_schedutil.c",
     "kernel/fork.c",
     "kernel/locking/semaphore.c",
     "kernel/locking/mutex.c",

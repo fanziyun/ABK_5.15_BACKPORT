@@ -698,6 +698,98 @@ def test_batch9_dynamic_readahead():
               status2 == "already_present", status2)
 
 
+def test_batch10_zram_async_recompress():
+    print("Batch 10-1 zram_async_recompress")
+    import abk_stable_core as core
+    import batch10_core_zram_async as z10
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_async_recompress"), None)
+    check("zram_async_recompress group registered", group is not None)
+    if group is None:
+        return
+
+    steps = z10.build_steps()
+    check("group files match its steps",
+          {s[0] for s in steps} == set(group.files), (steps, group.files))
+    for (rel, old, new, req) in steps:
+        check(f"step {old.splitlines()[0][:34]!r} is required",
+              req is True and old and old != new, (req, old == new))
+
+    zram_c = (
+        z10._C_INC_OLD + z10._DECL_OLD
+        + "\t&dev_attr_comp_algorithm.attr,\n"
+        + "static int zram_init(void) { return 0; }\n"
+        + z10._MODULE_INIT_OLD
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "drivers/block/zram/zram_drv.c": zram_c,
+        })
+        status, detail = core._zram_async_recompress_apply(ctx)
+        check("zram_async_recompress fixture applies all steps",
+              status == "applied", (status, detail))
+        text = ctx.read("drivers/block/zram/zram_drv.c")
+        check("async node and engine text landed in the driver",
+              "recompress_async" in text
+              and "abk_zram_recomp_enqueue" in text
+              and "kthread_create_worker(0, \"zram_recompd\")" in text)
+        check("sysfs list entry is guarded",
+              "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
+              "\t&dev_attr_recompress_async.attr,\n"
+              "#endif\n"
+              "\t&dev_attr_comp_algorithm.attr," in text)
+        check("reset drain entry point is declared",
+              "abk_zram_recomp_drain(struct zram *zram);" in text)
+        ctx2 = make_ctx(tmp, {"drivers/block/zram/zram_drv.c": text})
+        status2, _detail2 = core._zram_async_recompress_apply(ctx2)
+        check("zram_async_recompress fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = core._zram_async_recompress_apply(ctx)
+        check("zram_async_recompress degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
+def test_batch10_sched_smart_policy():
+    print("Batch 10-2 schedutil_smart_policy")
+    import abk_stable_perf as perf
+    import batch10_perf_sched_policy as s10
+
+    group = next((g for g in perf.PATCH_GROUPS
+                  if g.key == "schedutil_smart_policy"), None)
+    check("schedutil_smart_policy group registered", group is not None)
+    if group is None:
+        return
+
+    sched = s10._INC_OLD + "void governor(void);\n" + s10._TAIL_OLD
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"kernel/sched/cpufreq_schedutil.c": sched})
+        status, detail = perf._sched_smart_policy_apply(ctx)
+        check("sched smart-policy fixture applies all steps",
+              status == "applied", (status, detail))
+        text = ctx.read("kernel/sched/cpufreq_schedutil.c")
+        check("policy registers both android hooks",
+              "register_trace_android_vh_map_util_freq_new" in text
+              and "register_trace_android_vh_cpufreq_resolve_freq" in text)
+        check("policy carries the runtime enable knob",
+              "abk_sf_enable" in text)
+        ctx2 = make_ctx(tmp, {"kernel/sched/cpufreq_schedutil.c": text})
+        status2, _detail2 = perf._sched_smart_policy_apply(ctx2)
+        check("sched smart-policy fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = perf._sched_smart_policy_apply(ctx)
+        check("sched smart-policy degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
 def test_batch8_autofdo_tool():
     """The AutoFDO tool is a build-engineering script, not a graft.
 
@@ -863,6 +955,8 @@ def main():
     test_batch8_pagealloc_fallback_reuse()
     test_batch8_rcu_nocb_cpu_default_all()
     test_batch9_dynamic_readahead()
+    test_batch10_zram_async_recompress()
+    test_batch10_sched_smart_policy()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()

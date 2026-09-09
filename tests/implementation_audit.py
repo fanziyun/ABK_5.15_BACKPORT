@@ -95,6 +95,23 @@ REQUIRED_CONTENT = {
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
+    "core:zram_async_recompress": [
+        "Batch 10-1 async recompress engine (plan A)",
+        "abk_zram_recomp_enqueue",
+        "kthread_create_worker(0, \"zram_recompd\")",
+        "recompress_async",
+        "dev_attr_recompress_async.attr",
+        # The reset drain call is folded into the recompression group's reset
+        # text; make sure it really invokes the async teardown entry point.
+        "abk_zram_recomp_drain(zram);",
+    ],
+    "perf:schedutil_smart_policy": [
+        "Batch 10-2 sched smart-freq policy (PELT)",
+        "abk_sf_enable",
+        "register_trace_android_vh_map_util_freq_new(abk_sf_map_util, NULL)",
+        "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,",
+        "late_initcall(abk_sf_init)",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
