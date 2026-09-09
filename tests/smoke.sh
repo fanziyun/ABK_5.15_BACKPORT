@@ -72,6 +72,8 @@ SMOKE_FILES=(
   include/linux/zsmalloc.h
   arch/arm64/configs/gki_defconfig
   mm/Kconfig
+  mm/readahead.c
+  mm/filemap.c
   mm/khugepaged.c
   mm/madvise.c
   include/linux/huge_mm.h
@@ -212,6 +214,22 @@ scan_file_defs="$(grep -c "^static void khugepaged_scan_file" "$KERNEL_ROOT/comm
   || fail "expected 2 khugepaged_scan_file() definitions, found $scan_file_defs"
 grep -qE "^CONFIG_ZRAM_MULTI_COMP=y" "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
   || fail "defconfig lane did not enable ZRAM_MULTI_COMP"
+# Batch 9-1: dynamic readahead registers both android vendor-hook callbacks.
+grep -q "register_trace_android_vh_ra_tuning_max_page" \
+  "$KERNEL_ROOT/common/mm/readahead.c" \
+  || fail "dynamic readahead max-page hook registration missing"
+grep -q "register_trace_android_vh_tune_mmap_readaround" \
+  "$KERNEL_ROOT/common/mm/readahead.c" \
+  || fail "dynamic readahead readaround hook registration missing"
+# The mmap read-around shrink is only reachable if the baseline carries the
+# vendor-hook call site in mm/filemap.c; pin it so a hook-less baseline fails
+# loudly instead of silently no-opping.
+grep -q "trace_android_vh_tune_mmap_readaround" \
+  "$KERNEL_ROOT/common/mm/filemap.c" \
+  || fail "mmap read-around vendor-hook call site missing in mm/filemap.c"
+grep -qE "^CONFIG_ABK_DYNAMIC_READAHEAD=y" \
+  "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
+  || fail "defconfig lane did not enable ABK_DYNAMIC_READAHEAD"
 
 # The drm valid-clones revert must leave no trace of the 5.15.185 check on
 # any baseline: 167/178 never carried it, 194/lts had it removed by the graft.

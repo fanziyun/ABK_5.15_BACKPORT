@@ -117,6 +117,8 @@ AUDIT_FILES = [
     "include/uapi/asm-generic/mman-common.h",
     # Batch 7: the 5.15.185 drm valid-clones revert.
     "drivers/gpu/drm/drm_atomic_helper.c",
+    # Batch 9-1: dynamic readahead registers its callbacks in mm/readahead.c.
+    "mm/readahead.c",
 ]
 
 CHILD_MODULES = [

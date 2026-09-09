@@ -73,6 +73,8 @@ FETCH_FILES=(
   drivers/block/zram/zram_drv.h
   drivers/block/zram/zram_drv.c
   mm/Kconfig
+  mm/readahead.c
+  mm/filemap.c
   mm/khugepaged.c
   mm/madvise.c
   include/linux/huge_mm.h

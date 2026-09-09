@@ -26,6 +26,7 @@ is left byte-identical rather than touched up with a comment.
 | `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), Batch 8 page_alloc fallback-mode reuse and claimability cleanup (android15-6.6 / 6.12), opt-in `RCU_NOCB_CPU_DEFAULT_ALL`, plus the module's defconfig lane that actually enables the recompression symbols |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
+| `stable_backport_core` (Batch 9-1) | `dynamic_readahead_lowmem`: dynamic readahead (OPLUS/Xiaomi `mi_dynamic_readahead`) as a GKI built-in — a `core_initcall` in `mm/readahead.c` registers the `android_vh_ra_tuning_max_page` / `android_vh_tune_mmap_readaround` vendor-hook callbacks so low-memory background (cpuset "background") tasks get halved readahead windows and shrunk mmap read-around, behind `CONFIG_ABK_DYNAMIC_READAHEAD` with a `readahead.dynamic_readahead=0` runtime disable |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
@@ -117,12 +118,13 @@ The order is no longer a hard requirement: when ABK_ABI_PATCH_SUITE runs
 first anyway, this module's fd-table group recognizes the suite's fallback
 `alloc_fdtable()` and composes the upstream 5.15.191 conventions on top of
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
-place), so all 16 core groups land in either injection order.
+place), so all 17 core groups land in either injection order.
 
-The core child now carries 16 groups (the 11 pre-Batch-6 grafts plus
-`config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`, and
-`pagealloc_fallback_reuse`, and `rcu_nocb_cpu_default_all`); the perf
-child carries 12; the display child carries 1, for 29 groups in total.
+The core child now carries 17 groups (the 11 pre-Batch-6 grafts plus
+`config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
+`pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, and the Batch 9-1
+`dynamic_readahead_lowmem`); the perf child carries 12; the display child
+carries 1, for 30 groups in total.
 
 The full input string for the F2FS + ABI-suite combination, the shape
 registry and the KMI compatibility matrix are documented in

@@ -82,6 +82,16 @@ REQUIRED_CONTENT = {
         "offload_all",
         "cpumask_setall(rcu_nocb_mask)",
     ],
+    "core:dynamic_readahead_lowmem": [
+        "config ABK_DYNAMIC_READAHEAD",
+        # Both android vendor-hook callbacks must really be registered (a graft
+        # that only adds the Kconfig entry but no policy would be a phantom).
+        "register_trace_android_vh_ra_tuning_max_page(",
+        "register_trace_android_vh_tune_mmap_readaround(",
+        "core_initcall(abk_dra_init);",
+        "abk_dra_is_background_task",
+        "ABK stable_515_backport: dynamic readahead (Batch 9-1).",
+    ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],

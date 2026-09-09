@@ -3,6 +3,70 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 9 候选（popsicle-w-oss 调研 + Batch 9-1 dynamic_readahead 已落地）
+
+来源：`MiCode/Xiaomi_Kernel_OpenSource` 分支 `popsicle-w-oss`
+（小米 17 系，Android W，`Makefile` = 6.11.0）。调研结论与逐项证据见
+[`docs/survey_popsicle_w_611.md`](docs/survey_popsicle_w_611.md)，
+diff 工件与源树元数据见 `research/popsicle_w_oss/`。本批次主体仍是调研登记；
+**Batch 9-1 `dynamic_readahead_lowmem` 组已落地**（见下文进度块，代码已入
+registry、三档锚点/幂等/回滚审计全绿，`GROUP_COUNTS` core 16→17；
+`module.conf` 版本待 ABK CI 编译通过后再递增）。其余候选项零落地。
+
+要点（决定本线的可移植性结论）：
+
+- 该分支是 bazel 增量树：tip 全树仅 2370 文件（parent 约 79k），
+  `mm/` 只有 zsmalloc、`kernel/sched/` 只有 qcom `walt/` 模块，
+  readahead / fair.c / cpufreq_schedutil.c / `fs/` 均不在库内。
+- tip 文件语义比 parent 新（出现 6.12+ 主线形态的 bdev API、zsmalloc
+  锁重构），说明小米导入基座晚于仓库 parent → 无法做干净的小米增量归因。
+- zram 侧最大厂商增量 = Qualcomm **QPACE** 硬件压缩引擎接入
+  （`CONFIG_QTI_PAGE_COMPRESSION_ENGINE` + `zram_comp` 线程），
+  依赖 SoC 硬件；调度侧新增文件（smart_freq/pipeline/voter…）版权均为
+  Qualcomm，属 WALT 套件。
+- 与模块现状的交集：`zsmalloc_chain_size`、`zram_recompression`
+  （多压缩 + TRACK_ENTRY_ACTIME）已在 Batch 4/6 落地。
+
+- [ ] `zram_writeback_limit_audit`（P3，候选小项）— 核对 android13-5.15
+  目标树是否自带上游 zram `writeback_limit`；无则补上游小 hunk，
+  先与 ABK_ABI_PATCH_SUITE 的 zram-writeback 领地做重叠排查
+- [ ] `zram_recompress_max_pages`（P3，候选小项）— 先溯源 recompress
+  `max_pages` 参数是否已入 mainline；是则可作 `zram_recompression`
+  组的可选追加步
+- [-] QPACE / kcompressd 异步压缩：依赖 Qualcomm SoC 压缩引擎，
+  GKI 无锚点
+- [-] MFZ 内存冻结 / 小米 mm tracker：popsicle-w-oss 全树零载体，
+  且与描述语义不符（疑出自其它小米分支）；若需移植请另给来源分支
+- [-] dynamic_readahead（后台减预读 / UID 策略）：popsicle-w-oss 本分支无
+  载体；第三轮检索实锤来源为 OPLUS 模块 —— 见下方 **Batch 9-1 落地进度**
+- [-] schedutil 调度优化线：本分支调度面 = qcom WALT（smart_freq /
+  LRPB pipeline / votable / boost），AOSP android13-5.15 GKI 无 WALT，
+  无锚点；类 WALT 效果需独立调度器工程，超出模块 bounded-graft 边界
+
+### Batch 9-1 落地进度（dynamic_readahead_lowmem，代码已落地 / 待 ABK CI 编译）
+
+- [x] 来源实锤：`MiCode/Xiaomi_Kernel_OpenSource` 的
+  `xiaomi-modules/mi_dynamic_readahead/dynamic_readahead.c`
+  （GitLab 镜像 `MiCode-mirror/xiaomi_kernel_opensource`，`dijun-v-oss` 等
+  分支），版权 © 2020-2022 Oplus。模块只注册两个 android vendor hook；
+  android13-5.15 的 `include/trace/hooks/mm.h` + `mm/readahead.c`
+  `ondemand_readahead()` + `mm/filemap.c` readaround 调用点均已自带
+  （167/194 快照逐字节核实）→ 无需补 hook 声明/调用点。
+- [x] 新组 `dynamic_readahead_lowmem`（stable_backport_core，mm/readahead.c
+  + mm/Kconfig）：core_initcall 注册 `android_vh_ra_tuning_max_page` /
+  `android_vh_tune_mmap_readaround` 回调，低内存 + cpuset "background"
+  任务时预读上限减半、mmap readaround 收缩；剥离 xring 依赖，保留
+  `readahead.dynamic_readahead=0` 运行时开关与 `CONFIG_ABK_DYNAMIC_READAHEAD`
+  （defconfig lane 使能，进 `_MODULE_CONFIGS`；水位和每秒刷新跟踪
+  min_free_kbytes/热插拔变化）。
+- [x] 验证：py_compile + 单测全绿（新增 batch9 夹具：applied/标记/幂等）；
+  step_audit OK（167 132 步 / 178 133 步 / 194 124 步 core，二次幂等）；
+  implementation_audit OK（REQUIRED_CONTENT 新增断言，无 xring 残留）；
+  smoke OK 三档（167/178/194：pass1 applied、pass2 already_present、
+  回滚通过，核心计数 core 16→17）。
+- [ ] 编译验证：待 ABK CI 对三档跑编译（本模块只做锚点审计，不本地编内核）；
+  CI 编译通过后再递增 `module.conf` 版本并把本组标记为 Batch 9 正式落地。
+
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
 本批次从 android15-6.6 / android16-6.12 筛出的长期项目中，先落地当前模块边界

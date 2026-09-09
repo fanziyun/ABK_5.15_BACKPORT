@@ -659,6 +659,45 @@ def test_batch8_rcu_nocb_cpu_default_all():
               status2 == "already_present", status2)
 
 
+def test_batch9_dynamic_readahead():
+    print("Batch 9 dynamic_readahead_lowmem")
+    import abk_stable_core as core
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "dynamic_readahead_lowmem"), None)
+    check("dynamic_readahead group registered", group is not None)
+    if group is None:
+        return
+    check("dynamic_readahead touches its two source files",
+          set(group.files) == {"mm/readahead.c", "mm/Kconfig"}, group.files)
+
+    readahead = core._DRA_RA_OLD + "\nvoid\nfile_ra_state_init(void){}\n"
+    kconfig = core._DRA_KC_OLD + "\n\tdef_bool y\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "mm/readahead.c": readahead,
+            "mm/Kconfig": kconfig,
+        })
+        status, detail = core._dynamic_readahead_apply(ctx)
+        check("dynamic_readahead fixture applies all steps",
+              status == "applied", (status, detail))
+        patched = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
+        check("readahead policy registers the max-page hook",
+              "register_trace_android_vh_ra_tuning_max_page" in
+              patched["mm/readahead.c"])
+        check("readahead policy registers the readaround hook",
+              "register_trace_android_vh_tune_mmap_readaround" in
+              patched["mm/readahead.c"])
+        check("policy is gated by the module-owned Kconfig symbol",
+              "config ABK_DYNAMIC_READAHEAD" in patched["mm/Kconfig"])
+        check("no vendor xring dependency leaks into the graft",
+              "qos_inherit" not in patched["mm/readahead.c"])
+        ctx2 = make_ctx(tmp, patched)
+        status2, _detail2 = core._dynamic_readahead_apply(ctx2)
+        check("dynamic_readahead fixture is idempotent",
+              status2 == "already_present", status2)
+
+
 def test_batch8_autofdo_tool():
     """The AutoFDO tool is a build-engineering script, not a graft.
 
@@ -823,6 +862,7 @@ def main():
     test_batch6_registration()
     test_batch8_pagealloc_fallback_reuse()
     test_batch8_rcu_nocb_cpu_default_all()
+    test_batch9_dynamic_readahead()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()

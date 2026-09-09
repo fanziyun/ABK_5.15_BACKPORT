@@ -88,9 +88,9 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 16 applied | 12 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 16 applied | 11 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 13 applied + 3 present | 10 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 17 applied | 12 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 17 applied | 11 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 14 applied + 3 present | 10 applied + 2 present |
 
 A second pass is `already_present` for every group on all three. Groups the
 baseline pre-empts:

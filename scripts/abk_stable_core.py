@@ -2258,6 +2258,10 @@ _MODULE_CONFIGS = [
     # symbol, and Kconfig leaves both off by default.
     ("ZRAM_TRACK_ENTRY_ACTIME", "y"),
     ("ZRAM_MULTI_COMP", "y"),
+    # dynamic readahead (Batch 9-1): the grafted callbacks are inert until
+    # this module-owned symbol is on, mirroring the OPLUS/Xiaomi module's
+    # opt-in enablement.
+    ("ABK_DYNAMIC_READAHEAD", "y"),
 ]
 
 _ALIGN_CONFIGS = [
@@ -3493,6 +3497,207 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+
+
+# ---------------------------------------------------------------------------
+# Batch 9-1: dynamic readahead (OPLUS mi_dynamic_readahead, GKI built-in)
+#
+# Source: OPLUS "dynamic_readahead" kernel module (Copyright 2020-2022 Oplus),
+# shipped by Xiaomi as xiaomi-modules/mi_dynamic_readahead in
+# MiCode/Xiaomi_Kernel_OpenSource.  The module only registered two android
+# vendor-hook callbacks; android13-5.15 already carries both hook call
+# sites (mm/readahead.c ondemand_readahead(), mm/filemap.c mmap read-around),
+# so the port is a self-contained core_initcall registration in
+# mm/readahead.c behind CONFIG_ABK_DYNAMIC_READAHEAD.  The xring
+# (soc/xring/qos_inherit.h) key-task check is replaced by the original
+# OPLUS cgroup test (cpuset "background"), which the Xiaomi copy still
+# carries as a comment.
+# ---------------------------------------------------------------------------
+
+_DRA_RA_TAIL = (
+    "/*\n"
+    " * Initialise a struct file's readahead state.  Assumes that the caller has\n"
+    " * memset *ra to zero.\n"
+    " */"
+)
+
+_DRA_RA_OLD = (
+    '#include "internal.h"\n'
+    "\n"
+    + _DRA_RA_TAIL
+)
+
+_DRA_RA_BLOCK = "\n".join([
+    "#ifdef CONFIG_ABK_DYNAMIC_READAHEAD",
+    "#include <linux/moduleparam.h>",
+    "#include <linux/jiffies.h>",
+    "#include <linux/cgroup.h>",
+    "#include <linux/sched/rt.h>",
+    "#include <linux/vmstat.h>",
+    "",
+    "/*",
+    " * ABK stable_515_backport: dynamic readahead (Batch 9-1).",
+    " *",
+    ' * In-tree port of the OPLUS/Xiaomi "mi_dynamic_readahead" kernel module',
+    " * (Copyright 2020-2022 Oplus, as shipped in Xiaomi_Kernel_OpenSource",
+    " * xiaomi-modules/mi_dynamic_readahead): while memory is low, background",
+    " * tasks get their sequential readahead window halved and their mmap",
+    " * read-around window shrunk, cutting page-cache prefetch pressure during",
+    " * reclaim.  The original module registered these two android vendor-hook",
+    " * callbacks at module_init(); this built-in form does the same at",
+    " * core_initcall.  Runtime disable on the command line:",
+    " * readahead.dynamic_readahead=0 (or the same name under",
+    " * /sys/module/readahead/parameters/).",
+    " */",
+    "static unsigned long abk_dra_high_wm;",
+    "static unsigned long abk_dra_wm_stamp;",
+    "static bool abk_dra_enable = true;",
+    "",
+    "/* Refresh the watermark sum at most once per second so the low-memory",
+    " * gate tracks min_free_kbytes/hotplug changes instead of freezing at the",
+    " * boot-time value. */",
+    "static void abk_dra_refresh_high_wm(void)",
+    "{",
+    "\tstruct zone *zone;",
+    "",
+    "\tif (abk_dra_wm_stamp &&",
+    "\t    time_is_after_jiffies(abk_dra_wm_stamp + HZ))",
+    "\t\treturn;",
+    "",
+    "\tabk_dra_high_wm = 0;",
+    "\tfor_each_zone(zone)",
+    "\t\tabk_dra_high_wm += high_wmark_pages(zone);",
+    "\tabk_dra_wm_stamp = jiffies;",
+    "}",
+    "",
+    "static bool abk_dra_is_lowmem(void)",
+    "{",
+    "\tabk_dra_refresh_high_wm();",
+    "\treturn global_zone_page_state(NR_FREE_PAGES) < abk_dra_high_wm;",
+    "}",
+    "",
+    "static bool abk_dra_is_background_task(void)",
+    "{",
+    "\tstruct cgroup_subsys_state *css;",
+    "\tconst char *kn_name;",
+    "\tbool background = false;",
+    "",
+    "\tif (rt_task(current))",
+    "\t\treturn false;",
+    "",
+    "\trcu_read_lock();",
+    "\tcss = task_css(current, cpuset_cgrp_id);",
+    "\tkn_name = css->cgroup->kn ? css->cgroup->kn->name : NULL;",
+    '\tif (kn_name && !strncmp(kn_name, "background", strlen("background")))',
+    "\t\tbackground = true;",
+    "\trcu_read_unlock();",
+    "",
+    "\treturn background;",
+    "}",
+    "",
+    "static void abk_dra_adjust_readahead(void *data,",
+    "\t\tstruct readahead_control *ractl, unsigned long *max_pages)",
+    "{",
+    "\tif (abk_dra_enable && abk_dra_is_lowmem() &&",
+    "\t    abk_dra_is_background_task())",
+    "\t\t*max_pages = min_t(unsigned long, *max_pages,",
+    "\t\t\t\t   ractl->ra->ra_pages / 2);",
+    "}",
+    "",
+    "static void abk_dra_adjust_readaround(void *data, unsigned int ra_pages,",
+    "\t\tpgoff_t pgoff, pgoff_t *start, unsigned int *size,",
+    "\t\tunsigned int *async_size)",
+    "{",
+    "\tunsigned int dy_ra_pages;",
+    "",
+    "\tif (!abk_dra_enable || !abk_dra_is_lowmem() ||",
+    "\t    !abk_dra_is_background_task())",
+    "\t\treturn;",
+    "",
+    "\tdy_ra_pages = ra_pages / 2;",
+    "\t*start = max_t(long, 0, pgoff - dy_ra_pages / 2);",
+    "\t*size = dy_ra_pages;",
+    "\t*async_size = dy_ra_pages / 4;",
+    "}",
+    "",
+    "static int __init abk_dra_init(void)",
+    "{",
+    "\tint ret;",
+    "",
+    "\tabk_dra_refresh_high_wm();",
+    "",
+    "\tret = register_trace_android_vh_ra_tuning_max_page(",
+    "\t\t\tabk_dra_adjust_readahead, NULL);",
+    "\tif (ret)",
+    "\t\treturn ret;",
+    "",
+    "\tret = register_trace_android_vh_tune_mmap_readaround(",
+    "\t\t\tabk_dra_adjust_readaround, NULL);",
+    "\tif (ret)",
+    "\t\tunregister_trace_android_vh_ra_tuning_max_page(",
+    "\t\t\t\tabk_dra_adjust_readahead, NULL);",
+    "",
+    "\treturn ret;",
+    "}",
+    "core_initcall(abk_dra_init);",
+    "module_param_named(dynamic_readahead, abk_dra_enable, bool, 0644);",
+    "#endif /* CONFIG_ABK_DYNAMIC_READAHEAD */",
+])
+
+_DRA_RA_NEW = (
+    '#include "internal.h"\n'
+    "\n"
+    + _DRA_RA_BLOCK
+    + "\n\n"
+    + _DRA_RA_TAIL
+)
+
+_DRA_KC_OLD = (
+    'menu "Memory Management options"\n'
+    "\n"
+    "config SELECT_MEMORY_MODEL"
+)
+
+_DRA_KC_NEW = (
+    'menu "Memory Management options"\n'
+    "\n"
+    "# ABK stable_515_backport: Batch 9-1 dynamic readahead (OPLUS/Xiaomi)\n"
+    "config ABK_DYNAMIC_READAHEAD\n"
+    '\tbool "ABK dynamic readahead (low-memory background cap)"\n'
+    "\thelp\n"
+    "\t  In-tree port of the OPLUS/Xiaomi dynamic_readahead module (see\n"
+    "\t  plan.md Batch 9-1): while memory is low, background cpuset tasks\n"
+    "\t  get their readahead window halved and their mmap read-around\n"
+    "\t  shrunk.  Runtime toggle on the command line:\n"
+    "\t  readahead.dynamic_readahead=0 disables.\n"
+    "\n"
+    "config SELECT_MEMORY_MODEL"
+)
+
+
+def _dynamic_readahead_apply(ctx):
+    steps = [
+        ("mm/readahead.c", _DRA_RA_OLD, _DRA_RA_NEW, T),
+        ("mm/Kconfig", _DRA_KC_OLD, _DRA_KC_NEW, T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "dynamic_readahead_lowmem",
+        "dynamic readahead: register low-memory background readahead/mmap read-around caps via the android vendor hooks (OPLUS mi_dynamic_readahead, GKI built-in)",
+        [
+            "OPLUS mi_dynamic_readahead kernel module",
+            "(Xiaomi xiaomi-modules/mi_dynamic_readahead, dijun-v-oss)",
+        ],
+        ["mm/readahead.c", "mm/Kconfig"],
+        _dynamic_readahead_apply,
+    ),
+]
 
 if __name__ == "__main__":
     main()
