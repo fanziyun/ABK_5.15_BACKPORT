@@ -34,15 +34,22 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 - [ ] `zram_recompress_max_pages`（P3，候选小项）— 先溯源 recompress
   `max_pages` 参数是否已入 mainline；是则可作 `zram_recompression`
   组的可选追加步
-- [-] QPACE / kcompressd 异步压缩：依赖 Qualcomm SoC 压缩引擎，
-  GKI 无锚点
-- [-] MFZ 内存冻结 / 小米 mm tracker：popsicle-w-oss 全树零载体，
-  且与描述语义不符（疑出自其它小米分支）；若需移植请另给来源分支
-- [-] dynamic_readahead（后台减预读 / UID 策略）：popsicle-w-oss 本分支无
-  载体；第三轮检索实锤来源为 OPLUS 模块 —— 见下方 **Batch 9-1 落地进度**
-- [-] schedutil 调度优化线：本分支调度面 = qcom WALT（smart_freq /
-  LRPB pipeline / votable / boost），AOSP android13-5.15 GKI 无 WALT，
-  无锚点；类 WALT 效果需独立调度器工程，超出模块 bounded-graft 边界
+- [x] QPACE / kcompressd 异步压缩：popsicle diff 已抽读完毕（异步骨架 =
+  整 bio 提交 + ring + 完成回调，绑定 6.12 形态与 QTI 硬件）→ 选定
+  **方案 A**：把同一套"kthread + 队列 + 完成回调"骨架嫁接到本模块已落地的
+  `zram_recompress()` 重压缩路径，使其成为后台异步作业；见 **Batch 10-1**
+- [ ] MFZ 内存冻结 / 页面配额：MiCode 全仓 264 分支 + 厂商模块目录普查
+  （dijun/violin 的 xiaomi-modules 全递归）= **零 freeze 载体**；5.15 kalama
+  分支（fuxi/sheng 等）mm/freezer/zram 全部为 upstream 原样。媒体证据指向
+  HyperOS"后台冻结"为用户态框架行为 → 内核侧无源可搬，需按语义自行设计
+  （见 Batch 10 调研块），待用户确认冻结的可观测定义/或闭源模块线索
+- [x] dynamic_readahead：已落地 —— 见上方 **Batch 9-1 落地进度**
+- [~] schedutil smart_freq / LRPB：walt 源码已抽读并落盘
+  （`research/popsicle_w_oss/walt_extract/` + 报告 `walt_pelt_survey.md`）；
+  结论：控制层子集可保留、信号层必须自造，GKI 侧有现成
+  `android_vh_map_util_freq(_new)`/`android_vh_cpufreq_resolve_freq`/
+  `android_vh_scheduler_tick` 等 hook 作策略挂点，**无 PELT 化先例需自行设计**
+  —— 待按 GKI 策略模块立项（见 Batch 10 调研块）
 
 ### Batch 9-1 落地进度（dynamic_readahead_lowmem，已落地 + ABK CI 编译通过）
 
@@ -69,6 +76,58 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   <https://github.com/fanziyun/ABK/actions/runs/34407686264>，
   android13/5.15-X/lts，实际 5.15.215）编译内核 + Boot 打包全绿；
   已按惯例 bump `module.conf` 至 v0.11.0，本组正式落地。
+
+## Batch 10（三线调研 → 移植设计，进行中）
+
+调研工件：popsicle walt 源码抽读件 `research/popsicle_w_oss/walt_extract/`
+（smart_freq/pipeline/voter/cpufreq_walt）；LRPB/smart_freq PELT 化报告
+`research/popsicle_w_oss/walt_pelt_survey.md`；QPACE 骨架
+`research/popsicle_w_oss/zram_drv_tip_vs_parent.diff`；MFZ 全仓普查结论见上。
+
+### Batch 10-1 设计草案（zram_async_recompress，方案 A，未注册）
+
+- 语义：`recompress_store` 保持现扫描逻辑，但命中候选页后不再同步执行
+  `zram_recompress()`，而是按现参（threshold/prio/prio_max）把
+  {index, 参数} 提交到 per-device 作业队列，由专用 kthread 逐项执行；
+  调用侧不再等待压缩完成（sysfs 返回"已排程"）。
+- 复用 QPACE 骨架的通用件：作业队列 + kref 完成计数 + 溢出 list + 背压
+  唤醒（去 QTI）；不引入 crypto_acomp —— 方案 A 的"异步"由自有 kthread
+  承担（软件 scomp 的 acomp 本质同步，无收益还添 workqueue 上下文切换）。
+- 5.15 锚点（全部为 `zram_recompression` 组已落地文本，跨 167/178/194
+  同形）：`struct zram` 尾部（comps[] 之后）追加 per-device worker 字段；
+  `recompress_store()` 的参数解析段与主循环体；`zram_reset_device()` 内
+  comps 销毁前 flush 作业；`zram_add()`/destroy 建/销 worker。
+- 安全要点：作业持自身 scratch page（不复用 store 的共享 page）；reset 与
+  recompress 的互斥仍靠 init_lock（store 持 down_read 排程 → 返回前只排不
+  等；kthread 执行时再取 down_read？—— 需按"reset down_write 先 flush 已
+  排作业再销毁 comps"顺序锁死）；KMI 零改动（struct zram 非 ABI 面）。
+- 开关：`type=…` 语法外新加 `async=1` 参（默认同步，行为零回归），或另立
+  sysfs 属性；Kconfig 沿用 ABK 引擎行追加（参考 dynamic_readahead 惯例）。
+- 验证：step/implementation/smoke 三审（重压缩组锚点已被多档断言覆盖，
+  新组继承）+ ABK CI 编译门；CI 绿后 bump version 落 plan。
+
+### Batch 10-2 设计草案（schedutil smart_freq-PELT 策略层，未立项）
+
+- 范围认定（据 walt_pelt_survey.md）：只保留 reason 选举 + 去激活滞回 +
+  freq 上限钳制 + per-cluster 阈值表的"控制层子集"；pipeline 钉核/IPC-FMAX
+  (AMU)/per-ms LRPB 闩锁不迁移。
+- GKI 挂点：`android_vh_cpufreq_resolve_freq`（smart_freq 上限钳制最佳位，
+  覆盖 fast/slow 两路）+ `android_vh_map_util_freq(_new)`（util→freq 改写）
+  + `android_vh_scheduler_tick`/`android_rvh_tick_entry`（自维护 16ms 环形
+  busy 记账窗口，替代 WALT per-ms bitmap）。per-cluster 状态放自有全局数
+  组，不碰 KABI。
+- 产出形态：GKI 内置策略模块（新文件 + Kconfig，仿 dynamic_readahead 的
+  built-in 注册式），**明确标注为"受 smart_freq 启发的自行设计"**，非逐位
+  复刻。待 Batch 10-1 落地后立项。
+
+### Batch 10-3（MFZ，等语义定义）
+
+- 内核侧无公开源可搬。可行近似的内核件：基于已落地的 per-memcg
+  `memory.reclaim` + cgroup v2 freezer 事件，提供"冻结即主动回收其 memcg
+  到 zram"策略与配额/压缩统计 sysfs —— 属自行设计，需用户先确认：
+  (a) 目标可观测行为/节点；(b) 是否接受近似语义而非逐位复刻；(c) 有无
+  闭源 vendor 模块可逆向（diting-s-oss 顶层 `xiaomi/` 是仓外 gitlink，
+  未核验）。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
