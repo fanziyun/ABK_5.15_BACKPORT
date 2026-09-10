@@ -100,6 +100,16 @@ report `already_present` while the edit never lands — group stays "applied":
    run *any* of its steps on that shape. A hunk from a later sublevel than the
    shape probe recognizes needs its **own group** (why the 5.15.195 `replace_fd()`
    fix is a separate group, not a step in `fdtable_alloc_conventions`).
+5. A **C-level** error no text audit can see. `module_param(name, type, perm)`
+   compiles `name` as the *variable*, so a knob whose sysfs name differs from its
+   variable must use `module_param_named(name, variable, type, perm)` or
+   `module_param_string(name, var, len, perm)`. Batch 12 shipped
+   `module_param(abk_lock_algo, ...)` next to `static bool abk_zram_lock_algo`
+   and every local gate stayed green while ABK CI failed the TU with
+   `use of undeclared identifier 'abk_lock_algo'`. Whenever a group introduces C,
+   the compile is the only real gate: keep the ABK CI run in the loop, and pin the
+   two-name form (plus a `module_param()`-vs-declaration sweep) in the unit test
+   and `implementation_audit.py`.
 
 Also verify every helper the ported code calls against **its own tree**, not the
 source tree (convention traps — compile clean, behave wrong). The pinned example:

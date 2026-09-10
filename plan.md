@@ -113,6 +113,14 @@
   监督 tick）；`implementation_audit` 新增 `core:zram_algo_lock` 整文件/函数级断言。
 - [x] 门禁：`py_compile`、`bash -n`、单测 360 项全绿；`step_audit` /
   `implementation_audit` / `smoke` 在 167/178/194 全部 OK。
+- [x] CI 编译修复：ABK CI run 34497599075（`5.15.X-android13-lts`）在 `编译内核`
+  失败，clang 报 `drivers/block/zram/zram_drv.c:75:14: error: use of undeclared
+  identifier 'abk_lock_algo'` —— `module_param(name, ...)` 会把 `name` **当作变量名**
+  编译，而变量叫 `abk_zram_lock_algo`。已改用两名字形式
+  `module_param_named(abk_lock_algo, abk_zram_lock_algo, bool, 0444)`。
+  这类"文本门禁全绿、编译才炸"的错误已写进 `AGENTS.md` 的 step-authoring traps（第 5 条），
+  并在单测里加了一条扫描：文件里每个 `module_param(X, ...)` 都必须有同名变量声明
+  （真机树上验证：只有 `num_devices` 用单名字形式，且已声明）。
 - [ ] 待验（需刷入新内核）：`zram.abk_lock_algo` / `zram.abk_comp_algo` 出现且 0444；
   root 写 `comp_algorithm=deflate` 后节点仍为 `[lz4kd]`（dmesg 有 "is locked to" 一行）；
   `ABK_515_DEFCONFIG_ROM=1` build 上 `backing_dev` 被模块挂上且 `writeback_limit` 生效。
@@ -141,7 +149,6 @@
 | 未验证 | 内核锁本身（需要刷入用当前仓库重建的内核）；`backing_dev` 节点的真正写入（需要 `CONFIG_ZRAM_WRITEBACK`） |
 
 ### 真机踩到的两个 mksh 32 位陷阱（已修 + 测试锁定）
-
 本机 `/system/bin/sh`（Android mksh）的算术与 `[ -gt ]` 都是 **32 位**：
 `15561024 * 1024` = `-1245380608`、`$(( 17179869184 ))` = `0`、`[ 17179869184 -gt 0 ]`
 为假；KernelSU 用的是自带 busybox ash（64 位），所以只有从终端/`adb shell`/ROM init

@@ -927,7 +927,17 @@ def test_batch11_zram_algo_lock():
         check("locked primary parameter is declared read-only",
               'static char abk_zram_comp_algo[CRYPTO_MAX_ALG_NAME] = "lz4kd";' in text
               and "module_param_string(abk_comp_algo, abk_zram_comp_algo" in text
-              and "module_param(abk_lock_algo, bool, 0444);" in text)
+              and "module_param_named(abk_lock_algo, abk_zram_lock_algo, bool, 0444);"
+              in text)
+        # module_param(NAME, ...) compiles the *identifier* NAME as the
+        # variable, so a knob whose sysfs name differs from its variable has to
+        # use module_param_named()/module_param_string().  ABK CI caught exactly
+        # this ("use of undeclared identifier 'abk_lock_algo'") because the
+        # text-level audits cannot see it; check every one-argument form here.
+        declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", text))
+        for name in re.findall(r"(?m)^module_param\((\w+),", text):
+            check(f"one-name module_param {name!r} really declares that variable",
+                  name in declared, (name, sorted(declared)))
         check("locked primary is selected at device creation",
               "comp_algorithm_set(zram, ZRAM_PRIMARY_COMP," in text
               and "zcomp_available_algorithm(abk_zram_comp_algo)" in text)

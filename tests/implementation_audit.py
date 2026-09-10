@@ -136,7 +136,11 @@ REQUIRED_CONTENT = {
         # Read-only policy parameters: the measured primary and the lock switch.
         'static char abk_zram_comp_algo[CRYPTO_MAX_ALG_NAME] = "lz4kd";',
         "module_param_string(abk_comp_algo, abk_zram_comp_algo",
-        "module_param(abk_lock_algo, bool, 0444);",
+        # Two names on purpose: the knob is zram.abk_lock_algo, the variable is
+        # abk_zram_lock_algo, and plain module_param() refuses that split --
+        # it fails the compile with "use of undeclared identifier".
+        "module_param_named(abk_lock_algo, abk_zram_lock_algo, bool, 0444);",
+        "static bool abk_zram_lock_algo = true;",
         # The primary must be selected at creation, before any disksize write.
         "comp_algorithm_set(zram, ZRAM_PRIMARY_COMP,",
         # Both nodes must really be repointed, and the locked store must accept
