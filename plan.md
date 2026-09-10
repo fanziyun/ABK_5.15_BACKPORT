@@ -190,6 +190,36 @@
   模块改为把该工具打进 `bin/`（`embed.conf`）并在 `CFR_ONE_SHOT=1` 下调度，
   **删掉了此前模块内重复的 sweep 实现**，CLI 与模块共用一份代码。
 
+### Batch 12 伴生模块 v0.4.0：门控 zsmalloc 压缩整理（真机实验驱动）
+
+- [x] 来源：vermeer（5.15.215-FanZiyun）"极限挤压"真机实验：杀掉全部用户进程后
+  `mem_used_total` 352 MB vs `compr_data_size` 186 MB（**89% 是 zsmalloc 碎片**），
+  一次全量 `compact` 用时 <1 s、返还 105 MB；整理后开销降到 3.3%。
+- [x] `zram-policy.sh` 新增 `abk_zram_compact_if_fragmented()`：双门（浪费字节
+  > `zram.compact.min_waste_mb` **且** 开销 > `zram.compact.waste_pct`%）同时满足
+  才写 `echo 100 > compact`；判定整体走 awk（操作数可越过 2^31，见上文 mksh
+  32 位陷阱）；无 `compact` 节点的内核静默跳过。
+- [x] 挂接在监督器 sweep tick 之后（搭重压缩时钟）：`zram.recomp.enable=0`
+  同时停掉该门，配置注释与 README 均已写明。
+- [x] `tunables.conf` 新键 + `abk_known_keys` 登记：`zram.compact.enable=1`
+  （默认开）、`zram.compact.min_waste_mb=50`、`zram.compact.waste_pct=15`。
+- [x] 测试：模块夹具新增场景 10（go / healthy-skip / disable / 无节点四路径）
+  与监督 tick 断言（碎片态下 compact 节点被写 `100`）。
+- [x] 元数据：伴生模块 `module.prop` author 更正为 `FanZiyun`（原为仓库镜像署名），
+  versionCode 2→4、v0.2.0→v0.4.0（code review 后直接以 0.4.0 落地）；
+  `module.conf` 0.15.0→0.16.0。
+- [x] code review 修复：README "唯一默认开启" 旧句更正 + 作业清单补记 compact；
+  enable 解析并入仓库 `= "1"` 白名单约定；两个数值键改 `abk_clamp_uint` +
+  范围文档（1..1024 / 1..500）+ 非法值告警；判定/日志合并为单次 awk 解析、
+  `after` 走 `abk_read`；`tunables.conf` 注释去重（测量叙事以 README/plan 为准）；
+  测试锁定 shipped 默认值（`zram.compact.enable=1`/`50`/`15` 静态 pin +
+  监督 up 行 `compact=1>50MB+15%` 动态 pin）。
+- [x] 真机验证（就地升级安装中模块，v0.3.0）：监督器 up 行出现
+  `compact=1>50MB+15%`；健康态（5.7MB 开销 < 50MB 门）门控**零日志零写入**；
+  临时压门槛到 1MB/1% 单调用成功写真实 `compact` 节点（su 上下文无 avc 拒绝），
+  日志出现 `zsmalloc compaction: used …`，实测额外回收 5.4MB
+  （181.0→175.6MB，pages_compacted 43382→44699）。
+
 ## Batch 9 候选（popsicle-w-oss 调研 + Batch 9-1 dynamic_readahead 已落地）
 
 来源：`MiCode/Xiaomi_Kernel_OpenSource` 分支 `popsicle-w-oss`

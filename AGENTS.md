@@ -161,9 +161,11 @@ measured zram algorithm policy in force on device and drives the recompression
 sweeps. The policy itself lives in the kernel since Batch 12 (`zram_algo_lock`:
 `zram.abk_comp_algo` / `zram.abk_lock_algo`, both `0444`, and both
 `comp_algorithm`/`recomp_algorithm` stores made reported no-ops), so the companion
-only verifies, re-asserts the compressed-memory cap, and preserves or establishes
-the zram writeback backing device; on a kernel without the lock it falls back to
-owning the whole bring-up and re-checking it every
+only verifies, re-asserts the compressed-memory cap, runs one gated zsmalloc
+`compact` pass after each sweep tick (both overhead gates must call the device
+fragmented before the node is written; on by default since companion v0.4.0), and
+preserves or establishes the zram writeback backing device; on a kernel without the
+lock it falls back to owning the whole bring-up and re-checking it every
 `zram.reassert_interval_sec`. It is a distribution asset, **not** a graft: it
 registers no `PatchGroup`, never writes into the kernel tree, and the whole step
 is skipped with a warning when the build has no AnyKernel3 tree (or when

@@ -8,7 +8,8 @@ Two jobs, in order of importance:
 
 1. **Keep the zram algorithm policy in force** on every boot (hardcoded, not
    configurable -- see below).
-2. **Drive the recompression sweeps** through the kernel's async worker, and
+2. **Drive the recompression sweeps** through the kernel's async worker, follow
+   each sweep with a gated zsmalloc compaction pass (see Configuration), and
    report (or optionally tune) the other runtime knobs the grafts expose:
    MGLRU, THP, `vm.swappiness`, the schedutil smart-freq policy, dynamic
    readahead and cgroup proactive reclaim.
@@ -108,11 +109,14 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 
 | key | default | meaning |
 |---|---|---|
-| `zram.recomp.enable` | `1` | drive age-marked recompression sweeps (the only thing on by default) |
+| `zram.recomp.enable` | `1` | drive age-marked recompression sweeps (on by default, together with the compaction gate below -- both ride this clock) |
 | `zram.recomp.idle_age_sec` | `3600` | mark only pages untouched this long |
 | `zram.recomp.interval_sec` | `1800` | seconds between sweeps |
 | `zram.recomp.threshold` | `0` | only recompress entries at least this large |
 | `zram.recomp.mode` | `async` | `async` (kernel worker) or `sync` |
+| `zram.compact.enable` | `1` | after each sweep tick, run one gated `compact` pass (rides the sweep clock, so `zram.recomp.enable=0` stops it too) |
+| `zram.compact.min_waste_mb` | `50` | only compact when `mem_used_total − compr_data_size` exceeds this many MiB; 1..1024 |
+| `zram.compact.waste_pct` | `15` | ... and the overhead exceeds this percentage of the compressed size (both gates must agree); 1..500 |
 | `zram.writeback` | `auto` | `auto` attaches a backing file when the kernel supports writeback and nobody owns it; `off` only preserves an existing one |
 | `zram.writeback.size_mb` | `1024` | backing file size, sparse, 64..8192 |
 | `zram.reassert_interval_sec` | `60` | how often the supervisor re-checks the policy; on an unlocked kernel this is how long a runtime algorithm switch survives (5..3600) |
@@ -140,6 +144,15 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 kernel booted with `sysctl.kernel.sched_pelt_multiplier=4` (the policy clamps
 `util` to `capacity`, so the 90%-sustained test can saturate -- check whether
 `scaling_cur_freq` sits at the floor permanently before leaving it armed).
+
+The compaction gate exists because of a measured kill-storm on device: after an
+app-cleaner killed every user process, `mm_stat` showed `mem_used_total` 352 MB
+for a `compr_data_size` of 186 MB -- **89% of the zram footprint was zsmalloc
+fragmentation** (freed swap slots leave dead zspages behind, and those zspages
+stop serving their size class). One full pass via `/sys/block/zram0/compact`
+took under a second on a big core and returned 105 MB. A pass on a healthy
+device (post-compaction overhead measured: 3.3%) is pure CPU for nothing, so
+both gates must call the device fragmented before the module writes anything.
 
 ## Using it
 

@@ -1510,8 +1510,8 @@ def test_runtime_tunables_module():
           len(core_row) >= 12 and core_row[10] == "" and core_row[11] == "",
           core_row[10:12])
     check("both module.conf versions were bumped for the companion",
-          'ABK_MODULE_VERSION="0.15.0"' in conf
-          and 'ABK_MODULE_SET_VERSION="0.15.0"' in conf)
+          'ABK_MODULE_VERSION="0.16.0"' in conf
+          and 'ABK_MODULE_SET_VERSION="0.16.0"' in conf)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -1581,6 +1581,18 @@ def test_runtime_tunables_module():
                                            "zram.reassert_interval_sec"))
           and re.search(r"(?m)^\s*zram\.writeback=", tunables) is not None
           and re.search(r"(?m)^\s*zram\.reassert_interval_sec=", tunables) is not None)
+
+    # The compaction gate ships ON with measured defaults; a silent default
+    # drift would take the gate out the back door (healthy devices would
+    # start paying compaction passes, or fragmented ones would stop).
+    for line in ("zram.compact.enable=1", "zram.compact.min_waste_mb=50",
+                 "zram.compact.waste_pct=15"):
+        check(f"tunables.conf ships the compaction default {line}",
+              re.search(rf"(?m)^{re.escape(line)}\s*$", tunables) is not None)
+    check("compaction keys are known tunables.conf keys",
+          all(key in common_sh for key in ("zram.compact.enable",
+                                           "zram.compact.min_waste_mb",
+                                           "zram.compact.waste_pct")))
 
     # Byte-count arithmetic has to leave the shell: /system/bin/sh is Android's
     # mksh and wraps at 2^31 on the target ROM (measured on device:
@@ -1780,6 +1792,7 @@ reset_fixture() {
   printf '#1: lzo lz4 [lz4hc] lz4k lz4kd zstd\n' > "$T/sys/block/zram0/recomp_algorithm"
   printf '    4096       62    20480        0    20480        0        0        0        0\n' > "$T/sys/block/zram0/mm_stat"
   printf '0\n' > "$T/sys/block/zram0/mem_limit"
+  rm -f "$T/sys/block/zram0/compact"
   rm -f "$T/sys/block/zram0/writeback" "$T/sys/block/zram0/backing_dev"
   rm -f "$T/sys/block/zram0/writeback_limit" "$T/sys/block/zram0/writeback_limit_enable"
   rm -rf "$T/sys/module" "$T/wb"
@@ -1869,6 +1882,10 @@ echo "calls6=$(tr '\n' ';' < "$T/calls")"
 reset_fixture
 printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
 printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+# A fragmented device (the measured kill-storm state: 352 MB used vs 186 MB
+# compressed) + a compact node, so each sweep tick also exercises the gate.
+: > "$T/sys/block/zram0/compact"
+printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
 printf 'zram.recomp.enable=1\nzram.recomp.interval_sec=60\nzram.reassert_interval_sec=60\n' > "$T/tunables.conf"
 mkdir -p "$T/fakebin"
 cat > "$T/fakebin/tool.sh" <<EOF
@@ -1883,6 +1900,8 @@ sleep() { _n=$((_n+1)); [ "$_n" -ge 4 ] && exit 0; return 0; }
 ( abk_zram_supervisor_main > "$T/out7" 2>&1 )
 echo "supervisor_runs=$(wc -l < "$T/runs" | tr -d ' ')"
 echo "supervisor_args=$(head -n 1 "$T/runs")"
+echo "supervisor_compact=$(cat "$T/sys/block/zram0/compact" 2>/dev/null)"
+echo "supervisor_gate_line=$(grep -o 'compact=[^ ]*' "$T/state/abk_runtime_tunables.log" | tail -1)"
 echo "supervisor_pid=$([ -s "$T/state/zram.pid" ] && echo set || echo unset)"
 printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
 
@@ -1912,6 +1931,32 @@ echo "log_refusal=$(grep -c 'swap in use' "$LOG" 2>/dev/null)"
 echo "log_keep=$(grep -c 'keeping the live writeback device' "$LOG" 2>/dev/null)"
 echo "log_writeback=$(grep -c 'writeback: backing device' "$LOG" 2>/dev/null)"
 echo "log_supervisor=$(grep -c 'recompression supervisor up' "$LOG" 2>/dev/null)"
+
+# 10. the gated compaction: it fires only on a fragmented device, obeys the
+#     kill switch, is silent on a healthy one and on a kernel without the node.
+reset_fixture
+: > "$T/sys/block/zram0/compact"
+printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+abk_zram_compact_if_fragmented > "$T/out10a" 2>&1
+echo "compact_go=$(cat "$T/sys/block/zram0/compact" 2>/dev/null)"
+echo "compact_go_log=$(grep -c 'zsmalloc compaction: used' "$LOG" 2>/dev/null)"
+reset_fixture
+: > "$T/sys/block/zram0/compact"
+printf '1443160064 175755663 181440512 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+abk_zram_compact_if_fragmented > "$T/out10b" 2>&1
+echo "compact_healthy=$(wc -c < "$T/sys/block/zram0/compact" | tr -d ' ')"
+reset_fixture
+: > "$T/sys/block/zram0/compact"
+printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+printf 'zram.compact.enable=0\n' > "$T/tunables.conf"
+abk_zram_compact_if_fragmented > "$T/out10c" 2>&1
+echo "compact_off=$(wc -c < "$T/sys/block/zram0/compact" | tr -d ' ')"
+reset_fixture
+: > "$T/tunables.conf"
+printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+abk_zram_compact_if_fragmented > "$T/out10d" 2>&1
+echo "compact_nonode_rc=$?"
+echo "compact_nonode_warn=$(grep -c 'node missing' "$T/out10d" 2>/dev/null)"
 
 rm -rf "$T"
 '''
@@ -1990,6 +2035,10 @@ rm -rf "$T"
     check("the supervisor drives an age-marked pass",
           "--idle-age 3600" in got.get("supervisor_args", ""),
           got.get("supervisor_args"))
+    check("the supervisor tick runs the gated compaction on a fragmented device",
+          got.get("supervisor_compact") == "100", r.stdout)
+    check("the supervisor up line carries the gate config, so the defaults are pinned",
+          got.get("supervisor_gate_line") == "compact=1>50MB+15%", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
 
@@ -2027,6 +2076,19 @@ rm -rf "$T"
           (got.get("log_writeback") or "0") != "0", r.stdout)
     check("the log records the supervisor start",
           (got.get("log_supervisor") or "0") != "0", r.stdout)
+
+    # 10: the compaction gate, directly.
+    check("a fragmented device gets one full compaction pass",
+          got.get("compact_go") == "100"
+          and (got.get("compact_go_log") or "0") != "0",
+          (got.get("compact_go"), got.get("compact_go_log")))
+    check("a healthy device is never compacted",
+          got.get("compact_healthy") == "0", r.stdout)
+    check("zram.compact.enable=0 stops the pass even when fragmented",
+          got.get("compact_off") == "0", r.stdout)
+    check("a kernel without the compact node is left alone, silently",
+          got.get("compact_nonode_rc") == "0" and got.get("compact_nonode_warn") == "0",
+          (got.get("compact_nonode_rc"), got.get("compact_nonode_warn")))
 
 
 def test_batch8_autofdo_tool():

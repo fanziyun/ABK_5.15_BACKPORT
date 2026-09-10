@@ -513,12 +513,70 @@ abk_zram_wait_ready() {
   return 0
 }
 
+# --- fragmentation-gated zsmalloc compaction ------------------------------
+# When a process dies its swap slots are freed in the middle of zspages, and
+# those zspages stop serving their size class; the resulting overhead (and the
+# measured kill-storm numbers behind this gate) is documented in README.md.
+# Compacting a healthy device would be pure CPU for nothing, so one full pass
+# runs only when BOTH gates say "fragmented":
+#     mem_used_total - compr_data_size > zram.compact.min_waste_mb (MiB)
+#     mem_used_total > compr_data_size * (1 + zram.compact.waste_pct / 100)
+# All byte math lives in awk: both operands pass 2^31 on big devices and this
+# ROM's shell arithmetic does not survive that (see abk_mul_div in common.sh).
+abk_zram_compact_if_fragmented() {
+  # Same enable convention as every other knob in the module: on only for "1".
+  [ "$(abk_cfg zram.compact.enable 1)" = "1" ] || return 0
+
+  _cz_node="$ABK_ZRAM_DIR/compact"
+  [ -e "$_cz_node" ] || return 0   # kernel without the compact node
+
+  _cz_val="$(abk_cfg zram.compact.min_waste_mb 50)"
+  if ! _cz_min_mb="$(abk_clamp_uint "$_cz_val" 1 1024)"; then
+    abk_warn "zram.compact.min_waste_mb: '$_cz_val' is not a number in 1..1024, using 50"
+    _cz_min_mb=50
+  fi
+  _cz_val="$(abk_cfg zram.compact.waste_pct 15)"
+  if ! _cz_pct="$(abk_clamp_uint "$_cz_val" 1 500)"; then
+    abk_warn "zram.compact.waste_pct: '$_cz_val' is not a number in 1..500, using 15"
+    _cz_pct=15
+  fi
+
+  # One awk pass over mm_stat: verdict + f3 (mem_used_total) together, so the
+  # log line can never report numbers from a different parse than the gate.
+  _cz_verdict="$(abk_read "$ABK_ZRAM_DIR/mm_stat" \
+    | awk -v min_mb="$_cz_min_mb" -v pct="$_cz_pct" '
+        NF >= 3 {
+          compr = $2; used = $3
+          if (used - compr > min_mb * 1048576 \
+              && used * 100 > compr * (100 + pct)) print "go", used
+          else print "skip"
+          exit
+        }')"
+  case "$_cz_verdict" in
+    go\ *) _cz_before="${_cz_verdict#go }" ;;
+    *) return 0 ;;
+  esac
+
+  # "100" = the compact node's pass-size argument: 100 percent of zspages,
+  # i.e. one full compaction pass.
+  if abk_write "$_cz_node" 100; then
+    _cz_after="$(abk_read "$ABK_ZRAM_DIR/mm_stat" | awk 'NF >= 3 { print $3; exit }')"
+    _cz_freed="$(printf '%s %s\n' "$_cz_before" "${_cz_after:-$_cz_before}" \
+      | awk '{ print $1 - $2 }')"
+    abk_log "zsmalloc compaction: used $_cz_before -> ${_cz_after:-?} bytes (reclaimed $_cz_freed)"
+  fi
+  return 0
+}
+
 # --- recompression supervisor -------------------------------------------
 # Two jobs on two different clocks: the policy is re-checked every
 # zram.reassert_interval_sec (a writer that switches the compressors behind the
 # module is repaired within that window), and the recompression sweeps run
 # every zram.recomp.interval_sec.  The sweeps mark pages by age -- never "all",
 # which would recompress everything every round -- and drive the async worker.
+# Every sweep tick then ends with the gated zsmalloc compaction pass (see
+# abk_zram_compact_if_fragmented): it fires only when the overhead gates call
+# it fragmented, so a healthy device never pays for it.
 abk_zram_supervisor_main() {
   abk_pid_write zram "$$"
   _zs_tool="${ABK_RECOMP_TOOL:-$MODDIR/bin/zram_recompress_trigger.sh}"
@@ -547,7 +605,7 @@ abk_zram_supervisor_main() {
     return 1
   fi
 
-  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold reassert=${_zs_reassert}s"
+  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
 
   # The tool's own --daemon loop would block this process, and the supervisor
   # has two jobs the tool cannot do: keep the policy in force between passes,
@@ -568,6 +626,10 @@ abk_zram_supervisor_main() {
         3) abk_warn "recompression sweep refused: the secondary equals the primary" ;;
         *) abk_warn "recompression sweep failed (rc=$_zs_rc)" ;;
       esac
+      # Sweep tick: also give zsmalloc one gated compaction pass (the sweep
+      # itself churns objects, and app deaths between sweeps fragment too).
+      # Rides this clock, so `zram.recomp.enable=0` stops it as well.
+      abk_zram_compact_if_fragmented || true
     fi
     sleep "$_zs_reassert"
   done
