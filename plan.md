@@ -258,7 +258,15 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
   trigger 脚本，含"未注册时必须失败"用例）；step_audit /
   implementation_audit / smoke 在 167/178/194 三档全绿
   （core 144/145/136 步，二次幂等；smoke core 21 组全 applied）。
-- [ ] 编译验证：待 ABK CI 编译通过后 bump `module.conf` 至 v0.13.0。
+- [x] 编译验证：ABK CI（run 34482384766，android13/5.15-X/lts）after_patch +
+  编译内核 + Boot/AnyKernel3/签名 Bundle 全绿；已按惯例 bump `module.conf`
+  至 v0.13.0，Batch 10-4 正式落地。
+- [ ] 真机复验（下一次刷入后）：`/sys/module/zram/parameters/abk_recomp_algo`
+  存在且为 `lz4hc`；`/sys/block/zram0/recomp_algorithm` 非空；
+  `dmesg | grep recompression` 有注册日志；`tools/zram_recompress_trigger.sh
+  --status` 报 armed；`/dev/memcg/memory.reclaim` 与
+  `/dev/memcg/memory.stat` 的 `cfr_reclaim_*` 均可读；
+  `abk_sf` 在 walt governor 下也能进入 boosting（可由 floor 生效间接观察）。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
