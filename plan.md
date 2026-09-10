@@ -201,9 +201,10 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
   `CFR_ONE_SHOT=1` 单步可测）。
 - [x] 验证：py_compile + 单测全绿（新增 cfr 夹具 + 守护进程夹具）；
   step_audit / implementation_audit / smoke 在 167/178/194 三档全绿
-  （core 142/143/134 步，二次幂等；smoke core 19 组全 applied）。
-- [ ] 编译验证：ABK CI 编译通过后再 bump `module.conf` 至 v0.12.0（本批次
-  提交**不含**版本号变更，遵循 Batch 9-1 的"先编译、后 bump"顺序）。
+  （core 139/140/131 步，二次幂等；smoke core 19 组全 applied）。
+- [x] 编译验证：第二轮 ABK CI（run 34473748528）after_patch + 编译内核 +
+  Boot/AnyKernel3/签名 Bundle 全绿；已按惯例 bump `module.conf` 至 v0.12.0，
+  本组正式落地。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
