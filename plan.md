@@ -38,18 +38,20 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   整 bio 提交 + ring + 完成回调，绑定 6.12 形态与 QTI 硬件）→ 选定
   **方案 A**：把同一套"kthread + 队列 + 完成回调"骨架嫁接到本模块已落地的
   `zram_recompress()` 重压缩路径，使其成为后台异步作业；见 **Batch 10-1**
-- [ ] MFZ 内存冻结 / 页面配额：MiCode 全仓 264 分支 + 厂商模块目录普查
+- [x] MFZ 内存冻结 / 页面配额：MiCode 全仓 264 分支 + 厂商模块目录普查
   （dijun/violin 的 xiaomi-modules 全递归）= **零 freeze 载体**；5.15 kalama
   分支（fuxi/sheng 等）mm/freezer/zram 全部为 upstream 原样。媒体证据指向
-  HyperOS"后台冻结"为用户态框架行为 → 内核侧无源可搬，需按语义自行设计
-  （见 Batch 10 调研块），待用户确认冻结的可观测定义/或闭源模块线索
+  HyperOS"后台冻结"为用户态框架行为 → 内核侧无源可搬，已按 AOSP 官方
+  冻结器链条（frozen cgroup + `memory.reclaim` 最大回收）自行定义语义，
+  更名为通用名 **`cached_freeze_reclaim`**（C 前缀 `abk_cfr_`，节点前缀
+  `cfr_`，范围：内核记账 + 守护进程；见 **Batch 10-3**）—— 已落地
 - [x] dynamic_readahead：已落地 —— 见上方 **Batch 9-1 落地进度**
-- [~] schedutil smart_freq / LRPB：walt 源码已抽读并落盘
+- [x] schedutil smart_freq / LRPB：walt 源码已抽读并落盘
   （`research/popsicle_w_oss/walt_extract/` + 报告 `walt_pelt_survey.md`）；
   结论：控制层子集可保留、信号层必须自造，GKI 侧有现成
   `android_vh_map_util_freq(_new)`/`android_vh_cpufreq_resolve_freq`/
   `android_vh_scheduler_tick` 等 hook 作策略挂点，**无 PELT 化先例需自行设计**
-  —— 待按 GKI 策略模块立项（见 Batch 10 调研块）
+  —— 已按 GKI 策略模块落地，见 **Batch 10-2**
 
 ### Batch 9-1 落地进度（dynamic_readahead_lowmem，已落地 + ABK CI 编译通过）
 
@@ -120,14 +122,80 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   built-in 注册式），**明确标注为"受 smart_freq 启发的自行设计"**，非逐位
   复刻。待 Batch 10-1 落地后立项。
 
-### Batch 10-3（MFZ，等语义定义）
+### Batch 10-1 落地进度（zram_async_recompress，已落地 + ABK CI 编译通过）
 
-- 内核侧无公开源可搬。可行近似的内核件：基于已落地的 per-memcg
-  `memory.reclaim` + cgroup v2 freezer 事件，提供"冻结即主动回收其 memcg
-  到 zram"策略与配额/压缩统计 sysfs —— 属自行设计，需用户先确认：
-  (a) 目标可观测行为/节点；(b) 是否接受近似语义而非逐位复刻；(c) 有无
-  闭源 vendor 模块可逆向（diting-s-oss 顶层 `xiaomi/` 是仓外 gitlink，
-  未核验）。
+- [x] 实现：`zram_async_recompress`（stable_backport_core，步骤脚本
+  `scripts/batch10_core_zram_async.py`，接线见 `abk_stable_core.py` 尾部）。
+- [x] 验证：py_compile + 单测全绿；step_audit / implementation_audit /
+  smoke 在 167/178/194 三档全绿；ABK CI（run 34418417022，
+  android13/5.15-X/lts，实际 5.15.215）after_patch + 编译内核全绿。
+
+### Batch 10-2 落地进度（schedutil_smart_policy，已落地 + ABK CI 编译通过）
+
+- [x] 实现：`schedutil_smart_policy`（stable_perf_backport，步骤脚本
+  `scripts/batch10_perf_sched_policy.py`，接线见 `abk_stable_perf.py` 尾部）；
+  集团计数 core 18（含 10-1）、perf 12→13（`tests/sublevel_matrix.py`
+  `GROUP_COUNTS`）。
+- [x] 验证：与 Batch 10-1 同轮审计 + 同轮 ABK CI（run 34418417022）全绿。
+
+### Batch 10-3 语义定义（cached_freeze_reclaim，通用名替代 MFZ）
+
+MFZ 更名为通用名 `cached_freeze_reclaim`（组名），C 前缀 `abk_cfr_`。
+范围：内核记账 + 守护进程，两件。**语义按"当前内核可无 KABI 改动实现"界定**，
+不做超出实现能力的承诺（写明这一点是为了让 spec 与 registry 一致）。
+
+内核件（观测，不做自动策略，不碰 KABI 导出结构）：
+
+- 主动回收记账：在 `mm/vmscan.c` 的 `try_to_free_mem_cgroup_pages()` 中，
+  **仅当 `MEMCG_RECLAIM_PROACTIVE`（即 memory.reclaim 路径）**时累加
+  `abk_cfr_reclaim_{attempts,requested,reclaimed}` 三个进程级计数器，经
+  `mm/memcontrol.c` 的 `memory_stat_format()` 输出到 `memory.stat` 文本。
+  刻意不做 per-memcg 字段：`struct mem_cgroup` 属厂商可达结构，加字段有
+  KMI 风险；计数器只做全局观测，per-UID 归属由守护进程侧按目录读取区分。
+- freezer 状态变化 tracepoint：`kernel/cgroup/freezer.c` 的
+  `cgroup_update_frozen()` 两个 `CGRP_FROZEN` 迁移点发
+  `abk_cfr_freeze` / `abk_cfr_thaw`，供 Perfetto Freezer 轨迹与
+  `am freeze/unfreeze` 验证对齐。
+
+守护进程件（`tools/cached_freeze_reclaim.sh`，分发件，非树内 graft）：
+
+- 默认只回收：按 cached UID 目录把 `memory.current` 全额写入
+  `memory.reclaim`（= AOSP `CachedAppOptimizer` 的最大回收语义）；
+  `--quota-mb N` 可选封顶（`配额`即此上限，默认 0 = 不封顶）。
+- `--freeze` 可选：先 `cgroup.freeze=1` 静默该组，回收，再 `cgroup.freeze=0`
+  解冻 —— 冻结是可选项，且总在同一轮内解除，不会把应用长期挂起。
+  生命周期解冻（intent/job/activity 恢复）仍归平台 ActivityManager，
+  脚本不重新实现它。
+- 组不存在 `memory.reclaim`（未启用 memcg v2 接口）时跳过。
+
+可观测标准（真机验证）：`memory.stat` 里 `cfr_reclaim_*` 增长、
+`dumpsys activity` 冻结合集、`am freeze/compact` 手动复现、
+Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
+
+### Batch 10-3 落地进度（cached_freeze_reclaim，已落地 + 三档审计全绿）
+
+- [x] 实现：`cached_freeze_reclaim`（stable_backport_core，步骤脚本
+  `scripts/batch10_core_cached_freeze_reclaim.py`，接线见
+  `abk_stable_core.py` 尾部）；集团计数 core 18→19
+  （`tests/sublevel_matrix.py` `GROUP_COUNTS`）。
+- [x] 内核件：`mm/vmscan.c` 的 `try_to_free_mem_cgroup_pages()` 仅在
+  `MEMCG_RECLAIM_PROACTIVE`（即 memory.reclaim 路径）时累加
+  `abk_cfr_reclaim_{attempts,requested,reclaimed}`，经
+  `mm/memcontrol.c` 的 `memory_stat_format()` 输出到 `memory.stat`；
+  `kernel/cgroup/freezer.c` 的 `cgroup_update_frozen()` 两个
+  `CGRP_FROZEN` 迁移点发 `abk_cfr_freeze`/`abk_cfr_thaw` tracepoint。
+  **全部锚点均为 pristine 文本**，刻意避开 `memcg_memory_reclaim` 组安装的
+  替换块 —— 否则会把该组二次幂等打断（同 zram 重压缩组的坑）。
+  唯一跨组依赖是 `MEMCG_RECLAIM_PROACTIVE`（由 memcg 组定义，本组注册在其后）；
+  若 memcg 组降级，本组的计数条件宏缺失会编译失败而非静默半打补丁。
+- [x] 守护进程：`tools/cached_freeze_reclaim.sh`（默认全额回收、
+  `--quota-mb` 封顶、`--freeze` 可选静默后解除、`--dry-run` 演练、
+  `CFR_ONE_SHOT=1` 单步可测）。
+- [x] 验证：py_compile + 单测全绿（新增 cfr 夹具 + 守护进程夹具）；
+  step_audit / implementation_audit / smoke 在 167/178/194 三档全绿
+  （core 142/143/134 步，二次幂等；smoke core 19 组全 applied）。
+- [ ] 编译验证：ABK CI 编译通过后再 bump `module.conf` 至 v0.12.0（本批次
+  提交**不含**版本号变更，遵循 Batch 9-1 的"先编译、后 bump"顺序）。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 

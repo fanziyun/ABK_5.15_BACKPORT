@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -790,6 +791,179 @@ def test_batch10_sched_smart_policy():
               (status3, detail3))
 
 
+def test_batch10_cached_freeze_reclaim():
+    print("Batch 10-3 cached_freeze_reclaim")
+    import abk_stable_core as core
+    import batch10_core_cached_freeze_reclaim as c10
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "cached_freeze_reclaim"), None)
+    check("cached_freeze_reclaim group registered", group is not None)
+    if group is None:
+        return
+
+    steps = c10.build_steps()
+    check("group files match its steps",
+          {s[0] for s in steps} == set(group.files), (steps, group.files))
+    for (rel, old, new, req) in steps:
+        check(f"step {old.splitlines()[0][:34]!r} is required",
+              req is True and old and old != new, (req, old == new))
+
+    # vmscan/memcontrol fixtures: pristine anchors only (the accounting must
+    # not touch the text the memcg_memory_reclaim group installs, or that
+    # group stops being idempotent on the second pass).
+    vmscan = (
+        c10._CFR_DECL_OLD + "\n"
+        "unsigned long try_to_free_mem_cgroup_pages(void)\n"
+        "{\n"
+        + c10._CFR_ACC_OLD
+    )
+    memcontrol = (
+        "static char *memory_stat_format(void)\n"
+        "{\n" + c10._CFR_STAT_OLD + "}\n"
+    )
+    freezer = (
+        "void cgroup_propagate_frozen(void);\n"
+        "\n"
+        + c10._CFR_EVENTS_OLD +
+        "{\n"
+        "\tif (frozen) {\n"
+        "\t\tif (test_bit(CGRP_FROZEN, &cgrp->flags))\n"
+        "\t\t\treturn;\n"
+        "\n"
+        + c10._CFR_FREEZE_OLD +
+        "\t\tif (!test_bit(CGRP_FROZEN, &cgrp->flags))\n"
+        "\t\t\treturn;\n"
+        "\n"
+        + c10._CFR_THAW_OLD +
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "mm/vmscan.c": vmscan,
+            "mm/memcontrol.c": memcontrol,
+            "kernel/cgroup/freezer.c": freezer,
+        })
+        status, detail = core._cached_freeze_reclaim_apply(ctx)
+        check("cached_freeze_reclaim fixture applies all steps",
+              status == "applied", (status, detail))
+        patched = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
+        check("reclaim accounting lands in the reclaim engine",
+              "atomic_long_inc(&abk_cfr_reclaim_attempts);" in
+              patched["mm/vmscan.c"]
+              and "reclaim_options & MEMCG_RECLAIM_PROACTIVE" in
+              patched["mm/vmscan.c"])
+        check("counters surface in memory.stat text",
+              "cfr_reclaim_reclaimed %ld" in patched["mm/memcontrol.c"])
+        check("freezer tracepoints land at the frozen-state transitions",
+              "TRACE_EVENT(abk_cfr_freeze," in patched["kernel/cgroup/freezer.c"]
+              and "trace_abk_cfr_freeze(cgrp);" in
+              patched["kernel/cgroup/freezer.c"]
+              and "trace_abk_cfr_thaw(cgrp);" in
+              patched["kernel/cgroup/freezer.c"])
+        ctx2 = make_ctx(tmp, patched)
+        status2, _detail2 = core._cached_freeze_reclaim_apply(ctx2)
+        check("cached_freeze_reclaim fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = core._cached_freeze_reclaim_apply(ctx)
+        check("cached_freeze_reclaim degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
+def test_batch10_daemon_script():
+    """The cached-freeze-reclaim daemon is a userspace script, not a graft.
+
+    The script is exercised against a throwaway cgroup-v2-shaped directory
+    (memory.current / memory.reclaim / cgroup.freeze).  The whole driver is
+    fed to the shell on stdin so Windows/WSL path and quoting differences
+    never touch the assertions.
+    """
+    print("Batch 10-3 cached_freeze_reclaim daemon script")
+    tool = Path(__file__).resolve().parent.parent / "tools" / "cached_freeze_reclaim.sh"
+    check("cfr daemon script exists", tool.is_file(), tool)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  (no bash on this host: shell checks skipped)")
+        return
+
+    use_wsl = os.name == "nt"
+    shell = ["wsl", "bash", "-s"] if use_wsl else [bash, "-s"]
+    tool_sh = str(tool).replace("\\", "/")
+    if use_wsl and len(tool_sh) > 2 and tool_sh[1] == ":":
+        tool_sh = "/mnt/" + tool_sh[0].lower() + tool_sh[2:]
+
+    def run_shell(script):
+        # Feed the driver as bytes: text mode would rewrite LF to CRLF on
+        # Windows and bash would choke on the stray carriage returns.
+        r = subprocess.run(shell, input=script.encode("utf-8"),
+                           capture_output=True, timeout=120)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"),
+            r.stderr.decode("utf-8", "replace"))
+
+    r = run_shell(f'bash -n "{tool_sh}"\n')
+    check("cfr daemon script passes bash -n", r.returncode == 0, r.stderr)
+
+    driver = f'''
+set -u
+T=$(mktemp -d)
+mkdir -p "$T/apps/uid_1000"
+echo 1073741824 > "$T/apps/uid_1000/memory.current"
+: > "$T/apps/uid_1000/memory.reclaim"
+echo 0 > "$T/apps/uid_1000/cgroup.freeze"
+
+# default: reclaim memory.current whole (AOSP "maximal reclaim"), no freeze
+CFR_ONE_SHOT=1 bash "{tool_sh}" --cgroup-root "$T"
+echo "RC1=$?"
+echo "reclaim1=$(cat "$T/apps/uid_1000/memory.reclaim")"
+echo "freeze1=$(cat "$T/apps/uid_1000/cgroup.freeze")"
+
+# --quota-mb caps the write
+echo 999 > "$T/apps/uid_1000/memory.reclaim"
+CFR_ONE_SHOT=1 bash "{tool_sh}" --cgroup-root "$T" --quota-mb 16
+echo "RC2=$?"
+echo "reclaim2=$(cat "$T/apps/uid_1000/memory.reclaim")"
+
+# --freeze quiesces, reclaims, then thaws back to 0
+echo 999 > "$T/apps/uid_1000/memory.reclaim"
+CFR_ONE_SHOT=1 bash "{tool_sh}" --cgroup-root "$T" --quota-mb 16 --freeze
+echo "RC3=$?"
+echo "freeze3=$(cat "$T/apps/uid_1000/cgroup.freeze")"
+
+# --dry-run writes nothing
+echo 999 > "$T/apps/uid_1000/memory.reclaim"
+CFR_ONE_SHOT=1 bash "{tool_sh}" --cgroup-root "$T" --dry-run
+echo "RC4=$?"
+echo "reclaim4=$(cat "$T/apps/uid_1000/memory.reclaim")"
+rm -rf "$T"
+'''
+    r = run_shell(driver)
+    got = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            got[k] = v
+    check("cfr daemon default sweep succeeds", got.get("RC1") == "0",
+          r.stdout + r.stderr)
+    check("cfr daemon default reclaims memory.current whole",
+          got.get("reclaim1") == "1073741824", r.stdout)
+    check("cfr daemon does not freeze unless asked",
+          got.get("freeze1") == "0", r.stdout)
+    check("cfr daemon honours --quota-mb",
+          got.get("RC2") == "0" and got.get("reclaim2") == str(16 * 1024 * 1024),
+          r.stdout)
+    check("cfr daemon --freeze thaws back within the sweep",
+          got.get("RC3") == "0" and got.get("freeze3") == "0", r.stdout)
+    check("cfr daemon dry-run writes nothing",
+          got.get("RC4") == "0" and got.get("reclaim4") == "999", r.stdout)
+
+
 def test_batch8_autofdo_tool():
     """The AutoFDO tool is a build-engineering script, not a graft.
 
@@ -957,6 +1131,8 @@ def main():
     test_batch9_dynamic_readahead()
     test_batch10_zram_async_recompress()
     test_batch10_sched_smart_policy()
+    test_batch10_cached_freeze_reclaim()
+    test_batch10_daemon_script()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()

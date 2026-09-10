@@ -112,6 +112,17 @@ REQUIRED_CONTENT = {
         "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,",
         "late_initcall(abk_sf_init)",
     ],
+    "core:cached_freeze_reclaim": [
+        "Batch 10-3",
+        "abk_cfr_reclaim_attempts",
+        "abk_cfr_reclaim_requested",
+        "cfr_reclaim_reclaimed",
+        "reclaim_options & MEMCG_RECLAIM_PROACTIVE",
+        "abk_cfr_freeze",
+        "abk_cfr_thaw",
+        "trace_abk_cfr_freeze(cgrp);",
+        "trace_abk_cfr_thaw(cgrp);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever

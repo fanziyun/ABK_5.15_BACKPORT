@@ -3732,5 +3732,35 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 10-3: cached freeze reclaim (generic name for memory-freeze).
+# Steps live in scripts/batch10_core_cached_freeze_reclaim.py: per-reclaim
+# accounting in the memory.reclaim handler + freezer tracepoints, all on
+# pristine anchors (mm/memcontrol.c, kernel/cgroup/cgroup.c); the userspace
+# daemon half is tools/cached_freeze_reclaim.sh.
+# ============================================================================
+import batch10_core_cached_freeze_reclaim as _b10_cfr  # noqa: E402
+
+
+def _cached_freeze_reclaim_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b10_cfr.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "cached_freeze_reclaim",
+        "cached freeze reclaim: per-reclaim cfr_reclaim_* counters in memory.stat + abk_cfr_freeze/abk_cfr_thaw freezer tracepoints (Batch 10-3, generic memory-freeze name)",
+        [
+            "AOSP cached apps freezer (cgroup v2 freezer + memory.reclaim)",
+            "Batch 10-3 semantics (plan.md)",
+        ],
+        ["mm/vmscan.c", "mm/memcontrol.c", "kernel/cgroup/freezer.c"],
+        _cached_freeze_reclaim_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()
