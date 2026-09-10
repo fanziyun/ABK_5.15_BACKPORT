@@ -3757,7 +3757,7 @@ PATCH_GROUPS = PATCH_GROUPS + [
             "AOSP cached apps freezer (cgroup v2 freezer + memory.reclaim)",
             "Batch 10-3 semantics (plan.md)",
         ],
-        ["mm/vmscan.c", "mm/memcontrol.c", "kernel/cgroup/freezer.c"],
+        ["mm/vmscan.c", "mm/memcontrol.c"],
         _cached_freeze_reclaim_apply,
     ),
 ]

@@ -51,7 +51,6 @@ SMOKE_FILES=(
   kernel/cgroup/cgroup-internal.h
   kernel/cgroup/cgroup.c
   kernel/cgroup/cpuset.c
-  kernel/cgroup/freezer.c
   kernel/sched/sched.h
   kernel/sched/core.c
   kernel/sched/fair.c
@@ -232,13 +231,13 @@ grep -q "trace_android_vh_tune_mmap_readaround" \
 grep -qE "^CONFIG_ABK_DYNAMIC_READAHEAD=y" \
   "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
   || fail "defconfig lane did not enable ABK_DYNAMIC_READAHEAD"
-# Batch 10-3: cached freeze reclaim accounting + freezer tracepoints.
+# Batch 10-3: cached freeze reclaim accounting reaches memory.stat.  The
+# freezer side reuses the upstream cgroup notify_frozen trace event, so there
+# is nothing extra to assert there.
 grep -q "cfr_reclaim_reclaimed" "$KERNEL_ROOT/common/mm/vmscan.c" \
   || fail "cached freeze reclaim accounting missing"
 grep -q "abk_cfr_reclaim_reclaimed" "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cached freeze reclaim memory.stat report missing"
-grep -q "trace_abk_cfr_freeze" "$KERNEL_ROOT/common/kernel/cgroup/freezer.c" \
-  || fail "cached freeze reclaim freezer tracepoint missing"
 
 # The drm valid-clones revert must leave no trace of the 5.15.185 check on
 # any baseline: 167/178 never carried it, 194/lts had it removed by the graft.

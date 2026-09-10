@@ -118,10 +118,6 @@ REQUIRED_CONTENT = {
         "abk_cfr_reclaim_requested",
         "cfr_reclaim_reclaimed",
         "reclaim_options & MEMCG_RECLAIM_PROACTIVE",
-        "abk_cfr_freeze",
-        "abk_cfr_thaw",
-        "trace_abk_cfr_freeze(cgrp);",
-        "trace_abk_cfr_thaw(cgrp);",
     ],
 }
 

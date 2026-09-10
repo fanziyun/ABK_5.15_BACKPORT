@@ -55,7 +55,6 @@ FETCH_FILES=(
   kernel/cgroup/cgroup-internal.h
   kernel/cgroup/cgroup.c
   kernel/cgroup/cpuset.c
-  kernel/cgroup/freezer.c
   kernel/sched/sched.h
   kernel/sched/core.c
   kernel/sched/fair.c

@@ -152,10 +152,16 @@ MFZ 更名为通用名 `cached_freeze_reclaim`（组名），C 前缀 `abk_cfr_`
   `mm/memcontrol.c` 的 `memory_stat_format()` 输出到 `memory.stat` 文本。
   刻意不做 per-memcg 字段：`struct mem_cgroup` 属厂商可达结构，加字段有
   KMI 风险；计数器只做全局观测，per-UID 归属由守护进程侧按目录读取区分。
-- freezer 状态变化 tracepoint：`kernel/cgroup/freezer.c` 的
-  `cgroup_update_frozen()` 两个 `CGRP_FROZEN` 迁移点发
-  `abk_cfr_freeze` / `abk_cfr_thaw`，供 Perfetto Freezer 轨迹与
-  `am freeze/unfreeze` 验证对齐。
+- freezer 观测：**不新增 tracepoint**。`kernel/cgroup/freezer.c` 的
+  `cgroup_update_frozen()` 两个 `CGRP_FROZEN` 迁移点本就发上游
+  `TRACE_CGROUP_PATH(notify_frozen, cgrp, frozen)`，Perfetto Freezer 轨迹与
+  `am freeze/unfreeze` 验证消费的就是它。曾试过并列加
+  `abk_cfr_freeze`/`abk_cfr_thaw` 私有事件，已回滚：
+  (a) 与既有事件在同一迁移点重复；(b) 在 freezer.c 里写 `TRACE_EVENT`
+  链接不到符号 —— 该文件 include `<trace/events/cgroup.h>` 但没有
+  `CREATE_TRACE_POINTS`，`__tracepoint_/__traceiter_abk_cfr_*` 只有声明没有
+  定义，ABK CI 在 `ld.lld` 报
+  `undefined symbol: __tracepoint_abk_cfr_freeze`（run 34471008778）。
 
 守护进程件（`tools/cached_freeze_reclaim.sh`，分发件，非树内 graft）：
 
@@ -182,12 +188,14 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
   `MEMCG_RECLAIM_PROACTIVE`（即 memory.reclaim 路径）时累加
   `abk_cfr_reclaim_{attempts,requested,reclaimed}`，经
   `mm/memcontrol.c` 的 `memory_stat_format()` 输出到 `memory.stat`；
-  `kernel/cgroup/freezer.c` 的 `cgroup_update_frozen()` 两个
-  `CGRP_FROZEN` 迁移点发 `abk_cfr_freeze`/`abk_cfr_thaw` tracepoint。
+  freezer 侧复用上游 `notify_frozen` 事件（不新增 tracepoint，理由见上）。
   **全部锚点均为 pristine 文本**，刻意避开 `memcg_memory_reclaim` 组安装的
   替换块 —— 否则会把该组二次幂等打断（同 zram 重压缩组的坑）。
   唯一跨组依赖是 `MEMCG_RECLAIM_PROACTIVE`（由 memcg 组定义，本组注册在其后）；
   若 memcg 组降级，本组的计数条件宏缺失会编译失败而非静默半打补丁。
+- [x] 编译验证：第一轮 ABK CI（run 34471008778）在 `编译内核` 挂掉，实锤私有
+  tracepoint 的 undefined symbol 问题；已按上述回滚 freezer.c 步骤并复跑全部
+  本地门禁。第二轮 CI 见下方"编译验证"。
 - [x] 守护进程：`tools/cached_freeze_reclaim.sh`（默认全额回收、
   `--quota-mb` 封顶、`--freeze` 可选静默后解除、`--dry-run` 演练、
   `CFR_ONE_SHOT=1` 单步可测）。

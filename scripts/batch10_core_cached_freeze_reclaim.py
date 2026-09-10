@@ -14,9 +14,11 @@ group adds the missing observation half, matching the agreed semantics:
     try_to_free_mem_cgroup_pages() for proactive (memory.reclaim) requests
     only, and reported in the memory.stat text -- observable without new
     sysfs nodes or KABI struct fields;
-  * freezer tracepoints: abk_cfr_freeze / abk_cfr_thaw emitted on the two
-    CGRP_FROZEN transitions in cgroup_update_frozen(), which is what
-    Perfetto's Freezer track and `am freeze/unfreeze` verification read.
+  * freezer observability: NOT grafted.  cgroup_update_frozen() already emits
+    the upstream TRACE_CGROUP_PATH(notify_frozen, cgrp, frozen) event on both
+    CGRP_FROZEN transitions, which Perfetto's Freezer track and
+    `am freeze/unfreeze` verification consume -- see the note above
+    build_steps() for why a private duplicate was tried and reverted.
 
 Every anchor here is pristine text, deliberately *outside* the blocks the
 memcg_memory_reclaim group installs: recompressing inside another group's
@@ -32,10 +34,7 @@ Anchors verified verbatim on 5.15.167 (2024-11), 5.15.178 (2025-03) and
   * mm/vmscan.c: the `#include <linux/memcontrol.h>` line (file heads are
     byte-identical across the three baselines) and the
     try_to_free_mem_cgroup_pages() tail, which no earlier group rewrites;
-  * mm/memcontrol.c: the tail of memory_stat_format();
-  * kernel/cgroup/freezer.c: cgroup_update_frozen() and its two CGRP_FROZEN
-    transitions.  freezer.c already pulls in trace/events/cgroup.h, so
-    TRACE_EVENT is available.
+  * mm/memcontrol.c: the tail of memory_stat_format().
 
 The userspace daemon half lives in tools/cached_freeze_reclaim.sh
 (quota-limited reclaim sweeps over cached UIDs with AOSP-aligned unfreeze
@@ -121,71 +120,23 @@ _CFR_STAT_NEW = (
 )
 
 # ---------------------------------------------------------------------------
-# 4) kernel/cgroup/freezer.c: the two CGRP_FROZEN transitions become trace
-#    points.  The TRACE_EVENT definitions go in front of the function so the
-#    calls below resolve, and the comment block stays contiguous.
+# Freezer observability is deliberately NOT grafted.
+#
+# The two CGRP_FROZEN transitions in cgroup_update_frozen() already emit
+# TRACE_CGROUP_PATH(notify_frozen, cgrp, frozen) -- the platform-native cgroup
+# freezer event that Perfetto's Freezer track and `am freeze/unfreeze`
+# verification already consume, in both directions.  Adding abk_cfr_freeze /
+# abk_cfr_thaw next to it was tried in review and reverted for two reasons:
+#
+#   * it is a duplicate of an existing event on the exact same transition;
+#   * a TRACE_EVENT() written into kernel/cgroup/freezer.c links to nothing,
+#     because that file includes <trace/events/cgroup.h> without
+#     CREATE_TRACE_POINTS, so __tracepoint_/__traceiter_abk_cfr_* are only
+#     declared, never defined -- the build dies at ld.lld with
+#     "undefined symbol: __tracepoint_abk_cfr_freeze".  Instantiating them
+#     would need a new trace header plus a CREATE_TRACE_POINTS owner, for an
+#     event the baseline already provides.
 # ---------------------------------------------------------------------------
-
-_CFR_EVENTS_OLD = (
-    "/*\n"
-    " * Revisit the cgroup frozen state.\n"
-    " * Checks if the cgroup is really frozen and perform all state transitions.\n"
-    " */\n"
-    "void cgroup_update_frozen(struct cgroup *cgrp)\n"
-)
-
-_CFR_EVENTS_NEW = (
-    "/* ABK stable_515_backport: cached freeze reclaim freezer tracepoints (Batch 10-3). */\n"
-    "TRACE_EVENT(abk_cfr_freeze,\n"
-    "\tTP_PROTO(struct cgroup *cgrp),\n"
-    "\tTP_ARGS(cgrp),\n"
-    "\tTP_STRUCT__entry(\n"
-    "\t\t__field(struct cgroup *, cgrp)\n"
-    "\t),\n"
-    "\tTP_fast_assign(\n"
-    "\t\t__entry->cgrp = cgrp;\n"
-    "\t),\n"
-    "\tTP_printk(\"cgrp=%p\", __entry->cgrp)\n"
-    ");\n"
-    "\n"
-    "TRACE_EVENT(abk_cfr_thaw,\n"
-    "\tTP_PROTO(struct cgroup *cgrp),\n"
-    "\tTP_ARGS(cgrp),\n"
-    "\tTP_STRUCT__entry(\n"
-    "\t\t__field(struct cgroup *, cgrp)\n"
-    "\t),\n"
-    "\tTP_fast_assign(\n"
-    "\t\t__entry->cgrp = cgrp;\n"
-    "\t),\n"
-    "\tTP_printk(\"cgrp=%p\", __entry->cgrp)\n"
-    ");\n"
-    "\n" +
-    _CFR_EVENTS_OLD
-)
-
-_CFR_FREEZE_OLD = (
-    "\t\tset_bit(CGRP_FROZEN, &cgrp->flags);\n"
-    "\t} else {\n"
-)
-
-_CFR_FREEZE_NEW = (
-    "\t\tset_bit(CGRP_FROZEN, &cgrp->flags);\n"
-    "\t\t/* ABK stable_515_backport: Batch 10-3 freezer tracepoint. */\n"
-    "\t\ttrace_abk_cfr_freeze(cgrp);\n"
-    "\t} else {\n"
-)
-
-_CFR_THAW_OLD = (
-    "\t\tclear_bit(CGRP_FROZEN, &cgrp->flags);\n"
-    "\t}\n"
-)
-
-_CFR_THAW_NEW = (
-    "\t\tclear_bit(CGRP_FROZEN, &cgrp->flags);\n"
-    "\t\t/* ABK stable_515_backport: Batch 10-3 freezer tracepoint. */\n"
-    "\t\ttrace_abk_cfr_thaw(cgrp);\n"
-    "\t}\n"
-)
 
 
 def build_steps():
@@ -193,7 +144,4 @@ def build_steps():
         ("mm/vmscan.c", _CFR_DECL_OLD, _CFR_DECL_NEW, T),
         ("mm/vmscan.c", _CFR_ACC_OLD, _CFR_ACC_NEW, T),
         ("mm/memcontrol.c", _CFR_STAT_OLD, _CFR_STAT_NEW, T),
-        ("kernel/cgroup/freezer.c", _CFR_EVENTS_OLD, _CFR_EVENTS_NEW, T),
-        ("kernel/cgroup/freezer.c", _CFR_FREEZE_OLD, _CFR_FREEZE_NEW, T),
-        ("kernel/cgroup/freezer.c", _CFR_THAW_OLD, _CFR_THAW_NEW, T),
     ]

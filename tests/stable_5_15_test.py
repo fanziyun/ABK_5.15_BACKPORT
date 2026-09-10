@@ -822,27 +822,10 @@ def test_batch10_cached_freeze_reclaim():
         "static char *memory_stat_format(void)\n"
         "{\n" + c10._CFR_STAT_OLD + "}\n"
     )
-    freezer = (
-        "void cgroup_propagate_frozen(void);\n"
-        "\n"
-        + c10._CFR_EVENTS_OLD +
-        "{\n"
-        "\tif (frozen) {\n"
-        "\t\tif (test_bit(CGRP_FROZEN, &cgrp->flags))\n"
-        "\t\t\treturn;\n"
-        "\n"
-        + c10._CFR_FREEZE_OLD +
-        "\t\tif (!test_bit(CGRP_FROZEN, &cgrp->flags))\n"
-        "\t\t\treturn;\n"
-        "\n"
-        + c10._CFR_THAW_OLD +
-        "}\n"
-    )
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "mm/vmscan.c": vmscan,
             "mm/memcontrol.c": memcontrol,
-            "kernel/cgroup/freezer.c": freezer,
         })
         status, detail = core._cached_freeze_reclaim_apply(ctx)
         check("cached_freeze_reclaim fixture applies all steps",
@@ -855,12 +838,6 @@ def test_batch10_cached_freeze_reclaim():
               patched["mm/vmscan.c"])
         check("counters surface in memory.stat text",
               "cfr_reclaim_reclaimed %ld" in patched["mm/memcontrol.c"])
-        check("freezer tracepoints land at the frozen-state transitions",
-              "TRACE_EVENT(abk_cfr_freeze," in patched["kernel/cgroup/freezer.c"]
-              and "trace_abk_cfr_freeze(cgrp);" in
-              patched["kernel/cgroup/freezer.c"]
-              and "trace_abk_cfr_thaw(cgrp);" in
-              patched["kernel/cgroup/freezer.c"])
         ctx2 = make_ctx(tmp, patched)
         status2, _detail2 = core._cached_freeze_reclaim_apply(ctx2)
         check("cached_freeze_reclaim fixture is idempotent",
