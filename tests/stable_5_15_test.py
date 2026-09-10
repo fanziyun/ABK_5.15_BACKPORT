@@ -1489,8 +1489,14 @@ def test_runtime_tunables_module():
     check("module versionCode is a positive integer",
           props.get("versionCode", "").isdigit() and int(props["versionCode"]) > 0)
 
-    # module.conf advertises the companion through the module-set contract
-    # (ABK's app reads parts[10] = name and parts[11] = download url).
+    # module.conf carries the companion through the module-set contract
+    # (ABK's app reads parts[10] = name and parts[11] = download url).  On this
+    # repo the companion is *bundled into the AnyKernel3 zip* (after_patch ->
+    # ak3_bundle_ksu_module.py, abk-ksu-modules/), so flashing the kernel also
+    # installs it and there is nothing for the app to download: both fields are
+    # deliberately empty placeholders.  The 12-field shape still holds; if a
+    # future layout stops bundling the module, the fields get filled and this
+    # check flips to the old non-empty assertions.
     conf = (repo / "module.conf").read_text(encoding="utf-8")
     items = re.search(r"ABK_MODULE_SET_ITEMS='(.*?)'", conf, re.S)
     check("module.conf declares ABK_MODULE_SET_ITEMS", items is not None)
@@ -1500,12 +1506,9 @@ def test_runtime_tunables_module():
           bool(fields) and all(len(row) >= 12 for row in fields.values()),
           {name: len(row) for name, row in fields.items()})
     core_row = fields.get("stable_backport_core", [])
-    check("the core child advertises the companion module name",
-          len(core_row) > 10 and core_row[10] == "ABK 5.15 Runtime Tunables",
+    check("companion ships inside the kernel zip, not via an app download",
+          len(core_row) >= 12 and core_row[10] == "" and core_row[11] == "",
           core_row[10:12])
-    check("the core child advertises the companion download url",
-          len(core_row) > 11 and core_row[11].endswith("abk_runtime_tunables.zip"),
-          core_row[11:12])
     check("both module.conf versions were bumped for the companion",
           'ABK_MODULE_VERSION="0.15.0"' in conf
           and 'ABK_MODULE_SET_VERSION="0.15.0"' in conf)

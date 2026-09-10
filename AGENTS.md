@@ -200,9 +200,12 @@ Injection goes into `custom_external_modules`, `|`-separated; the grammar:
 `child_id|name|description|repo_url|supported_stages|default_stage|recommended_stages|group_role|controllable|has_web_ui|magisk_module_name|magisk_module_url`.
 Plain modules instead use `ABK_MODULE_SUPPORTED_STAGES` / `ABK_MODULE_DEFAULT_STAGE`
 / `ABK_MODULE_RECOMMENDED_STAGES`. The last two fields are what the ABK app reads to
-offer the companion module (`ABK_MAGISK_MODULE_NAME` /
-`ABK_MAGISK_MODULE_DOWNLOAD_URL` for plain modules); this repo declares them on
-`stable_backport_core`.
+offer a companion module (`ABK_MAGISK_MODULE_NAME` /
+`ABK_MAGISK_MODULE_DOWNLOAD_URL` for plain modules). On this repo the companion is
+**bundled into the AnyKernel3 zip** (`after_patch` → `ak3_bundle_ksu_module.py`,
+under `abk-ksu-modules/`), so flashing the kernel installs it and the app has
+nothing to download: the `stable_backport_core` row keeps the two fields as empty
+placeholders on purpose (still 12 fields, still parseable).
 
 Distribution assets live outside the graft: `tools/` (device-facing CLIs, shipped
 into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
