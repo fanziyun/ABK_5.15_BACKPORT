@@ -93,6 +93,38 @@ abk_stable_backport_preflight_display() {
   abk_require_file "$common_dir/drivers/gpu/drm/drm_atomic_helper.c"
 }
 
+# The runtime companion (ksu/abk_runtime_tunables) is a distribution asset, not
+# a graft: it registers no PatchGroup and never writes into the kernel tree.  It
+# rides inside the AnyKernel3 zip so that flashing a kernel also installs the
+# policy that makes the landed zram recompression actually run, and that fixes
+# the primary algorithm the ROM's own zram owner leaves on the dominated lz4hc.
+abk_stable_backport_bundle_ksu_module() {
+  local output
+
+  if [ "${ABK_515_KSU_MODULE:-1}" = "0" ]; then
+    abk_log "runtime companion module disabled (ABK_515_KSU_MODULE=0)"
+    return 0
+  fi
+
+  if ! output="$("$(abk_python)" "$MODULE_DIR/scripts/ak3_bundle_ksu_module.py" \
+        inject --ak3-dir auto 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    abk_die "failed to bundle the runtime companion KernelSU module into the AnyKernel3 tree"
+  fi
+  case "$output" in
+    *"nothing to bundle"*)
+      abk_warn "$output"
+      abk_warn "this build has no AnyKernel3 tree; flash ksu/abk_runtime_tunables manually"
+      return 0
+      ;;
+  esac
+
+  abk_log "$output"
+  "$(abk_python)" "$MODULE_DIR/scripts/ak3_bundle_ksu_module.py" verify --ak3-dir auto >/dev/null \
+    || abk_die "the AnyKernel3 tree does not carry a valid runtime companion bundle"
+  return 0
+}
+
 abk_stable_backport_apply_child() {
   local child_id="$1"
   local script report_dir sub_level family

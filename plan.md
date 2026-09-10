@@ -3,6 +3,186 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 11（v0.14.0，运行时伴随模块 + zram 算法策略）
+
+真机勘查（vermeer / Redmi K70，`5.15.215-android13-8-g6c35ef5f7a13`，KernelSU
+`ksud 3.3.0`，SELinux Enforcing，HyperOS 移植 ROM）：**嫁接已进内核且活着，
+问题是没有任何用户态去驱动它**。
+
+| # | 结论 | 证据 |
+|---|---|---|
+| 1 | 嫁接活着 | `abk_recomp_algo` 存在；`recomp_algorithm=#1: … [lz4hc]`；`recompress_async`/`idle`/`compact`/`mem_limit` 都在；`dynamic_readahead=Y`；`abk_sf_*` 都在；`/dev/memcg/memory.reclaim` 可写、`memory.stat` 有 `cfr_reclaim_*` |
+| 2 | 重压缩从未执行 | 无人写 `idle`/`recompress*`；`mm_stat = 4096 62 …`（只存过 1 页），`io_stat` 全 0 |
+| 3 | 主算法被 ROM 锁在最差档 | `comp_algorithm` 括号在 `lz4hc`，而 `CONFIG_ZRAM_DEF_COMP="lz4kd"`；启动后再写返回 `EBUSY`，用户态无法修复 |
+| 4 | ROM mmd 整链死亡 | `CONFIG_ZRAM_WRITEBACK` 未开 → `init.rc` chown 的 `writeback*` 节点不存在 → `mmd_setup`（Android 16 Rust 实现）在 writeback 步失败 → `mmd.setup_complete` 永不设置、`mmd` 永不 enable |
+| 5 | zram 大而不用 | `disksize=16 GiB`、`SwapFree=SwapTotal`、`Used=0`；`pgsteal_anon=0` / `pgsteal_file=2041656`、`pswpout=759`、`Cached≈4.9 GB` |
+| 6 | 其他"编进去了但不动" | `transparent_hugepage=[never]`（MADV_COLLAPSE 无载体）、`lru_gen/enabled=0x0000`（MGLRU 有代码未开）、`ZRAM_WRITEBACK` 未开 |
+| 7 | 本机多余的项 | cmdline 已带 `rcu_nocbs=0-7` → `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` 在本机无意义 |
+| 8 | 根权限可用、无需 sepolicy | `su -c` 下 `idle`/`compact`/`mem_limit`/`recompress_async`/`swappiness` 写入成功，`dmesg` 无 ksu 域拒绝 |
+
+### 算法实测（64 MiB 定长 ELF 语料，单核，`hot_add` 临时 zram 设备，不动 swap）
+
+| 算法 | 压缩后 | 压缩率 | 压缩 | 解压 | 重复文本 64 MiB |
+|---|---|---|---|---|---|
+| `lz4` | 31.19 MB | 2.15× | 0.60 s (107 MB/s) | 865 MB/s | — |
+| **`lz4kd`（主算法）** | **31.06 MB** | **2.16×** | **0.57 s (112 MB/s)** | **955 MB/s** | **901 KB** |
+| `lz4hc` | 29.31 MB | 2.29× | 1.13 s (57 MB/s) | 901 MB/s | 999 KB |
+| **`zstd`（二级算法）** | **24.21 MB** | **2.77×** | 0.73 s (88 MB/s) | 330 MB/s | **868 KB** |
+| `deflate` | 23.51 MB | 2.85× | 2.29 s (28 MB/s) | 208 MB/s | — |
+
+结论：`lz4hc` 在主/二级两个位置都是劣解（热路径压缩成本翻倍只换 5.6% 压缩率；
+重复数据上甚至不如 `lz4kd`）。主算法取 `lz4kd`、二级取 `zstd`，
+且**不允许用户修改**：内核参数只读、模块无任何算法/容量配置项。
+
+### Batch 11 落地进度
+
+- [x] 内核侧：`zram_secondary_comp` 默认 `lz4hc` → `zstd`，参数 `0644` → **`0444`**
+  （真机实测 0444 连 KernelSU root 写入都是 `Permission denied` → 运行时锁死）；
+  同步 `abk_stable_core.py` 组描述、`implementation_audit.py`（含 0444 断言）、
+  `smoke.sh`、`stable_5_15_test.py` 夹具、`tools/` 帮助文本、`module.conf`。
+- [x] 新资产 `ksu/abk_runtime_tunables/`（KernelSU 模块，非 graft、不写内核树）：
+  `common.sh` / `zram-policy.sh` / `post-fs-data.sh` / `service.sh` / `action.sh` /
+  `tunables.conf` / `embed.conf` / `README.md`。策略硬编码（主 `lz4kd`、二级 `zstd`、
+  `mem_limit`=RAM 25%、容量继承 ROM）；接管序列
+  `swapoff → reset → 算法 → disksize → mem_limit → mkswap → swapon -p`，
+  带安全门（swap 在用则不改写）、writeback 内核自动让位、`state/` pidfile 与监督循环。
+- [x] 打包与注入：`scripts/build_ksu_module.py`（确定性 zip；`embed.conf` 把
+  `tools/zram_recompress_trigger.sh` 注入 `bin/`，保持单一实现）、
+  `scripts/ak3_bundle_ksu_module.py`（AnyKernel3 树/成品 zip 两种注入 + 幂等围栏 + `verify`）；
+  `after_patch` 自动执行，无 AK3 树则告警跳过，`ABK_515_KSU_MODULE=0` 关闭。
+- [x] `tools/zram_recompress_trigger.sh`：新增 `--idle-age SECS`（年龄语义）、
+  标记与 pass 分离（`--daemon` 不再每轮重标）、`--mark-each-pass` 显式化、
+  同算法护栏（退出码 3）、参数校验统一退出码 2。
+- [x] 测试：`test_runtime_tunables_module`（打包确定性 / AK3 注入幂等与校验 /
+  策略常量与接管顺序 / 夹具行为：接管改写、swap 在用拒绝、writeback 让位、
+  监督循环在失败后仍继续、未知键告警、数值钳制）。
+- [x] 门禁：`py_compile`、`bash -n`（含 `ksu/*/*.sh`）、单测全绿；
+  接管序列已在真机逐条实测通过（含用 `swapon -p 0` 保持 ROM 的 swap 优先级）。
+- [x] 真机复验（刷入本模块后）：`action.sh status`；重启后 +60/+120 s 算法未被 ROM 改回；
+  swap 正常；`mm_stat.compr_data_size` 在冷页被重压缩后下降；无 `u:r:ksu:s0` 拒绝。
+  （复验结论见 Batch 12：接管在某些 boot 会与 ROM 的 `init.kernel.post_boot.sh` 撞车，
+  已被 Batch 12 的"无需改写就不改写 + 60 s 复检"取代。）
+- [x] ~~可选（需另一次刷机，且与算法强制互斥）~~ → Batch 12 已解决互斥：内核锁使算法
+  不再依赖抢占 pre-`disksize` 窗口，`ABK_515_DEFCONFIG_ROM=1` 的
+  `CONFIG_ZRAM_WRITEBACK=y` 现在与算法策略并存。
+- [ ] 待验（Batch 10-4 遗留）：`dmesg | grep recompression` 注册日志（ring buffer 已滚动）、
+  `abk_sf` 在 `sched_pelt_multiplier=4` 下是否长期 boosting。
+
+## Batch 12（v0.15.0，内核侧算法锁 + writeback 并存）
+
+真机复勘（同一台 vermeer，`5.15.215`）暴露三个新事实，本批次按事实改设计：
+
+| # | 事实 | 证据（adb 实测） |
+|---|---|---|
+| 1 | **算法仍可被 root 改掉** | 某次 boot 后 `comp_algorithm` 停在 `[deflate]`；`CONFIG_ZRAM_DEF_COMP="lz4kd"`，即 deflate 是**被写进去的**；`echo lz4hc > comp_algorithm` 返回 `EBUSY`（`dmesg: Can't change algorithm for initialized device`），唯一改写路径是 `swapoff + reset + 重写`，而模块当时要 30 min 才复检一次 |
+| 2 | **ROM 的 zram 主不是 mmd** | `/product/etc/build.prop: vendor.zram.disable=1`；`mmd.setup_complete` 未设置、`init.svc.mmd` 不存在；真实 owner 是 `/vendor/bin/init.kernel.post_boot.sh: configure_zram_parameters()`（`disksize` + `mkswap` + `swapon -p 32758`，**完全不写算法**） |
+| 3 | writeback 互斥的根因是窗口 | `backing_dev` 与 `comp_algorithm`/`recomp_algorithm` 都只在 `disksize` 之前可写，而 `zram_reset_device()` → `reset_bdev()` 在 reset 时关闭 backing device：所以"修算法"必然要重挂 backing device，旧模块选择了放弃一边 |
+
+### 落地
+
+- [x] 新 graft `zram_algo_lock`（`scripts/batch11_core_zram_algo_lock.py`，core `GROUP_COUNTS` 21→22）：
+  - `zram.abk_comp_algo`（0444，默认 `lz4kd`）：`zram_add()` 里在创建磁盘前选定主算法；
+    该 build 没有该 backend 时保留 `CONFIG_ZRAM_DEF_COMP` 并 `pr_warn`。
+  - `zram.abk_lock_algo`（0444，默认 `Y`）：`late_initcall` 把
+    `dev_attr_comp_algorithm.store` / `dev_attr_recomp_algorithm.store` 指向
+    "记录并返回成功"的 store —— **接受写入但保留锁定值**。不用 `-EPERM`：Android 16 的
+    `mmd_setup` 在算法写失败时会放弃整条 zram bring-up（含 writeback 与
+    `mmd.setup_complete`），拒绝反而会重建本批次要消除的互斥。
+  - 锁在 `reset` 后仍然有效：`zram_destroy_comps()` 只清 `comps[]`，不动 `comp_algs[]`。
+  - 锚点全部落在**其它组的块边界或 pristine 文本**上（`default_compressor`、
+    `zram_debugfs_register(zram);`、`module_init(zram_init);` 之后），不修改任何已有组的
+    替换文本 —— 否则那些组的第二遍幂等会失效（实测踩过：把锁插进
+    `__comp_algorithm_store` 会让 `zram_recompression` 报 `blocked_by_shape`）。
+- [x] config 分档：新增 ROM 档 `ABK_515_DEFCONFIG_ROM=1` → `CONFIG_ZRAM_WRITEBACK=y`
+  （默认关；`_config_enablement_apply` 现在报 `[module-owned symbols only, ROM integration]`）。
+- [x] 模块侧（`ksu/abk_runtime_tunables`，v0.2.0）：
+  - `abk_zram_ensure()`：只有"策略确实不成立"（算法不对 / 未初始化 / 无 swap /
+    writeback 该有而没有）才改写；内核带锁时**完全不碰 bring-up**，只重设 `mem_limit`。
+  - writeback 不再是"有节点就让位"：改写前先记住 `backing_dev` + `writeback_limit`，
+    reset 后在同一个 pre-`disksize` 窗口**原样挂回**（同一个 loop，不新建）；
+    内核支持且无人占用时按 `zram.writeback=auto` 自己建稀疏 `backing file`
+    （`/data/per_boot/zram/zram_swap`，`losetup`，限额 4 KiB 单位，
+    有 `compressed_writeback` 则打开）。
+  - swap 在用 + 存在活跃 writeback 时明确记日志"keeping the live writeback device"并拒绝改写。
+  - 监督循环改为 tick：`zram.reassert_interval_sec`（默认 60 s）复检策略、
+    `zram.recomp.interval_sec` 跑 sweep；未加锁内核上算法被改在 60 s 内被改回。
+  - `action.sh unlock` 说明锁只能从 cmdline 关（0444 参数）。
+- [x] 测试：`test_batch11_zram_algo_lock`（单测夹具 + 幂等 + 空树降级）、
+  `test_config_tiers`（三档互斥与内容）；模块夹具新增 5 个场景（自动建立 writeback、
+  活跃 writeback 跨 reset 保留、活跃 writeback + swap 在用拒绝、锁内核零改写、
+  监督 tick）；`implementation_audit` 新增 `core:zram_algo_lock` 整文件/函数级断言。
+- [x] 门禁：`py_compile`、`bash -n`、单测 360 项全绿；`step_audit` /
+  `implementation_audit` / `smoke` 在 167/178/194 全部 OK。
+- [ ] 待验（需刷入新内核）：`zram.abk_lock_algo` / `zram.abk_comp_algo` 出现且 0444；
+  root 写 `comp_algorithm=deflate` 后节点仍为 `[lz4kd]`（dmesg 有 "is locked to" 一行）；
+  `ABK_515_DEFCONFIG_ROM=1` build 上 `backing_dev` 被模块挂上且 `writeback_limit` 生效。
+- [ ] 待验（本模块刷入即可，无需新内核）：60 s 内把被改掉的算法改回；日志出现
+  `rewrite: size=…`；`action.sh status` 的 `policy` 行。
+
+### 本轮顺带修正（旧实现的两处判断）
+
+- 旧模块把"内核暴露了 `writeback` 节点"当成"ROM 的 mmd 在管 writeback"而整体让位，
+  在本机（节点不存在）看不出来，一旦开了 `CONFIG_ZRAM_WRITEBACK` 就会把算法策略
+  白送出去：现在只有 `backing_dev` 非 `none` 或 `mmd.setup_complete=true` 才算"有人在用"。
+- 旧模块每次 boot 都无条件接管，撞上 ROM 的 `init.kernel.post_boot.sh`（本机 32 s）
+  就会 `swapon`/`disksize` 双双失败并留下半套状态（真机日志：`swapon failed` →
+  `write failed: disksize` → `RECOVERY FAILED`）。现在算法已正确就根本不动设备。
+
+### 真机验证（本轮已跑完，均为未加锁内核上的模块侧行为）
+
+| 验证 | 结果 |
+|---|---|
+| 装 v0.2.0 模块 | `ksud module install` + 就地应用 `modules_update`，`action.sh status` 打出新字段（`zram.abk_lock_algo absent (module enforces the policy instead)`、`policy in force`） |
+| 监督 tick | 日志每 60 s 一条（`reassert=60s`），与 `zram.reassert_interval_sec` 一致 |
+| **用户切断算法** | 模拟 root 用户 `swapoff + reset + echo deflate + disksize + swapon`：60 s 内被模块发现并改写回 `[lz4kd]`，日志 `algorithms changed behind the module (primary=deflate …)` → `rewrite: size=17179869184 …` → `zram ready` |
+| 容量保持 | 同一次改写把 ROM/用户的 **16 GiB 原样保留**（`/proc/swaps` 16777212 KB） |
+| `mem_limit` | `mm_stat` f4 = `3983622144`（RAM 25%）真机写成功 |
+| writeback 原语 | 在本机（无 `CONFIG_ZRAM_WRITEBACK`）直接调用 `abk_zram_create_backing_dev`：生成稀疏 1 GiB 文件（`ls` 显示 1073741824 B，仅占 ~1 MiB 块）、`losetup -f` 取到 `/dev/block/loop49`、挂载成功、`losetup -d` 卸载干净 |
+| 未验证 | 内核锁本身（需要刷入用当前仓库重建的内核）；`backing_dev` 节点的真正写入（需要 `CONFIG_ZRAM_WRITEBACK`） |
+
+### 真机踩到的两个 mksh 32 位陷阱（已修 + 测试锁定）
+
+本机 `/system/bin/sh`（Android mksh）的算术与 `[ -gt ]` 都是 **32 位**：
+`15561024 * 1024` = `-1245380608`、`$(( 17179869184 ))` = `0`、`[ 17179869184 -gt 0 ]`
+为假；KernelSU 用的是自带 busybox ash（64 位），所以只有从终端/`adb shell`/ROM init
+路径进入时才暴露。
+
+1. `mem_limit`：`abk_mem_total_bytes` 与 `* 25 / 100` 在 shell 里算 → 得到负值 →
+   内核拒绝写入 → **压缩内存上限静默失效**（真机日志 `write failed: … <- -10697441`）。
+   现已改为 `abk_mul_div` / `abk_mem_pct_bytes`（awk 64 位）。
+2. `disksize` 保持：`[ "$_sd_live" -gt 0 ]` 对 16 GiB 为假 → 模块把健康设备当成"没有容量"
+   而回退到 `MemTotal/2`，**把 16 GiB 砍成 7.97 GiB**（真机实测）。现改为 `abk_gt`
+   / `abk_le`（awk）。
+   同类问题也在 `tools/cached_freeze_reclaim.sh`（`--quota-mb` 的 `* 1024 * 1024` 与
+   每组的 `memory.current` 字节比较）里修掉。
+
+### Batch 11 附带修复（两个既有缺陷）
+
+- [x] `tools/autofdo_515_profile.sh` **在仓库里从未提交过**（README/plan 记为已落地，
+  单测因此固定 7 项失败并在该处中断；测试自身还传 `C:\...` 路径给 WSL bash，在
+  Windows 上根本无法运行该工具）。本次补齐完整实现：`init`（只接受 5.15 身份的树、
+  写 `manifest.env`，记录 kernel 版本 / vmlinux sha256 / .config 指纹 / source revision /
+  toolchain / `scripts/Makefile.autofdo` 是否存在）、`record`（adb + simpleperf，落
+  `perf.data` 并记设备指纹）、`convert`（create_llvm_prof，可选 simpleperf inject 与
+  llvm-profdata）、`validate`（重算 vmlinux sha256，哈希不符即失败）、`build-env`
+  （打印 `CONFIG_AUTOFDO_CLANG=y` / `CLANG_AUTOFDO_PROFILE=`）。测试像其它 shell 测试
+  一样做 WSL 路径映射；工具对 CRLF 的 Makefile/manifest 也能解析（Windows checkout）。
+- [x] `tools/cached_freeze_reclaim.sh` 原本是 `#!/bin/bash` + `set -euo pipefail` +
+  bash 数组 + 只认 cgroup v2，在这台把 memory 控制器挂在 **v1** 的设备
+  （`/dev/memcg`、`memory.usage_in_bytes`、`freezer.state`）上完全跑不起来。已改为
+  POSIX sh 并同时支持两种布局（v2：`memory.current`/`cgroup.freeze`；v1：
+  `memory.usage_in_bytes`/`freezer.state`），新增 `--list`（只报不写，用于诊断
+  "为什么 cfr 什么都不做"）、`--cgroup-root` 可重复、默认根为
+  `/sys/fs/cgroup` + `/dev/memcg`；无组可扫时明确失败而不是静默成功。
+  真机实测还发现两点并已修/接：这台 ROM 的 v1 **没有 `uid_*` 组**，用的是命名组
+  （`freeze-app` / `game` / `mimd` / `protect_memcg_*`，`memory.reclaim` 由本模块的
+  `memcg_v1_reclaim` 移植提供 ✓），因此新增 `--group NAME` 与 `cfr.group` 配置项
+  （显式列出，绝不擅自扫厂商组）；`--list` 对"已发现但当前为 0 字节"的组也会打印
+  （否则"无输出 + 退出 0"会被误读成"没找到"）。变量名 `GROUPS` 与 bash 内建的
+  用户组列表冲突，已改名 `GROUP_NAMES`（默认分支曾被它污染）。
+  模块改为把该工具打进 `bin/`（`embed.conf`）并在 `CFR_ONE_SHOT=1` 下调度，
+  **删掉了此前模块内重复的 sweep 实现**，CLI 与模块共用一份代码。
+
 ## Batch 9 候选（popsicle-w-oss 调研 + Batch 9-1 dynamic_readahead 已落地）
 
 来源：`MiCode/Xiaomi_Kernel_OpenSource` 分支 `popsicle-w-oss`
@@ -261,12 +441,14 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
 - [x] 编译验证：ABK CI（run 34482384766，android13/5.15-X/lts）after_patch +
   编译内核 + Boot/AnyKernel3/签名 Bundle 全绿；已按惯例 bump `module.conf`
   至 v0.13.0，Batch 10-4 正式落地。
-- [ ] 真机复验（下一次刷入后）：`/sys/module/zram/parameters/abk_recomp_algo`
-  存在且为 `lz4hc`；`/sys/block/zram0/recomp_algorithm` 非空；
-  `dmesg | grep recompression` 有注册日志；`tools/zram_recompress_trigger.sh
-  --status` 报 armed；`/dev/memcg/memory.reclaim` 与
-  `/dev/memcg/memory.stat` 的 `cfr_reclaim_*` 均可读；
-  `abk_sf` 在 walt governor 下也能进入 boosting（可由 floor 生效间接观察）。
+- [x] 真机复验（Batch 11 期间部分完成）：`/sys/module/zram/parameters/abk_recomp_algo`
+  存在（Batch 11 起为**只读 `zstd`**）；`/sys/block/zram0/recomp_algorithm` priority 1
+  = `[zstd]`（Batch 11 的模块接管后）；`/dev/memcg/memory.reclaim` 可写、
+  `/dev/memcg/memory.stat` 的 `cfr_reclaim_*` 可读；`tools/zram_recompress_trigger.sh
+  --status` 报 armed。
+- [ ] 待验（Batch 11 遗留）：`dmesg | grep recompression` 注册日志（ring buffer 已滚动）、
+  `abk_sf` 在 walt governor 下是否进入 boosting（`sched_pelt_multiplier=4` 有长期
+  boosting 风险，见 Batch 11）。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 

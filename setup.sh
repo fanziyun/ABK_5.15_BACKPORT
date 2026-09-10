@@ -29,6 +29,7 @@ fi
 case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
   after_patch)
     abk_stable_backport_apply_selected
+    abk_stable_backport_bundle_ksu_module
     ;;
 
   before_build)

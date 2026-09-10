@@ -244,6 +244,15 @@ grep -q "abk_cfr_reclaim_reclaimed" "$KERNEL_ROOT/common/mm/memcontrol.c" \
 # memory controller is mounted v1 rather than under /sys/fs/cgroup.
 grep -q "abk_recomp_algo" "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
   || fail "zram secondary compressor registration missing"
+# The secondary algorithm is zstd and its parameter is read-only (0444): a
+# writable lz4hc default is what let the ROM's userspace daemon lock the
+# primary onto the dominated algorithm on a 5.15.215 device.
+grep -q 'abk_zram_recomp_algo\[CRYPTO_MAX_ALG_NAME\] = "zstd"' \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram secondary compressor is not the fixed zstd default"
+grep -q 'sizeof(abk_zram_recomp_algo), 0444);' \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram secondary compressor parameter is writable"
 grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 cfr_reclaim counters missing"
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \

@@ -1,0 +1,6 @@
+id=abk_runtime_tunables
+name=ABK 5.15 Runtime Tunables
+version=v0.2.0
+versionCode=2
+author=xingguangcuican6666 + ABK
+description=Drives the ABK 5.15 kernel grafts that are otherwise inert on device: keeps the zram algorithm policy in force at every boot (primary lz4kd, secondary zstd, locked in the kernel by Batch 11 and re-asserted here on older kernels), preserves or establishes the zram writeback backing device instead of trading it away, runs age-based recompression sweeps through the async worker, and reports or tunes the remaining runtime knobs (MGLRU, THP, swappiness, abk_sf, dynamic readahead, cgroup-v1 proactive reclaim).

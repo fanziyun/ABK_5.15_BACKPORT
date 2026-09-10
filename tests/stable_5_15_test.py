@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -836,9 +838,11 @@ def test_batch10_zram_secondary_comp():
         check("zram_secondary_comp fixture applies all steps",
               status == "applied", (status, detail))
         text = ctx.read("drivers/block/zram/zram_drv.c")
-        check("secondary compressor parameter is declared",
-              'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "lz4hc";'
-              in text and "module_param_string(abk_recomp_algo" in text)
+        check("secondary compressor parameter is declared read-only",
+              'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "zstd";'
+              in text and "module_param_string(abk_recomp_algo" in text
+              and "sizeof(abk_zram_recomp_algo), 0444);" in text
+              and "0644" not in text)
         check("secondary slot is filled at device creation",
               "comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, abk_alg);" in text
               and "zcomp_available_algorithm(abk_zram_recomp_algo)" in text)
@@ -853,6 +857,170 @@ def test_batch10_zram_secondary_comp():
         check("zram_secondary_comp degrades on an empty tree",
               status3.startswith("blocked") and ctx.pending_writes() == [],
               (status3, detail3))
+
+
+def test_batch11_zram_algo_lock():
+    print("Batch 11 zram_algo_lock")
+    import abk_stable_core as core
+    import batch11_core_zram_algo_lock as zl
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_algo_lock"), None)
+    check("zram_algo_lock group registered", group is not None)
+    if group is None:
+        return
+    check("zram_algo_lock touches only the zram driver",
+          set(group.files) == {"drivers/block/zram/zram_drv.c"}, group.files)
+    check("zram_algo_lock runs after the groups it anchors on",
+          [g.key for g in core.PATCH_GROUPS].index("zram_algo_lock")
+          > [g.key for g in core.PATCH_GROUPS].index("zram_secondary_comp"))
+
+    steps = zl.build_steps()
+    for (rel, old, new, req) in steps:
+        check(f"step {old.splitlines()[0][:34]!r} is required",
+              req is True and old and old != new, (req, old == new))
+
+    # The fixture is the shape the earlier groups leave behind: Batch 10-4's
+    # parameter block, the multi-comp store both nodes share, the primary
+    # assignment in zram_add(), and Batch 10-1's engine before module_init().
+    zram = (
+        "static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;\n"
+        "\n"
+        "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
+        "static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = \"zstd\";\n"
+        "module_param_string(abk_recomp_algo, abk_zram_recomp_algo,\n"
+        "\t\t    sizeof(abk_zram_recomp_algo), 0444);\n"
+        "MODULE_PARM_DESC(abk_recomp_algo,\n"
+        "\t\"ABK: secondary zram compressor enabling recompression (read-only; empty disables)\");\n"
+        "#endif\n"
+        "\n"
+        "static void comp_algorithm_set(struct zram *zram, u32 prio,\n"
+        "\t\t\t       const char *alg) {}\n"
+        "\n"
+        "static int zram_add(void)\n"
+        "{\n"
+        "\tint ret, device_id;\n"
+        "\n"
+        "\tret = idr_alloc(&zram_index_idr, zram, 0, 0, GFP_KERNEL);\n"
+        "\tif (ret < 0)\n"
+        "\t\tgoto out_free_dev;\n"
+        "\tdevice_id = ret;\n"
+        "\n"
+        "\tzram->comp_algs[ZRAM_PRIMARY_COMP] = default_compressor;\n"
+        "\tzram->num_active_comps = 1;\n"
+        "\n"
+        "\tzram_debugfs_register(zram);\n"
+        "\tpr_info(\"Added device: %s\\n\", zram->disk->disk_name);\n"
+        "}\n"
+        "\n"
+        "/* ABK stable_515_backport: Batch 10-1 async recompress engine (plan A) */\n"
+        "\n"
+        "module_init(zram_init);\n"
+        "module_exit(zram_exit);\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"drivers/block/zram/zram_drv.c": zram})
+        status, detail = core._zram_algo_lock_apply(ctx)
+        check("zram_algo_lock fixture applies all steps",
+              status == "applied", (status, detail))
+        text = ctx.read("drivers/block/zram/zram_drv.c")
+        check("locked primary parameter is declared read-only",
+              'static char abk_zram_comp_algo[CRYPTO_MAX_ALG_NAME] = "lz4kd";' in text
+              and "module_param_string(abk_comp_algo, abk_zram_comp_algo" in text
+              and "module_param(abk_lock_algo, bool, 0444);" in text)
+        check("locked primary is selected at device creation",
+              "comp_algorithm_set(zram, ZRAM_PRIMARY_COMP," in text
+              and "zcomp_available_algorithm(abk_zram_comp_algo)" in text)
+        check("a name this build lacks keeps the build default",
+              "keeping %s\\n" in text and "default_compressor);" in text)
+        check("both algorithm nodes are repointed at the locked store",
+              "dev_attr_comp_algorithm.store = abk_zram_locked_algo_store;" in text
+              and "dev_attr_recomp_algorithm.store = abk_zram_locked_algo_store;" in text
+              and "late_initcall(abk_zram_algo_lock_init)" in text)
+        # The whole point of accepting the write: a refused algorithm write
+        # aborts Android's mmd_setup, writeback backing device included.
+        check("a locked-out write is reported as success, not refused",
+              "-EPERM" not in text and "-EACCES" not in text,
+              [line for line in text.splitlines() if "-EP" in line])
+        check("the lock is reported through the kernel log",
+              "pr_info_ratelimited(" in text)
+        # And the texts the earlier groups own must survive byte-identical, or
+        # their second pass stops being idempotent (the audit checks this).
+        check("earlier groups' blocks stay untouched",
+              "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
+              "static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = \"zstd\";\n"
+              "module_param_string(abk_recomp_algo, abk_zram_recomp_algo,\n"
+              "\t\t    sizeof(abk_zram_recomp_algo), 0444);\n"
+              "MODULE_PARM_DESC(abk_recomp_algo,\n"
+              "\t\"ABK: secondary zram compressor enabling recompression (read-only; empty disables)\");\n"
+              "#endif\n" in text
+              and "\tzram->comp_algs[ZRAM_PRIMARY_COMP] = default_compressor;\n"
+              "\tzram->num_active_comps = 1;\n" in text
+              and "/* ABK stable_515_backport: Batch 10-1 async recompress engine"
+              " (plan A) */\n\nmodule_init(zram_init);\n" in text)
+        check("the lock is registered after zram's own initcall",
+              text.index("late_initcall(abk_zram_algo_lock_init)")
+              > text.index("module_init(zram_init);"))
+        ctx2 = make_ctx(tmp, {"drivers/block/zram/zram_drv.c": text})
+        status2, _detail2 = core._zram_algo_lock_apply(ctx2)
+        check("zram_algo_lock fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = core._zram_algo_lock_apply(ctx)
+        check("zram_algo_lock degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
+def test_config_tiers():
+    print("config tiers: module-owned vs GKI align vs ROM integration")
+    import abk_stable_core as core
+    import os
+
+    def enabled(env_name):
+        saved = {k: os.environ.get(k) for k in
+                 ("ABK_515_DEFCONFIG_ALIGN", "ABK_515_DEFCONFIG_ROM")}
+        for key in saved:
+            os.environ.pop(key, None)
+        if env_name:
+            os.environ[env_name] = "1"
+        caught = {}
+
+        class Probe:
+            family = "android13-5.15"
+            sub_level = "167"
+
+            def enable_configs(self, configs):
+                caught["configs"] = list(configs)
+                return "applied", "probe"
+
+        try:
+            status, detail = core._config_enablement_apply(Probe())
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return status, detail, dict(caught.get("configs", []))
+
+    _s, _d, plain = enabled(None)
+    _s, _d, align = enabled("ABK_515_DEFCONFIG_ALIGN")
+    status, detail, rom = enabled("ABK_515_DEFCONFIG_ROM")
+
+    check("module-owned tier enables the module's own symbols",
+          dict(plain).get("ZRAM_MULTI_COMP") == "y"
+          and "ZRAM_WRITEBACK" not in dict(plain), sorted(dict(plain)))
+    check("align tier adds the 6.6 GKI config deltas",
+          dict(align).get("LRU_GEN_ENABLED") == "y"
+          and "ZRAM_WRITEBACK" not in dict(align), sorted(dict(align)))
+    check("ROM tier adds CONFIG_ZRAM_WRITEBACK",
+          dict(rom).get("ZRAM_WRITEBACK") == "y"
+          and "LRU_GEN_ENABLED" not in dict(rom), sorted(dict(rom)))
+    check("ROM tier is reported in the detail string",
+          status == "applied" and "ROM integration" in detail, (status, detail))
 
 
 def test_batch10_memcg_v1_reclaim():
@@ -963,10 +1131,12 @@ def test_batch10_cached_freeze_reclaim():
 def test_batch10_daemon_script():
     """The cached-freeze-reclaim daemon is a userspace script, not a graft.
 
-    The script is exercised against a throwaway cgroup-v2-shaped directory
-    (memory.current / memory.reclaim / cgroup.freeze).  The whole driver is
-    fed to the shell on stdin so Windows/WSL path and quoting differences
-    never touch the assertions.
+    The script is exercised against throwaway cgroup directories in *both*
+    layouts: v2 (memory.current / memory.reclaim / cgroup.freeze) and v1
+    (memory.usage_in_bytes / memory.reclaim / freezer.state), because this
+    module's own target device mounts the memory controller on v1.  The whole
+    driver is fed to the shell on stdin so Windows/WSL path and quoting
+    differences never touch the assertions.
     """
     print("Batch 10-3 cached_freeze_reclaim daemon script")
     tool = Path(__file__).resolve().parent.parent / "tools" / "cached_freeze_reclaim.sh"
@@ -1027,7 +1197,66 @@ echo 999 > "$T/apps/uid_1000/memory.reclaim"
 CFR_ONE_SHOT=1 bash "{tool_sh}" --cgroup-root "$T" --dry-run
 echo "RC4=$?"
 echo "reclaim4=$(cat "$T/apps/uid_1000/memory.reclaim")"
-rm -rf "$T"
+
+# cgroup v1 layout: memory.usage_in_bytes + freezer.state (FROZEN/THAWED)
+T1=$(mktemp -d)
+T1E=$(mktemp -d)
+mkdir -p "$T1/apps/uid_10042"
+echo 268435456 > "$T1/apps/uid_10042/memory.usage_in_bytes"
+: > "$T1/apps/uid_10042/memory.reclaim"
+echo THAWED > "$T1/apps/uid_10042/freezer.state"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --freeze
+echo "RC_V1=$?"
+echo "v1_reclaim=$(cat "$T1/apps/uid_10042/memory.reclaim")"
+echo "v1_freezer=$(cat "$T1/apps/uid_10042/freezer.state")"
+
+# --list reports the targets without writing to them
+echo 123 > "$T1/apps/uid_10042/memory.reclaim"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --list
+echo "v1_list_rc=$?"
+echo "v1_after_list=$(cat "$T1/apps/uid_10042/memory.reclaim")"
+
+# a root with no uid_* group must fail loudly instead of reporting success
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1E" >/dev/null 2>&1
+echo "RC_NO_GROUPS=$?"
+
+# --uid narrows the sweep to one group
+mkdir -p "$T1/apps/uid_10043"
+echo 1048576 > "$T1/apps/uid_10043/memory.usage_in_bytes"
+: > "$T1/apps/uid_10043/memory.reclaim"
+echo 555 > "$T1/apps/uid_10042/memory.reclaim"
+echo 555 > "$T1/apps/uid_10043/memory.reclaim"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --uid 10043
+echo "v1_uid_rc=$?"
+echo "v1_uid_target=$(cat "$T1/apps/uid_10043/memory.reclaim")"
+echo "v1_uid_other=$(cat "$T1/apps/uid_10042/memory.reclaim")"
+
+# named groups (HyperOS keeps freeze-app / game / mimd / protect_memcg_* on v1)
+mkdir -p "$T1/freeze-app"
+echo 52428800 > "$T1/freeze-app/memory.usage_in_bytes"
+echo 555 > "$T1/freeze-app/memory.reclaim"
+echo 555 > "$T1/apps/uid_10043/memory.reclaim"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --group freeze-app
+echo "v1_group_rc=$?"
+echo "v1_group_target=$(cat "$T1/freeze-app/memory.reclaim")"
+echo "v1_group_other=$(cat "$T1/apps/uid_10043/memory.reclaim")"
+
+# a named group with nothing to reclaim, and a --group that is a path
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --group no-such-group >/dev/null 2>&1
+echo "RC_GROUP_MISSING=$?"
+sh "{tool_sh}" --cgroup-root "$T1" --group ../../etc >/dev/null 2>&1
+echo "RC_GROUP_TRAVERSAL=$?"
+
+# --list must still name a group that is found but currently empty: on a real
+# v1 ROM the named groups read 0 while idle, and silence would look like
+# "nothing found" instead of "found, nothing charged".
+mkdir -p "$T1/game"
+echo 0 > "$T1/game/memory.usage_in_bytes"
+: > "$T1/game/memory.reclaim"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --group game --list
+echo "v1_list_zero_rc=$?"
+
+rm -rf "$T" "$T1" "$T1E"
 '''
     r = run_shell(driver)
     got = {}
@@ -1048,6 +1277,28 @@ rm -rf "$T"
           got.get("RC3") == "0" and got.get("freeze3") == "0", r.stdout)
     check("cfr daemon dry-run writes nothing",
           got.get("RC4") == "0" and got.get("reclaim4") == "999", r.stdout)
+    check("cfr daemon handles the cgroup v1 layout (usage_in_bytes + freezer.state)",
+          got.get("RC_V1") == "0"
+          and got.get("v1_reclaim") == "268435456"
+          and got.get("v1_freezer") == "THAWED", r.stdout)
+    check("cfr daemon --list reports the targets without writing",
+          got.get("v1_list_rc") == "0" and got.get("v1_after_list") == "123", r.stdout)
+    check("cfr daemon fails loudly when no cached group exists",
+          got.get("RC_NO_GROUPS") == "1", r.stdout)
+    check("cfr daemon --uid narrows the sweep",
+          got.get("v1_uid_rc") == "0"
+          and got.get("v1_uid_target") == "1048576"
+          and got.get("v1_uid_other") == "555", r.stdout)
+    check("cfr daemon --group sweeps a named v1 group only",
+          got.get("v1_group_rc") == "0"
+          and got.get("v1_group_target") == "52428800"
+          and got.get("v1_group_other") == "555", r.stdout)
+    check("cfr daemon fails loudly for a named group with no reclaim file",
+          got.get("RC_GROUP_MISSING") == "1", r.stdout)
+    check("cfr daemon rejects a --group that is a path",
+          got.get("RC_GROUP_TRAVERSAL") == "2", r.stdout)
+    check("cfr daemon --list still names a group that is currently empty",
+          got.get("v1_list_zero_rc") == "0" and "/game" in r.stdout, r.stdout)
 
 
 def test_batch10_zram_trigger_script():
@@ -1118,6 +1369,38 @@ sh "{tool_sh}" --sys-root "$T" --dry-run
 echo "async_after_dryrun=$(cat "$T/block/zram0/recompress_async")"
 
 sh "{tool_sh}" --sys-root "$T" --status
+
+# A secondary that equals the primary cannot shrink anything: refuse with exit
+# 3 and write nothing, unless the caller explicitly allows it.
+echo "lzo [lz4hc]" > "$T/block/zram0/comp_algorithm"
+echo "lz4hc" > "$T/block/zram0/recomp_algorithm"
+: > "$T/block/zram0/recompress_async"
+set +e
+sh "{tool_sh}" --sys-root "$T" >/dev/null 2>&1
+echo "RC_SAME_ALGO=$?"
+set -e
+echo "same_algo_wrote=$(cat "$T/block/zram0/recompress_async")"
+sh "{tool_sh}" --sys-root "$T" --allow-same-algo >/dev/null 2>&1
+echo "RC_SAME_ALGO_ALLOWED=$?"
+echo "same_algo_allowed_wrote=$(cat "$T/block/zram0/recompress_async")"
+
+# --idle-age carries the age through to the kernel (age semantics), instead of
+# the blunt "all" that --mark-idle writes.
+echo "lzo [lz4kd]" > "$T/block/zram0/comp_algorithm"
+: > "$T/block/zram0/idle"
+sh "{tool_sh}" --sys-root "$T" --idle-age 3600
+echo "idle_age=$(cat "$T/block/zram0/idle")"
+
+# Usage errors must be rejected before anything is written.
+set +e
+sh "{tool_sh}" --sys-root "$T" --idle-age 0 >/dev/null 2>&1
+echo "RC_IDLE_AGE_ZERO=$?"
+sh "{tool_sh}" --sys-root "$T" --mark-idle --idle-age 60 >/dev/null 2>&1
+echo "RC_IDLE_AGE_CONFLICT=$?"
+sh "{tool_sh}" --sys-root "$T" --daemon --mark-each-pass >/dev/null 2>&1
+echo "RC_MARK_EACH_BAD=$?"
+set -e
+
 rm -rf "$T"
 '''
     r = run_shell(driver)
@@ -1142,6 +1425,595 @@ rm -rf "$T"
           got.get("async_after_dryrun") == "", r.stdout)
     check("--status reports the armed device",
           "recomp     = [lz4hc]" in r.stdout, r.stdout)
+    check("same-algorithm secondary is refused with exit 3",
+          got.get("RC_SAME_ALGO") == "3"
+          and got.get("same_algo_wrote") == "", r.stdout + r.stderr)
+    check("--allow-same-algo runs the pass anyway",
+          got.get("RC_SAME_ALGO_ALLOWED") == "0"
+          and got.get("same_algo_allowed_wrote") == "type=idle threshold=0",
+          r.stdout)
+    check("--idle-age passes the age to the kernel, not 'all'",
+          got.get("idle_age") == "3600", r.stdout)
+    check("bad --idle-age and --mark-idle conflicts are usage errors",
+          got.get("RC_IDLE_AGE_ZERO") == "2"
+          and got.get("RC_IDLE_AGE_CONFLICT") == "2"
+          and got.get("RC_MARK_EACH_BAD") == "2", r.stdout)
+
+
+def test_runtime_tunables_module():
+    """The KernelSU companion module, its fixed zram policy and its packagers.
+
+    Three separate things are pinned here:
+
+      * the module packages deterministically and the AK3 ride-along is
+        idempotent, because that is how the policy reaches the device,
+      * the algorithm policy is a *constant* with a fixed order of operations,
+        so the ROM's own zram owner cannot win the race again, and
+      * the device scripts behave: they rewrite the algorithms, they refuse to
+        touch swap that is in use, they preserve (or establish) the writeback
+        backing device instead of trading it away, they do nothing at all on a
+        kernel that already locks the compressors, and the supervisor keeps
+        sweeping when a pass fails.
+    """
+    print("Batch 11 runtime tunables companion module")
+    repo = Path(__file__).resolve().parent.parent
+    module_dir = repo / "ksu" / "abk_runtime_tunables"
+    check("companion module directory exists", module_dir.is_dir(), module_dir)
+    if not module_dir.is_dir():
+        return
+
+    required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
+                "service.sh", "action.sh", "tunables.conf", "embed.conf", "README.md")
+    for name in required:
+        check(f"module ships {name}", (module_dir / name).is_file())
+
+    props = {}
+    for line in (module_dir / "module.prop").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+    check("module id matches the directory KernelSU installs into",
+          props.get("id") == module_dir.name == "abk_runtime_tunables", props.get("id"))
+    for key in ("name", "version", "versionCode", "author", "description"):
+        check(f"module.prop has {key}", bool(props.get(key)))
+    check("module versionCode is a positive integer",
+          props.get("versionCode", "").isdigit() and int(props["versionCode"]) > 0)
+
+    # module.conf advertises the companion through the module-set contract
+    # (ABK's app reads parts[10] = name and parts[11] = download url).
+    conf = (repo / "module.conf").read_text(encoding="utf-8")
+    items = re.search(r"ABK_MODULE_SET_ITEMS='(.*?)'", conf, re.S)
+    check("module.conf declares ABK_MODULE_SET_ITEMS", items is not None)
+    rows = [line for line in items.group(1).splitlines() if line.strip()] if items else []
+    fields = {row.split("|")[0]: row.split("|") for row in rows}
+    check("every child row keeps the 12-field module-set shape",
+          bool(fields) and all(len(row) >= 12 for row in fields.values()),
+          {name: len(row) for name, row in fields.items()})
+    core_row = fields.get("stable_backport_core", [])
+    check("the core child advertises the companion module name",
+          len(core_row) > 10 and core_row[10] == "ABK 5.15 Runtime Tunables",
+          core_row[10:12])
+    check("the core child advertises the companion download url",
+          len(core_row) > 11 and core_row[11].endswith("abk_runtime_tunables.zip"),
+          core_row[11:12])
+    check("both module.conf versions were bumped for the companion",
+          'ABK_MODULE_VERSION="0.15.0"' in conf
+          and 'ABK_MODULE_SET_VERSION="0.15.0"' in conf)
+
+    tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
+    for forbidden in ("algo", "disksize", "mem_limit"):
+        check(f"tunables.conf exposes no {forbidden} knob",
+              not re.search(rf"(?m)^\s*{forbidden}", tunables))
+
+    policy = (module_dir / "zram-policy.sh").read_text(encoding="utf-8")
+    common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
+    check("policy hardcodes the measured primary",
+          'ABK_ZRAM_PRIMARY="lz4kd"' in common_sh)
+    check("policy hardcodes the measured secondary",
+          'ABK_ZRAM_SECONDARY="zstd"' in common_sh)
+    check("the dominated lz4hc is never selected as a policy value",
+          not re.search(r'(?m)^\s*ABK_ZRAM_\w+="lz4hc"', common_sh + policy))
+
+    takeover = policy[policy.index("abk_zram_takeover() {"):policy.index("abk_zram_reassert() {")]
+    takeover_order = [takeover.index(token) for token in
+                      ("ABK_SWAPOFF", 'reset" 1', "abk_zram_set_algorithms",
+                       "abk_zram_mount_swap")]
+    check("takeover order is swapoff -> reset -> algorithms -> remount",
+          takeover_order == sorted(takeover_order), takeover_order)
+
+    mount = policy[policy.index("abk_zram_mount_swap() {"):policy.index("abk_zram_takeover() {")]
+    mount_order = [mount.index(token) for token in
+                   ("disksize", "abk_zram_set_mem_limit", "ABK_MKSWAP", "ABK_SWAPON")]
+    check("remount order is disksize -> mem_limit -> mkswap -> swapon",
+          mount_order == sorted(mount_order), mount_order)
+
+    check("the safety gate precedes the swapoff",
+          "abk_zram_swap_idle_enough" in takeover
+          and takeover.index("abk_zram_swap_idle_enough") < takeover.index("ABK_SWAPOFF"))
+    # Writeback and the algorithm policy used to exclude each other: the
+    # backing device lives in the same pre-disksize window and `reset` drops it
+    # (reset_bdev()).  The rewrite now remembers it before the reset and puts it
+    # back in that window instead of trading it away.
+    check("the writeback attachment is remembered before the rewrite",
+          "abk_zram_backing_dev" in takeover
+          and takeover.index("abk_zram_backing_dev") < takeover.index("ABK_SWAPOFF"))
+    check("and restored in the pre-disksize window",
+          "abk_zram_attach_writeback" in takeover
+          and takeover.rindex("abk_zram_attach_writeback")
+          < takeover.rindex("abk_zram_mount_swap"))
+    check("a device that already owns writeback is never rewritten blindly",
+          "keeping the live writeback device" in takeover)
+
+    # The locked-kernel path: `abk_zram_ensure` rewrites only when something is
+    # actually missing, which is what keeps writeback and the ROM's own
+    # bring-up out of the module's way.
+    ensure = policy[policy.index("abk_zram_ensure() {"):policy.index("abk_zram_reassert() {")]
+    check("the service entry point rewrites only when the policy is not in force",
+          "abk_zram_need_rewrite" in ensure
+          and ensure.index("abk_zram_need_rewrite") < ensure.index("abk_zram_takeover"))
+    check("the policy check covers algorithms, init, swap and writeback",
+          all(token in policy[policy.index("abk_zram_need_rewrite() {"):
+                             policy.index("abk_zram_ensure() {")]
+              for token in ("abk_zram_algorithms_ok", "abk_zram_initstate",
+                            "abk_zram_swap_on", "abk_zram_writeback_wanted")))
+    check("the kernel-side lock is detected and reported",
+          "abk_lock_algo" in policy and 'Y|y|1' in policy
+          and "the kernel locks the compressors" in policy)
+    check("the supervisor re-checks the policy on its own clock",
+          'abk_cfg zram.reassert_interval_sec' in policy
+          and "reassert=${_zs_reassert}s" in policy)
+    check("writeback policy keys are known tunables.conf keys",
+          all(key in common_sh for key in ("zram.writeback",
+                                           "zram.writeback.size_mb",
+                                           "zram.reassert_interval_sec"))
+          and re.search(r"(?m)^\s*zram\.writeback=", tunables) is not None
+          and re.search(r"(?m)^\s*zram\.reassert_interval_sec=", tunables) is not None)
+
+    # Byte-count arithmetic has to leave the shell: /system/bin/sh is Android's
+    # mksh and wraps at 2^31 on the target ROM (measured on device:
+    # `15561024 * 1024` -> -1245380608), while KernelSU's busybox ash does not.
+    # A wrapped value turns the compressed-memory cap negative, the kernel
+    # refuses the write, and the cap silently stays off.
+    check("RAM byte math goes through awk, not shell arithmetic",
+          "abk_mul_div() {" in common_sh and "a * b / c" in common_sh
+          and "_mt_kb * 1024" not in common_sh
+          and "printf '%s\\n' \"$(( _mt_kb" not in common_sh
+          and "_ml_mem * ABK_ZRAM_MEM_LIMIT_PCT" not in policy)
+    check("... and the swap-size fallback too",
+          "abk_mul_div \"$_sd_mem\" 1 2" in policy)
+    check("large-value comparisons go through awk as well",
+          "abk_gt() {" in common_sh and "abk_le() {" in common_sh
+          and 'abk_is_uint "$_sd_live" && abk_gt "$_sd_live" 0' in policy
+          and 'abk_le "$_si_used" "$_si_limit"' in policy
+          and '[ "$_sd_live" -gt 0 ]' not in policy)
+    cfr_tool = (repo / "tools" / "cached_freeze_reclaim.sh").read_text(
+        encoding="utf-8")
+    check("... and the reclaim quota in the shipped tool",
+          'QUOTA_MB * 1024 * 1024' not in cfr_tool
+          and 'awk -v mb="$QUOTA_MB"' in cfr_tool)
+    check("... and the per-group byte comparison in the shipped tool",
+          '[ "$cur" -gt 0 ]' not in cfr_tool
+          and '[ "$cur" -gt "$quota_bytes" ]' not in cfr_tool
+          and "awk -v a=\"$cur\" -v b=\"$quota_bytes\"" in cfr_tool)
+
+    service_sh = (module_dir / "service.sh").read_text(encoding="utf-8")
+    check("the spawn path clears a stale supervisor with SIGKILL",
+          'pkill -9 -f "service.sh $_sp_arg"' in service_sh)
+    check("the cfr supervisor drives the embedded reclaim tool in one-shot mode",
+          'cached_freeze_reclaim.sh' in policy
+          and 'CFR_ONE_SHOT=1 sh "$_cf_tool"' in policy
+          and "--cgroup-root $ABK_SYS_ROOT/fs/cgroup" in policy
+          and "--cgroup-root $ABK_MEMCG_ROOT" in policy)
+    check("the cfr supervisor can select named groups",
+          'abk_cfg cfr.group' in policy and '--group $_cf_g' in policy)
+    check("cfr.group is a known tunables.conf key",
+          "cfr.group" in common_sh
+          and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
+
+    for script in sorted(module_dir.glob("*.sh")):
+        body = script.read_text(encoding="utf-8")
+        code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+        check(f"{script.name} never touches a read-only partition",
+              not re.search(r"/(vendor|odm|product|system)\b", code))
+        check(f"{script.name} never relaxes SELinux",
+              "setenforce" not in code and "permissive" not in code.lower())
+
+    # --- packaging: the module zip and the AK3 ride-along ---
+    sys.path.insert(0, str(repo / "scripts"))
+    import ak3_bundle_ksu_module as ak3  # noqa: E402
+    import build_ksu_module as bkm  # noqa: E402
+
+    check("packager reads the module id", bkm.read_module_id(module_dir) == "abk_runtime_tunables")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        first = bkm.build(module_dir, tmp_path / "one.zip")
+        second = bkm.build(module_dir, tmp_path / "abk_runtime_tunables.zip")
+        check("module zip build is deterministic", first.read_bytes() == second.read_bytes())
+
+        with zipfile.ZipFile(second) as archive:
+            names = archive.namelist()
+            check("module zip carries tunables.conf", "tunables.conf" in names)
+            check("module zip carries the device scripts",
+                  {"common.sh", "zram-policy.sh", "post-fs-data.sh",
+                   "service.sh", "action.sh"} <= set(names))
+            check("embedded trigger tool is inside the module",
+                  "bin/zram_recompress_trigger.sh" in names)
+            check("embedded trigger tool is byte-identical to tools/",
+                  archive.read("bin/zram_recompress_trigger.sh")
+                  == (repo / "tools" / "zram_recompress_trigger.sh").read_bytes())
+            check("embedded reclaim tool is inside the module",
+                  "bin/cached_freeze_reclaim.sh" in names)
+            check("embedded reclaim tool is byte-identical to tools/",
+                  archive.read("bin/cached_freeze_reclaim.sh")
+                  == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
+            check("embed.conf contributes exactly the two device tools",
+                  sorted(name for name in names if name.startswith("bin/"))
+                  == ["bin/cached_freeze_reclaim.sh",
+                      "bin/zram_recompress_trigger.sh"])
+            modes = {info.filename: (info.external_attr >> 16) & 0o777
+                     for info in archive.infolist()}
+            check("every module script is 0755",
+                  all(modes[name] == 0o755 for name in names if name.endswith(".sh")))
+            check("the zip root carries module.prop (KernelSU layout)",
+                  "module.prop" in names and not any("/" in name and name.count("/") > 1
+                                                   for name in names))
+
+        ak3_dir = tmp_path / "AnyKernel3"
+        (ak3_dir / "tools").mkdir(parents=True)
+        script = ak3_dir / "anykernel.sh"
+        script.write_text("#!/sbin/sh\nproperties() {\n  kernel.string=test\n}\n"
+                          "# trailing CRLF from a Windows checkout\r\n")
+        module_zip = second
+
+        script_path, target = ak3.inject_dir(ak3_dir, module_zip)
+        first_body = script.read_bytes()
+        check("AK3 bundle receives the module zip",
+              (ak3_dir / "abk-ksu-modules" / "abk_runtime_tunables.zip").is_file(), target)
+        check("AK3 installer block is present exactly once",
+              first_body.count(ak3.BEGIN_MARKER.encode()) == 1)
+        check("AK3 injection normalises line endings", b"\r" not in first_body)
+        check("AK3 tree verifies after injection", ak3.verify_dir(ak3_dir) == [])
+
+        ak3.inject_dir(ak3_dir, module_zip)
+        check("AK3 injection is idempotent (byte-identical second pass)",
+              script.read_bytes() == first_body)
+
+        (ak3_dir / "abk-ksu-modules" / "abk_runtime_tunables.zip").unlink()
+        check("verify catches a missing bundle", ak3.verify_dir(ak3_dir) != [])
+
+        finished = tmp_path / "AnyKernel3.zip"
+        with zipfile.ZipFile(finished, "w") as archive:
+            archive.writestr("anykernel.sh", "#!/sbin/sh\n")
+            archive.writestr("tools/ak3-core.sh", "# core\n")
+        patched = tmp_path / "AnyKernel3-patched.zip"
+        _, entry = ak3.inject_zip(finished, patched, module_zip)
+        check("zip injection adds the bundle and verifies",
+              ak3.verify_zip(patched) == [] and entry.endswith("abk_runtime_tunables.zip"))
+
+        saved_env = {key: os.environ.pop(key, None)
+                     for key in ("ANYKERNEL3", "GITHUB_WORKSPACE")}
+        try:
+            # Outside the directory that now holds a real AK3 tree, the
+            # discovery must report "nothing" rather than pick a stranger's
+            # anykernel.sh.
+            with tempfile.TemporaryDirectory() as empty_tmp:
+                check("injector discovers nothing instead of guessing",
+                      ak3.discover_ak3_dir(None, start=Path(empty_tmp)) is None)
+        finally:
+            for key, value in saved_env.items():
+                if value is not None:
+                    os.environ[key] = value
+
+    # --- device behaviour, against a fixture sysfs tree ---
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  (no bash on this host: policy behaviour checks skipped)")
+        return
+
+    use_wsl = os.name == "nt"
+    shell = ["wsl", "bash", "-s"] if use_wsl else [bash, "-s"]
+    module_sh = str(module_dir).replace("\\", "/")
+    if use_wsl and len(module_sh) > 2 and module_sh[1] == ":":
+        module_sh = "/mnt/" + module_sh[0].lower() + module_sh[2:]
+
+    def run_shell(script):
+        r = subprocess.run(shell, input=script.encode("utf-8"),
+                           capture_output=True, timeout=180)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"),
+            r.stderr.decode("utf-8", "replace"))
+
+    harness = r'''
+set -u
+MD="__MD__"
+T=$(mktemp -d)
+mkdir -p "$T/sys/block/zram0" "$T/stub"
+HARNESS_CALLS="$T/calls"
+export HARNESS_CALLS
+
+printf 'MemTotal:       15561024 kB\n' > "$T/meminfo"
+printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
+printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
+
+for c in swapoff swapon mkswap; do
+  printf '#!/bin/sh\necho "%s $*" >> "$HARNESS_CALLS"\nexit 0\n' "$c" > "$T/stub/$c"
+  chmod +x "$T/stub/$c"
+done
+printf '#!/bin/sh\necho "losetup $*" >> "$HARNESS_CALLS"\n[ "$1" = "-f" ] && echo /dev/block/loop42\nexit 0\n' > "$T/stub/losetup"
+printf '#!/bin/sh\necho "dd $*" >> "$HARNESS_CALLS"\nexit 0\n' > "$T/stub/dd"
+chmod +x "$T/stub/losetup" "$T/stub/dd"
+
+export ABK_CONF="$T/tunables.conf"
+export ABK_RUN_DIR="$T/run" ABK_STATE_DIR="$T/state" ABK_SYS_ROOT="$T/sys"
+export ABK_PROC_SWAPS="$T/proc_swaps" ABK_MEMINFO="$T/meminfo"
+export ABK_SWAPOFF="$T/stub/swapoff" ABK_SWAPON="$T/stub/swapon" ABK_MKSWAP="$T/stub/mkswap"
+export ABK_LOSETUP="$T/stub/losetup" ABK_DD="$T/stub/dd"
+export ABK_ZRAM_NODE="/dev/block/zram0" ABK_ZRAM_WB_DIR="$T/wb"
+export MODDIR="$MD"
+export ABK_STDOUT=1
+
+. "$MD/common.sh"
+. "$MD/zram-policy.sh"
+
+# the reset/initstate loops sleep; make that instant
+sleep() { return 0; }
+
+reset_fixture() {
+  printf '17179869184\n' > "$T/sys/block/zram0/disksize"
+  printf '1\n' > "$T/sys/block/zram0/initstate"
+  printf 'lzo lzo-rle lz4 [lz4hc] lz4k lz4k_oplus lz4kd deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+  printf '#1: lzo lz4 [lz4hc] lz4k lz4kd zstd\n' > "$T/sys/block/zram0/recomp_algorithm"
+  printf '    4096       62    20480        0    20480        0        0        0        0\n' > "$T/sys/block/zram0/mm_stat"
+  printf '0\n' > "$T/sys/block/zram0/mem_limit"
+  rm -f "$T/sys/block/zram0/writeback" "$T/sys/block/zram0/backing_dev"
+  rm -f "$T/sys/block/zram0/writeback_limit" "$T/sys/block/zram0/writeback_limit_enable"
+  rm -rf "$T/sys/module" "$T/wb"
+  : > "$T/calls"
+}
+
+echo "locked0=$(abk_zram_kernel_locked && echo yes || echo no)"
+
+# 1. the happy path: the ROM left lz4hc, the module rewrites both algorithms
+reset_fixture
+abk_zram_takeover > "$T/out1" 2>&1
+echo "RC1=$?"
+echo "primary1=$(abk_zram_primary)"
+echo "secondary1=$(abk_zram_secondary)"
+echo "disksize1=$(abk_zram_disksize)"
+echo "memlimit1=$(cat "$T/sys/block/zram0/mem_limit" 2>/dev/null)"
+echo "calls1=$(tr '\n' ';' < "$T/calls")"
+
+# 2. the safety gate: swap in use must stop the rewrite before swapoff
+reset_fixture
+printf '/dev/block/zram0                        partition       16777212  1048576     0\n' > "$T/proc_swaps"
+abk_zram_takeover > "$T/out2" 2>&1
+echo "RC2=$?"
+echo "primary2=$(abk_zram_primary)"
+echo "calls2=$(tr '\n' ';' < "$T/calls")"
+
+# 3. the kernel supports writeback and nobody owns it: the rewrite attaches one
+printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+printf '0\n' > "$T/sys/block/zram0/writeback_limit"
+printf '0\n' > "$T/sys/block/zram0/writeback_limit_enable"
+abk_zram_takeover > "$T/out3" 2>&1
+echo "RC3=$?"
+echo "primary3=$(abk_zram_primary)"
+echo "backing3=$(abk_zram_backing_dev)"
+echo "limit3=$(cat "$T/sys/block/zram0/writeback_limit")"
+echo "limit_enable3=$(cat "$T/sys/block/zram0/writeback_limit_enable")"
+echo "calls3=$(tr '\n' ';' < "$T/calls")"
+
+# 4. a live writeback device survives the rewrite (the whole point: `reset`
+#    drops it, so it has to be put back in the same pre-disksize window)
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf '1\n' > "$T/sys/block/zram0/writeback_limit_enable"
+abk_zram_takeover > "$T/out4" 2>&1
+echo "RC4=$?"
+echo "primary4=$(abk_zram_primary)"
+echo "backing4=$(abk_zram_backing_dev)"
+echo "limit4=$(cat "$T/sys/block/zram0/writeback_limit")"
+echo "calls4=$(tr '\n' ';' < "$T/calls")"
+
+# 5. ... and a live writeback device is never traded for the algorithm when the
+#    swap area is in use
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf '/dev/block/zram0                        partition       16777212  1048576     0\n' > "$T/proc_swaps"
+abk_zram_takeover > "$T/out5" 2>&1
+echo "RC5=$?"
+echo "primary5=$(abk_zram_primary)"
+echo "calls5=$(tr '\n' ';' < "$T/calls")"
+printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
+
+# 6. a kernel that locks the compressors: the policy is in force by definition,
+#    so nothing is rewritten (this is the path that lets writeback and the ROM's
+#    own bring-up run untouched)
+reset_fixture
+mkdir -p "$T/sys/module/zram/parameters"
+printf 'Y\n' > "$T/sys/module/zram/parameters/abk_lock_algo"
+printf 'lz4kd\n' > "$T/sys/module/zram/parameters/abk_comp_algo"
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+echo "locked6=$(abk_zram_kernel_locked && echo yes || echo no)"
+abk_zram_ensure > "$T/out6" 2>&1
+echo "RC6=$?"
+echo "memlimit6=$(cat "$T/sys/block/zram0/mem_limit" 2>/dev/null)"
+echo "calls6=$(tr '\n' ';' < "$T/calls")"
+
+# 7. the supervisor keeps sweeping when a pass fails, and records its pid.  The
+#    device already carries the policy here, so each tick is a cheap re-check
+#    plus the sweep -- which is the point of the tick loop.
+reset_fixture
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+printf 'zram.recomp.enable=1\nzram.recomp.interval_sec=60\nzram.reassert_interval_sec=60\n' > "$T/tunables.conf"
+mkdir -p "$T/fakebin"
+cat > "$T/fakebin/tool.sh" <<EOF
+#!/bin/sh
+echo "run \$*" >> "$T/runs"
+exit 1
+EOF
+chmod +x "$T/fakebin/tool.sh"
+export ABK_RECOMP_TOOL="$T/fakebin/tool.sh"
+_n=0
+sleep() { _n=$((_n+1)); [ "$_n" -ge 4 ] && exit 0; return 0; }
+( abk_zram_supervisor_main > "$T/out7" 2>&1 )
+echo "supervisor_runs=$(wc -l < "$T/runs" | tr -d ' ')"
+echo "supervisor_args=$(head -n 1 "$T/runs")"
+echo "supervisor_pid=$([ -s "$T/state/zram.pid" ] && echo set || echo unset)"
+printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
+
+# 8. tunables.conf parsing: unknown keys warn, empty means "leave alone"
+reset_fixture
+printf 'zram.recomp.enable=1\nvm.swappiness=\nbogus.key=7\n' > "$T/tunables.conf"
+echo "cfg_default=$(abk_cfg zram.recomp.idle_age_sec 3600)"
+echo "cfg_empty=$(abk_cfg vm.swappiness '')"
+echo "cfg_clamped=$(abk_clamp_uint 999 0 300)"
+echo "cfg_writeback=$(abk_cfg zram.writeback auto)"
+echo "ram_bytes=$(abk_mem_total_bytes)"
+echo "ram_25pct=$(abk_mem_pct_bytes 25)"
+echo "ram_half=$(abk_mul_div "$(abk_mem_total_bytes)" 1 2)"
+echo "saved_live=$(abk_zram_saved_disksize)"
+rm -f "$T/state/disksize"
+printf '0\n' > "$T/sys/block/zram0/disksize"
+echo "saved_fallback=$(abk_zram_saved_disksize)"
+printf '17179869184\n' > "$T/sys/block/zram0/disksize"
+abk_cfg_lint > "$T/out8" 2>&1
+echo "lint=$(tr '\n' ';' < "$T/out8")"
+
+# 9. the module keeps its own log, because logcat cannot be relied on
+LOG="$T/state/abk_runtime_tunables.log"
+echo "log_file=$([ -s "$LOG" ] && echo present || echo missing)"
+echo "log_rewrite=$(grep -c 'rewrite: size=' "$LOG" 2>/dev/null)"
+echo "log_refusal=$(grep -c 'swap in use' "$LOG" 2>/dev/null)"
+echo "log_keep=$(grep -c 'keeping the live writeback device' "$LOG" 2>/dev/null)"
+echo "log_writeback=$(grep -c 'writeback: backing device' "$LOG" 2>/dev/null)"
+echo "log_supervisor=$(grep -c 'recompression supervisor up' "$LOG" 2>/dev/null)"
+
+rm -rf "$T"
+'''
+    r = run_shell(harness.replace("__MD__", module_sh))
+    got = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            got[key] = value
+
+    check("takeover succeeds on the ROM's lz4hc state", got.get("RC1") == "0",
+          r.stdout + r.stderr)
+    check("takeover installs the lz4kd primary", got.get("primary1") == "lz4kd",
+          r.stdout)
+    check("takeover installs the zstd secondary", got.get("secondary1") == "zstd",
+          r.stdout)
+    check("takeover preserves the ROM's swap size",
+          got.get("disksize1") == "17179869184", r.stdout)
+    check("takeover caps zram at 25% of RAM (3983622144 bytes)",
+          got.get("memlimit1") == "3983622144", r.stdout)
+    calls1 = got.get("calls1", "")
+    check("takeover unmounts and remounts the swap area itself",
+          "swapoff /dev/block/zram0" in calls1
+          and "mkswap /dev/block/zram0" in calls1
+          and "swapon -p 0 /dev/block/zram0" in calls1, calls1)
+    check("no lock is claimed on a kernel that has none",
+          got.get("locked0") == "no", r.stdout)
+
+    check("swap in use is refused instead of rewritten", got.get("RC2") != "0")
+    check("the refused run never calls swapoff", "swapoff" not in got.get("calls2", ""),
+          got.get("calls2"))
+    check("the refused run leaves the ROM's algorithm alone",
+          got.get("primary2") == "lz4hc", r.stdout)
+
+    # 3: writeback-capable, unowned -> the module establishes it rather than
+    # losing it (this is the half that used to be traded away).
+    check("an unowned writeback device is set up during the rewrite",
+          got.get("RC3") == "0" and got.get("primary3") == "lz4kd", r.stdout)
+    check("the backing device is a loop device over the backing file",
+          got.get("backing3") == "/dev/block/loop42", got.get("backing3"))
+    check("the writeback limit is bounded and enabled",
+          got.get("limit3") == "262144" and got.get("limit_enable3") == "1",
+          (got.get("limit3"), got.get("limit_enable3")))
+    check("the backing file is a sparse 1024 MiB file",
+          "dd if=/dev/zero" in got.get("calls3", "")
+          and "bs=1048576" in got.get("calls3", "")
+          and "seek=1023" in got.get("calls3", ""), got.get("calls3"))
+
+    # 4: a live writeback device survives the rewrite.
+    check("a live writeback device is re-attached, not dropped",
+          got.get("backing4") == "/dev/block/loop7" and got.get("RC4") == "0", r.stdout)
+    check("... and the same device is reused instead of a new loop",
+          "losetup -f" not in got.get("calls4", "")
+          and "dd if=/dev/zero" not in got.get("calls4", ""), got.get("calls4"))
+    check("... with the ROM's own writeback limit kept",
+          got.get("limit4") == "512", got.get("limit4"))
+
+    # 5: never trade a live writeback device for the algorithm.
+    check("a live writeback device plus swap in use refuses the rewrite",
+          got.get("RC5") != "0" and "swapoff" not in got.get("calls5", ""),
+          (got.get("RC5"), got.get("calls5")))
+    check("... leaving the ROM's algorithm alone", got.get("primary5") == "lz4hc",
+          r.stdout)
+
+    # 6: locked kernel -> nothing to rewrite.
+    check("the kernel-side lock is detected", got.get("locked6") == "yes", r.stdout)
+    check("a locked kernel is left completely alone",
+          got.get("RC6") == "0" and "swapoff" not in got.get("calls6", "")
+          and 'reset" 1' not in got.get("calls6", ""), got.get("calls6"))
+    check("... with only the compressed-memory cap re-asserted",
+          got.get("memlimit6") == "3983622144", got.get("memlimit6"))
+
+    check("the supervisor sweeps repeatedly after a failing pass",
+          (got.get("supervisor_runs") or "0").isdigit()
+          and int(got["supervisor_runs"]) >= 3, r.stdout)
+    check("the supervisor drives an age-marked pass",
+          "--idle-age 3600" in got.get("supervisor_args", ""),
+          got.get("supervisor_args"))
+    check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
+          r.stdout)
+
+    check("an unset key falls back to the built-in default",
+          got.get("cfg_default") == "3600", r.stdout)
+    check("an empty value means leave the kernel alone",
+          got.get("cfg_empty") == "", r.stdout)
+    check("numeric knobs are clamped to their safe range",
+          got.get("cfg_clamped") == "300", r.stdout)
+    check("the writeback policy defaults to auto", got.get("cfg_writeback") == "auto",
+          r.stdout)
+    # 15561024 KiB is past 2^31 bytes; a 32-bit shell would wrap it negative.
+    check("byte counts survive the 32-bit shell arithmetic limit",
+          got.get("ram_bytes") == "15934488576"
+          and got.get("ram_25pct") == "3983622144"
+          and got.get("ram_half") == "7967244288",
+          (got.get("ram_bytes"), got.get("ram_25pct"), got.get("ram_half")))
+    # A 16 GiB swap is the case that broke on device: `[ 17179869184 -gt 0 ]` is
+    # false under this ROM's mksh, so the module treated a healthy device as
+    # sizeless and halved it on the next rewrite.
+    check("a 16 GiB swap size is preserved, not treated as sizeless",
+          got.get("saved_live") == "17179869184"
+          and got.get("saved_fallback") == "7967244288",
+          (got.get("saved_live"), got.get("saved_fallback")))
+    check("unknown config keys are reported, not applied",
+          "bogus.key" in got.get("lint", ""), got.get("lint"))
+
+    check("the module keeps its own log", got.get("log_file") == "present", r.stdout)
+    check("the log records the rewrite", (got.get("log_rewrite") or "0") != "0", r.stdout)
+    check("the log records the swap-in-use refusal",
+          (got.get("log_refusal") or "0") != "0", r.stdout)
+    check("the log records that a live writeback device was kept",
+          (got.get("log_keep") or "0") != "0", r.stdout)
+    check("the log records the writeback attachment",
+          (got.get("log_writeback") or "0") != "0", r.stdout)
+    check("the log records the supervisor start",
+          (got.get("log_supervisor") or "0") != "0", r.stdout)
 
 
 def test_batch8_autofdo_tool():
@@ -1158,11 +2030,31 @@ def test_batch8_autofdo_tool():
     tool = Path(__file__).resolve().parent.parent / "tools" / "autofdo_515_profile.sh"
     check("autofdo tool exists", tool.is_file(), tool)
 
+    # The tool is a host script; on Windows the only bash is WSL's, which cannot
+    # open a C:\... path (backslashes and the drive letter are mangled before
+    # bash ever sees them).  Every path argument therefore has to be handed over
+    # in /mnt/<drive>/... form, exactly as the other shell-driven tests do.
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  (no bash on this host: autofdo checks skipped)")
+        return
+    use_wsl = os.name == "nt"
+    shell = ["wsl", "bash"] if use_wsl else [bash]
+
+    def shell_path(path):
+        text = str(path).replace("\\", "/")
+        if use_wsl and len(text) > 2 and text[1] == ":":
+            return "/mnt/" + text[0].lower() + text[2:]
+        return text
+
+    tool_sh = shell_path(tool)
+
     def run_tool(args):
-        return subprocess.run(["bash", str(tool)] + args,
+        mapped = [arg if arg.startswith("--") else shell_path(arg) for arg in args]
+        return subprocess.run(shell + [tool_sh] + mapped,
                               capture_output=True, text=True, env=dict(os.environ))
 
-    r = subprocess.run(["bash", "-n", str(tool)], capture_output=True, text=True)
+    r = subprocess.run(shell + ["-n", tool_sh], capture_output=True, text=True)
     check("autofdo tool passes bash -n", r.returncode == 0, r.stderr)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1312,10 +2204,13 @@ def main():
     test_batch10_zram_async_recompress()
     test_batch10_sched_smart_policy()
     test_batch10_zram_secondary_comp()
+    test_batch11_zram_algo_lock()
+    test_config_tiers()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()
     test_batch10_daemon_script()
     test_batch10_zram_trigger_script()
+    test_runtime_tunables_module()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()

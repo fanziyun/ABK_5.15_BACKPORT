@@ -53,7 +53,7 @@ only the ~44 files the groups touch). Real branches per baseline are in
 
 ```bash
 python3 -m py_compile scripts/*.py tests/*.py     # syntax gate
-bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh  # shell syntax gate
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh  # shell syntax gate
 python3 tests/stable_5_15_test.py                 # unit tests (no kernel tree needed)
 python3 tests/step_audit.py <tree>                # per-step: anchors land, structure balanced, idempotent
 python3 tests/implementation_audit.py <tree>      # content: no phantom groups, features really present
@@ -141,8 +141,23 @@ This is an ABK (`AnyBase Kernel`) external module. ABK's build workflow
 (`.github/workflows/build.yml` in the ABK repo) injects it by cloning the repo and
 running `bash setup.sh` **from the checked-out module dir** — once per stage. Two
 stages, each a separate run:
-- `after_patch` — the real graft (this module does all work here).
+- `after_patch` — the real graft, plus the runtime-companion bundle (below).
 - `before_build` — accepted but a no-op for this module.
+
+`after_patch` also builds and injects the **runtime companion**, a KernelSU module
+(`ksu/abk_runtime_tunables/`, packed by `scripts/build_ksu_module.py` and bundled
+into the AnyKernel3 tree by `scripts/ak3_bundle_ksu_module.py`) that keeps the
+measured zram algorithm policy in force on device and drives the recompression
+sweeps. The policy itself lives in the kernel since Batch 12 (`zram_algo_lock`:
+`zram.abk_comp_algo` / `zram.abk_lock_algo`, both `0444`, and both
+`comp_algorithm`/`recomp_algorithm` stores made reported no-ops), so the companion
+only verifies, re-asserts the compressed-memory cap, and preserves or establishes
+the zram writeback backing device; on a kernel without the lock it falls back to
+owning the whole bring-up and re-checking it every
+`zram.reassert_interval_sec`. It is a distribution asset, **not** a graft: it
+registers no `PatchGroup`, never writes into the kernel tree, and the whole step
+is skipped with a warning when the build has no AnyKernel3 tree (or when
+`ABK_515_KSU_MODULE=0`).
 
 ABK exports these before invoking `setup.sh`; `setup.sh`/`stable_backport.sh` read
 them (the kernel tree to graft is always under `KERNEL_ROOT`, with `common/` below):
@@ -155,8 +170,13 @@ them (the kernel tree to graft is always under `KERNEL_ROOT`, with `common/` bel
   `OS_PATCH_LEVEL`, … (`ABK_BUILD_SUB_LEVEL`, `ABK_BUILD_ANDROID_VERSION`,
   `ABK_BUILD_KERNEL_VERSION` drive the family/sublevel detection in
   `stable_backport.sh`). `ABK_FEATURE_*` are the build's feature toggles.
-- `ABK_515_ALLOW_UNSUPPORTED`, `ABK_515_DEFCONFIG_ALIGN` are **module-specific
-  overrides set by the user**, not by ABK.
+- `ABK_515_ALLOW_UNSUPPORTED`, `ABK_515_DEFCONFIG_ALIGN` and
+  `ABK_515_DEFCONFIG_ROM` are **module-specific overrides set by the user**, not
+  by ABK. `ABK_515_KSU_MODULE=0` skips the runtime-companion bundle;
+  `ABK_515_DEFCONFIG_ALIGN=1` adds the 6.6-GKI config deltas and
+  `ABK_515_DEFCONFIG_ROM=1` the ROM-integration tier (currently
+  `CONFIG_ZRAM_WRITEBACK=y`, off by default). The tiers are additive and each is
+  named in the config-lane detail string.
 
 Injection goes into `custom_external_modules`, `|`-separated; the grammar:
 - plain module: `module:repo;stage` (legacy `repo;stage`);
@@ -169,7 +189,15 @@ Injection goes into `custom_external_modules`, `|`-separated; the grammar:
 `ABK_MODULE_SET_ITEMS` lists children as
 `child_id|name|description|repo_url|supported_stages|default_stage|recommended_stages|group_role|controllable|has_web_ui|magisk_module_name|magisk_module_url`.
 Plain modules instead use `ABK_MODULE_SUPPORTED_STAGES` / `ABK_MODULE_DEFAULT_STAGE`
-/ `ABK_MODULE_RECOMMENDED_STAGES`.
+/ `ABK_MODULE_RECOMMENDED_STAGES`. The last two fields are what the ABK app reads to
+offer the companion module (`ABK_MAGISK_MODULE_NAME` /
+`ABK_MAGISK_MODULE_DOWNLOAD_URL` for plain modules); this repo declares them on
+`stable_backport_core`.
+
+Distribution assets live outside the graft: `tools/` (device-facing CLIs, shipped
+into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
+implementation) and `ksu/` (the KernelSU module source). `patches/` and `files/`
+stay empty.
 
 Each module ships its **own** `scripts/libabk.sh`; ABK provides nothing shared. The
 reference template (`xingguangcuican6666/ABK_KSU_SANDBOX_MODULE`) has a fuller

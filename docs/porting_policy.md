@@ -185,6 +185,59 @@ Footprint disjointness (verified against the F2FS suite script and its
 hunks live in `blk_mq_hctx_notify_offline()` — disjoint from both the F2FS
 hunk and the ABI suite's blk-mq regions.
 
+## Runtime companion and the ROM-integration config tier
+
+Batch 11 adds a **runtime companion** (`ksu/abk_runtime_tunables/`), which is a
+distribution asset rather than a graft: it registers no `PatchGroup`, never
+writes into the kernel tree, and `after_patch` merely packs it
+(`scripts/build_ksu_module.py`) and injects it into the AnyKernel3 tree
+(`scripts/ak3_bundle_ksu_module.py`, idempotent marker-delimited block, skipped
+with a warning when there is no AK3 tree, `ABK_515_KSU_MODULE=0` to disable).
+The same change makes the secondary compressor policy a constant instead of a
+knob: `zram.abk_recomp_algo` defaults to `zstd` and is exposed `0444`, so no
+runtime write — not even from KernelSU's root, verified on device — can put the
+dominated `lz4hc` back. The companion module ("non-`PatchGroup` asset") ships on
+the `stable_backport_core` child, whose `module.conf` row advertises it through
+`magisk_module_name` / `magisk_module_url`.
+
+Batch 12 (`zram_algo_lock`) moved that policy into the kernel, because userspace
+cannot defend it. Both `comp_algorithm` and `recomp_algorithm` are writable only
+before `disksize`, so the whole policy belonged to whoever won that single
+window — on the target device a root writer won it and left the primary on
+`deflate` while the companion was installed. The group now selects the primary
+in `zram_add()` from the read-only `zram.abk_comp_algo` (default `lz4kd`,
+falling back to the build's `CONFIG_ZRAM_DEF_COMP`) and, in a `late_initcall`,
+points both `DEVICE_ATTR_RW` stores at a function that **reports success and
+keeps the locked value** (`zram.abk_lock_algo`, `0444`, default `Y`). Reporting
+success rather than `-EPERM` is part of the contract, not an oversight: Android
+16's `mmd_setup` aborts its whole zram bring-up — writeback backing device and
+`mmd.setup_complete` included — when an algorithm write fails.
+
+That is also what removes the config-tier conflict below. `reset` drops a
+writeback backing device (`reset_bdev()`), so repairing the algorithm used to
+cost the writeback setup; with the lock the algorithm needs no repair at all,
+and the companion only ever attaches/re-attaches a backing device without
+touching the compressor selection. The anchor rule the group follows is worth
+noting for future batches: it inserts only at block **boundaries** (the pristine
+`default_compressor` line Batch 10-4's parameter block opens with, the pristine
+`zram_debugfs_register(zram);` call, and after the pristine
+`module_init(zram_init);` line Batch 10-1 inserts before) — editing inside
+another group's replacement text breaks that group's second-pass idempotency and
+is what `step_audit.py` catches.
+
+One gap is deliberately **not** closed by the companion: the ROM's own zram
+daemon (`mmd_setup`, Android 16's Rust memory daemon) needs
+`CONFIG_ZRAM_WRITEBACK`, which no userspace can supply. Enabling it is a
+config-tier decision (`ABK_515_DEFCONFIG_ROM=1` → `CONFIG_ZRAM_WRITEBACK=y`,
+off by default) and it now **coexists** with the algorithm policy: the companion
+takes writeback ownership only when the kernel exposes the node and nobody owns
+it (`backing_dev` is `none` and `mmd.setup_complete` is unset), preserves an
+existing attachment across any rewrite it has to do, and does nothing at all on
+a locked kernel whose policy is already in force. Note the overlap with
+`ABK_ABI_PATCH_SUITE`, which owns zram **writeback code**; this module would only
+flip the Kconfig symbol, never the code, and any build enabling it must be
+verified with that suite injected.
+
 ## Report contract
 
 Each child writes `<report_dir>/<child>_report.json` + `.md` (default

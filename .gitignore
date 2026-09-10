@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 tests/out/
+build/
 *.ko
 *.img
 *.bin

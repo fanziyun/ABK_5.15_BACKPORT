@@ -124,7 +124,28 @@ REQUIRED_CONTENT = {
         # The secondary slot must really be filled, or recompression stays the
         # silent no-op this group exists to fix.
         "comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, abk_alg);",
-        'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "lz4hc";',
+        # The secondary is zstd (measured best ratio-per-cost) and the parameter
+        # is read-only: the target ROM's own userspace daemon forced the
+        # dominated lz4hc primary before disksize, so a writable parameter
+        # would only invite the same choice back.
+        'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "zstd";',
+        "sizeof(abk_zram_recomp_algo), 0444);",
+    ],
+    "core:zram_algo_lock": [
+        "Batch 11 - the zram algorithm lock",
+        # Read-only policy parameters: the measured primary and the lock switch.
+        'static char abk_zram_comp_algo[CRYPTO_MAX_ALG_NAME] = "lz4kd";',
+        "module_param_string(abk_comp_algo, abk_zram_comp_algo",
+        "module_param(abk_lock_algo, bool, 0444);",
+        # The primary must be selected at creation, before any disksize write.
+        "comp_algorithm_set(zram, ZRAM_PRIMARY_COMP,",
+        # Both nodes must really be repointed, and the locked store must accept
+        # the write (a refused algorithm write aborts Android's mmd_setup,
+        # writeback setup included -- the exclusivity this batch removes).
+        "dev_attr_comp_algorithm.store = abk_zram_locked_algo_store;",
+        "dev_attr_recomp_algorithm.store = abk_zram_locked_algo_store;",
+        "late_initcall(abk_zram_algo_lock_init)",
+        "return len;",
     ],
     "core:memcg_v1_reclaim": [
         "Batch 10-4 cgroup-v1 proactive reclaim",
@@ -210,6 +231,26 @@ REQUIRED_IN_FUNCTION = {
          ["find_suitable_fallback(area, order, migratetype,\n"
           "\t\t\t\t\t\ttrue) >= 0"],
          ["bool can_steal"]),
+    ],
+    "core:zram_algo_lock": [
+        # The locked store must report success rather than refuse the write:
+        # Android's mmd_setup aborts its whole zram bring-up -- writeback
+        # backing device included -- on a failed algorithm write.
+        ("drivers/block/zram/zram_drv.c", "abk_zram_locked_algo_store",
+         ["abk_zram_algo_lock_report(attr->attr.name, buf);",
+          "return len;"],
+         ["-EPERM", "-EACCES"]),
+        # The locked primary has to be chosen at device creation, or a build
+        # whose def-comp is the dominated lz4hc keeps it for the whole boot.
+        ("drivers/block/zram/zram_drv.c", "zram_add",
+         ["comp_algorithm_set(zram, ZRAM_PRIMARY_COMP,",
+          "zcomp_available_algorithm(abk_zram_comp_algo)"],
+         []),
+        # ... and the earlier groups' blocks must stay byte-identical, because
+        # a later edit inside them breaks their idempotency.
+        ("drivers/block/zram/zram_drv.c", "__comp_algorithm_store",
+         ["comp_algorithm_set(zram, prio, compressor);"],
+         ["abk_zram_lock_algo", "abk_zram_locked_algo_store"]),
     ],
     "core:rcu_nocb_cpu_default_all": [
         ("kernel/rcu/tree_nocb.h", "rcu_init_nohz",

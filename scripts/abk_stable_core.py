@@ -2281,13 +2281,36 @@ _ALIGN_CONFIGS = [
     ("TASK_DELAY_ACCT", "y"),        # delay accounting
 ]
 
+# ROM-integration tier (ABK_515_DEFCONFIG_ROM=1), off by default: these change
+# who owns a device, not just how fast it is, so they are never enabled by a
+# plain injection.
+_ROM_CONFIGS = [
+    # This ROM's memory daemon (init.rc starts mmd_setup, Android 16's Rust
+    # implementation) sets up a per-process zram writeback backing device and
+    # only then sets mmd.setup_complete -- which is what enables the mmd
+    # service.  Without CONFIG_ZRAM_WRITEBACK the writeback nodes do not exist,
+    # mmd_setup never completes on a ROM that relies on it, and mmd stays dead
+    # (`vendor.zram.disable=1` on the target ROM disables its setup outright).
+    # It used to be mutually exclusive with the zram algorithm policy (both
+    # write in the pre-`disksize` window); Batch 11's kernel-side lock removed
+    # that, so the writeback owner and the algorithm policy now coexist.
+    ("ZRAM_WRITEBACK", "y"),
+]
+
 
 def _config_enablement_apply(ctx):
     align = os.environ.get("ABK_515_DEFCONFIG_ALIGN", "").strip() == "1"
-    configs = list(_MODULE_CONFIGS) + (list(_ALIGN_CONFIGS) if align else [])
+    rom = os.environ.get("ABK_515_DEFCONFIG_ROM", "").strip() == "1"
+    configs = list(_MODULE_CONFIGS)
+    tiers = ["module-owned symbols only"]
+    if align:
+        configs += _ALIGN_CONFIGS
+        tiers.append("6.6 GKI align")
+    if rom:
+        configs += _ROM_CONFIGS
+        tiers.append("ROM integration")
     status, detail = ctx.enable_configs(configs)
-    tier = "6.6 GKI align" if align else "module-owned symbols only"
-    return status, f"{detail} [{tier}]"
+    return status, f"{detail} [{', '.join(tiers)}]"
 
 
 PATCH_GROUPS = [
@@ -3799,7 +3822,7 @@ def _memcg_v1_reclaim_apply(ctx):
 PATCH_GROUPS = PATCH_GROUPS + [
     PatchGroup(
         "zram_secondary_comp",
-        "zram secondary compressor registered at device creation, so ZRAM_MULTI_COMP recompression is no longer a silent no-op (zram.abk_recomp_algo, default lz4hc)",
+        "zram secondary compressor registered at device creation, so ZRAM_MULTI_COMP recompression is no longer a silent no-op (zram.abk_recomp_algo, read-only 0444, default zstd)",
         [
             "Batch 10-1/10-4 on-device finding: recomp_algorithm empty, recompress paths no-op",
             "Batch 10-4 semantics (plan.md)",
@@ -3816,6 +3839,43 @@ PATCH_GROUPS = PATCH_GROUPS + [
         ],
         ["mm/memcontrol.c"],
         _memcg_v1_reclaim_apply,
+    ),
+]
+
+# ============================================================================
+# Batch 11: the zram algorithm lock.  Steps live in
+# scripts/batch11_core_zram_algo_lock.py.
+#
+# Batch 10-4 made the secondary compressor reachable and the runtime companion
+# module forces the primary, but both live in userspace and both nodes close at
+# `disksize`: the policy belonged to whoever won that one window.  The lock
+# selects the primary at device creation from a read-only parameter and makes
+# every later write to comp_algorithm/recomp_algorithm a reported no-op, which
+# is what lets the algorithm policy and CONFIG_ZRAM_WRITEBACK coexist -- a
+# writeback backing device is attached in the same pre-`disksize` window and is
+# dropped by `reset`, so repairing a bad algorithm choice used to cost the
+# writeback setup.
+# ============================================================================
+import batch11_core_zram_algo_lock as _b11_zlock  # noqa: E402
+
+
+def _zram_algo_lock_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b11_zlock.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "zram_algo_lock",
+        "zram algorithm lock: primary chosen at device creation from the read-only zram.abk_comp_algo (default lz4kd), and later writes to comp_algorithm/recomp_algorithm are accepted and ignored (zram.abk_lock_algo, read-only 0444)",
+        [
+            "Batch 11 on-device finding: a root writer still switched comp_algorithm after boot (deflate), and the only repair path (swapoff+reset) drops any writeback backing device",
+            "Batch 11 semantics (plan.md)",
+        ],
+        ["drivers/block/zram/zram_drv.c"],
+        _zram_algo_lock_apply,
     ),
 ]
 

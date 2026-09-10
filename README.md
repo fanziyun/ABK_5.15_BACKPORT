@@ -23,7 +23,7 @@ is left byte-identical rather than touched up with a comment.
 
 | child id | content |
 |---|---|
-| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), Batch 8 page_alloc fallback-mode reuse and claimability cleanup (android15-6.6 / 6.12), opt-in `RCU_NOCB_CPU_DEFAULT_ALL`, plus the module's defconfig lane that actually enables the recompression symbols |
+| `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series) with a read-only `zstd` secondary compressor, the Batch 12 zram algorithm lock (read-only `zram.abk_comp_algo` / `zram.abk_lock_algo`; both algorithm stores become reported no-ops, so no runtime writer can reassign them — and a refused write would abort Android's `mmd_setup`, writeback included), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), Batch 8 page_alloc fallback-mode reuse and claimability cleanup (android15-6.6 / 6.12), opt-in `RCU_NOCB_CPU_DEFAULT_ALL`, plus the module's defconfig lane that actually enables the recompression symbols |
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 | `stable_backport_core` (Batch 9-1) | `dynamic_readahead_lowmem`: dynamic readahead (OPLUS/Xiaomi `mi_dynamic_readahead`) as a GKI built-in — a `core_initcall` in `mm/readahead.c` registers the `android_vh_ra_tuning_max_page` / `android_vh_tune_mmap_readaround` vendor-hook callbacks so low-memory background (cpuset "background") tasks get halved readahead windows and shrunk mmap read-around, behind `CONFIG_ABK_DYNAMIC_READAHEAD` with a `readahead.dynamic_readahead=0` runtime disable |
@@ -42,7 +42,9 @@ line (`zram recompression`, `ZSMALLOC_CHAIN_SIZE` zspage sizing), the 6.1
 `DEFCONFIG` the CLI always demanded: `config_enablement` enables the module's
 own symbols by default and, with `ABK_515_DEFCONFIG_ALIGN=1`, also the
 android15-6.6 GKI config deltas whose 5.15 code already exists
-(`LRU_GEN_ENABLED`, BBR, `BLK_WBT`, cgroup IO throttling, delay accounting).
+(`LRU_GEN_ENABLED`, BBR, `BLK_WBT`, cgroup IO throttling, delay accounting);
+`ABK_515_DEFCONFIG_ROM=1` adds the ROM-integration tier
+(`CONFIG_ZRAM_WRITEBACK=y`, off by default — see the runtime-companion section).
 Unsupported lineage is now a real gate too: outside android13-5.15 every group
 reports `report_only` and nothing is written unless `ABK_515_ALLOW_UNSUPPORTED=1`
 is set.
@@ -101,6 +103,53 @@ The children read `KERNEL_ROOT`, `DEFCONFIG`,
 Both children are idempotent; running them is safe at any point after the
 kernel patches are applied.
 
+## Runtime companion (KernelSU module)
+
+The grafts ship mechanisms; a mechanism nothing triggers changes nothing. On the
+device this repository targets (Redmi K70 / `vermeer`, android13-5.15-lts
+5.15.215) the measurement was blunt: `mm_stat` showed one page ever stored,
+`io_stat` was all zeros, and the ROM's own zram owner had left the primary
+compressor on the dominated `lz4hc` before `disksize` — after which the node is
+`-EBUSY` and no userspace can repair it.
+
+`ksu/abk_runtime_tunables/` is a flashable KernelSU module that closes that gap:
+
+* it keeps the **measured** zram policy in force — primary `lz4kd`, secondary
+  `zstd`, `mem_limit` 25% of RAM, swap size inherited from the ROM — with no
+  configuration knob for any of it. Since the `zram_algo_lock` graft the policy
+  is enforced *in the kernel* (`zram.abk_comp_algo` / `zram.abk_lock_algo`, both
+  `0444`; both algorithm stores accept a write and keep the locked value), so a
+  root writer cannot switch it either, and the module does not have to fight for
+  the pre-`disksize` window. On a kernel without the lock the module owns the
+  bring-up instead and re-checks it every `zram.reassert_interval_sec`;
+* it preserves a `CONFIG_ZRAM_WRITEBACK` attachment across any rewrite it has to
+  do — the backing device lives in that same pre-`disksize` window and `reset`
+  drops it, which is why the two used to exclude each other — and attaches a
+  sparse backing file itself when writeback is available and unowned
+  (`zram.writeback=auto`). On the reference device writeback is simply absent
+  (`CONFIG_ZRAM_WRITEBACK` off, `vendor.zram.disable=1`, `mmd.setup_complete`
+  unset), so `ABK_515_DEFCONFIG_ROM=1` is the tier that turns it on;
+* it drives age-marked recompression sweeps through the kernel's async worker
+  (this is the only part that is on by default);
+* it reports — or optionally applies — the remaining runtime knobs: MGLRU, THP,
+  `vm.swappiness`, the schedutil smart-freq policy, dynamic readahead and
+  cgroup-v1 proactive reclaim. See the module's [README](ksu/abk_runtime_tunables/README.md)
+  for the algorithm measurements, the knob table and the trade-offs.
+
+It is a distribution asset, not a graft: no `PatchGroup`, no kernel-tree writes.
+`after_patch` packs it (`scripts/build_ksu_module.py` →
+`build/ksu/abk_runtime_tunables.zip`) and bundles it into the AnyKernel3 tree
+(`scripts/ak3_bundle_ksu_module.py`), so flashing the kernel also installs the
+policy. Without an AnyKernel3 tree the step warns and continues (or set
+`ABK_515_KSU_MODULE=0` to skip it); the standalone zip can always be flashed or
+`ksud module install`-ed by hand.
+
+```bash
+python3 scripts/build_ksu_module.py              # build/ksu/abk_runtime_tunables.zip
+python3 scripts/ak3_bundle_ksu_module.py inject --zip <AK3.zip> --output <out.zip>
+python3 scripts/ak3_bundle_ksu_module.py verify --zip <out.zip>
+```
+
 ## Coexistence with other ABK modules
 
 The module is self-contained and injectable on its own. If the same build
@@ -118,13 +167,16 @@ The order is no longer a hard requirement: when ABK_ABI_PATCH_SUITE runs
 first anyway, this module's fd-table group recognizes the suite's fallback
 `alloc_fdtable()` and composes the upstream 5.15.191 conventions on top of
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
-place), so all 17 core groups land in either injection order.
+place), so every core group lands in either injection order.
 
-The core child now carries 17 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 22 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
-`pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, and the Batch 9-1
-`dynamic_readahead_lowmem`); the perf child carries 12; the display child
-carries 1, for 30 groups in total.
+`pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
+the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
+`zram_secondary_comp`, `memcg_v1_reclaim`) and Batch 12's `zram_algo_lock`); the
+perf child carries 13; the display child carries 1, for 36 groups in total.
+`tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
+assert it against the registry.
 
 The full input string for the F2FS + ABI-suite combination, the shape
 registry and the KMI compatibility matrix are documented in
@@ -134,11 +186,21 @@ registry and the KMI compatibility matrix are documented in
 
 ```bash
 python3 -m py_compile scripts/*.py tests/*.py
-bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh
 python3 tests/stable_5_15_test.py
 python3 tests/implementation_audit.py /path/to/android13-5.15-common-kernel-tree
 bash tests/smoke.sh /path/to/android13-5.15-common-kernel-tree
 ```
+
+`tests/stable_5_15_test.py` also pins the companion module: deterministic packing,
+the AK3 injection being idempotent and self-verifying, the algorithm policy's
+constants and operation order, and the device scripts' behaviour against a fixture
+sysfs tree (the rewrite itself, the "swap is in use" refusal, establishing a
+writeback backing device when nobody owns one, preserving a live one across a
+rewrite, doing nothing at all on a kernel that locks the compressors, and the
+supervisor's liveness). It also pins the three defconfig tiers
+(`ABK_515_DEFCONFIG_ALIGN`, `ABK_515_DEFCONFIG_ROM`) and the `zram_algo_lock`
+group's own fixture.
 
 `tests/implementation_audit.py` then asserts the graft content is real (no
 "applied with zero edits" phantom groups, feature symbols actually present, and

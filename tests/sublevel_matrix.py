@@ -26,7 +26,7 @@ from __future__ import annotations
 
 # child id -> total registered groups
 GROUP_COUNTS = {
-    "stable_backport_core": 21,
+    "stable_backport_core": 22,
     "stable_perf_backport": 13,
     "stable_display_fix": 1,
 }
