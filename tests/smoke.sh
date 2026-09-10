@@ -238,6 +238,16 @@ grep -q "cfr_reclaim_reclaimed" "$KERNEL_ROOT/common/mm/vmscan.c" \
   || fail "cached freeze reclaim accounting missing"
 grep -q "abk_cfr_reclaim_reclaimed" "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cached freeze reclaim memory.stat report missing"
+# Batch 10-4: the secondary compressor must be registered at device creation
+# (otherwise ZRAM_MULTI_COMP recompression is a silent no-op on every
+# baseline), and the cgroup-v1 reclaim surface must exist for devices whose
+# memory controller is mounted v1 rather than under /sys/fs/cgroup.
+grep -q "abk_recomp_algo" "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram secondary compressor registration missing"
+grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "cgroup-v1 cfr_reclaim counters missing"
+grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "cgroup-v1 memory.reclaim entry missing"
 
 # The drm valid-clones revert must leave no trace of the 5.15.185 check on
 # any baseline: 167/178 never carried it, 194/lts had it removed by the graft.

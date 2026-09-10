@@ -1,29 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Batch 10-2: schedutil "smart freq" policy layer on PELT (plan).
+"""Batch 10-4c: schedutil smart-freq policy, made governor-independent.
 
-The Qualcomm WALT suite (smart_freq/pipeline/voter, popsicle-w-oss) cannot
-be transported onto AOSP android13-5.15: the frequency-decision inputs are
-WALT window stats, and there is no PELT-based precedent anywhere public
-(see research/popsicle_w_oss/walt_pelt_survey.md).  What *is* portable is
-the control-layer subset -- a per-cluster reason election with hysteresis
-that clamps/boosts the resulting frequency -- re-anchored on signals that
-exist under PELT:
+The first form of this policy sampled its input in
+``android_vh_map_util_freq_new`` -- a hook schedutil calls from
+``get_next_freq()``.  On the target device the CPUfreq governor is the vendor
+``walt``, so that hook is never reached: the ``abk_sf_*`` parameters were
+visible and the module loaded, but no CPU ever became "boosting" and the floor
+in ``android_vh_cpufreq_resolve_freq`` never fired.  Inert by construction.
 
-  * sustained-high-util detection reuses the PELT util that schedutil
-    already feeds into get_next_freq() (android_vh_map_util_freq_new gives
-    util/max before the freq mapping);
-  * the actual cap/floor is applied where every frequency decision passes
-    (android_vh_cpufreq_resolve_freq, the hook the driver calls on both the
-    fast and the slow paths).
+Sampling now happens in ``android_vh_scheduler_tick``, which runs for every
+governor.  Critically, ``scheduler_tick()`` calls that hook *after*
+``rq_unlock()`` (kernel/sched/core.c: the unlock precedes the tracepoint), so
+reading PELT state there is safe and lock-free.  Per-CPU state is sampled per
+tick and the floor is aggregated over ``policy->cpus`` at resolve time, which
+``drivers/cpufreq/cpufreq.c`` reaches on both the fast and the slow path --
+again regardless of governor.
 
-This is a from-scratch GKI policy layer *inspired by* smart_freq's
-SUSTAINED_HIGH_UTIL reason, not a code move: pipeline pinning, per-ms busy
+The heuristic itself is unchanged from the original design: a per-CPU
+sustained-high-util reason with hysteresis, floor-ed at resolve time, inspired
+by Qualcomm WALT smart_freq's SUSTAINED_HIGH_UTIL reason.  It remains a
+from-scratch GPL policy layer, not a port: pipeline pinning, per-ms busy
 locks, AMU IPC-FMAX and the WALT state machines are deliberately absent.
-It is inert by design unless a runtime knob is flipped: /sys/module/
-cpufreq_schedutil/parameters/abk_sf_enable defaults to 1 but sustained
->=90%-util for >=300 ms is required before any floor applies, and the floor
-only prevents the frequency from collapsing during the short dips that
-follow a sustained-high window.
 """
 
 import re
@@ -51,24 +48,28 @@ _TAIL_OLD = "cpufreq_governor_init(schedutil_gov);\n"
 
 _POLICY = _tabs(r"""
 /*
- * ABK stable_515_backport: Batch 10-2 sched smart-freq policy (PELT).
+ * ABK stable_515_backport: Batch 10-4 sched smart-freq policy (PELT).
  *
- * Per-cluster reason election (inspired by Qualcomm WALT smart_freq's
- * SUSTAINED_HIGH_UTIL) built on the PELT util schedutil already computes:
+ * Sampling runs in the scheduler tick, not in a schedutil-only vendor hook:
+ * the target device runs the vendor walt governor, so the schedutil path
+ * (android_vh_map_util_freq_new) is never reached and the reason election
+ * stayed inert.  android_vh_scheduler_tick() fires for every governor and
+ * runs after rq_unlock() in scheduler_tick(), so reading PELT state there is
+ * safe and lock-free.  The resulting floor is applied in
+ * android_vh_cpufreq_resolve_freq(), which cpufreq.c calls on both the fast
+ * and the slow path, again regardless of governor.
  *
- *   - while a cluster's aggregate util stays >= abk_sf_sustained_pct of the
- *     capacity for >= abk_sf_sustained_ms, the cluster is "boosting";
+ *   - while a CPU's PELT util stays >= abk_sf_sustained_pct of its capacity
+ *     for >= abk_sf_sustained_ms, that CPU is "boosting";
  *   - once boosting, util must stay below abk_sf_exit_pct for
  *     abk_sf_exit_ms before the reason clears (hysteresis);
- *   - while boosting, cpufreq_resolve_freq clamps the target frequency to
- *     at least abk_sf_floor_pct of cpuinfo.max_freq, so short frame gaps do
- *     not collapse the frequency right after a sustained-high window.
- *
- * Inert unless /sys/module/cpufreq_schedutil/parameters/abk_sf_enable is 1
- * (default) and the util thresholds are actually crossed.
+ *   - while any CPU of a policy is boosting, resolve_freq raises the target
+ *     frequency to at least abk_sf_floor_pct of cpuinfo.max_freq, so short
+ *     frame gaps do not collapse the frequency right after a sustained-high
+ *     window.
  */
-#define ABK_SF_SUSTAINED_PCT        90
-#define ABK_SF_EXIT_PCT             70
+#define ABK_SF_SUSTAINED_PCT	90
+#define ABK_SF_EXIT_PCT		70
 
 static bool abk_sf_enable = true;
 static int abk_sf_sustained_ms = 300;
@@ -80,53 +81,35 @@ module_param(abk_sf_sustained_ms, int, 0644);
 module_param(abk_sf_exit_ms, int, 0644);
 module_param(abk_sf_floor_pct, int, 0644);
 MODULE_PARM_DESC(abk_sf_enable,
-    "ABK smart-freq policy: sustained-high-util cluster floor");
+    "ABK smart-freq policy: sustained-high-util frequency floor");
 MODULE_PARM_DESC(abk_sf_sustained_ms,
-    "ms of >=90% PELT util before a cluster starts boosting");
+    "ms of >=90% PELT util before a CPU starts boosting");
 MODULE_PARM_DESC(abk_sf_exit_ms,
-    "ms of <=70% PELT util before a boosting cluster clears");
+    "ms of <=70% PELT util before a boosting CPU clears");
 MODULE_PARM_DESC(abk_sf_floor_pct,
     "floor frequency as a percentage of cpuinfo.max_freq while boosting");
 
-struct abk_sf_cluster {
-    struct cpufreq_policy *policy;
+struct abk_sf_cpu {
     unsigned long boost_start;  /* jiffies when sustained util began */
     unsigned long low_start;    /* jiffies when util dropped below exit */
     bool boosting;
 };
 
-static struct abk_sf_cluster *abk_sf_cl;
+static struct abk_sf_cpu *abk_sf_cpus;
 
-static struct abk_sf_cluster *abk_sf_of(struct cpufreq_policy *policy)
+static void abk_sf_sample(int cpu, unsigned long util, unsigned long cap)
 {
-    struct abk_sf_cluster *c;
-
-    if (!abk_sf_cl)
-        return NULL;
-
-    c = &abk_sf_cl[policy->cpu];
-    if (c->policy != policy)
-        c->policy = policy;
-    return c;
-}
-
-static void abk_sf_map_util(void *data, unsigned long util,
-                            unsigned long freq, unsigned long cap,
-                            unsigned long *next_freq,
-                            struct cpufreq_policy *policy,
-                            bool *need_freq_update)
-{
-    struct abk_sf_cluster *c;
+    struct abk_sf_cpu *c;
     unsigned long now = jiffies;
     bool high;
 
-    if (!abk_sf_enable || !cap)
+    if (!cap)
         return;
 
-    c = abk_sf_of(policy);
-    if (!c)
-        return;
+    if (util > cap)
+        util = cap;
 
+    c = &abk_sf_cpus[cpu];
     high = util * 100 >= cap * ABK_SF_SUSTAINED_PCT;
 
     if (high) {
@@ -137,36 +120,48 @@ static void abk_sf_map_util(void *data, unsigned long util,
                  time_after(now, c->boost_start +
                             msecs_to_jiffies(abk_sf_sustained_ms)))
             c->boosting = true;
-    } else {
-        if (util * 100 < cap * ABK_SF_EXIT_PCT) {
-            if (c->boosting) {
-                if (!c->low_start)
-                    c->low_start = now;
-                else if (time_after(now, c->low_start +
-                                    msecs_to_jiffies(abk_sf_exit_ms)))
-                    c->boosting = false;
-            } else {
-                c->boost_start = 0;
-            }
+    } else if (util * 100 < cap * ABK_SF_EXIT_PCT) {
+        if (c->boosting) {
+            if (!c->low_start)
+                c->low_start = now;
+            else if (time_after(now, c->low_start +
+                                msecs_to_jiffies(abk_sf_exit_ms)))
+                c->boosting = false;
+        } else {
+            c->boost_start = 0;
         }
     }
+}
 
-    if (c->boosting && need_freq_update)
-        *need_freq_update = true;
+static void abk_sf_tick(void *data, struct rq *rq)
+{
+    unsigned long cap;
+
+    if (!abk_sf_enable || !abk_sf_cpus)
+        return;
+
+    cap = arch_scale_cpu_capacity(rq->cpu);
+    abk_sf_sample(rq->cpu, cpu_util_cfs(rq), cap);
 }
 
 static void abk_sf_resolve_freq(void *data, struct cpufreq_policy *policy,
                                 unsigned int *target_freq,
                                 unsigned int old_target_freq)
 {
-    struct abk_sf_cluster *c;
     unsigned int floor;
+    bool boosting = false;
+    int cpu;
 
-    if (!abk_sf_enable || !target_freq)
+    if (!abk_sf_enable || !abk_sf_cpus || !target_freq)
         return;
 
-    c = abk_sf_of(policy);
-    if (!c || !c->boosting)
+    for_each_cpu(cpu, policy->cpus) {
+        if (abk_sf_cpus[cpu].boosting) {
+            boosting = true;
+            break;
+        }
+    }
+    if (!boosting)
         return;
 
     floor = mult_frac(policy->cpuinfo.max_freq, abk_sf_floor_pct, 100);
@@ -181,15 +176,16 @@ static void abk_sf_resolve_freq(void *data, struct cpufreq_policy *policy,
 
 static int __init abk_sf_init(void)
 {
-    int ret = 0;
+    int ret;
 
-    abk_sf_cl = kcalloc(num_possible_cpus(), sizeof(*abk_sf_cl), GFP_KERNEL);
-    if (!abk_sf_cl)
+    abk_sf_cpus = kcalloc(num_possible_cpus(), sizeof(*abk_sf_cpus),
+                          GFP_KERNEL);
+    if (!abk_sf_cpus)
         return -ENOMEM;
 
-    ret = register_trace_android_vh_map_util_freq_new(abk_sf_map_util, NULL);
+    ret = register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL);
     if (ret)
-        pr_warn("ABK smart-freq: map_util_freq_new hook unavailable (%d)\n",
+        pr_warn("ABK smart-freq: scheduler_tick hook unavailable (%d)\n",
                 ret);
 
     ret = register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,
@@ -198,10 +194,10 @@ static int __init abk_sf_init(void)
         pr_warn("ABK smart-freq: cpufreq_resolve_freq hook unavailable (%d)\n",
                 ret);
 
-    pr_info("ABK stable_515_backport: sched smart-freq policy (PELT) loaded; "
-            "enable=%d sustained_ms=%d exit_ms=%d floor_pct=%d\n",
-            abk_sf_enable, abk_sf_sustained_ms, abk_sf_exit_ms,
-            abk_sf_floor_pct);
+    pr_info("ABK stable_515_backport: sched smart-freq policy (PELT, "
+        "governor-independent); enable=%d sustained_ms=%d exit_ms=%d "
+        "floor_pct=%d\n", abk_sf_enable, abk_sf_sustained_ms,
+        abk_sf_exit_ms, abk_sf_floor_pct);
     return 0;
 }
 

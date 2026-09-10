@@ -106,11 +106,35 @@ REQUIRED_CONTENT = {
         "abk_zram_recomp_drain(zram);",
     ],
     "perf:schedutil_smart_policy": [
-        "Batch 10-2 sched smart-freq policy (PELT)",
+        "Batch 10-4 sched smart-freq policy (PELT)",
         "abk_sf_enable",
-        "register_trace_android_vh_map_util_freq_new(abk_sf_map_util, NULL)",
+        "register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL)",
         "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,",
         "late_initcall(abk_sf_init)",
+        # Sampling must be governor-independent: the util read happens in the
+        # scheduler tick, not in a schedutil-only vendor hook (the device runs
+        # the vendor walt governor, which never reaches the schedutil path).
+        "cpu_util_cfs(rq)",
+        "arch_scale_cpu_capacity(rq->cpu)",
+    ],
+    "core:zram_secondary_comp": [
+        "Batch 10-4 secondary zram compressor",
+        "abk_zram_recomp_algo",
+        "module_param_string(abk_recomp_algo",
+        # The secondary slot must really be filled, or recompression stays the
+        # silent no-op this group exists to fix.
+        "comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, abk_alg);",
+        'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "lz4hc";',
+    ],
+    "core:memcg_v1_reclaim": [
+        "Batch 10-4 cgroup-v1 proactive reclaim",
+        # Forward declaration must precede the legacy table, and that table
+        # must carry the entry, or v1 devices have no memory.reclaim at all.
+        "static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,",
+        'static struct cftype mem_cgroup_legacy_files[] = {',
+        '.name = "reclaim",',
+        ".write = memory_reclaim,",
+        "cfr_reclaim_attempts %ld",
     ],
     "core:cached_freeze_reclaim": [
         "Batch 10-3",

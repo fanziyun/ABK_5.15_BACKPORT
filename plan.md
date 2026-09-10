@@ -206,6 +206,60 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
   Boot/AnyKernel3/签名 Bundle 全绿；已按惯例 bump `module.conf` 至 v0.12.0，
   本组正式落地。
 
+### Batch 10-4 落地进度（让已落地特性在真机上真正生效）
+
+真机核查（vermeer，`5.15.215-android13-8-g6c35ef5f7a13`，即 run 34473748528
+的构建）暴露出三个「编进去了但当前不生效」的机制性问题。三处都已修，
+并补上触发工具。**注意这与编译正确性无关**：三处都能编过、三档锚点审计
+全绿，问题在运行时触发条件。
+
+- [x] **zram 重压缩空转（Batch 4 + 10-1，影响最大）**：
+  `ZRAM_MULTI_COMP` 只提供机制。`recomp_algorithm` 为空时
+  `zram->comps[1..3]` 全为 NULL，`zram_recompress()` 的
+  `if (!zram->comps[prio]) continue;` 把每个算法都跳过 → `zstrm` 保持
+  NULL → 直接 `return 0`。而 `recomp_algorithm_store()` 在设备已初始化后
+  返回 `-EBUSY`，Android 开机早期就写了 `disksize`，用户态永远来不及。
+  真机实测：`recomp_algorithm=[]`；写 `algo=zstd priority=1` → `rc=1`；
+  dmesg `zram: Can't change algorithm for initialized device`；
+  `[zram_recompd]` 线程确实被创建（说明派发链路通），但没有一页被重压缩。
+  **修法**：新组 `zram_secondary_comp`（core）在 `zram_add()` 里、任何
+  `disksize` 写入之前注册第二压缩算法；模块参数 `zram.abk_recomp_algo`
+  （默认 `lz4hc`，置空关闭，可用内核 cmdline 覆盖）。
+  选 `lz4hc` 的理由：比 lz4 / vendor lz4kd 压得更好，但解码与 lz4 同速，
+  重压缩后的页不会拖慢缺页读；要更高压缩率可设 `zstd`（解码更慢）。
+  `zram_destroy_comps()` 只清 `comps[]`、不清 `comp_algs[]`，所以 `reset`
+  之后依然有效。
+- [x] **schedutil 策略休眠（Batch 10-2）**：采样原挂在
+  `android_vh_map_util_freq_new`——那是 schedutil 专用路径
+  （`get_next_freq()`），而真机 governor 是高通 `walt`，钩子永不触发 →
+  没有任何 CPU 进入 boosting → resolve 侧地板永不生效（参数可见但恒不动作）。
+  **修法**：改到 `android_vh_scheduler_tick` 采样（对所有 governor 都触发）。
+  关键前提已在源码核实：`scheduler_tick()` 里该钩子在 `rq_unlock()` **之后**
+  调用（core.c 5437 解锁 → 5449 触发），所以 tick 上下文里无锁读 PELT 安全。
+  状态按 CPU 记录，resolve 时按 `policy->cpus` 聚合。
+- [x] **cgroup v1 缺口（Batch 5 + 10-3）**：真机 memory 控制器挂在 **v1**
+  （`/dev/memcg`，`/sys/fs/cgroup/cgroup.controllers` 为空），而
+  `memory.reclaim`（Batch 5）与 `cfr_reclaim_*`（Batch 10-3）都只挂在 v2
+  路径（`memory_files[]` / `memory_stat_format()`）上。后果：
+  `tools/cached_freeze_reclaim.sh` 在这台设备上完全跑不起来，
+  计数器也读不到（厂商自己在 v1 上有 `memory.reclaim_once`）。
+  **修法**：新组 `memcg_v1_reclaim`（core）—— 在
+  `mem_cgroup_legacy_files[]` 前前置声明并复用 Batch 5 的
+  `memory_reclaim()`（复用而非复制；它设置 `MEMCG_RECLAIM_PROACTIVE`，
+  因此 v1 路径**自动**计入 Batch 10-3 的计数器），并在
+  `memcg_stat_show()` 输出 `cfr_reclaim_*`（v1 的 stat 渲染器与 v2 不同）。
+- [x] **触发工具 `tools/zram_recompress_trigger.sh`**：`--mark-idle` 把当前
+  存活页标为冷（`idle=all`），之后周期性 pass 只重压缩期间没被读过的页
+  （读到即清标志，正是 ZRAM_IDLE 语义），默认走 `recompress_async`。
+  **第二压缩算法未注册时直接报错退出**——正是这次踩到的静默 no-op，
+  工具的价值就在把它变成显式失败。`--sys-root` 供测试注入。
+- [x] 验证：py_compile + `bash -n` 通过；单测新增 4 组夹具全绿
+  （`zram_secondary_comp` / `memcg_v1_reclaim` / 改造后的 sched policy /
+  trigger 脚本，含"未注册时必须失败"用例）；step_audit /
+  implementation_audit / smoke 在 167/178/194 三档全绿
+  （core 144/145/136 步，二次幂等；smoke core 21 组全 applied）。
+- [ ] 编译验证：待 ABK CI 编译通过后 bump `module.conf` 至 v0.13.0。
+
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
 本批次从 android15-6.6 / android16-6.12 筛出的长期项目中，先落地当前模块边界

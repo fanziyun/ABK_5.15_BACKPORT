@@ -3762,5 +3762,62 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 10-4: make the zram recompression and the memcg side actually reachable
+# on the target device.  Steps live in scripts/batch10_core_zram_secondary.py
+# and scripts/batch10_core_memcg_v1.py.
+#
+#  * zram_secondary_comp  -- ZRAM_MULTI_COMP was enabled but every secondary
+#    comp slot stayed NULL (recomp_algorithm_store() only accepts a write
+#    before disksize, which Android has already done by then), so both the
+#    synchronous and the asynchronous recompress paths returned without
+#    touching a page.  The secondary compressor is now registered in
+#    zram_add(), before any disksize write can race it.
+#  * memcg_v1_reclaim     -- the device mounts the memory controller as
+#    cgroup v1, where memory.reclaim and the reclaim counters do not exist
+#    (they are v2-only in this module).  The shared handler is declared for
+#    the legacy cftype table and the counters are added to memcg_stat_show().
+# ============================================================================
+import batch10_core_zram_secondary as _b10_zsec  # noqa: E402
+import batch10_core_memcg_v1 as _b10_v1  # noqa: E402
+
+
+def _zram_secondary_comp_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b10_zsec.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _memcg_v1_reclaim_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b10_v1.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "zram_secondary_comp",
+        "zram secondary compressor registered at device creation, so ZRAM_MULTI_COMP recompression is no longer a silent no-op (zram.abk_recomp_algo, default lz4hc)",
+        [
+            "Batch 10-1/10-4 on-device finding: recomp_algorithm empty, recompress paths no-op",
+            "Batch 10-4 semantics (plan.md)",
+        ],
+        ["drivers/block/zram/zram_drv.c"],
+        _zram_secondary_comp_apply,
+    ),
+    PatchGroup(
+        "memcg_v1_reclaim",
+        "cgroup-v1 proactive reclaim: memory.reclaim cftype + cfr_reclaim_* counters in memcg_stat_show, for devices whose memory controller is mounted v1",
+        [
+            "Batch 10-1/10-4 on-device finding: /sys/fs/cgroup memory controller absent, only /dev/memcg",
+            "Batch 10-4 semantics (plan.md)",
+        ],
+        ["mm/memcontrol.c"],
+        _memcg_v1_reclaim_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()

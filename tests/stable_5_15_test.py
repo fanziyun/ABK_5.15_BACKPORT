@@ -756,7 +756,7 @@ def test_batch10_zram_async_recompress():
 
 
 def test_batch10_sched_smart_policy():
-    print("Batch 10-2 schedutil_smart_policy")
+    print("Batch 10-4 schedutil_smart_policy (governor-independent)")
     import abk_stable_perf as perf
     import batch10_perf_sched_policy as s10
 
@@ -773,9 +773,14 @@ def test_batch10_sched_smart_policy():
         check("sched smart-policy fixture applies all steps",
               status == "applied", (status, detail))
         text = ctx.read("kernel/sched/cpufreq_schedutil.c")
-        check("policy registers both android hooks",
-              "register_trace_android_vh_map_util_freq_new" in text
-              and "register_trace_android_vh_cpufreq_resolve_freq" in text)
+        check("policy samples util from the scheduler tick",
+              "register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL)"
+              in text and "cpu_util_cfs(rq)" in text)
+        check("policy applies its floor at cpufreq resolve time",
+              "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,"
+              in text)
+        check("policy no longer depends on a schedutil-only hook",
+              "register_trace_android_vh_map_util_freq_new" not in text)
         check("policy carries the runtime enable knob",
               "abk_sf_enable" in text)
         ctx2 = make_ctx(tmp, {"kernel/sched/cpufreq_schedutil.c": text})
@@ -787,6 +792,110 @@ def test_batch10_sched_smart_policy():
         ctx = make_ctx(tmp, {})
         status3, detail3 = perf._sched_smart_policy_apply(ctx)
         check("sched smart-policy degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
+def test_batch10_zram_secondary_comp():
+    print("Batch 10-4 zram_secondary_comp")
+    import abk_stable_core as core
+    import batch10_core_zram_secondary as zs
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_secondary_comp"), None)
+    check("zram_secondary_comp group registered", group is not None)
+    if group is None:
+        return
+    check("zram_secondary_comp touches only the zram driver",
+          set(group.files) == {"drivers/block/zram/zram_drv.c"}, group.files)
+
+    steps = zs.build_steps()
+    for (rel, old, new, req) in steps:
+        check(f"step {old.splitlines()[0][:34]!r} is required",
+              req is True and old and old != new, (req, old == new))
+
+    zram = (
+        "static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;\n"
+        "\n"
+        "static void comp_algorithm_set(struct zram *zram, u32 prio,\n"
+        "\t\t\t       const char *alg) {}\n"
+        "\n"
+        "static int zram_add(void)\n"
+        "{\n"
+        "\tint ret, device_id;\n"
+        "\n"
+        "\tret = idr_alloc(&zram_index_idr, zram, 0, 0, GFP_KERNEL);\n"
+        "\tif (ret < 0)\n"
+        "\t\tgoto out_free_dev;\n"
+        "\tdevice_id = ret;\n"
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"drivers/block/zram/zram_drv.c": zram})
+        status, detail = core._zram_secondary_comp_apply(ctx)
+        check("zram_secondary_comp fixture applies all steps",
+              status == "applied", (status, detail))
+        text = ctx.read("drivers/block/zram/zram_drv.c")
+        check("secondary compressor parameter is declared",
+              'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "lz4hc";'
+              in text and "module_param_string(abk_recomp_algo" in text)
+        check("secondary slot is filled at device creation",
+              "comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, abk_alg);" in text
+              and "zcomp_available_algorithm(abk_zram_recomp_algo)" in text)
+        ctx2 = make_ctx(tmp, {"drivers/block/zram/zram_drv.c": text})
+        status2, _detail2 = core._zram_secondary_comp_apply(ctx2)
+        check("zram_secondary_comp fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = core._zram_secondary_comp_apply(ctx)
+        check("zram_secondary_comp degrades on an empty tree",
+              status3.startswith("blocked") and ctx.pending_writes() == [],
+              (status3, detail3))
+
+
+def test_batch10_memcg_v1_reclaim():
+    print("Batch 10-4 memcg_v1_reclaim")
+    import abk_stable_core as core
+    import batch10_core_memcg_v1 as v1
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "memcg_v1_reclaim"), None)
+    check("memcg_v1_reclaim group registered", group is not None)
+    if group is None:
+        return
+
+    memcontrol = (
+        "static int memcg_stat_show(struct seq_file *m, void *v)\n"
+        "{\n" + v1._V1_STAT_OLD + "}\n"
+        "\n"
+        + v1._LEGACY_HDR_OLD +
+        v1._LEGACY_ENT_OLD +
+        "};\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/memcontrol.c": memcontrol})
+        status, detail = core._memcg_v1_reclaim_apply(ctx)
+        check("memcg_v1_reclaim fixture applies all steps",
+              status == "applied", (status, detail))
+        text = ctx.read("mm/memcontrol.c")
+        check("legacy table gains the reclaim entry",
+              ".write = memory_reclaim," in text)
+        check("forward declaration precedes the legacy table",
+              text.index("static ssize_t memory_reclaim(struct kernfs_open_file")
+              < text.index("static struct cftype mem_cgroup_legacy_files[] = {"))
+        check("v1 memory.stat reports the reclaim counters",
+              "cfr_reclaim_attempts %ld" in text)
+        ctx2 = make_ctx(tmp, {"mm/memcontrol.c": text})
+        status2, _detail2 = core._memcg_v1_reclaim_apply(ctx2)
+        check("memcg_v1_reclaim fixture is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status3, detail3 = core._memcg_v1_reclaim_apply(ctx)
+        check("memcg_v1_reclaim degrades on an empty tree",
               status3.startswith("blocked") and ctx.pending_writes() == [],
               (status3, detail3))
 
@@ -939,6 +1048,100 @@ rm -rf "$T"
           got.get("RC3") == "0" and got.get("freeze3") == "0", r.stdout)
     check("cfr daemon dry-run writes nothing",
           got.get("RC4") == "0" and got.get("reclaim4") == "999", r.stdout)
+
+
+def test_batch10_zram_trigger_script():
+    """The recompression trigger is a userspace script, not a graft.
+
+    Its most important behaviour is refusing to report success on a device
+    whose secondary compressor was never registered -- that silent no-op is
+    exactly what the on-device check found, and it is what Batch 10-4's
+    kernel half fixes.
+    """
+    print("Batch 10-4 zram_recompress_trigger script")
+    tool = (Path(__file__).resolve().parent.parent / "tools"
+            / "zram_recompress_trigger.sh")
+    check("zram trigger script exists", tool.is_file(), tool)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  (no bash on this host: shell checks skipped)")
+        return
+
+    use_wsl = os.name == "nt"
+    shell = ["wsl", "bash", "-s"] if use_wsl else [bash, "-s"]
+    tool_sh = str(tool).replace("\\", "/")
+    if use_wsl and len(tool_sh) > 2 and tool_sh[1] == ":":
+        tool_sh = "/mnt/" + tool_sh[0].lower() + tool_sh[2:]
+
+    def run_shell(script):
+        r = subprocess.run(shell, input=script.encode("utf-8"),
+                           capture_output=True, timeout=120)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            r.stdout.decode("utf-8", "replace"),
+            r.stderr.decode("utf-8", "replace"))
+
+    driver = f'''
+set -u
+T=$(mktemp -d)
+mkdir -p "$T/block/zram0"
+echo 17179869184 > "$T/block/zram0/disksize"
+echo "lzo [lz4kd]" > "$T/block/zram0/comp_algorithm"
+: > "$T/block/zram0/recomp_algorithm"
+echo "1000 400 500 0 0 0 0 0 0" > "$T/block/zram0/mm_stat"
+: > "$T/block/zram0/idle"
+: > "$T/block/zram0/recompress"
+: > "$T/block/zram0/recompress_async"
+
+# unarmed: must fail loudly and write nothing
+set +e
+sh "{tool_sh}" --sys-root "$T" >/dev/null 2>&1
+echo "RC_UNARMED=$?"
+set -e
+echo "unarmed_wrote=$(cat "$T/block/zram0/recompress_async")"
+
+# arm it: the pass must go through the async node with our threshold
+echo "lz4hc" > "$T/block/zram0/recomp_algorithm"
+sh "{tool_sh}" --sys-root "$T" --threshold 64
+echo "RC_ARMED=$?"
+echo "async_after=$(cat "$T/block/zram0/recompress_async")"
+
+# --mark-idle writes 'all', --mode sync uses the synchronous node
+sh "{tool_sh}" --sys-root "$T" --mark-idle --mode sync
+echo "idle=$(cat "$T/block/zram0/idle")"
+echo "sync_after=$(cat "$T/block/zram0/recompress")"
+
+# --dry-run writes nothing
+: > "$T/block/zram0/recompress_async"
+sh "{tool_sh}" --sys-root "$T" --dry-run
+echo "async_after_dryrun=$(cat "$T/block/zram0/recompress_async")"
+
+sh "{tool_sh}" --sys-root "$T" --status
+rm -rf "$T"
+'''
+    r = run_shell(driver)
+    got = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            got[k] = v
+
+    check("trigger refuses to no-op on an unarmed device",
+          got.get("RC_UNARMED") == "1", r.stdout + r.stderr)
+    check("unarmed run writes nothing",
+          got.get("unarmed_wrote") == "", r.stdout)
+    check("armed run drives the async node",
+          got.get("RC_ARMED") == "0"
+          and got.get("async_after") == "type=idle threshold=64", r.stdout)
+    check("--mark-idle marks every stored page",
+          got.get("idle") == "all", r.stdout)
+    check("--mode sync drives the synchronous node",
+          got.get("sync_after") == "type=idle threshold=0", r.stdout)
+    check("--dry-run writes nothing",
+          got.get("async_after_dryrun") == "", r.stdout)
+    check("--status reports the armed device",
+          "recomp     = [lz4hc]" in r.stdout, r.stdout)
 
 
 def test_batch8_autofdo_tool():
@@ -1108,8 +1311,11 @@ def main():
     test_batch9_dynamic_readahead()
     test_batch10_zram_async_recompress()
     test_batch10_sched_smart_policy()
+    test_batch10_zram_secondary_comp()
+    test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()
     test_batch10_daemon_script()
+    test_batch10_zram_trigger_script()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()
