@@ -680,14 +680,17 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 | `a48d069` | 本批全部代码 | 34553441530 | **success**（job 103120927194） |
 | `a1d38d8` | 更正启动采样计数 + 记录本结果 | 34591231732 | **success**（job 103236756742） |
 | `8b8bf5d` | 两处注释/文档里的数字对齐 | 34593035429 | **success**（job 103242443028） |
+| `5692b56` | 补跑设备门 + 工具 off 分支（`tools/` 进产物，载荷不动） | 34599579302 | **success**（job 103263329417） |
 
-最后一跑（构建 `8b8bf5d`；它之后的提交只动 `plan.md` 这类不进产物的文件）的日志：`[ABK module] version: 0.17.1`、
+最后一跑（构建 `5692b56`，日志 `head_log` 行确认模块克隆就停在这个提交）的日志：`[ABK module] version: 0.17.1`、
 `stable_perf_backport/schedutil_smart_policy: applied`、
 `stable_perf_backport: {already_present: 5, applied: 7, blocked_by_shape: 1}`、
-`ok: abk_runtime_tunables is bundled and its installer block is present`，
-过滤掉工作流自身回显的 `echo "::error::…"` 之后编译诊断计数为 **0**。
-三次构建的载荷指纹都是 `4e2a7a19be82aba2`（后两次只动注释与文档，载荷字节未变，
-由 `policy_sha256()` 自验），所以编译结论对 HEAD 成立。此后仅 `plan.md`
+`ok: abk_runtime_tunables is bundled and its installer block is present`（这次随包打进的是
+companion **v0.6.1**），过滤掉工作流自身回显之后编译诊断计数为 **0**——全日志唯一含
+`error:` 的行是 `continue_on_error: false` 的配置回显。
+四次构建的载荷指纹都是 `4e2a7a19be82aba2`：`git diff a48d069..HEAD -- scripts/` 为空，
+载荷字节未变（`5692b56` 改的是进包的 `tools/` 与 companion 版本号，不触载荷），
+所以编译结论对 HEAD 成立。此后仅 `plan.md`
 这类不进产物的文件再变化时，不再需要重跑。
 
 - [x] 设备侧 shell 门（AGENTS.md 新增的 `sh -n`）已在无线调试重连后补跑，对 HEAD
