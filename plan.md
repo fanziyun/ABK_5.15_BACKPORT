@@ -676,7 +676,7 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 | `a1d38d8` | 更正启动采样计数 + 记录本结果 | 34591231732 | **success**（job 103236756742） |
 | `8b8bf5d` | 两处注释/文档里的数字对齐 | 34593035429 | **success**（job 103242443028） |
 
-最终 HEAD 那一跑的日志：`[ABK module] version: 0.17.1`、
+最后一跑（构建 `8b8bf5d`；它之后的提交只动 `plan.md` 这类不进产物的文件）的日志：`[ABK module] version: 0.17.1`、
 `stable_perf_backport/schedutil_smart_policy: applied`、
 `stable_perf_backport: {already_present: 5, applied: 7, blocked_by_shape: 1}`、
 `ok: abk_runtime_tunables is bundled and its installer block is present`，
