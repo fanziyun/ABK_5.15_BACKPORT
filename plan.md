@@ -668,6 +668,29 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
   `blocked_by_shape` 是 `blk_mq_suspend_wakeup_abort`（lts 基线的既有债务，与本批无关）；
 - 全日志无 `error:` 编译诊断。
 
+复跑记录（同一条注入串、同一份 `dispatch.json`，只换被构建的提交）：
+
+| 提交 | 改了什么 | run | 结果 |
+|---|---|---|---|
+| `a48d069` | 本批全部代码 | 34553441530 | **success**（job 103120927194） |
+| `a1d38d8` | 更正启动采样计数 + 记录本结果 | 34591231732 | **success**（job 103236756742） |
+| `8b8bf5d` | 两处注释/文档里的数字对齐 | 34593035429 | **success**（job 103242443028） |
+
+最终 HEAD 那一跑的日志：`[ABK module] version: 0.17.1`、
+`stable_perf_backport/schedutil_smart_policy: applied`、
+`stable_perf_backport: {already_present: 5, applied: 7, blocked_by_shape: 1}`、
+`ok: abk_runtime_tunables is bundled and its installer block is present`，
+过滤掉工作流自身回显的 `echo "::error::…"` 之后编译诊断计数为 **0**。
+三次构建的载荷指纹都是 `4e2a7a19be82aba2`（后两次只动注释与文档，载荷字节未变，
+由 `policy_sha256()` 自验），所以编译结论对 HEAD 成立。此后仅 `plan.md`
+这类不进产物的文件再变化时，不再需要重跑。
+
+- [~] 设备侧 shell 门（AGENTS.md 新增的 `sh -n`）最后一次**没能重跑**：手机侧无线调试
+      在记录 CI 结果期间掉线，`adb devices` / `adb mdns services` 都空了，需要用户在
+      开发者选项里重新开启无线调试或改用 USB。该次改动只在 `tools/abk_fas_check.sh`
+      头部 `#` 注释块内（数字 586-750 → 585-749），不是被引号包裹的字符串内部，
+      解析风险为零；但按新规则仍应补跑一次 `sh -n` + 两个容量夹具。
+
 顺带一条副产品：这次构建的是 **android13-5.15-lts（SUBLEVEL 已被 ABK 解析为 X）**，
 也就是本仓库 `sublevel_matrix.py` 还没有 216 条目的那条线——载荷在它上面 applied
 且编译通过，说明"给 lts 补矩阵条目"只是审计覆盖问题，不是正确性问题（仍是独立待办）。
