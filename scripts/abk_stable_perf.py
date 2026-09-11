@@ -1484,27 +1484,60 @@ PATCH_GROUPS = [
 ]
 
 # ============================================================================
-# Batch 10-2: schedutil smart-freq policy layer on PELT (inspired by the WALT
-# smart_freq SUSTAINED_HIGH_UTIL reason; see walt_pelt_survey.md).  Steps
-# live in scripts/batch10_perf_sched_policy.py: per-cluster sustained-high
-# util election on the PELT util schedutil already feeds into get_next_freq()
-# (android_vh_map_util_freq_new), floored at cpufreq resolve time
-# (android_vh_cpufreq_resolve_freq).  A from-scratch policy, not a code move.
+# Batch 10-2 / 10-4c / 10-5: schedutil smart-freq policy layer on PELT
+# (inspired by the WALT smart_freq SUSTAINED_HIGH_UTIL reason; see
+# walt_pelt_survey.md).  Steps live in scripts/batch10_perf_sched_policy.py:
+# per-cluster sustained-high util election sampled in the scheduler tick,
+# floored at cpufreq resolve time (android_vh_cpufreq_resolve_freq).
+#
+# 10-5 is the ownership fix.  A device whose only governor is the vendor walt
+# one (FAS driven by a userspace scheduler profile) showed the floor turning
+# into a ratchet: waltgov computed 766 MHz from cluster demand while the policy
+# sat at 1785600 for a whole game session, because a FAS owner requests
+# min == max == its own target and a floor clamped to policy->max simply
+# re-states the current frequency.  The policy is now disabled by default and
+# refuses to act on any policy that is not plain schedutil or has collapsed to
+# a single operating point; a tree already carrying the 10-4c payload is
+# upgraded in place (build_upgrade_steps) instead of getting a second copy.
 # ============================================================================
 import batch10_perf_sched_policy as _b10_sched  # noqa: E402
 
 
 def _sched_smart_policy_apply(ctx):
-    status, _results, detail = apply_steps(ctx, _b10_sched.build_steps())
+    rel = "kernel/sched/cpufreq_schedutil.c"
+    try:
+        text = ctx.read(rel)
+    except FileNotFoundError:
+        # Let apply_steps report the missing file as a degraded shape, exactly
+        # as it does for any other absent anchor.
+        text = ""
+    if _b10_sched.has_unknown_policy(text):
+        # Batch 10-2 grafted this group once with a different payload, and that
+        # shape matches neither migration anchor while still leaving the insert
+        # anchor in place.  Taking the plain path there would define the policy
+        # twice -- and still report `applied`.  A shape this module cannot name
+        # is refused; nothing is written.
+        return "blocked_by_shape", (
+            "an unrecognised smart-freq payload is already in the tree "
+            "(neither the current nor the Batch 10-4c shape); inserting would "
+            "duplicate its definitions, so nothing was written")
+    upgrade = _b10_sched.needs_legacy_upgrade(text)
+    steps = (_b10_sched.build_upgrade_steps() if upgrade
+             else _b10_sched.build_steps())
+    status, _results, detail = apply_steps(ctx, steps)
     if status is None:
         return "blocked_by_shape", detail
-    return status, detail
+    if upgrade:
+        detail = "upgraded the Batch 10-4c payload in place; " + detail
+    # The payload cannot carry its own digest (that would move the digest), so the
+    # graft report is where "which generation did this build write" is recorded.
+    return status, detail + "; payload " + _b10_sched.policy_sha256()
 
 
 PATCH_GROUPS = PATCH_GROUPS + [
     PatchGroup(
         "schedutil_smart_policy",
-        "schedutil smart-freq policy (PELT): per-cluster sustained-high-util reason election with hysteresis + frequency floor at cpufreq resolve time, via the android_vh hooks (inspired by WALT smart_freq; Batch 10-2)",
+        "schedutil smart-freq policy (PELT): per-cluster sustained-high-util reason election with a sliding window + frequency floor at cpufreq resolve time, via the android_vh hooks; the hooks are governor-independent, so the policy is disabled by default and defers to any policy whose governor is not schedutil or whose range is already pinned (inspired by WALT smart_freq; Batch 10-2, 10-4c, ownership fix in 10-5)",
         [
             "popsicle-w-oss walt smart_freq/pipeline semantics (control-layer subset)",
             "research/popsicle_w_oss/walt_pelt_survey.md",

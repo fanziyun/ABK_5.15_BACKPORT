@@ -116,6 +116,25 @@ REQUIRED_CONTENT = {
         # the vendor walt governor, which never reaches the schedutil path).
         "cpu_util_cfs(rq)",
         "arch_scale_cpu_capacity(rq->cpu)",
+        # Batch 10-5 ownership fix.  The floor is a *ratchet* on any policy
+        # whose owner drives cpufreq by pinning min == max == its own target
+        # (vendor FAS/WALT): the clamp to policy->max turns "raise to the
+        # floor" into "keep the frequency already applied" and every downscale
+        # is swallowed.  Measured on kalama: waltgov asked for 766 MHz while
+        # the policy held 1785600 for a whole game session.  All of the
+        # following must be present or the ratchet is back.
+        "static bool abk_sf_enable = false;",
+        "#include <linux/string.h>",
+        "static bool abk_sf_dvfs_owned(struct cpufreq_policy *policy)",
+        'strcmp(policy->governor->name, "schedutil") != 0',
+        "if (abk_sf_dvfs_owned(policy) || policy->min == policy->max)",
+        "if (floor <= policy->min || floor >= policy->max)",
+        # The reason must expire on a wall-clock deadline as well as in the
+        # tick, and the sustained window must actually slide; plus a read-only
+        # view of the reason state so the next diagnosis is not blind.
+        "unsigned long boost_release;",
+        "static bool abk_sf_cpu_boosting(int cpu)",
+        "module_param_cb(abk_sf_boosting, &abk_sf_boosting_ops, NULL, 0444);",
     ],
     "core:zram_secondary_comp": [
         "Batch 10-4 secondary zram compressor",
@@ -177,6 +196,12 @@ REQUIRED_ABSENT = {
         "drm_atomic_check_valid_clones",
         "drm_atomic_check_valid_clones(state, crtc)",
     ],
+    "perf:schedutil_smart_policy": [
+        # The Batch 10-4c shapes: enabled by default, and a floor clamped *up
+        # to* policy->max -- the ceiling lock itself.
+        "static bool abk_sf_enable = true;",
+        "if (floor > policy->max)",
+    ],
 }
 
 # Function-scoped assertions.  REQUIRED_CONTENT above is whole-file substring
@@ -186,6 +211,35 @@ REQUIRED_ABSENT = {
 # fails the audit.  Keyed as "child:group" -> list of
 # (rel, function_name, must_contain, must_not_contain).
 REQUIRED_IN_FUNCTION = {
+    "perf:schedutil_smart_policy": [
+        # The ownership gate has to sit in the resolve path itself: a gate that
+        # lands in a helper nobody calls is exactly the "compiles but behaves
+        # like the source kernel" failure this audit exists for.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sf_resolve_freq",
+         ["if (abk_sf_dvfs_owned(policy) || policy->min == policy->max)",
+          "floor = mult_frac(policy->cpuinfo.max_freq, abk_sf_floor_pct, 100)",
+          "if (floor <= policy->min || floor >= policy->max)",
+          "abk_sf_cpu_boosting(cpu)"],
+         ["floor = policy->max"]),
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sf_dvfs_owned",
+         ['strcmp(policy->governor->name, "schedutil") != 0',
+          "if (!policy->governor)"],
+         []),
+        # Sliding window: any sample below the entry threshold restarts it.
+        # The dead-band form (reset only below the *exit* threshold) let a CPU
+        # bank boost time across 70-90% oscillation, which is what kept the
+        # reason latched for a whole game.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sf_sample",
+         ["c->boost_start = 0;",
+          "if (util * 100 < cap * ABK_SF_SUSTAINED_PCT)",
+          "c->boost_release = now + msecs_to_jiffies(abk_sf_exit_ms)"],
+         ["} else if (util * 100 < cap * ABK_SF_EXIT_PCT) {"]),
+        # The deadline is re-checked outside the tick, because an idle CPU stops
+        # ticking under NO_HZ_IDLE and would otherwise latch the reason.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sf_cpu_boosting",
+         ["time_after(jiffies, c->boost_release)", "abk_sf_clear(c)"],
+         []),
+    ],
     "core:zram_recompression": [
         # The read path must delegate to the shared helper, not carry its own
         # copy of the decompress logic (two copies is how the get/put anchors

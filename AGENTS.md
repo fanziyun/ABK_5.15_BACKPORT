@@ -60,6 +60,16 @@ python3 tests/implementation_audit.py <tree>      # content: no phantom groups, 
 bash tests/smoke.sh <tree>                        # end-to-end: 2-pass idempotency + rollback
 ```
 
+`bash -n` is **not** the shell that runs this code on the phone. Anything that
+ships into the module (`tools/*.sh`, `ksu/**/*.sh`) must also pass `sh -n` under the
+device's own shell (Android mksh) — push the file and run `su -c 'sh -n <path>'`.
+Bash accepts constructs mksh rejects, and this bit for real: an apostrophe inside a
+single-quoted `awk '...'` program in `abk_fas_check.sh` terminated that string, every
+local gate stayed green, and the shipped tool died at its first sampling loop.
+Build-host scripts (`scripts/abk_rollback.sh`, `scripts/stable_backport.sh`,
+`scripts/libabk.sh`, `tests/smoke.sh`) are `#!/usr/bin/env bash` by design and are
+excluded from that rule.
+
 Layering reason: `step_audit.py` proves **structure** (anchors apply, no
 `already_present` in a must-apply group, comment/brace/`#ifdef` balance kept,
 second pass is byte-identical), `implementation_audit.py` proves **content**
@@ -157,16 +167,21 @@ stages, each a separate run:
 `after_patch` also builds and injects the **runtime companion**, a KernelSU module
 (`ksu/abk_runtime_tunables/`, packed by `scripts/build_ksu_module.py` and bundled
 into the AnyKernel3 tree by `scripts/ak3_bundle_ksu_module.py`) that keeps the
-measured zram algorithm policy in force on device and drives the recompression
-sweeps. The policy itself lives in the kernel since Batch 12 (`zram_algo_lock`:
-`zram.abk_comp_algo` / `zram.abk_lock_algo`, both `0444`, and both
+measured zram algorithm policy in force on device, drives the recompression
+sweeps, and records **who owns CPU frequency** at boot. The policy itself lives
+in the kernel since Batch 12 (`zram_algo_lock`: `zram.abk_comp_algo` /
+`zram.abk_lock_algo`, both `0444`, and both
 `comp_algorithm`/`recomp_algorithm` stores made reported no-ops), so the companion
 only verifies, re-asserts the compressed-memory cap, runs one gated zsmalloc
 `compact` pass after each sweep tick (both overhead gates must call the device
 fragmented before the node is written; on by default since companion v0.4.0), and
 preserves or establishes the zram writeback backing device; on a kernel without the
 lock it falls back to owning the whole bring-up and re-checking it every
-`zram.reassert_interval_sec`. It is a distribution asset, **not** a graft: it
+`zram.reassert_interval_sec`. Its DVFS duty is **report only**: `abk_report_dvfs_state()`
+logs each cpufreq policy's governor, range, transition count and the capacity the
+placer actually ranks by, because a FAS/WALT tree owns frequency and this module
+must not (Batch 10-5/10-6; `tools/abk_fas_check.sh`, shipped as `bin/`, is the
+on-demand verdict-carrying version). It is a distribution asset, **not** a graft: it
 registers no `PatchGroup`, never writes into the kernel tree, and the whole step
 is skipped with a warning when the build has no AnyKernel3 tree (or when
 `ABK_515_KSU_MODULE=0`).

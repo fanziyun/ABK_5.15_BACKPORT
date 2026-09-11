@@ -188,6 +188,33 @@ grep -q "android_vh_resched_curr_lazy" "$KERNEL_ROOT/common/include/trace/hooks/
   || fail "lazy preemption hook missing"
 grep -q "android_vh_mutex_wakeup_patch" "$KERNEL_ROOT/common/kernel/locking/mutex.c" \
   || fail "mutex wakeup patch hook missing"
+# The smart-freq payload's load-bearing markers.  The group is inert by *default*
+# (the knob ships off), so nothing in the pass-1 status proves the gated form is
+# the one in the tree -- and an older payload mixed into this file would be a
+# duplicate-definition compile failure, not a status the report could show.
+if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+sub = sys.argv[2]
+key = "schedutil_smart_policy"
+expected = (key not in sublevel_matrix.pre_applied(sub, "stable_perf_backport")
+            and key not in sublevel_matrix.debt(sub, "stable_perf_backport"))
+sys.exit(0 if expected else 1)
+PY
+then
+  grep -q "static bool abk_sf_dvfs_owned(struct cpufreq_policy \*policy)" \
+    "$KERNEL_ROOT/common/kernel/sched/cpufreq_schedutil.c" \
+    || fail "smart-freq DVFS-ownership gate missing"
+  grep -q "static bool abk_sf_enable = false;" \
+    "$KERNEL_ROOT/common/kernel/sched/cpufreq_schedutil.c" \
+    || fail "smart-freq policy is not the default-off payload"
+  grep -q "module_param_cb(abk_sf_boosting" \
+    "$KERNEL_ROOT/common/kernel/sched/cpufreq_schedutil.c" \
+    || fail "smart-freq reason state is not observable"
+else
+  echo "  smart-freq markers not expected on 5.15.$SUB_LEVEL (known debt)"
+fi
 grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h" \
   || fail "kernfs polling trigger wrapper missing"
 grep -q "calculate_zspage_chain_size" "$KERNEL_ROOT/common/mm/zsmalloc.c" \

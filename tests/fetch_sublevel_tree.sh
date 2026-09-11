@@ -91,24 +91,53 @@ decode() {
   fi
 }
 
+# A downloaded file is accepted only when it looks like source: large enough
+# and free of NUL bytes.  A rate-limited gitiles reply is a short non-text body,
+# and it used to be written straight over the destination -- so re-running to
+# "fill the gaps" silently corrupted files that had already downloaded fine
+# (observed: init/main.c and 5 others truncated to 6 bytes on a retry pass).
+acceptable() {
+  _a_f="$1"
+  [ -s "$_a_f" ] || return 1
+  _a_size=$(wc -c < "$_a_f")
+  [ "$_a_size" -ge 200 ] || return 1
+  # Binary junk (a truncated base64 body) decodes to bytes with NULs in them;
+  # a NUL-free size that matches the file's own is source text.  Command
+  # substitution cannot express a NUL pattern, so compare lengths instead.
+  [ "$(tr -d '\000' < "$_a_f" | wc -c)" = "$_a_size" ] || return 1
+  # A rate-limited reply is an HTML page, and it can easily clear 200 bytes.
+  if head -c 512 "$_a_f" | tr 'A-Z' 'a-z' | grep -q "<\(html\|!doctype\|body\)"; then
+    return 1
+  fi
+  return 0
+}
+
 mkdir -p "$OUTDIR"
 echo "fetching ${#FETCH_FILES[@]} files from $BRANCH into $OUTDIR"
 
 failed=0
 for rel in "${FETCH_FILES[@]}"; do
   dst="$OUTDIR/$rel"
+  # Gap-filling, not re-downloading: a complete tree is a no-op, so a retry
+  # pass cannot damage a file that is already good.
+  if acceptable "$dst"; then
+    continue
+  fi
   mkdir -p "$(dirname "$dst")"
+  part="$dst.part"
   # gitiles serves base64 with ?format=TEXT; retry because it rate-limits.
   if ! curl -sSL --max-time 180 --retry 3 --retry-delay 2 \
-      "$BASE/$rel?format=TEXT" | decode > "$dst"; then
+      "$BASE/$rel?format=TEXT" | decode > "$part"; then
     echo "  FAILED $rel" >&2
+    rm -f "$part"
     failed=$((failed + 1))
     continue
   fi
-  # A rate-limited or missing path yields an empty/HTML body, not source.
-  size=$(wc -c < "$dst")
-  if [ "$size" -lt 200 ]; then
-    echo "  SUSPECT $rel ($size bytes) - probably rate-limited, re-run" >&2
+  if acceptable "$part"; then
+    mv "$part" "$dst"
+  else
+    echo "  SUSPECT $rel ($(wc -c < "$part") bytes) - probably rate-limited, re-run" >&2
+    rm -f "$part"
     failed=$((failed + 1))
   fi
 done

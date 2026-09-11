@@ -65,8 +65,11 @@
 - [x] ~~可选（需另一次刷机，且与算法强制互斥）~~ → Batch 12 已解决互斥：内核锁使算法
   不再依赖抢占 pre-`disksize` 窗口，`ABK_515_DEFCONFIG_ROM=1` 的
   `CONFIG_ZRAM_WRITEBACK=y` 现在与算法策略并存。
-- [ ] 待验（Batch 10-4 遗留）：`dmesg | grep recompression` 注册日志（ring buffer 已滚动）、
-  `abk_sf` 在 `sched_pelt_multiplier=4` 下是否长期 boosting。
+- [x] ~~待验（Batch 10-4 遗留）：`abk_sf` 在 walt governor 下是否长期 boosting~~ → **会，而且必须禁止**。
+  已在 Batch 10-5 收口：真机 `ftrace schedwalt/waltgov_next_freq` 抓到 governor 算出 766 MHz
+  而簇恒为 1785600，`total_trans` 十余秒不动；`abk_sf_enable` 默认已改 `false` 并加三条
+  调频权 gate，`bin/abk_fas_check.sh --probe` 可在 20 秒内判定。
+  仍留一项（与本问题无关）：`dmesg | grep recompression` 注册日志因 ring buffer 滚动未取到。
 
 ## Batch 12（v0.15.0，内核侧算法锁 + writeback 并存）
 
@@ -486,6 +489,171 @@ Perfetto Freezer 轨迹有 Freeze/Unfreeze 切片。
 - [ ] 待验（Batch 11 遗留）：`dmesg | grep recompression` 注册日志（ring buffer 已滚动）、
   `abk_sf` 在 walt governor 下是否进入 boosting（`sched_pelt_multiplier=4` 有长期
   boosting 风险，见 Batch 11）。
+
+### Batch 10-5 落地进度（smart-freq 与 FAS 的调频权收口，v0.17.0）
+
+真机（Redmi K70 / kalama / SM8550，`5.15.215-...-FanZiyun`，无线 adb + su）压测暴露：
+**Batch 10-4c 把策略改成"governor 无关"是反向修复**——它让原本休眠的策略在高通
+WALT/FAS 设备上真的活了，然后立刻变成缺陷。全部结论来自实测，不是推断。
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | FAS 的调频方式是**把 `policy->min` 和 `policy->max` 同时写成自己的目标** | `ftrace schedwalt/waltgov_next_freq` 持续输出 `policy_min_freq=policy_max_freq=cached_raw_freq`，且 `abk_sf_enable=0` 时同样成立（所以 `min==max` 是 FAS 的正常签名，不是故障签名） |
+| 2 | 于是 ABK 的 floor（`85% × cpuinfo.max` 再被 `policy->max` 夹住）退化成 **"目标 = 上一个目标"** | `waltgov` 按簇需求算出 **766 MHz**（util 187/855≈22%），实际恒为 **1785600**；`stats/total_trans` 4 秒只 +4（同窗 p0 +25、p7 +133） |
+| 3 | 空载 A/B 直接闭环（息屏，唯一变量 = `abk_sf_enable`） | `1`：p0 恒 1555200 / p3 恒 1920000（= 当时的簇上限）、`total_trans` 十余秒零跳变 → `0`：4 个采样周期内落到 556800 / 614400 并恢复跳变 → 再 `1`：空载下频率自己爬回 1228800 / 1651200 |
+| 4 | 棘轮几乎不可解除的两个放大器 | `boost_start` 只在 `<70% 且未 boosting` 时清零 ⇒ 70–90% 死区持续累积，"持续 300ms"实际退化为"很久以前高过一次"；解除只在 tick 里判定 ⇒ NO_HZ_IDLE 下 CPU 一 idle 就不再有 tick，flag 永久冻结 |
+| 5 | 但游戏里那局 1785 **不是** ABK 造成的（本批次据此更正归因） | 出现同一 pin 时 `abk_sf_enable` 已是 `N`；放开 `policy3/scaling_max_freq` 后 mid 立刻铺开 13 个频点。同游戏同 profile 的 FAS 开/关对照：开=占用 67.9% 跑 1253 MHz（45% 上限）/3.97 W/57.2 ℃，关=占用 60.1% 跑 1868 MHz（67% 上限，1785 众数 67%）/5.04 W/67.9 ℃ |
+| 6 | `sceneFAS` 的实际开关面 | `/proc/fas`（metis 的 `proc_show_fas`/`proc_write_fas`）：光遇那局恒为 `forground app uid:0`（未注册），王者局为 `uid:10085=com.tencent.tmgp.sgame`。**uid 非 0 才是"已注册"**，且退出游戏不会清空 |
+| 7 | userspace 抢不到调频权 | `scaling_governor` / `scaling_min_freq` 权限位被**运行时反复 chmod**（观测到 0444↔0664、属主 root↔system，mtime 就在采样当下），root 直接写会 `EACCES` |
+
+修法（`scripts/batch10_perf_sched_policy.py` 载荷 v2）：
+
+- [x] `abk_sf_enable` **默认 false**：FAS/WALT 设备由厂商 FAS 独占调频；
+- [x] 三条归属权 gate：`governor != schedutil` ⇒ 跳过、`policy->min == policy->max` ⇒ 跳过、
+      `floor <= policy->min || floor >= policy->max` ⇒ 跳过（最后一条是**不变量**：
+      `__resolve_freq()` 本就把 target 夹在 `[min,max]`，所以这两个边界外的 floor
+      要么已满足、要么没有余量——"没有余量"正是把下限变成锁的唯一途径）；
+- [x] `boost_start` 改真正滑动窗口（低于进入阈值的样本一律重置）；
+- [x] 解除改为墙钟 `boost_release`，tick 与 resolve 两侧都判（补上 idle CPU 不再 tick 的空洞）；
+- [x] 新增只读 `abk_sf_boosting`（`module_param_cb`，0444）：reason 位图。此前只能从
+      频率反推状态，是这次排障绕了一圈的真正原因；
+- [x] **旧树原地升级**：保留 `_POLICY_V1` 原文作锚点 + `build_upgrade_steps()`。
+      单锚 `_TAIL_OLD` 在已 graft 的树上仍然命中（它就是载荷被追加的那行），
+      走普通路径会在旧载荷**前面再插一份** → 重复定义、编译失败。
+      单测 `the upgrade branch is load-bearing (plain insert duplicates)` 把这点钉住；
+- [x] companion v0.5.0：`tunables.conf` 显式 `sched.abk_sf_enable=0`；
+      `abk_report_dvfs_state()` 开机记录每簇 `gov/cur/min/max/total_trans` +
+      `/proc/fas` + `abk_sf_enable/boosting`，并在 `enable=Y` 遇到非 schedutil governor 时 WARN；
+- [x] 新工具 `tools/abk_fas_check.sh`（随模块打包为 `bin/abk_fas_check.sh`，只读不写）：
+      `--sample N` 用"频点数/众数占比/跳变速率 + `/proc/loadavg` 负载门控"区分
+      `MOVING / IDLE / PARKED_IDLE / FROZEN_UNDER_LOAD`，`--probe` 主动加负载再验回落
+      （这是唯一能区分"park"与"lock"的手段）。已在真机两分支验证：空载 RC=0、
+      `abk_sf_enable=Y` 撞 walt 时 RC=1 并给出修法。（Batch 10-6 一度把这条判据连同归因一起改掉，理由是"governor 是 walt 所以 floor 不执行"——**那个理由是错的**：10-4c 起载荷挂在 `android_vh_scheduler_tick` 与 `android_vh_cpufreq_resolve_freq` 上，两者与 governor 无关；现已还原，并加了一件事：按只读节点 `abk_sf_boosting` 是否存在区分两代载荷，v1 无闸门⇒FAIL，10-5 有闸门⇒降级为提示。）
+- [x] 审计同步：`implementation_audit.py` 加 required/absent/function 三档钉（含
+      `if (floor > policy->max)` 与 `static bool abk_sf_enable = true;` 必须消失）；
+      单测新增 20 条断言（含 `module_param()` 与变量声明同名的扫描）。
+- [x] 门禁：`compileall`、`bash -n`（含 `tools/`、`ksu/*/*.sh`）、单测全绿；
+      `step_audit` / `implementation_audit` / `smoke` 在 **167 / 178 / 194 三档全绿**
+      （`schedutil_smart_policy` 三档均 `applied`，二次 `already_present` 且字节一致；
+      167 core 147 步、178 148 步、194 139 步）。
+- [x] 顺带修 `tests/fetch_sublevel_tree.sh`（审计基础设施缺陷，本轮实测踩到）：它无条件
+      `curl | base64 -d > "$dst"`，所以 gitiles 限流返回的短错误体会**覆盖已经下好的文件**
+      ——"re-run to fill the gaps"实际上会制造新的空洞（实测 194 树里 `init/main.c`
+      变 6 字节乱码、`kernel/fork.c` 变 0 字节，第二次重试又把 5 个好文件打成 6 字节，
+      含本组要读的 `kernel/sched/cpufreq_schedutil.c`，表现为 `step_audit` 抛
+      `UnicodeDecodeError`）。现在改为：先 `acceptable()` 判"是否已是源码"
+      （≥200 B、无 NUL、开头不是 HTML），已合格的文件跳过，下载写进 `*.part`
+      且只有合格才 `mv` 到位。完整树重跑从"重下 53 个文件并可能损坏"变成 1 秒 no-op。
+- [ ] 待验：ABK CI 编译（本批改的是 C，文本审计看不见 `module_param_cb`/`strcmp` 这类
+      编译期问题，AGENTS.md 陷阱 5 的同类风险）。
+
+遗留（超出本模块边界，记录以免重蹈）：FAS 未注册时 mid 簇停在 1785600 这一
+"高位 park"是否由 Scene 的 profile 写死，需要在 Scene 侧核对每簇上限配置；
+内核侧已经做到的是"ABK 绝不参与抢调频"，以及把这件事变成一条命令可查。
+——**本问题已在 Batch 10-6 结案**（就是 Scene 的 limiter 写的）。
+
+### Batch 10-6 落地进度（超大核"不被调用"结案：上限持有者同时在决定放置，v0.17.1）
+
+症状（用户报）：刷机后打开应用时超大核很闲，负载基本落在别的核上。
+设备 Redmi K70（vermeer / SM8550），`5.15.215-202609201-FanZiyun`，无线 adb + su。
+
+**结案链（每一步都是真机实测，不是推理）**
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | ABK 的 floor **在本机是执行的**，本批次一度误判为惰性（已还原并记录） | 三个 policy 的 governor 全是 `walt`，但载荷故意挂在 `android_vh_scheduler_tick` + `android_vh_cpufreq_resolve_freq`（与 governor 无关：见 `scripts/batch10_perf_sched_policy.py` 的模块 docstring 与 `_POLICY_V1` 注释、`late_initcall(abk_sf_init)`）；`/sys/module/cpufreq_schedutil/parameters/abk_sf_*` 存在且 `abk_sf_boosting` **不存在** ⇒ 刷机内核是 v1 载荷，无归属闸门，enable=Y 时会棘轮。真机验证：临时 `echo Y` 后本工具立即 RC=1 并给出修法，`echo N` 复原后 RC=0 |
+| 2 | 谁在钉频：Scene 的 profile，不是 metis、不是内核 | `scene-daemon`（`/data/user/0/com.omarea.vtools/files/scene-daemon`）的 fd 里持有 `policy0/3/7/scaling_max_freq`（写）与 `scaling_cur_freq`（读），外加 `/proc/sys/walt/sched_per_task_boost`、`/dev/cpuset/top-app/3-7/tasks`；`/data/user/0/com.omarea.vtools/files/profile.json` 的 `features.limiter` 逐档给出每簇 `{max,min,margins}`：`idle` 档超大核 max=**1843200**、`inactive` 档 **2092800**、`p1..p4` 2476800/2476800/2726400/2995200（满血 3187200，即 58%~94%） |
+| 3 | **上限会改写调度器眼中的核大小**（这是症状的直接机制） | `schedwalt/update_cpu_capacity` tracepoint 直读：`cpu=7 arch_capacity=1024 thermal_cap=1024 fmax_capacity=277 max_freq=864000 max_possible_freq=3187200 rq_cpu_capacity_orig=277`，同一时刻 `cpu=3 ... rq_cpu_capacity_orig=503..749`。即 **EAS/WALT 的 capacity 按 `scaling_max_freq/cpuinfo_max_freq` 缩放**，上限被压到 27% 的超大核在放置器眼里比中核还小 |
+| 4 | 上限以 ~12.5 Hz 抖动，放置决策读到的是抖动快照 | 4 秒内 `update_cpu_capacity` 137 次、`cpu_frequency_limits` 44 次；超大核 `total_trans` 已达 5.4e5（little 1.3e5、mid 1.0e5），`--sample 10` 实测 trans/s ≈ 64~96 |
+| 5 | 冷启动实测：主线程基本不上 prime | 4 个真实应用（网易云/微信/酷安/高德）冷启动，`sched_find_best_target` 的 `most_spare_cap` 直方图里 app 线程几乎全是 3/4/5/6；`start_cpu=7` 的扫描每次都退回非 prime；主线程 50 ms 采样落在 cpu7 的比例 1/40~16/40；启动瞬间超大核上限常为 729600~998400（23%~31%） |
+| 6 | **A/B 证明归因** | `kill -STOP scene-daemon` + `echo 3187200 > policy7/scaling_max_freq`：该 policy 在整次启动窗口内 `cpu_frequency_limits` **0 次**（上限不再抖动），`rq_cpu_capacity_orig` 稳定 1024；网易云冷启动主线程上 prime 采样 4/36 → **14/37**，`TotalTime` 2661 ms → **2227 ms（−16%）**，cpu7 占用从"最低"变成与中核持平（91% vs 93%）。随后 `kill -CONT`，Scene 已在数秒内重新接管（下一轮 p7 上限又变回 1708800/864000） |
+| 7 | 另有两处 Scene 主动改写、非 ABK | `/proc/sys/walt/sched_upmigrate` 从 `60 95` 变成 `70 70`（实验中途被 Scene 写入，我最后一轮已交还给 Scene）；cpuset：`common_app` = `0-2 / 0-6 / 0-6 / 0-7`、`common_gaming` = `0-2 / 0-5 / 0-5 / 0-7`，实测王者荣耀 236 个线程全在 `top-app/0-5`（物理上碰不到 cpu6/7） |
+
+**本批落地的修法（不越红线：ABK 不抢调频权，只把这件事变成可判定、可回归的观测）**
+
+- [x] `tools/abk_fas_check.sh` 新增**容量翻转判定**：每 policy 计算
+      `cap_view = cpu_capacity × scaling_max_freq / cpuinfo_max_freq`（就是
+      `rq_cpu_capacity_orig`），快照给出 WARN，`--sample` 统计"最大核不再是最大核"
+      的轮询占比，超过 `--invert-pct`（默认 5%）判 **新退出码 4** 并指名去改上限的持有者；
+      表格新增 `ceilings=`（上限换了几个点，看的是"爬升"还是"钉死"）与 `cap_view=min-max`。
+- [x] 修掉上一轮工具自身的两个缺陷（都在真机暴露）：
+      ① 负载门控原来用 `/proc/loadavg`，1 分钟均值滞后会让空转手机被判
+      `FROZEN_UNDER_LOAD`（实测误报）；现在用采样窗口内 `/proc/stat` 的**实测 busy 百分比**
+      （新增 `--min-busy`，默认 5），loadavg 只作上下文打印；
+      ② 轮询太重：`rd()` 原来是 `cat|tr` 两个进程，`policies()`/`cpuinfo_*`/`cpu_capacity`
+      每轮重复读 —— 10 秒窗口只跑 3 轮，改成 `head -n 1` + 常量缓存 `CONSTS`/`POLICY_LIST`
+      后同样 10 秒跑 16 轮；
+      ③ **32 位溢出**：`cpu_capacity × scaling_max_freq` = 855×2803200 = 2.4e9 在 mksh 里
+      溢出成负数（实测 `cap_view=-677`），改为 kHz 先除 1000 再乘，shell 与 awk 两侧同公式；
+      ④ `usage()` 的 `sed -n '2,43p'` 改成 `# ----8<---- end of help` 标记，加选项不再悄悄截断帮助。
+- [x] companion `abk_report_dvfs_state()`：每 policy 增记 `arch=`/`cap_view=`，翻转时 WARN；
+      并把 `abk_sf_enable` 的判定改成诚实的三分支（无 schedutil policy → 惰性，只 log；
+      schedutil policy 被钉 min==max → WARN；否则不提）。**companion v0.5.0 → v0.6.0**。
+- [x] `docs/porting_policy.md` 红线 5 扩写：交出调频权要**同时**交出 `scaling_max_freq`，
+      因为那个节点同时是容量节点；并记录"放置失败是静默的"这一事实。
+- [x] 纠正 `tools/abk_fas_check.sh` 头部、companion README、根 README 里"非 schedutil governor
+      会让 floor 棘轮"的错误说法（本表第 1 行）。
+- [x] 单测 +10 条断言（RC=4 存在、busy 门控取代 loadavg、32 位安全公式、常量出循环、
+      `abk_report_dvfs_state` 的 `cap_view=`/WARN/三分支/glob 路径）；版本 0.17.0 → **0.17.1**。
+- [x] 真机 4 分支回归：healthy→RC=0（`cap inversion: 0/5`）、starved→RC=4（5/5）、
+      ramp（上限来回翻）→RC=4（4/6=66%）且 `--invert-pct 60` 时降为提示 RC=0、
+      live（本机现状）→RC=4（5/16=31%，worst `policy7=548/1024k vs policy3=626/855k`）；
+      companion 报告在真机打印 `arch=/cap_view=` 正常。
+- [x] 门禁：`bash -n`（含 `tools/`、`ksu/*/*.sh`）、`compileall`、单测全绿；
+      本轮未动 registry（`scripts/*.py` 无改动），故沿用上批三档树级结果。
+- [ ] 待验（与上批同一项）：ABK CI 编译。
+
+**交给用户在 Scene 侧的执行项（本模块不能替它改，改了就是抢调频权）**
+
+1. `profile.json` → `features.limiter` 里第三个条目（= `policy7`）的 `max` 提到 3187200，
+   至少保证 `cap_view(超大核) > cap_view(中核)`：即 `max7 > max3 × 1024/855`；
+   `idle/inactive` 两档同样处理（现在分别是 1843200/2092800，是启动瞬间最容易撞到的档）。
+2. `margins` 是 Scene 自己的爬升限速（`"300 1977600:150"`），启动窗口的第一秒正落在
+   它还没爬上去的时候；调小或允许超大核一步到位。
+3. 若希望轻负载用上超大核，`common_app` 的 `@cpuset` 第二/三项（0-6）里至少给一个含 7 的组；
+   游戏档 `common_gaming`（0-5）是刻意把游戏线程关在超大核之外的，那是它的稳帧策略，按需取舍。
+4. `sched_upmigrate` 现在被 Scene 写成 `70 70`（原来是 `60 95`）——这一项本身无害，
+   但在上限不放开的前提下它没有生效机会（实测改阈值对放置无影响，见上批实验）。
+
+回归阈值（下次再看"超大核积极不积极"就按这几条量）：`abk_fas_check.sh --sample 20`
+必须 RC≠4，且 `cap inversion: 0/N polls`；`policy7` 的 `ceilings` 在启动窗口内 ≤3、
+`cap_view` 下界 ≥ 中核 `cap_view` 上界；网易云冷启动 `TotalTime` ≤2300 ms。
+
+
+### Batch 10-6 审查收口（/code-review 两轴：Standards × Spec，fixed point = `beb3b4f`）
+
+审查方式：`git diff HEAD`（16 文件 / +1397）交给两个互不共享上下文的子代理并行做——
+Standards 轴对照 AGENTS.md、docs/group_recipe.md、docs/porting_policy.md 加 Fowler 味道基线；
+Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码里验，不信声明**。
+
+**Standards 轴 3 条硬伤（全部已修）**
+
+| # | 问题 | 为什么是硬伤 | 修法 |
+|---|---|---|---|
+| S1 | 迁移路径只认 v1 一种旧形状 | 带 **Batch 10-2** 载荷（`android_vh_map_util_freq_new` 形状，commit `3cd05e8` 曾上线并编译通过）的树既不匹配当前载荷也不匹配 v1 锚点，却仍匹配 `_TAIL_OLD` ⇒ 走普通插入 ⇒ 同一文件**两份 `abk_sf_*` 定义**，而组状态照样报 `applied`。这正是 group_recipe §2「事务性：部分树不可能构建成功」与 AGENTS.md 陷阱 5 说的那一类：文本门禁全绿，只有编译会炸 | 新增 `has_unknown_policy()`：树里已声明 `static bool abk_sf_enable` 而两种已知形状都不匹配 ⇒ 组返回 `blocked_by_shape` 并**一字不写**；单测用 10-2 形状夹具钉住状态、无写入、且 v1/当前形状不被误伤 |
+| S2 | 只读分区门禁的作用域自相矛盾 | 旧正则把 sysfs 的 `/devices/system/` 也当成 `/system` 分区，逼出 module 脚本里 `devices/*/cpu/` 的 glob 变形；而扫描只走 `module_dir.glob("*.sh")`，**漏掉 embed.conf 打进 `bin/` 的工具**——同一模块里两套规矩，规矩还被绕过了 | 规则改准：`/(vendor|odm|product)\b|(?<!/devices)/system\b`，并把同一套断言扩到归档里的 `bin/*.sh`（含 SELinux 那条）；common.sh / action.sh 里为躲旧正则而写的 glob 全部还原成字面路径 |
+| S3 | 没有随组扩 `tests/smoke.sh` | group_recipe §3 要求"组落了承重标记就扩 smoke 断言"，而 `abk_sf_dvfs_owned` / `abk_sf_boosting` 一条都没有；smoke 的日志断言只比组状态，而载荷默认是**关**的，所以默认状态下"树里是哪一代载荷"完全没有门禁证据 | smoke 增三条标记断言（闸门函数、`= false` 默认、`module_param_cb` 可观测节点），并按 `sublevel_matrix` 的 debt/pre_applied 规则在该基线不该有标记时跳过 |
+
+**Standards 轴判断类**：采纳 4 条 —— `cap_view` 三处公式不一致（现统一为**精确值**：工具与 companion 都用 awk 乘除，可直接与内核 `rq_cpu_capacity_orig` 对照，截断只剩在采样循环内部的相互比较中）；action.sh 内联 `abk_read \| tr` 改用同批新增的 `abk_read_flat`；提示路径由相对 `bin/...` 改成本文件既有约定 `$MODDIR/bin/...`；`_POLICY = _POLICY_V2` 死别名删除，而 `policy_sha256()` 从"导出却没人调用"改成拼进 graft 报告的 detail（载荷文本自身不能带摘要，带上就改变摘要），报告从此直接回答"这次构建写进去的是哪一代载荷"。
+暂缓 2 条并记录理由 —— 载荷注释仍写 "Batch 10-4"（`implementation_audit.py` 把这行当承重钉在用，改名收益低于风险）；big/others 容量比较级联在三处重复（POSIX sh 没有跨文件共享库，强行抽出会造出 `tools/` 依赖 `common.sh` 的假耦合）。
+
+**Spec 轴 5 条**
+
+- **P1（缺失，已补）**：我声称扩写了 `docs/porting_policy.md` 红线 5，实际文件里只有 10-5 的旧文本——**这条当时根本没写进去**。现已写真：`scaling_max_freq` 同时是容量节点，以及"放置失败是静默的，没有任何节点会报告这个核不可选"。
+- **P2（本批最严重）**：Batch 10-6 的"更正"本身是错的（见上一节的证据行 1）。它让一份未提交的批次里同时存在两种矛盾叙述：工具/README/plan 说"惰性"，而载荷 docstring、`_POLICY_V1` 注释、10-5 自己的 A/B 说"会执行"。现已全部收敛为一种说法，并补上可操作的判别法（`abk_sf_boosting` 是否存在）。
+- **P3（真机缺陷，已修）**：工具采样临时文件写死 `${TMPDIR:-/data/local/tmp}`，在没有该目录的测试机上被 `set -e` 直接打死 ⇒ 改为 TMPDIR → /data/local/tmp → /tmp → `.` 取第一个存在者。
+- **P4**：即 S1，两轴各自独立发现同一件事。
+- **P5（范围，保留）**：action.sh 的 "dvfs owners" / "fas health" 两行不在任何声明里，属小幅扩围；保留，因为它们是 companion 的展示面且全程只读。
+
+**门禁与真机**
+
+- `compileall` 0、`bash -n` 0、单测全绿（含 S1/S2/S3 的新钉）；`step_audit` / `implementation_audit` / `smoke` 在 **167 / 178 / 194** 三档全绿（本批动了 registry：新增形状守卫与载荷注释，故重跑）。
+- 新增一道**设备 shell 语法门**，并已写进 AGENTS.md 的 Verification 节：`tools/*.sh` 与 `ksu/**/*.sh` 必须额外过真机 `sh -n`。理由是本批实测——单引号 awk 程序里一个撇号（`module's`）提前终结了字符串，`bash -n` 放过、本地全绿，设备上第一次进采样循环就 `syntax error: unexpected '('`。构建机专用脚本（`abk_rollback.sh` 等）按 `#!/usr/bin/env bash` 设计排除。
+- 真机回归（Redmi K70）：healthy ⇒ RC=0 且 `cap_view=1024` 精确、starved ⇒ RC=4（277 vs 749）、**armed v1 载荷 ⇒ RC=1 并给出修法**、复原 ⇒ RC=0、companion 报告 `arch=` / `cap_view=` 正常。
+- 载荷指纹：v1 锚点 `5b341516e8ca1e56` **未变**（逐字节冻结仍然成立），当前载荷 `4e2a7a19be82aba2`。
+
+**ABK CI（本批的编译验，`待验` 项）**：按 run `34517053732` 的**完全相同输入**在 `fanziyun/ABK` 的 `dev` 分支重新派发 `Android 内核构建-自定义`（workflow id 276392595；android13 / 5.15 / X / lts / ksu None / zram+full_algo / ntsync / virt 678 / 同一条 7 段 `custom_external_modules`）。CI 克隆本仓库默认分支，故必须先推送 `main`。
+构建结果：待记录。
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 

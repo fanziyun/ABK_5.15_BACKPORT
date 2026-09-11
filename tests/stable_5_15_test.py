@@ -758,7 +758,7 @@ def test_batch10_zram_async_recompress():
 
 
 def test_batch10_sched_smart_policy():
-    print("Batch 10-4 schedutil_smart_policy (governor-independent)")
+    print("Batch 10-5 schedutil_smart_policy (DVFS-ownership gated)")
     import abk_stable_perf as perf
     import batch10_perf_sched_policy as s10
 
@@ -768,27 +768,118 @@ def test_batch10_sched_smart_policy():
     if group is None:
         return
 
-    sched = s10._INC_OLD + "void governor(void);\n" + s10._TAIL_OLD
+    rel = "kernel/sched/cpufreq_schedutil.c"
+    pristine = s10._INC_OLD + "void governor(void);\n" + s10._TAIL_OLD
+    # What Batch 10-4c leaves in a tree it already grafted: its include block
+    # plus its payload appended after the governor init.
+    v1_tree = (s10._INC_V1 + "void governor(void);\n" + s10._TAIL_OLD
+               + s10._POLICY_V1)
+
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {"kernel/sched/cpufreq_schedutil.c": sched})
+        ctx = make_ctx(tmp, {rel: pristine})
         status, detail = perf._sched_smart_policy_apply(ctx)
         check("sched smart-policy fixture applies all steps",
               status == "applied", (status, detail))
-        text = ctx.read("kernel/sched/cpufreq_schedutil.c")
-        check("policy samples util from the scheduler tick",
-              "register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL)"
-              in text and "cpu_util_cfs(rq)" in text)
-        check("policy applies its floor at cpufreq resolve time",
-              "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,"
-              in text)
-        check("policy no longer depends on a schedutil-only hook",
-              "register_trace_android_vh_map_util_freq_new" not in text)
-        check("policy carries the runtime enable knob",
-              "abk_sf_enable" in text)
-        ctx2 = make_ctx(tmp, {"kernel/sched/cpufreq_schedutil.c": text})
+        text = ctx.read(rel)
+        for name, cond in {
+            "policy samples util from the scheduler tick":
+                "register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL)"
+                in text and "cpu_util_cfs(rq)" in text,
+            "policy applies its floor at cpufreq resolve time":
+                "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,"
+                in text,
+            "policy no longer depends on a schedutil-only hook":
+                "register_trace_android_vh_map_util_freq_new" not in text,
+            "policy ships disabled so FAS/WALT keeps DVFS":
+                "static bool abk_sf_enable = false;" in text,
+            "policy refuses to speak to a foreign governor or a pinned range":
+                'strcmp(policy->governor->name, "schedutil") != 0' in text
+                and "if (abk_sf_dvfs_owned(policy) || policy->min == policy->max)"
+                in text,
+            "a floor without headroom is never applied":
+                "if (floor <= policy->min || floor >= policy->max)" in text
+                and "floor = policy->max" not in text,
+            "the sustained window slides instead of banking boost time":
+                "if (util * 100 < cap * ABK_SF_SUSTAINED_PCT) {" in text
+                and "} else if (util * 100 < cap * ABK_SF_EXIT_PCT) {"
+                not in text,
+            "the reason also expires at resolve time (NO_HZ_IDLE)":
+                "static bool abk_sf_cpu_boosting(int cpu)" in text
+                and "time_after(jiffies, c->boost_release)" in text,
+            "the reason state is observable read-only":
+                "module_param_cb(abk_sf_boosting, &abk_sf_boosting_ops, "
+                "NULL, 0444);" in text,
+        }.items():
+            check(name, cond)
+        check("the payload lands exactly once",
+              text.count("static bool abk_sf_enable") == 1,
+              text.count("static bool abk_sf_enable"))
+        # module_param(NAME, ...) compiles the identifier NAME as the variable,
+        # so every one-name form must really declare it (ABK CI caught the
+        # counterexample once already; text audits cannot see this class).
+        declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", text))
+        for name in re.findall(r"(?m)^module_param\((\w+),", text):
+            check(f"one-name module_param {name!r} really declares that variable",
+                  name in declared, (name, sorted(declared)))
+        ctx2 = make_ctx(tmp, {rel: text})
         status2, _detail2 = perf._sched_smart_policy_apply(ctx2)
         check("sched smart-policy fixture is idempotent",
               status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {rel: v1_tree})
+        status, detail = perf._sched_smart_policy_apply(ctx)
+        check("a Batch 10-4c tree is upgraded in place",
+              status == "applied" and "upgraded" in detail, (status, detail))
+        text = ctx.read(rel)
+        check("the upgrade leaves one payload, already at the current shape",
+              text.count("static bool abk_sf_enable") == 1
+              and s10.has_current_policy(text)
+              and not s10.needs_legacy_upgrade(text),
+              text.count("static bool abk_sf_enable"))
+        check("the upgrade does not duplicate the include block",
+              text.count("#include <linux/string.h>") == 1
+              and text.count("#include <trace/hooks/cpufreq.h>") == 1,
+              text.count("#include <trace/hooks/cpufreq.h>"))
+        ctx2 = make_ctx(tmp, {rel: text})
+        status2, _d2 = perf._sched_smart_policy_apply(ctx2)
+        check("the upgraded tree is idempotent",
+              status2 == "already_present", status2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Why the upgrade branch exists: the plain insert anchors on the line
+        # the payload was appended to, which still matches -- so it would
+        # define the policy a second time and fail the compile.
+        ctx = make_ctx(tmp, {rel: v1_tree})
+        perf.apply_steps(ctx, s10.build_steps())
+        copies = ctx.read(rel).count("static bool abk_sf_enable")
+        check("the upgrade branch is load-bearing (plain insert duplicates)",
+              copies == 2, copies)
+
+        # Batch 10-2 grafted this group once with a payload that matches neither
+        # migration anchor, and its `_TAIL_OLD` anchor survives there too.  The
+        # same duplication would happen silently, so an unnamed shape must be
+        # refused rather than "applied".
+        b10_2 = (s10._INC_V1 + "void governor(void);\n" + s10._TAIL_OLD
+                 + "\n/*\n * ABK stable_515_backport: Batch 10-2 sched"
+                 " smart-freq policy (PELT).\n */\n"
+                 "static bool abk_sf_enable = true;\n"
+                 "register_trace_android_vh_map_util_freq_new(abk_sf_sample, NULL);\n")
+        check("the Batch 10-2 shape is detected as unnamed",
+              s10.has_unknown_policy(b10_2)
+              and not s10.has_legacy_policy(b10_2)
+              and not s10.has_current_policy(b10_2))
+        ctx = make_ctx(tmp, {rel: b10_2})
+        status_u, detail_u = perf._sched_smart_policy_apply(ctx)
+        check("an unnamed payload shape is refused, not applied",
+              status_u == "blocked_by_shape" and "unrecognised" in detail_u,
+              (status_u, detail_u))
+        check("and the refusal writes nothing",
+              ctx.pending_writes() == [], ctx.pending_writes())
+        check("the v1 and current shapes are not treated as unnamed",
+              not s10.has_unknown_policy(v1_tree)
+              and not s10.has_unknown_policy(pristine)
+              and not s10.has_unknown_policy(s10._POLICY_V2))
 
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {})
@@ -1509,9 +1600,16 @@ def test_runtime_tunables_module():
     check("companion ships inside the kernel zip, not via an app download",
           len(core_row) >= 12 and core_row[10] == "" and core_row[11] == "",
           core_row[10:12])
-    check("both module.conf versions were bumped for the companion",
-          'ABK_MODULE_VERSION="0.16.0"' in conf
-          and 'ABK_MODULE_SET_VERSION="0.16.0"' in conf)
+    # The companion rides the kernel module's version: it is bundled into the
+    # same zip, so a release that bumps one and not the other would ship a
+    # module.prop that disagrees with module.conf.  Releasing means updating
+    # the expected version below -- that is deliberate, it is the touch point
+    # that makes an unreleased version drift visible instead of silent.
+    _versions = re.findall(r'^ABK_MODULE_(?:SET_)?VERSION="([^"]+)"', conf, re.M)
+    check("both module.conf versions move together",
+          len(_versions) == 2 and _versions[0] == _versions[1], _versions)
+    check("module.conf carries the released version",
+          _versions == ["0.17.1", "0.17.1"], _versions)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -1526,6 +1624,32 @@ def test_runtime_tunables_module():
           'ABK_ZRAM_SECONDARY="zstd"' in common_sh)
     check("the dominated lz4hc is never selected as a policy value",
           not re.search(r'(?m)^\s*ABK_ZRAM_\w+="lz4hc"', common_sh + policy))
+
+    # The DVFS ownership report (Batch 10-5/10-6).  A cluster's *placement
+    # weight* is its DMIPS capacity scaled by the ceiling somebody else wrote to
+    # scaling_max_freq, which is how a userspace limiter ends up deciding that
+    # the super core never runs an app launch.  Without that number in the boot
+    # log the symptom has nothing to start from.
+    dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):
+                     common_sh.index("abk_apply_readahead_knob() {")]
+    check("the DVFS report logs the capacity the placer sees",
+          "cap_view=" in dvfs and "_rs_capv" in dvfs)
+    check("the DVFS report warns when the super core is no bigger than a weaker cluster",
+          "is capped to" in dvfs and "abk_warn" in dvfs)
+    check("the smart-freq floor warns per payload generation, not per governor name",
+          "_rs_foreign" in dvfs and "_rs_pinned" in dvfs
+          and "pre-10-5 payload" in dvfs and "abk_sf_boosting node" in dvfs)
+    check("the DVFS capacity math goes through abk_mul_div, not shell arithmetic",
+          'abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax"' in dvfs)
+    # Comments may name the path they are avoiding; only the code must not.
+    dvfs_code = "\n".join(l for l in dvfs.splitlines()
+                          if not l.lstrip().startswith("#"))
+    # The report reads sysfs by design; what must never appear is an Android
+    # partition path.  That is the precise rule, and it is the sweep over every
+    # installed script (including bin/) below that enforces it.
+    check("the DVFS report reads plain sysfs paths",
+          "/devices/system/cpu/cpufreq/policy" in dvfs_code
+          and "/devices/system/cpu/cpu" in dvfs_code)
 
     takeover = policy[policy.index("abk_zram_takeover() {"):policy.index("abk_zram_reassert() {")]
     takeover_order = [takeover.index(token) for token in
@@ -1635,11 +1759,19 @@ def test_runtime_tunables_module():
           "cfr.group" in common_sh
           and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
 
+    # "Never touches a read-only partition" is about the Android partitions
+    # (/system, /vendor, /odm, /product).  /sys/devices/system/... is sysfs, which
+    # this module reads and writes by design, so it must not match -- an earlier
+    # form of this regex did, and module code was contorted into globs to dodge
+    # it.  With the rule precise, the sweep can and must cover the tools this
+    # module ships in bin/ as well: once installed they are module code too.
+    ro_path = re.compile(r"/(?:vendor|odm|product)\b|(?<!/devices)/system\b")
     for script in sorted(module_dir.glob("*.sh")):
         body = script.read_text(encoding="utf-8")
         code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
         check(f"{script.name} never touches a read-only partition",
-              not re.search(r"/(vendor|odm|product|system)\b", code))
+              ro_path.search(code) is None,
+              ro_path.search(code).group(0) if ro_path.search(code) else "")
         check(f"{script.name} never relaxes SELinux",
               "setenforce" not in code and "permissive" not in code.lower())
 
@@ -1672,10 +1804,39 @@ def test_runtime_tunables_module():
             check("embedded reclaim tool is byte-identical to tools/",
                   archive.read("bin/cached_freeze_reclaim.sh")
                   == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
-            check("embed.conf contributes exactly the two device tools",
+            check("embed.conf contributes exactly the three device tools",
                   sorted(name for name in names if name.startswith("bin/"))
-                  == ["bin/cached_freeze_reclaim.sh",
+                  == ["bin/abk_fas_check.sh",
+                      "bin/cached_freeze_reclaim.sh",
                       "bin/zram_recompress_trigger.sh"])
+            check("embedded FAS check tool is byte-identical to tools/",
+                  archive.read("bin/abk_fas_check.sh")
+                  == (repo / "tools" / "abk_fas_check.sh").read_bytes())
+            # Installed under bin/, these are module code as much as service.sh
+            # is, so the same two invariants apply to them.
+            for _bin in sorted(n for n in names if n.startswith("bin/")):
+                _bin_code = "\n".join(
+                    line.split("#", 1)[0]
+                    for line in archive.read(_bin).decode("utf-8").splitlines())
+                check(f"{_bin} never touches a read-only partition",
+                      ro_path.search(_bin_code) is None,
+                      ro_path.search(_bin_code).group(0)
+                      if ro_path.search(_bin_code) else "")
+                check(f"{_bin} never relaxes SELinux",
+                      "setenforce" not in _bin_code
+                      and "permissive" not in _bin_code.lower())
+            _fas_tool = archive.read("bin/abk_fas_check.sh").decode("utf-8")
+            check("the shipped FAS check ranks clusters by the capacity the placer sees",
+                  "cap_view" in _fas_tool and "const_for" in _fas_tool)
+            check("the shipped FAS check has its own exit code for a starved super core",
+                  "flag 4" in _fas_tool
+                  and "capped out of the placement decision" in _fas_tool)
+            check("the shipped FAS check judges load by measured busy time, not loadavg",
+                  '(busy + 0 < minbusy + 0) ? "PARKED_IDLE" : "FROZEN_UNDER_LOAD"' in _fas_tool)
+            check("the shipped FAS check scales capacity through awk, not 32-bit shell math",
+                  "a * f / m" in _fas_tool and "$2 / 1000) * $1" not in _fas_tool)
+            check("the shipped FAS check caches the constants out of the sample loop",
+                  "POLICY_LIST=" in _fas_tool and "head -n 1" in _fas_tool)
             modes = {info.filename: (info.external_attr >> 16) & 0o777
                      for info in archive.infolist()}
             check("every module script is 0755",

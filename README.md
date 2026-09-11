@@ -133,7 +133,24 @@ compressor on the dominated `lz4hc` before `disksize` — after which the node i
   (this is the only part that is on by default);
 * it reports — or optionally applies — the remaining runtime knobs: MGLRU, THP,
   `vm.swappiness`, the schedutil smart-freq policy, dynamic readahead and
-  cgroup-v1 proactive reclaim. See the module's [README](ksu/abk_runtime_tunables/README.md)
+  cgroup-v1 proactive reclaim;
+* it records **who owns CPU frequency** at boot: one log line per cpufreq policy
+  (governor, `cur/min/max`, `total_trans`, DMIPS `arch`, and `cap_view`) plus the
+  kernel's FAS registration (`/proc/fas`).  `cap_view` is the policy's capacity as
+  the scheduler ranks by it — DMIPS scaled by `scaling_max_freq / cpuinfo_max_freq`
+  — so the line also shows what a *ceiling* holder is doing to **placement**: a
+  super core capped to a third of its frequency is a core the EAS/WALT placer
+  will not pick for an app launch (Batch 10-6, measured on SM8550).  It warns when
+  that inversion is live, and separately when `abk_sf_enable` is armed while some
+  policy is foreign-governored or pinned at `min == max`: fatal for a pre-10-5
+  payload, whose floor is reached through the governor-independent `android_vh`
+  hooks and ratchets such a cluster to its ceiling anyway (the measured
+  1785600-with-`walt`-computing-766-MHz case), while the Batch 10-5 payload stands
+  down there by its ownership gate and the knob ships off. The bundled
+  `bin/abk_fas_check.sh` answers the same questions on demand, including a
+  load/decay probe that tells a healthy single-point owner apart from a lock, and
+  its own exit code (4) for a super core capped out of the placement decision.
+  See the module's [README](ksu/abk_runtime_tunables/README.md)
   for the algorithm measurements, the knob table and the trade-offs.
 
 It is a distribution asset, not a graft: no `PatchGroup`, no kernel-tree writes.

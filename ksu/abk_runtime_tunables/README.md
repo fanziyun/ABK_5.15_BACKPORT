@@ -127,7 +127,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `lru_gen.enable` | `0` | `1` turns MGLRU on (kernel has the code, ships it off) |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
-| `sched.abk_sf_enable` | *(empty)* | `0`/`1` |
+| `sched.abk_sf_enable` | `0` | the smart-freq floor; leave at `0` whenever a vendor FAS/WALT governor owns DVFS (see below) |
 | `sched.abk_sf_floor_pct` | *(empty)* | 0..100 |
 | `sched.abk_sf_sustained_ms` | *(empty)* | 1..60000 |
 | `sched.abk_sf_exit_ms` | *(empty)* | 1..60000 |
@@ -140,10 +140,45 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
 **Measure before you enable the opt-in knobs.** `lru_gen`, `thp` and
-`swappiness` change global reclaim behaviour; `abk_sf` may over-boost on a
-kernel booted with `sysctl.kernel.sched_pelt_multiplier=4` (the policy clamps
-`util` to `capacity`, so the 90%-sustained test can saturate -- check whether
-`scaling_cur_freq` sits at the floor permanently before leaving it armed).
+`swappiness` change global reclaim behaviour.
+
+`abk_sf` (the Batch 10-4/10-5 schedutil smart-freq floor) ships disabled because
+of what was measured here, not because of a theory.  A FAS-style owner keeps
+`min == max == its own target`, and the floor is clamped to `policy->max`, so on
+such a policy "raise to the floor" degenerates into "keep the frequency already
+applied" and every downscale is cancelled.  That is *not* avoided by the tree
+running a foreign governor: the policy samples in `android_vh_scheduler_tick` and
+applies in `android_vh_cpufreq_resolve_freq`, both reached whichever governor owns
+the policy.  Which is how the first shipped form (Batch 10-4c -- still what a
+pre-10-5 kernel runs) froze a cluster at 1785600 for a whole game session while
+`waltgov` computed 766 MHz from 22% demand, and why Batch 10-5 added
+`abk_sf_dvfs_owned()` to make a current payload stand down there.  The two payload
+generations are tellable apart from userspace: only 10-5 exposes the read-only
+`abk_sf_boosting` node.
+
+The same ceiling reaches *placement*, which no frequency check can see.  EAS and
+WALT rank cores by DMIPS capacity scaled by the policy's own ceiling, so whoever
+writes `scaling_max_freq` also decides how big each core looks.  Measured on
+SM8550 with a userspace scheduler profile in play: the super core's capacity
+became `277 of 1024` while the mid cluster stood at `749 of 855`, and across 10 s
+windows the super core was **no bigger than a mid core in a third to a half of the
+polls** -- so app launches ran on the mid cluster and the prime sat at its floor
+with nothing on it.  The fix belongs to whoever writes that ceiling (raise the
+super core's ceiling in the profile, or stop the profile writing
+`policy*/scaling_max_freq`); no governor change and nothing in this module can
+undo an inverted capacity ranking.
+
+The module logs both pictures at boot (`dvfs: ...`, one line per policy, with
+`arch=` the DMIPS capacity and `cap_view=` the scaled one, plus `/proc/fas`),
+warns when the biggest core is not the biggest core on offer, and warns -- fatally
+for a pre-10-5 payload, which has no ownership gate -- when `abk_sf_enable=Y` is
+armed while some policy is foreign-governored or pinned at `min == max`.  It ships
+`bin/abk_fas_check.sh`, which decides between a healthy single-point owner and a
+lock -- `--sample N` over a real workload (it counts the polls where the capacity
+inversion is live and exits 4 when that share reaches `--invert-pct`, default 5%),
+or `--probe` to apply load and confirm the frequency comes back down.  Only arm
+`abk_sf` on a device whose governor really is `schedutil`, and re-check with
+`--probe` after.
 
 The compaction gate exists because of a measured kill-storm on device: after an
 app-cleaner killed every user process, `mm_stat` showed `mem_used_total` 352 MB

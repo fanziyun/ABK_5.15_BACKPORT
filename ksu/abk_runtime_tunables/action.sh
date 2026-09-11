@@ -101,6 +101,23 @@ abk_status_report() {
     "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sf_enable"
   abk_show_or_absent "abk_sf_floor_pct" \
     "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sf_floor_pct"
+  # Batch 10-5 exposes which CPUs currently hold the sustained-high reason, so
+  # the floor can be diagnosed without inferring it from frequencies.
+  abk_show_or_absent "abk_sf_boosting" \
+    "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sf_boosting"
+  abk_show "fas registration" \
+    "$(abk_read "$ABK_FAS_NODE" | tr -d '\n')$( [ -e "$ABK_FAS_NODE" ] || echo ' (no /proc/fas: not a FAS kernel)')"
+  _sr_dvfs=""
+  for _sr_p in "$ABK_SYS_ROOT"/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$_sr_p" ] || continue
+    _sr_dvfs="$_sr_dvfs ${_sr_p##*/}=$(abk_read_flat "$_sr_p/scaling_governor")/$(abk_read_flat "$_sr_p/scaling_cur_freq")"
+  done
+  abk_show "dvfs owners" "${_sr_dvfs# }"
+  # abk_fas_check.sh answers "park or lock?" and "is the super core still the
+  # biggest core on offer?"; the latter needs the ceiling the placer reads, which
+  # is why the boot report above logs cap_view per policy.
+  abk_show "fas health" \
+    "$MODDIR/bin/abk_fas_check.sh --sample 20 (exit 1 = a policy looks pinned, 4 = the super core is capped out of placement)"
   abk_show "pelt multiplier" \
     "$(sed -n 's/.*sysctl\.kernel\.sched_pelt_multiplier=\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null)"
   abk_show "mmd.setup_complete" "$(abk_getprop mmd.setup_complete)"

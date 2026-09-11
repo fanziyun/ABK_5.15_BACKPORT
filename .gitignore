@@ -8,3 +8,5 @@ build/
 research/hunks_dump.txt
 .idea/
 .zcode/
+
+.commandcode/

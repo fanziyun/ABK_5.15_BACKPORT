@@ -23,6 +23,42 @@
    group to `partial`. Unknown shapes on the hard fdtable group abort the
    build with a precise message (same protection style as the ABI suite's
    `fd_alloc_hotpath`).
+5. **Never take DVFS ownership that the tree already has.** A frequency
+   *floor* is only meaningful while the owner of the policy still leaves
+   headroom. A FAS-style owner (vendor WALT/FAS, e.g. driven by a scheduler
+   profile such as Scene's `sceneFAS`) requests `min == max == its own target`
+   on every change, so a floor clamped to `policy->max` re-states the
+   frequency that is already applied: the cluster can go up and can never come
+   down. Note that this is *not* avoided by the tree running a foreign
+   governor: the policy samples in `android_vh_scheduler_tick` and applies in
+   `android_vh_cpufreq_resolve_freq`, both reached whatever the governor is, so
+   an armed pre-10-5 floor ratchets a `walt` policy too — which is what was
+   measured on kalama (SM8550): `waltgov_next_freq` computed 766 MHz for a
+   cluster at 22% demand while it held 1785600 for a whole game session, and
+   the pin released when the knob was turned off. `schedutil_smart_policy` is
+   therefore disabled by default, and the payload refuses to act unless the
+   governor really is `schedutil` and the range really is a range;
+   `floor >= policy->max` (or `<= policy->min`, which cpufreq's own clamp
+   already satisfies) is a no-op by construction. A grafted tree can be told
+   from an ungrafted one from userspace because the 10-5 payload also exposes
+   the read-only `abk_sf_boosting` node.
+   `tools/abk_fas_check.sh` (shipped as `bin/abk_fas_check.sh`) is the
+   read-only check that tells a healthy single-point owner from a lock.
+
+   The same rule reaches further than frequency, and that is the part to
+   internalise before adding any cpufreq-adjacent group: **`scaling_max_freq` is
+   also a capacity node.** EAS and WALT scale a policy's reported capacity by
+   `scaling_max_freq / cpuinfo_max_freq` (the `fmax_capacity` /
+   `rq_cpu_capacity_orig` pair of the `update_cpu_capacity` tracepoint), so
+   whoever owns that ceiling is editing *placement* as well — cap a super core
+   at 27% of its frequency and the placer sees a core smaller than the mid
+   cluster and stops putting work on it, at any util. Measured on the same
+   device: `rq_cpu_capacity_orig` of the prime policy crawled 277 → 400 → 549 →
+   672 of 1024 while the mid cluster stood at 586-750, and the super core was
+   the smaller core on offer in 5 of 16 sampled polls. A group that lifts such a
+   ceiling to help throughput would be stealing that ownership, and **placement
+   failure is silent**: unlike a frequency, no node reports "this core was
+   never eligible", so it can only be seen by comparing the scaled capacities.
 
 ## 6.1-origin line (Batch 3+)
 
