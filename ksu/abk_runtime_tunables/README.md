@@ -176,7 +176,10 @@ armed while some policy is foreign-governored or pinned at `min == max`.  It shi
 `bin/abk_fas_check.sh`, which decides between a healthy single-point owner and a
 lock -- `--sample N` over a real workload (it counts the polls where the capacity
 inversion is live and exits 4 when that share reaches `--invert-pct`, default 5%),
-or `--probe` to apply load and confirm the frequency comes back down.  Only arm
+or `--probe` to apply load and confirm the frequency comes back down.  It also
+refuses to read a quiet `abk_sf_enable=N` as safety on a pre-10-5 payload: the
+knob is runtime-only there, so a reboot can re-arm an ungated floor (pin
+`sched.abk_sf_enable=0` in this file instead).  Only arm
 `abk_sf` on a device whose governor really is `schedutil`, and re-check with
 `--probe` after.
 

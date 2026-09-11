@@ -236,6 +236,23 @@ case "$SF_ENABLE" in
       fi
     fi
     ;;
+  *)
+    # The knob is runtime-only, so an off reading is not a durable state.  On a
+    # 10-5 payload that is harmless (rebooting back to Y still stands down on
+    # foreign-governored or pinned policies).  On a pre-10-5 payload it is not:
+    # there is no ownership gate, and trees grafted before the default flipped
+    # to N boot with the floor armed again -- the exact FAIL condition above,
+    # dormant until the next reboot.
+    if [ ! -e "$SF_PARAMS/abk_sf_boosting" ]; then
+      echo "WARN: abk_sf_enable reads $SF_ENABLE (off) but this is a pre-10-5 payload" \
+           "(no abk_sf_boosting node), so the off state is runtime-only."
+      echo "      If this build's compiled default is Y (every graft before the 10-5"
+      echo "      default flip), the next reboot re-arms an ungated floor.  Pin it in"
+      echo "      the runtime module (sched.abk_sf_enable=0 in tunables.conf) or graft"
+      echo "      the 10-5 payload."
+      flag 1
+    fi
+    ;;
 esac
 
 # --- 2. per-policy single-point check --------------------------------------

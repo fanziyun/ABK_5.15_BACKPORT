@@ -584,7 +584,10 @@ WALT/FAS 设备上真的活了，然后立刻变成缺陷。全部结论来自�
       每轮重复读 —— 10 秒窗口只跑 3 轮，改成 `head -n 1` + 常量缓存 `CONSTS`/`POLICY_LIST`
       后同样 10 秒跑 16 轮；
       ③ **32 位溢出**：`cpu_capacity × scaling_max_freq` = 855×2803200 = 2.4e9 在 mksh 里
-      溢出成负数（实测 `cap_view=-677`），改为 kHz 先除 1000 再乘，shell 与 awk 两侧同公式；
+      溢出成负数（实测 `cap_view=-677`）。第一版改成 kHz 先除 1000 再乘，但那会在某些
+      点上与内核的整数商（`arch × max / imax`）截断不一致；最终形态两侧都走 awk 精确
+      乘除——工具 `cap_view()` 与 companion `abk_mul_div()` 同一公式——真机夹具
+      855/949/1188 全对；
       ④ `usage()` 的 `sed -n '2,43p'` 改成 `# ----8<---- end of help` 标记，加选项不再悄悄截断帮助。
 - [x] companion `abk_report_dvfs_state()`：每 policy 增记 `arch=`/`cap_view=`，翻转时 WARN；
       并把 `abk_sf_enable` 的判定改成诚实的三分支（无 schedutil policy → 惰性，只 log；
@@ -685,11 +688,18 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 由 `policy_sha256()` 自验），所以编译结论对 HEAD 成立。此后仅 `plan.md`
 这类不进产物的文件再变化时，不再需要重跑。
 
-- [~] 设备侧 shell 门（AGENTS.md 新增的 `sh -n`）最后一次**没能重跑**：手机侧无线调试
-      在记录 CI 结果期间掉线，`adb devices` / `adb mdns services` 都空了，需要用户在
-      开发者选项里重新开启无线调试或改用 USB。该次改动只在 `tools/abk_fas_check.sh`
-      头部 `#` 注释块内（数字 586-750 → 585-749），不是被引号包裹的字符串内部，
-      解析风险为零；但按新规则仍应补跑一次 `sh -n` + 两个容量夹具。
+- [x] 设备侧 shell 门（AGENTS.md 新增的 `sh -n`）已在无线调试重连后补跑，对 HEAD
+      （含其后注释块改动，及本轮 off 分支新逻辑）：`su -c 'sh -n'` RC=0；容量夹具
+      `855×2803200/2803200=855`、`1024×2956800/3187200=949`、溢出位
+      `855×2803200/2016000=1188`、非数字输入 →0，四条全对；`--sample 8`（就是当初
+      awk 撇号炸掉的那条循环路径）与 `--probe`（4s 加载 + 8s 衰减）均走通、RC=0。
+      本机快照：三 policy 全 `walt`、`/proc/fas` uid:0、`abk_sf_enable=N`，无钉死无翻转。
+- [x] 补跑时确认并修掉工具的一处口径缺口：`abk_sf_enable` 读出 off 时工具原先完全沉默，
+      但那是**运行时状态**——10-5 之前的载荷没有所有权门控，而默认翻 N 之前的构建重启就
+      重新武装。现在 off 分支在缺 `abk_sf_boosting` 节点（即 pre-10-5 载荷）时 WARN 并
+      `flag 1`，指向 `tunables.conf` 的 `sched.abk_sf_enable=0` 或升级载荷；10-5 载荷上
+      保持静默（本机实测：`enable=N` + `boosting` 节点存在 → 无 WARN、RC=0，正是设计意图）。
+      单测加钉（`runtime-only` / `no abk_sf_boosting node`）。
 
 顺带一条副产品：这次构建的是 **android13-5.15-lts（SUBLEVEL 已被 ABK 解析为 X）**，
 也就是本仓库 `sublevel_matrix.py` 还没有 216 条目的那条线——载荷在它上面 applied

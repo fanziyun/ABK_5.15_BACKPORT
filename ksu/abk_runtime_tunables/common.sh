@@ -5,7 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.6.0"
+ABK_VERSION="v0.6.1"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device

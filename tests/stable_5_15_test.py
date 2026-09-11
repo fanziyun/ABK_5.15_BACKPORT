@@ -1828,6 +1828,9 @@ def test_runtime_tunables_module():
             _fas_tool = archive.read("bin/abk_fas_check.sh").decode("utf-8")
             check("the shipped FAS check ranks clusters by the capacity the placer sees",
                   "cap_view" in _fas_tool and "const_for" in _fas_tool)
+            check("the shipped FAS check says an off smart-freq knob is runtime-only on a pre-10-5 payload",
+                  "runtime-only" in _fas_tool
+                  and "no abk_sf_boosting node" in _fas_tool)
             check("the shipped FAS check has its own exit code for a starved super core",
                   "flag 4" in _fas_tool
                   and "capped out of the placement decision" in _fas_tool)
