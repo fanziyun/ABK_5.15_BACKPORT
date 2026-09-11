@@ -683,16 +683,18 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 | `a1d38d8` | 更正启动采样计数 + 记录本结果 | 34591231732 | **success**（job 103236756742） |
 | `8b8bf5d` | 两处注释/文档里的数字对齐 | 34593035429 | **success**（job 103242443028） |
 | `5692b56` | 补跑设备门 + 工具 off 分支（`tools/` 进产物，载荷不动） | 34599579302 | **success**（job 103263329417） |
+| `a50df6e` | 真机 status 快照揪出的 awk `%d` 钳位修复，companion **v0.6.2**（`common.sh` + 进包的 `tools/cached_freeze_reclaim.sh`，载荷不动） | 34611016147 | **success** |
 
-最后一跑（构建 `5692b56`，日志 `head_log` 行确认模块克隆就停在这个提交）的日志：`[ABK module] version: 0.17.1`、
+第四跑（构建 `5692b56`，日志 `head_log` 行确认模块克隆就停在这个提交）的日志：`[ABK module] version: 0.17.1`、
 `stable_perf_backport/schedutil_smart_policy: applied`、
 `stable_perf_backport: {already_present: 5, applied: 7, blocked_by_shape: 1}`、
 `ok: abk_runtime_tunables is bundled and its installer block is present`（这次随包打进的是
 companion **v0.6.1**），过滤掉工作流自身回显之后编译诊断计数为 **0**——全日志唯一含
 `error:` 的行是 `continue_on_error: false` 的配置回显。
-四次构建的载荷指纹都是 `4e2a7a19be82aba2`：`git diff a48d069..HEAD -- scripts/` 为空，
+前四次构建的载荷指纹都是 `4e2a7a19be82aba2`：`git diff a48d069..HEAD -- scripts/` 为空，
 载荷字节未变（`5692b56` 改的是进包的 `tools/` 与 companion 版本号，不触载荷），
-所以编译结论对 HEAD 成立。此后仅 `plan.md`
+所以编译结论对 HEAD 成立。第五跑（`a50df6e`，v0.6.2）同样核验了这条 diff 为空，
+指纹链延续成立。此后仅 `plan.md`
 这类不进产物的文件再变化时，不再需要重跑。
 
 - [x] 设备侧 shell 门（AGENTS.md 新增的 `sh -n`）已在无线调试重连后补跑，对 HEAD
@@ -707,6 +709,42 @@ companion **v0.6.1**），过滤掉工作流自身回显之后编译诊断计数
       `flag 1`，指向 `tunables.conf` 的 `sched.abk_sf_enable=0` 或升级载荷；10-5 载荷上
       保持静默（本机实测：`enable=N` + `boosting` 节点存在 → 无 WARN、RC=0，正是设计意图）。
       单测加钉（`runtime-only` / `no abk_sf_boosting node`）。
+- [x] 真机 CI 测试：刷入 `5692b56` 构建（`5.15.216-202609202-FanZiyun`，companion 随包
+      装为 v0.6.1），首启 status 快照逐项判读全部符合设计——锁回读 `Y/lz4kd/zstd`、
+      三 policy 全 `walt`（10-5 交接成立）、`abk_sf_enable=N`、sweeps 存活、
+      `proactive reclaim` 按默认关。唯一异常恰是它的价值：boot 22:15:00 的
+      `mem_limit readback is '536870912', wanted 536870911`。`536870911 =
+      floor(2147483647×25/100)`——`abk_mul_div` 的 `printf "%d"` 要经过 awk 构建的
+      int 转换，这一次（且仅这一次）服务上下文的 awk 把 `MemTotal` 字节
+      `15889203200` 钳到了 INT32_MAX；内核又把 512MiB−1 向上取整回 512MiB，
+      60 s 重设即自愈（快照与后来实机 `mm_stat f4` 都是真 25%）。属 README 记载的
+      32 位陷阱家族，但依赖「awk `%d` 恰好 64 位」这个假设本身就不该留：
+      字节输出的格式全部改 `%.0f`（double 对 2^53 以下整数精确，与 int 宽度无关），
+      `cached_freeze_reclaim.sh` 的 4 GiB 配额换算（今天就会越 2^31）同改；
+      `cap_view` 只打印容量（≤1024）保留 `%d`。设备门重过：`su -c 'sh -n'` 两文件、
+      mksh 下 `15516800×1024`、`×25/100`、`4096×1048576=4294967296` 夹具全精确。
+      companion **v0.6.2**（`a50df6e`），第五跑（34611016147）成功：载荷 `scripts/`
+      与 `module.conf` 相对 `a48d069` 仍零改动（指纹链保持成立），`head_log` 确认
+      模块克隆在 `a50df6e`，随包 companion 为 v0.6.2，perf 汇总不变，编译器格式的
+      `error:` 诊断 **0**（31 处命中全部是工作流 YAML 自身的 `echo "::error::"`
+      模板回显，非诊断）。「随包 companion 为 v0.6.2」的产物级证据链（构建 job
+      103301236345 日志）：`head_log` 行即 `a50df6e …(v0.6.2)`，随后
+      `[ABK module] injected abk-ksu-modules/abk_runtime_tunables.zip and the
+      installer block into .../AnyKernel3/anykernel.sh` + `ok: bundled and its
+      installer block is present`，打包行 `adding: abk-ksu-modules/abk_runtime_tunables.zip`，
+      产物 `None_kernel-android13-5.15-X`（80,650,903 B）。
+- [x] 第五跑真机验收（23:19 开机、23:20 快照）：刷入的正是这条流水线的 AnyKernel3，
+      模块日志头第一行报 **v0.6.2**，内核版本串与第四跑构建完全同名
+      （`5.15.216-202609202-FanZiyun`）——本身就是「载荷字节未变」主张的旁证。
+      修复得到 before/after 闭环：v0.6.1 boot 记
+      `mem_limit readback is '536870912', wanted 536870911`；v0.6.2 boot 直接
+      `zram mem_limit=3972300800 bytes (25% of RAM)`（= `15889203200` 的精确
+      25%），60 s 后 reassert `3983572992` 无 readback 不一致，快照 `mm_stat f4`
+      与之一致；`disksize 17179869184` 等字节行在 mksh 下全部正常，无格式化报错。
+      其余逐项同第四跑结论：三 policy 全 `walt`（2016000/2592000/864000，
+      report-only 行工作正常）、锁回读 `Y/lz4kd/zstd`、`abk_sf_enable=N`、
+      `floor_pct=85`、`boosting=0x0`、sweeps 存活、proactive 按默认关、pelt×4。
+      本批真机 CI 至此闭环。
 
 顺带一条副产品：这次构建的是 **android13-5.15-lts（SUBLEVEL 已被 ABK 解析为 X）**，
 也就是本仓库 `sublevel_matrix.py` 还没有 216 条目的那条线——载荷在它上面 applied
