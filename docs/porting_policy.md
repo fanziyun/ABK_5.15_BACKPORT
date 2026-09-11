@@ -54,7 +54,7 @@
    at 27% of its frequency and the placer sees a core smaller than the mid
    cluster and stops putting work on it, at any util. Measured on the same
    device: `rq_cpu_capacity_orig` of the prime policy crawled 277 → 400 → 549 →
-   672 of 1024 while the mid cluster stood at 586-750, and the super core was
+   672 of 1024 while the mid cluster stood at 585-749, and the super core was
    the smaller core on offer in 5 of 16 sampled polls. A group that lifts such a
    ceiling to help throughput would be stealing that ownership, and **placement
    failure is silent**: unlike a frequency, no node reports "this core was

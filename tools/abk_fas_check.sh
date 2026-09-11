@@ -24,7 +24,7 @@
 #   hands the placer a core that looks *smaller* than the mid cores -- and light
 #   work, an app launch, is then never put on it.  Measured on SM8550 with a
 #   userspace scheduler profile in play: capacity_orig of the super core crawled
-#   277 -> 400 -> 549 -> 672 of 1024 while the mid cluster sat at 586-750, and a
+#   277 -> 400 -> 549 -> 672 of 1024 while the mid cluster sat at 585-749, and a
 #   cold launch sampled the app's UI thread on the super core 5 times in 36 with
 #   that ceiling in place against 11 times in 37 with it released -- same build,
 #   same app, only the ceiling's owner was stopped.  Section 3 counts the polls
