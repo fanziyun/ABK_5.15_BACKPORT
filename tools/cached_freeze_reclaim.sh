@@ -101,9 +101,12 @@ done
 # Through awk on purpose: /system/bin/sh is Android's mksh and wraps at 2^31 on
 # some ROMs (measured on the target device), and a 4 GiB quota is exactly at
 # that boundary -- a wrapped negative quota silently reclaims nothing.
+# And printf must be %.0f, not %d: %d casts through the awk build's int, and an
+# on-device boot measured one service-context awk clamping MemTotal bytes to
+# 2147483647.  The double is exact below 2^53; no sane quota reaches that.
 quota_bytes=0
 if [ "$QUOTA_MB" -gt 0 ]; then
-  quota_bytes="$(awk -v mb="$QUOTA_MB" 'BEGIN { printf "%d\n", mb * 1048576 }')"
+  quota_bytes="$(awk -v mb="$QUOTA_MB" 'BEGIN { printf "%.0f\n", mb * 1048576 }')"
 fi
 
 # Every uid_* group under the configured roots that actually exposes

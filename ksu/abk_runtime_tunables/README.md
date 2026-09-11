@@ -249,6 +249,14 @@ The long-running parts are two supervisors started by `service.sh`
   refused by the kernel (the cap silently stays off, with only a warning in the
   log), and a false `-gt` made the module treat a healthy 16 GiB device as
   sizeless and rewrite it to `MemTotal/2`.
+  The awk itself needs one guard too: `printf "%d"` converts through the awk
+  build's int, and the first boot of the v0.6.1 module measured one
+  service-context awk clamping `MemTotal` bytes to `2147483647` there -- the
+  25 % cap briefly landed as 512 MiB (the kernel rounded the `536870911` it was
+  given; the WARN and the supervisor's next pass say the rest). Every awk
+  format that can print a byte count now uses `%.0f`, exact for integers below
+  2^53. `abk_gt`/`abk_le` print nothing and `cap_view` prints a capacity
+  (≤ 1024), so `%d` is provably safe where they keep it.
 * The writeback path itself (backing file + loop device + `backing_dev`) is
   **not fully hardware-verified on the reference device**, because that kernel
   has no `CONFIG_ZRAM_WRITEBACK`. The backing-file half is: the helper creates a
