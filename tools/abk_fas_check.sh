@@ -24,10 +24,11 @@
 #   hands the placer a core that looks *smaller* than the mid cores -- and light
 #   work, an app launch, is then never put on it.  Measured on SM8550 with a
 #   userspace scheduler profile in play: capacity_orig of the super core crawled
-#   277 -> 400 -> 549 -> 672 of 1024 while the mid cluster sat at 586-750, and
-#   15 of 36 launch-time samples of a music app's UI thread found it on a mid
-#   core with the super core at 88% busy but never chosen.  Section 3 counts the
-#   polls where that inversion is actually in effect.
+#   277 -> 400 -> 549 -> 672 of 1024 while the mid cluster sat at 586-750, and a
+#   cold launch sampled the app's UI thread on the super core 5 times in 36 with
+#   that ceiling in place against 11 times in 37 with it released -- same build,
+#   same app, only the ceiling's owner was stopped.  Section 3 counts the polls
+#   where that inversion is actually in effect.
 #
 #   The ABK schedutil smart-freq floor (Batch 10-4) armed on a device whose
 #   policies run a foreign governor.  That floor is *not* reached through

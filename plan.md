@@ -566,7 +566,7 @@ WALT/FAS 设备上真的活了，然后立刻变成缺陷。全部结论来自�
 | 3 | **上限会改写调度器眼中的核大小**（这是症状的直接机制） | `schedwalt/update_cpu_capacity` tracepoint 直读：`cpu=7 arch_capacity=1024 thermal_cap=1024 fmax_capacity=277 max_freq=864000 max_possible_freq=3187200 rq_cpu_capacity_orig=277`，同一时刻 `cpu=3 ... rq_cpu_capacity_orig=503..749`。即 **EAS/WALT 的 capacity 按 `scaling_max_freq/cpuinfo_max_freq` 缩放**，上限被压到 27% 的超大核在放置器眼里比中核还小 |
 | 4 | 上限以 ~12.5 Hz 抖动，放置决策读到的是抖动快照 | 4 秒内 `update_cpu_capacity` 137 次、`cpu_frequency_limits` 44 次；超大核 `total_trans` 已达 5.4e5（little 1.3e5、mid 1.0e5），`--sample 10` 实测 trans/s ≈ 64~96 |
 | 5 | 冷启动实测：主线程基本不上 prime | 4 个真实应用（网易云/微信/酷安/高德）冷启动，`sched_find_best_target` 的 `most_spare_cap` 直方图里 app 线程几乎全是 3/4/5/6；`start_cpu=7` 的扫描每次都退回非 prime；主线程 50 ms 采样落在 cpu7 的比例 1/40~16/40；启动瞬间超大核上限常为 729600~998400（23%~31%） |
-| 6 | **A/B 证明归因** | `kill -STOP scene-daemon` + `echo 3187200 > policy7/scaling_max_freq`：该 policy 在整次启动窗口内 `cpu_frequency_limits` **0 次**（上限不再抖动），`rq_cpu_capacity_orig` 稳定 1024；网易云冷启动主线程上 prime 采样 4/36 → **14/37**，`TotalTime` 2661 ms → **2227 ms（−16%）**，cpu7 占用从"最低"变成与中核持平（91% vs 93%）。随后 `kill -CONT`，Scene 已在数秒内重新接管（下一轮 p7 上限又变回 1708800/864000） |
+| 6 | **A/B 证明归因** | `kill -STOP scene-daemon` + `echo 3187200 > policy7/scaling_max_freq`：该 policy 在整次启动窗口内 `cpu_frequency_limits` **0 次**（上限不再抖动），`rq_cpu_capacity_orig` 稳定 1024；网易云冷启动主线程在 50ms 采样里落在 prime 的次数 **5/36 → 11/37**，`TotalTime` 2661 ms → **2227 ms（−16%）**，cpu7 占用从"最低"变成与中核持平（91% vs 93%）。随后 `kill -CONT`，Scene 已在数秒内重新接管（下一轮 p7 上限又变回 1708800/864000） |
 | 7 | 另有两处 Scene 主动改写、非 ABK | `/proc/sys/walt/sched_upmigrate` 从 `60 95` 变成 `70 70`（实验中途被 Scene 写入，我最后一轮已交还给 Scene）；cpuset：`common_app` = `0-2 / 0-6 / 0-6 / 0-7`、`common_gaming` = `0-2 / 0-5 / 0-5 / 0-7`，实测王者荣耀 236 个线程全在 `top-app/0-5`（物理上碰不到 cpu6/7） |
 
 **本批落地的修法（不越红线：ABK 不抢调频权，只把这件事变成可判定、可回归的观测）**
@@ -653,7 +653,25 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 - 载荷指纹：v1 锚点 `5b341516e8ca1e56` **未变**（逐字节冻结仍然成立），当前载荷 `4e2a7a19be82aba2`。
 
 **ABK CI（本批的编译验，`待验` 项）**：按 run `34517053732` 的**完全相同输入**在 `fanziyun/ABK` 的 `dev` 分支重新派发 `Android 内核构建-自定义`（workflow id 276392595；android13 / 5.15 / X / lts / ksu None / zram+full_algo / ntsync / virt 678 / 同一条 7 段 `custom_external_modules`）。CI 克隆本仓库默认分支，故必须先推送 `main`。
-构建结果：待记录。
+构建结果：**run `34553441530` 一次通过（success）**，job
+`103120927194`（`5.15.X-android13-lts / 5.15.X-android13-lts-None`）2026-09-11T02:08:16Z →
+02:28:37Z，产物 `None_kernel-android13-5.15-X.zip`（80,649,905 B，artifact 10182112517）。
+关键日志（逐条从 job log 取的，不是推断）：
+
+- `[ABK module] version: 0.17.1` ×3 个子模块 ⇒ CI 克隆到的就是本批推送的 `main`；
+- `stable_perf_backport/schedutil_smart_policy: applied` ⇒ v2 载荷（指纹
+  `4e2a7a19be82aba2`）确实写进了这棵树，并且**编译通过**：AGENTS.md 陷阱 5 那一类
+  （`module_param_cb` / `kernel_param_ops` / `strcmp` / `BITS_PER_LONG`）到此关闭；
+- `ok: abk_runtime_tunables is bundled and its installer block is present` ⇒ companion
+  v0.6.0 随 AnyKernel3 打包成功（本批改过它的 `common.sh` / `action.sh` / `embed.conf`）；
+- perf 子模块汇总 `{already_present: 5, applied: 7, blocked_by_shape: 1}`，唯一的
+  `blocked_by_shape` 是 `blk_mq_suspend_wakeup_abort`（lts 基线的既有债务，与本批无关）；
+- 全日志无 `error:` 编译诊断。
+
+顺带一条副产品：这次构建的是 **android13-5.15-lts（SUBLEVEL 已被 ABK 解析为 X）**，
+也就是本仓库 `sublevel_matrix.py` 还没有 216 条目的那条线——载荷在它上面 applied
+且编译通过，说明"给 lts 补矩阵条目"只是审计覆盖问题，不是正确性问题（仍是独立待办）。
+
 
 ## Batch 8（v0.10.1，page_alloc fallback + RCU NOCB 项目已落地）
 
