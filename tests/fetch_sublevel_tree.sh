@@ -51,7 +51,9 @@ FETCH_FILES=(
   include/linux/psi.h
   include/linux/zsmalloc.h
   include/trace/hooks/dtask.h
+  include/trace/hooks/mm.h
   include/trace/hooks/rwsem.h
+  drivers/android/vendor_hooks.c
   kernel/cgroup/cgroup-internal.h
   kernel/cgroup/cgroup.c
   kernel/cgroup/cpuset.c

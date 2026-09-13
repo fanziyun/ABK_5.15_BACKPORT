@@ -1,0 +1,49 @@
+From 4466afd69452088299671fcf3df891ba07daa8e0 Mon Sep 17 00:00:00 2001
+From: wei li <liwei1234@oppo.com>
+Date: Fri, 26 Apr 2024 02:08:00 +0000
+Subject: [PATCH] ANDROID: vendor_hooks: add vendor hook for supporting
+ customize alloc_gfp at alloc_page_slowpath
+
+add vendor hook for supporting customize alloc_gfp at alloc_page_slowpath,
+give the ability to customize alloc_gfp according to customer specific requirement.
+
+Bug: 337192903
+Change-Id: I42fd97fa76a47b9fde554434f607285bee8915c0
+Signed-off-by: liwei <liwei1234@oppo.com>
+
+Source: aosp/kernel/common @ android15-6.6 (re-fetched from the
+aosp-mirror/kernel_common GitHub API on 2026; hunks verbatim).
+---
+ drivers/android/vendor_hooks.c | 1 +
+ include/trace/hooks/mm.h       | 3 +++
+ mm/page_alloc.c                | 1 +
+ 3 files changed, 5 insertions(+)
+
+diff --git a/drivers/android/vendor_hooks.c b/drivers/android/vendor_hooks.c
+@@ -306,6 +306,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mm_direct_reclaim_enter);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mm_direct_reclaim_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mm_may_oom_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_vmscan_kswapd_done);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_customize_alloc_gfp);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_cpu_capacity_show);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_shmem_swapin_folio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_do_wp_page);
+diff --git a/include/trace/hooks/mm.h b/include/trace/hooks/mm.h
+@@ -121,6 +121,9 @@ DECLARE_HOOK(android_vh_page_add_new_anon_rmap,
+ 	TP_PROTO(struct page *page, struct vm_area_struct *vma,
+ 		unsigned long address),
+ 	TP_ARGS(page, vma, address));
++DECLARE_HOOK(android_vh_customize_alloc_gfp,
++	TP_PROTO(gfp_t *alloc_gfp, unsigned int order),
++	TP_ARGS(alloc_gfp, order));
+ 
+ #endif /* _TRACE_HOOK_MM_H */
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+@@ -4589,6 +4589,7 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
+ 	 */
+ 	ac.nodemask = nodemask;
++	trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);
+ 
+ 	page = __alloc_pages_slowpath(alloc_gfp, order, &ac);

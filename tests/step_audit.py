@@ -121,6 +121,10 @@ AUDIT_FILES = [
     "drivers/gpu/drm/drm_atomic_helper.c",
     # Batch 9-1: dynamic readahead registers its callbacks in mm/readahead.c.
     "mm/readahead.c",
+    # Batch 13: the customize_alloc_gfp hook declares in mm.h, calls in
+    # mm/page_alloc.c and exports in drivers/android/vendor_hooks.c.
+    "include/trace/hooks/mm.h",
+    "drivers/android/vendor_hooks.c",
 ]
 
 CHILD_MODULES = [

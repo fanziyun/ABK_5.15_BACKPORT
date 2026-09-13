@@ -223,6 +223,76 @@
   日志出现 `zsmalloc compaction: used …`，实测额外回收 5.4MB
   （181.0→175.6MB，pages_compacted 43382→44699）。
 
+## Batch 13（v0.18.0，`android_vh_customize_alloc_gfp` 挂点 + 高阶慢路径快速失败策略）
+
+起因：调研两个 GKI vendor hook（全文见 `research/hooks_gfp_vs_wake_up_new_task.md`，
+上游补丁存档 `research/upstream-5.15.y/patches/4466afd69452.patch`）。
+
+- `android_rvh_wake_up_new_task`（受限钩子，`wake_up_new_task()` 首条语句，
+  `include/trace/hooks/sched.h` 声明 + `kernel/sched/core.c` 调用）：**四条基线
+  （.167/.178/.194/lts）逐字自带**，形状与 6.x 相同 → 不建 group；未来的
+  FAS fast_start / 初始放置 payload 直接 `register_trace_android_rvh_wake_up_new_task`
+  （与 Batch 10 挂 `android_vh_scheduler_tick` 同族）。已排除，不再重议。
+- `android_vh_customize_alloc_gfp`（android15-6.6 引入，commit `4466afd69452`，
+  Bug 337192903，OPPO；6.1 与 5.15 全线没有）：慢路径入口把**即将用于
+  `__alloc_pages_slowpath()` 的 gfp** 按指针交给回调改写。落地两组：
+
+- [x] `customize_alloc_gfp_vh` —— 3-hunk **upstream-shape** 逐字移植
+  （`include/trace/hooks/mm.h` 声明 + `mm/page_alloc.c` 调用 +
+  `drivers/android/vendor_hooks.c` 导出），不加 ABK 标记 ⇒ 未来基线自带该
+  commit 时自动 `already_present` 且零写入。可行性前提已实测：ACK 早已把 6.1 的
+  cpuset 快路径系列收进 android13-5.15，慢路径入口块与 6.6 逐字相同
+  （变量即 `alloc_gfp`），三处锚点在 .167/.178/.194/lts 上各唯一。
+- [x] `gfp_pressure_fastfail` —— ABK 策略载荷（`mm/page_alloc.c` 文件尾，
+  `#ifdef CONFIG_ANDROID_VENDOR_HOOKS` 内）：`__alloc_pages()` 快路径失败进入
+  慢路径前，若 `si_mem_available()` < high 水位和的 `abk_gfp_fastfail_pct`%
+  （默认 50，水位和每秒采样一次，沿用 Batch 9-1 的门形状），order ≥
+  `abk_gfp_fastfail_order`（默认 9 = 4K-page arm64 的 THP 级）的尝试加上
+  `__GFP_NORETRY|__GFP_NOWARN`。5.15 的 NORETRY 语义（实测 `.167` 的
+  `__alloc_pages_slowpath` @5408）= 各允许一轮直接回收+压缩、**不进**
+  compact/reclaim 重试循环，请求快速失败回落到调用方既有 fallback（THP→4K 页、
+  宽容调用方拿 -ENOMEM），消除碎片化近满内存下的毫秒级分配停顿。**默认档
+  不是 no-op（评审质疑已实测排除）**：`.167` 的 `GFP_TRANSHUGE_LIGHT` 只带
+  `__GFP_NOWARN`、不带 `__GFP_NORETRY`（`include/linux/gfp.h` @365），默认
+  defrag=madvise 下 madvised fault 走 `LIGHT | __GFP_DIRECT_RECLAIM`、
+  khugepaged defrag 走 `GFP_TRANSHUGE`（`vma_thp_gfp_mask` @688、
+  `khugepaged.c` @837）——全是可重试类，正被本门捕获；外加 hugetlb 运行期
+  扩池与驱动 order-9。`abk_gfp_fastfail_pct=0` = 移除压力门（恒快速失败），
+  关开关用 `page_alloc.abk_gfp_fastfail=0`；启动期 CMA/hugetlb 池建立
+  **故意**不在覆盖范围（`late_initcall` 之前发生，那类分配该重试）。
+  knobs 全部
+  0644，落在 `/sys/module/page_alloc/parameters/`（obj-y 按文件基名的
+  module_param 归属约定，Batch 9-1 的 `readahead.dynamic_readahead` 已验证该
+  形状）。两组都先探测三要素——mm.h 声明、page_alloc.c 调用行、同文件
+  `#include <trace/hooks/mm.h>`；gate 的两次全局量读写走
+  READ_ONCE/WRITE_ONCE（hook 从分配器上下文无同步触发）——缺一即
+  `blocked_by_shape` 且零写入（守 AGENTS.md 陷阱 5 族：文本
+  门禁全绿而编译死在 undefined `register_trace_`，或声明了却永不触发）。
+- [x] KMI 自查：只**新增** `__tracepoint_android_vh_customize_alloc_gfp` 与
+  key 的导出（纯增量），不动任何导出结构体字段、不占 KABI 槽，现有符号 CRC
+  不变 ⇒ 既有 GKI vendor 模块照常加载；`CONFIG_ANDROID_VENDOR_HOOKS=y` 基线
+  gki_defconfig 自带（.167 实测），config lane 无动作。
+- [x] 配套：`tests/fetch_sublevel_tree.sh` FETCH_FILES 与 `step_audit.py`
+  AUDIT_FILES 补 `include/trace/hooks/mm.h`、`drivers/android/vendor_hooks.c`
+  两文件；`GROUP_COUNTS(core)` 22→24；单测三组（含 hook 顺序守卫、carried 树
+  `already_present` 零写入、缺 include / 缺调用行的 `blocked_by_shape`
+  负例、`module_param` 名≡变量名扫描、载荷 idempotency，以及
+  wake_up_new_task 的**负面 pin**——pin 住"四条基线逐字自带、不建组"的
+  调研结论，防止将来误建重复 graft）；`implementation_audit.py` 加两组
+  REQUIRED_CONTENT + hook 组的 per-file REQUIRED_ABSENT（mm.h / vendor_hooks.c
+  两文件必须零 ABK 标记——upstream-shape 的机检化；REQUIRED_ABSENT 因此
+  新增 `[file, needle]` 作用域形态，page_alloc.c 混有他批标记不能整 blob
+  扫）+ 载荷 handler 门与压力门（含 READ_ONCE/WRITE_ONCE、禁 racy
+  `+=`）的 REQUIRED_IN_FUNCTION；lts 树已滚动到 SUBLEVEL **216**，
+  `sublevel_matrix` 的 PRE_APPLIED/KNOWN_DEBT 行键 211→216（重取树后按
+  Makefile 重新对键是 policy 既有要求）；`docs/porting_policy.md` 基线表
+  core pass-1 计数随 registry 移动（17→19 / 14+3→16+3）。
+
+待验证：ABK CI 编译（本批引入 C，编译是唯一真门禁）；真机上
+`/sys/module/page_alloc/parameters/abk_gfp_fastfail*` 三节点存在、低内存高压下
+`compact_failures`/direct reclaim 停顿与 THP 成功率的对照另立后续批次
+（distribution asset，不进 registry）。
+
 ## Batch 9 候选（popsicle-w-oss 调研 + Batch 9-1 dynamic_readahead 已落地）
 
 来源：`MiCode/Xiaomi_Kernel_OpenSource` 分支 `popsicle-w-oss`

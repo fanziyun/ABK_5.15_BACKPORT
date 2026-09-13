@@ -124,9 +124,9 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 17 applied | 12 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 17 applied | 11 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 14 applied + 3 present | 10 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 19 applied | 12 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 19 applied | 11 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 16 applied + 3 present | 10 applied + 2 present |
 
 A second pass is `already_present` for every group on all three. Groups the
 baseline pre-empts:
@@ -143,11 +143,14 @@ and `tests/step_audit.py` read (keyed by the tree's Makefile `SUBLEVEL`, or
 files the groups touch, so no kernel clone is needed. Adding a baseline means
 adding a matrix entry; it does not mean adding version gating.
 
-The android13-5.15-lts tree (5.15.211) is a fourth fixture only: `step_audit.py`
-audits it against a matrix row whose two known debts are recorded
-(`randomize_kstack_pertask` and `blk_mq_suspend_wakeup_abort`, both
+The android13-5.15-lts tree (recorded at 5.15.211; the branch has since rolled
+-- the matrix row is keyed to the fetched tree's Makefile `SUBLEVEL`, 216 as of
+the 2026-09 re-fetch, re-proven on that tree) is a fourth fixture only:
+`step_audit.py` audits it against a matrix row whose two known debts are
+recorded (`randomize_kstack_pertask` and `blk_mq_suspend_wakeup_abort`, both
 `blocked_by_shape`). lts is not a CI combination and nothing gates on it. It is
-a rolling branch, so re-check its `PRE_APPLIED` row when re-fetching the tree —
+a rolling branch, so re-check its `PRE_APPLIED` row and re-key it when
+re-fetching the tree —
 `sched_rt_optimizations` (5.15.202) and `sched_dst_group_allowed_stats` (5.15.212)
 have since landed there and moved from drift to pre-applied.
 

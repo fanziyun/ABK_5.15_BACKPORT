@@ -187,10 +187,30 @@ REQUIRED_CONTENT = {
         "cfr_reclaim_reclaimed",
         "reclaim_options & MEMCG_RECLAIM_PROACTIVE",
     ],
+    "core:customize_alloc_gfp_vh": [
+        # All three upstream hunk lines must really land (declare / call /
+        # export); a hook that is declared but never called is inert, and one
+        # that is called but not exported cannot be reached by a module.
+        "DECLARE_HOOK(android_vh_customize_alloc_gfp,",
+        "trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);",
+        "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_customize_alloc_gfp);",
+    ],
+    "core:gfp_pressure_fastfail": [
+        "Batch 13 high-order slowpath fast-fail",
+        "register_trace_android_vh_customize_alloc_gfp(",
+        "*gfp |= __GFP_NORETRY | __GFP_NOWARN;",
+        "late_initcall(abk_gfp_fastfail_init);",
+        # The THP-class default: order 9 on 4K-page arm64.
+        "static unsigned int abk_gfp_fastfail_order = 9;",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
-# the group reports applied.  Keyed as "child:group".
+# the group reports applied.  Keyed as "child:group".  An entry is either a
+# bare string (checked against the blob of the group's files, the original
+# removal-graft shape) or a [rel, needle] pair (checked against that one
+# file only, for absence claims a *neighbouring* group's legitimate content
+# in a shared file would otherwise defeat).
 REQUIRED_ABSENT = {
     "display:drm_valid_clones_revert": [
         "drm_atomic_check_valid_clones",
@@ -201,6 +221,16 @@ REQUIRED_ABSENT = {
         # to* policy->max -- the ceiling lock itself.
         "static bool abk_sf_enable = true;",
         "if (floor > policy->max)",
+    ],
+    "core:customize_alloc_gfp_vh": [
+        # Upstream-shape graft: the two files it exists to reproduce must
+        # stay marker-free -- an ABK marker on a line upstream also has
+        # breaks the already_present short-circuit on a future baseline that
+        # carries 4466afd69452 itself.  Pinned per-file on purpose: the
+        # group's third file, mm/page_alloc.c, legitimately carries markers
+        # from other batches, so a whole-blob sweep can never see this.
+        ["include/trace/hooks/mm.h", "ABK stable_515_backport:"],
+        ["drivers/android/vendor_hooks.c", "ABK stable_515_backport:"],
     ],
 }
 
@@ -319,6 +349,26 @@ REQUIRED_IN_FUNCTION = {
           "cpumask_setall(rcu_nocb_mask)"],
          ["rcu_state.nocb_is_setup"]),
     ],
+    "core:gfp_pressure_fastfail": [
+        # The handler's three gates are the policy: a dropped enable check or
+        # a dropped order comparison changes the blast radius of NORETRY from
+        # "THP-class under pressure" to every allocation, silently.
+        ("mm/page_alloc.c", "abk_gfp_fastfail_hook",
+         ["if (!READ_ONCE(abk_gfp_fastfail))",
+          "if (order < READ_ONCE(abk_gfp_fastfail_order))",
+          "if (!abk_gfp_under_pressure())",
+          "*gfp |= __GFP_NORETRY | __GFP_NOWARN;"],
+         ["return true"]),
+        # The gate is the once-per-second watermark probe, not a per-call
+        # walk of every zone (that would put for_each_zone on the allocator's
+        # hot path), and its two globals move through READ_ONCE/WRITE_ONCE:
+        # the hook runs from the allocator, unsynchronised against itself.
+        ("mm/page_alloc.c", "abk_gfp_under_pressure",
+         ["time_is_after_jiffies(READ_ONCE(abk_gfp_wm_stamp) + HZ)",
+          "WRITE_ONCE(abk_gfp_high_wm, sum);",
+          "si_mem_available() < (long)limit"],
+         ["abk_gfp_high_wm += "]),
+    ],
 }
 
 
@@ -409,8 +459,15 @@ def run_tree(source):
                 if key in REQUIRED_ABSENT and status in ("applied", "partial"):
                     blob = "".join(ctx.read(f) for f in group.files
                                    if ctx.path(f).exists())
-                    present = [needle for needle in REQUIRED_ABSENT[key]
-                               if needle in blob]
+                    present = []
+                    for needle in REQUIRED_ABSENT[key]:
+                        if isinstance(needle, (list, tuple)):
+                            rel, sub = needle
+                            if (ctx.path(rel).exists()
+                                    and sub in ctx.read(rel)):
+                                present.append(f"{sub!r} in {rel}")
+                        elif needle in blob:
+                            present.append(needle)
                     if present:
                         problems.append(f"{child}/{group.key}: removed "
                                         f"content survived {present}")

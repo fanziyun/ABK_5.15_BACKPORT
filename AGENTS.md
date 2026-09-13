@@ -2,7 +2,8 @@
 
 ABK external `module_set` that grafts upstream kernel features / optimizations /
 structural refactors onto the `android13-5.15` GKI baselines 5.15.167 / .178 / .194
-(and audits the `android13-5.15-lts` .211 rolling branch). **This is not a kernel
+(and audits the `android13-5.15-lts` rolling branch — its matrix row is keyed to
+the fetched tree's Makefile `SUBLEVEL`, currently .216). **This is not a kernel
 source tree** — it is a Python registry that rewrites one.
 
 ## The one thing to internalize

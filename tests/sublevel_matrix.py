@@ -26,7 +26,7 @@ from __future__ import annotations
 
 # child id -> total registered groups
 GROUP_COUNTS = {
-    "stable_backport_core": 22,
+    "stable_backport_core": 24,
     "stable_perf_backport": 13,
     "stable_display_fix": 1,
 }
@@ -64,13 +64,16 @@ PRE_APPLIED = {
         "stable_display_fix": set(),
     },
     # android13-5.15-lts: not a CI combination yet, but tracked so the local
-    # .211 tree can be audited and drift surfaces before the baseline ships.
-    # This is a rolling branch, so re-check these two sets when re-fetching it.
+    # tree (Makefile SUBLEVEL 216 as of the 2026-09 re-fetch; row recorded
+    # against 5.15.211, expectations re-proven on the .216 tree) can be
+    # audited and drift surfaces before the baseline ships.
+    # This is a rolling branch, so re-check these two sets -- and re-key this
+    # row to the new Makefile SUBLEVEL -- when re-fetching it.
     # The two remaining perf debts are known blockers from plan.md: the lts
     # branch already occupies the kstack KABI slot 1 shape, and its blk-mq
     # suspend path was rewritten upstream-first, so both report
     # blocked_by_shape until a later batch.
-    "211": {
+    "216": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
             "fdtable_replace_fd_errno",
@@ -96,10 +99,10 @@ PRE_APPLIED = {
 
 # sublevel -> child -> group key -> expected degraded status.
 # Disjoint from PRE_APPLIED: a group either arrives upstream-clean or is a
-# tracked debt; never both.  Only used to keep auditing .211 honest about the
-# two Batch-2-era blockers instead of failing the whole tree.
+# tracked debt; never both.  Only used to keep auditing the lts row honest
+# about the two Batch-2-era blockers instead of failing the whole tree.
 KNOWN_DEBT = {
-    "211": {
+    "216": {
         "stable_perf_backport": {
             "randomize_kstack_pertask": "blocked_by_shape",
             "blk_mq_suspend_wakeup_abort": "blocked_by_shape",

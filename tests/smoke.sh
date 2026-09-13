@@ -47,7 +47,9 @@ SMOKE_FILES=(
   include/linux/psi_types.h
   include/linux/psi.h
   include/trace/hooks/dtask.h
+  include/trace/hooks/mm.h
   include/trace/hooks/rwsem.h
+  drivers/android/vendor_hooks.c
   kernel/cgroup/cgroup-internal.h
   kernel/cgroup/cgroup.c
   kernel/cgroup/cpuset.c
@@ -284,6 +286,25 @@ grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 cfr_reclaim counters missing"
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 memory.reclaim entry missing"
+
+# Batch 13: the customize_alloc_gfp hook (declare/call/export) must be in the
+# tree and the ABK fast-fail policy must really register on it.  The hook
+# lines carry no ABK marker by design (upstream-shape), so assert the exact
+# upstream text here instead.
+grep -q "DECLARE_HOOK(android_vh_customize_alloc_gfp" \
+  "$KERNEL_ROOT/common/include/trace/hooks/mm.h" \
+  || fail "customize_alloc_gfp hook declaration missing"
+grep -q "trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);" \
+  "$KERNEL_ROOT/common/mm/page_alloc.c" \
+  || fail "customize_alloc_gfp slowpath call site missing"
+grep -q "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_customize_alloc_gfp);" \
+  "$KERNEL_ROOT/common/drivers/android/vendor_hooks.c" \
+  || fail "customize_alloc_gfp tracepoint export missing"
+grep -q "register_trace_android_vh_customize_alloc_gfp(" \
+  "$KERNEL_ROOT/common/mm/page_alloc.c" \
+  || fail "gfp fast-fail policy does not register on the hook"
+grep -q "abk_gfp_fastfail" "$KERNEL_ROOT/common/mm/page_alloc.c" \
+  || fail "gfp fast-fail knobs missing"
 
 # The drm valid-clones revert must leave no trace of the 5.15.185 check on
 # any baseline: 167/178 never carried it, 194/lts had it removed by the graft.

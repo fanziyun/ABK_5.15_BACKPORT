@@ -27,6 +27,7 @@ is left byte-identical rather than touched up with a comment.
 | `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 | `stable_backport_core` (Batch 9-1) | `dynamic_readahead_lowmem`: dynamic readahead (OPLUS/Xiaomi `mi_dynamic_readahead`) as a GKI built-in — a `core_initcall` in `mm/readahead.c` registers the `android_vh_ra_tuning_max_page` / `android_vh_tune_mmap_readaround` vendor-hook callbacks so low-memory background (cpuset "background") tasks get halved readahead windows and shrunk mmap read-around, behind `CONFIG_ABK_DYNAMIC_READAHEAD` with a `readahead.dynamic_readahead=0` runtime disable |
+| `stable_backport_core` (Batch 13) | `customize_alloc_gfp_vh` + `gfp_pressure_fastfail`: the `android_vh_customize_alloc_gfp` vendor hook grafted verbatim from android15-6.6 (commit `4466afd69452`; declare in `include/trace/hooks/mm.h`, call between the nodemask restore and `__alloc_pages_slowpath()`, export in `drivers/android/vendor_hooks.c`), plus its ABK consumer: while `si_mem_available()` sits below `abk_gfp_fastfail_pct`% (default 50) of the summed high watermarks, slowpath attempts of order >= `abk_gfp_fastfail_order` (default 9 — the THP class) gain `__GFP_NORETRY|__GFP_NOWARN`, so a fragmented, nearly-full phone fails those requests into their callers' fallback after one direct-reclaim/compaction try instead of stalling the faulting task; knobs at `/sys/module/page_alloc/parameters/`, off with `page_alloc.abk_gfp_fastfail=0` |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
@@ -186,12 +187,14 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 22 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 24 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
-`zram_secondary_comp`, `memcg_v1_reclaim`) and Batch 12's `zram_algo_lock`); the
-perf child carries 13; the display child carries 1, for 36 groups in total.
+`zram_secondary_comp`, `memcg_v1_reclaim`), Batch 12's `zram_algo_lock`, and
+Batch 13's hook + policy pair (`customize_alloc_gfp_vh`,
+`gfp_pressure_fastfail`); the
+perf child carries 13; the display child carries 1, for 38 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 

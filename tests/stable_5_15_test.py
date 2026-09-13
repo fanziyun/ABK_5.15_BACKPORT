@@ -573,7 +573,7 @@ def test_batch6_registration():
               status == "blocked_by_shape", status)
         check("madvise degrades cleanly",
               status2 == "blocked_by_shape", status2)
-    for sub_level, child in (("211", "stable_perf_backport"),):
+    for sub_level, child in (("216", "stable_perf_backport"),):
         for key, want in sublevel_matrix.debt(sub_level, child).items():
             check(f"debt {sub_level}/{key} is a real group",
                   key in perf_keys, key)
@@ -1073,6 +1073,237 @@ def test_batch11_zram_algo_lock():
         check("zram_algo_lock degrades on an empty tree",
               status3.startswith("blocked") and ctx.pending_writes() == [],
               (status3, detail3))
+
+
+_BATCH13_MM_H = (
+    "DECLARE_HOOK(android_vh_page_cache_miss,\n"
+    "\tTP_PROTO(struct file *file),\n"
+    "\tTP_ARGS(file));\n"
+    "#endif /* _TRACE_HOOK_MM_H */\n"
+)
+_BATCH13_PAGE_ALLOC = (
+    "#include <trace/hooks/mm.h>\n"
+    "\tac.nodemask = nodemask;\n"
+    "\n"
+    "\tpage = __alloc_pages_slowpath(alloc_gfp, order, &ac);\n"
+    "out:\n"
+    "\treturn page;\n"
+    "}\n"
+    "\n"
+    "#ifdef CONFIG_ZONE_DMA\n"
+    "bool has_managed_dma(void)\n"
+    "{\n"
+    "\tstruct pglist_data *pgdat;\n"
+    "\n"
+    "\tfor_each_online_pgdat(pgdat) {\n"
+    "\t\tstruct zone *zone = &pgdat->node_zones[ZONE_DMA];\n"
+    "\n"
+    "\t\tif (managed_zone(zone))\n"
+    "\t\t\treturn true;\n"
+    "\t}\n"
+    "\treturn false;\n"
+    "}\n"
+    "#endif /* CONFIG_ZONE_DMA */\n"
+)
+_BATCH13_VENDOR_HOOKS = (
+    "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_vmscan_kswapd_done);\n"
+    "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_should_end_madvise);\n"
+)
+
+
+def test_batch13_customize_alloc_gfp_vh():
+    print("Batch 13 customize_alloc_gfp_vh (upstream-shape hook graft)")
+    import abk_stable_core as core
+    import batch13_core_gfp_customize_vh as g13
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "customize_alloc_gfp_vh"), None)
+    check("customize_alloc_gfp_vh group registered", group is not None)
+    if group is None:
+        return
+    check("hook group files match its steps",
+          set(group.files) == {s[0] for s in g13.build_hook_steps()},
+          group.files)
+    # The 5.15.167 slowpath-entry block is byte-identical to 6.6's; the graft
+    # is the upstream text and must stay that way -- an ABK marker comment on
+    # a line upstream also has would break already_present on a future
+    # baseline that carries the commit itself.  This is the whole-tree rule's
+    # fixture-level pin: the implementation audit cannot check it per-group
+    # because page_alloc.c legitimately carries markers from other groups.
+    for blob in (g13.HOOK_MM_NEW, g13.HOOK_PA_NEW, g13.HOOK_VH_NEW):
+        check("hook graft text carries no ABK marker (upstream-shape)",
+              "ABK stable_515_backport" not in blob, blob[:60])
+    check("upstream commit recorded",
+          any("4466afd69452" in c for c in group.commits), group.commits)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": _BATCH13_MM_H,
+            "mm/page_alloc.c": _BATCH13_PAGE_ALLOC,
+            "drivers/android/vendor_hooks.c": _BATCH13_VENDOR_HOOKS,
+        })
+        status, detail = core._customize_alloc_gfp_vh_apply(ctx)
+        check("hook fixture applies all three steps",
+              status == "applied", (status, detail))
+        mm_h = ctx.read("include/trace/hooks/mm.h")
+        pa = ctx.read("mm/page_alloc.c")
+        vh = ctx.read("drivers/android/vendor_hooks.c")
+        check("hook declared in mm.h",
+              "DECLARE_HOOK(android_vh_customize_alloc_gfp," in mm_h
+              and "TP_PROTO(gfp_t *alloc_gfp, unsigned int order)" in mm_h)
+        check("call lands between the nodemask restore and the slowpath entry",
+              "ac.nodemask = nodemask;\n"
+              "\ttrace_android_vh_customize_alloc_gfp(&alloc_gfp, order);\n"
+              "\n\tpage = __alloc_pages_slowpath(alloc_gfp, order, &ac);" in pa)
+        check("tracepoint exported for modules",
+              "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_customize_alloc_gfp);"
+              in vh)
+        ctx2 = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": mm_h,
+            "mm/page_alloc.c": pa,
+            "drivers/android/vendor_hooks.c": vh,
+        })
+        status2, _detail2 = core._customize_alloc_gfp_vh_apply(ctx2)
+        check("hook fixture is idempotent",
+              status2 == "already_present", status2)
+
+    # A tree whose baseline already carries the commit (android15-6.6 form)
+    # must short-circuit to already_present with zero writes -- that is what
+    # the marker-free upstream-shape form buys.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": g13.HOOK_MM_NEW,
+            "mm/page_alloc.c":
+                _BATCH13_PAGE_ALLOC.replace(g13.HOOK_PA_OLD, g13.HOOK_PA_NEW),
+            "drivers/android/vendor_hooks.c": g13.HOOK_VH_NEW,
+        })
+        status3, _d3 = core._customize_alloc_gfp_vh_apply(ctx)
+        check("upstream-carried tree reports already_present",
+              status3 == "already_present", status3)
+        check("already_present writes nothing",
+              ctx.pending_writes() == [], ctx.pending_writes())
+
+    # AGENTS.md trap 5: a grafted call in a TU that lost the hook-header
+    # include cannot compile -- the group must block, writing nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": _BATCH13_MM_H,
+            "mm/page_alloc.c": _BATCH13_PAGE_ALLOC.replace(
+                "#include <trace/hooks/mm.h>\n", ""),
+            "drivers/android/vendor_hooks.c": _BATCH13_VENDOR_HOOKS,
+        })
+        status, detail = core._customize_alloc_gfp_vh_apply(ctx)
+        check("hook graft refuses a TU without the header include",
+              status == "blocked_by_shape" and ctx.pending_writes() == [],
+              (status, detail))
+
+
+def test_batch13_gfp_pressure_fastfail():
+    print("Batch 13 gfp_pressure_fastfail (policy payload)")
+    import abk_stable_core as core
+    import batch13_core_gfp_customize_vh as g13
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "gfp_pressure_fastfail"), None)
+    check("gfp_pressure_fastfail group registered", group is not None)
+    if group is None:
+        return
+    check("policy group registered after the hook group",
+          [g.key for g in core.PATCH_GROUPS].index("gfp_pressure_fastfail")
+          > [g.key for g in core.PATCH_GROUPS].index("customize_alloc_gfp_vh"))
+
+    # The payload must not land on a tree without the hook: the
+    # register_trace_ symbol would not exist at compile time (AGENTS.md trap
+    # 5 family -- text gates stay green, the build dies).
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": _BATCH13_MM_H,
+            "mm/page_alloc.c": _BATCH13_PAGE_ALLOC,
+        })
+        status, detail = core._gfp_pressure_fastfail_apply(ctx)
+        check("policy refuses a tree without the grafted hook",
+              status == "blocked_by_shape" and ctx.pending_writes() == [],
+              (status, detail))
+
+    # A merely-declared hook is still inert: the callback would register but
+    # never fire, so the probe also demands the call site in the same TU.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": g13.HOOK_MM_NEW,
+            "mm/page_alloc.c": _BATCH13_PAGE_ALLOC,
+        })
+        status, detail = core._gfp_pressure_fastfail_apply(ctx)
+        check("policy refuses a declared-but-never-called hook",
+              status == "blocked_by_shape" and ctx.pending_writes() == [],
+              (status, detail))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": _BATCH13_MM_H,
+            "mm/page_alloc.c": _BATCH13_PAGE_ALLOC,
+            "drivers/android/vendor_hooks.c": _BATCH13_VENDOR_HOOKS,
+        })
+        s0, _d0 = core._customize_alloc_gfp_vh_apply(ctx)
+        assert s0 == "applied"
+        status, detail = core._gfp_pressure_fastfail_apply(ctx)
+        check("policy fixture applies after the hook",
+              status == "applied", (status, detail))
+        text = ctx.read("mm/page_alloc.c")
+        mm_h = ctx.read("include/trace/hooks/mm.h")
+        vh = ctx.read("drivers/android/vendor_hooks.c")
+        for name, cond in {
+            "policy registers the hook callback":
+                "register_trace_android_vh_customize_alloc_gfp(" in text,
+            "policy is vendor-hook gated":
+                "#ifdef CONFIG_ANDROID_VENDOR_HOOKS" in text,
+            "pressure adds NORETRY and NOWARN":
+                "*gfp |= __GFP_NORETRY | __GFP_NOWARN;" in text,
+            "order gate really compares against the knob":
+                "if (order < READ_ONCE(abk_gfp_fastfail_order))" in text,
+            "enable knob really gates the handler":
+                "if (!READ_ONCE(abk_gfp_fastfail))" in text,
+            "THP-class default order":
+                "static unsigned int abk_gfp_fastfail_order = 9;" in text,
+            "carrier carries the ABK marker (module-introduced code)":
+                "ABK stable_515_backport: Batch 13 high-order slowpath "
+                "fast-fail." in text,
+        }.items():
+            check(name, cond)
+        # One-name module_param() compiles the identifier as the variable;
+        # pin that every knob declared here really declares that name.
+        for knob in re.findall(r"(?m)^module_param\((\w+),", text):
+            check(f"one-name module_param {knob!r} really declares it",
+                  re.search(rf"(?m)^static [^;]*\b{knob}\b", text) is not None)
+        ctx2 = make_ctx(tmp, {
+            "include/trace/hooks/mm.h": mm_h,
+            "mm/page_alloc.c": text,
+            "drivers/android/vendor_hooks.c": vh,
+        })
+        s1, _d1 = core._customize_alloc_gfp_vh_apply(ctx2)
+        check("hook stays already_present under the policy", s1 == "already_present", s1)
+        status2, _detail2 = core._gfp_pressure_fastfail_apply(ctx2)
+        check("policy fixture is idempotent",
+              status2 == "already_present", status2)
+
+
+def test_batch13_wake_up_new_task_excluded():
+    """Pin the survey's negative result.
+
+    research/hooks_gfp_vs_wake_up_new_task.md verified
+    ``android_rvh_wake_up_new_task`` verbatim on .167/.178/.194/lts: already
+    carried, so it gets **no group** (plan.md: 已排除，不再重议).  This is
+    the guard that keeps that decision from silently regressing into a
+    duplicate graft on a future baseline that still carries the hook.
+    """
+    print("Batch 13 wake_up_new_task exclusion pin")
+    import abk_stable_core as core
+    import abk_stable_perf as perf
+
+    keys = [g.key for g in core.PATCH_GROUPS] + \
+           [g.key for g in perf.PATCH_GROUPS]
+    check("no group grafts wake_up_new_task (carried by every baseline)",
+          not any("wake_up_new_task" in k for k in keys),
+          [k for k in keys if "wake_up_new_task" in k])
 
 
 def test_config_tiers():
@@ -1609,7 +1840,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.17.1", "0.17.1"], _versions)
+          _versions == ["0.18.0", "0.18.0"], _versions)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -2444,6 +2675,9 @@ def main():
     test_batch10_sched_smart_policy()
     test_batch10_zram_secondary_comp()
     test_batch11_zram_algo_lock()
+    test_batch13_customize_alloc_gfp_vh()
+    test_batch13_gfp_pressure_fastfail()
+    test_batch13_wake_up_new_task_excluded()
     test_config_tiers()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()

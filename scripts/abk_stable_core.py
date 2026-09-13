@@ -2616,7 +2616,7 @@ _MC_VALID_NEW = ("#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
                  "\tcase MADV_COLLAPSE:\n"
                  "#endif")
 
-# The scan helpers signatures are unchanged in shape across 167/.178/.194/.211,
+# The scan helpers signatures are unchanged in shape across 167/.178/.194/.216,
 # so every step below is a single anchor set (see docs/porting_policy.md).
 _MC_PMD_SIG_OLD = ("static int khugepaged_scan_pmd(struct mm_struct *mm,\n"
                    "\t\t\t       struct vm_area_struct *vma,\n"
@@ -3876,6 +3876,102 @@ PATCH_GROUPS = PATCH_GROUPS + [
         ],
         ["drivers/block/zram/zram_drv.c"],
         _zram_algo_lock_apply,
+    ),
+]
+
+# ============================================================================
+# Batch 13: the android_vh_customize_alloc_gfp hook and its ABK policy.
+# Steps live in scripts/batch13_core_gfp_customize_vh.py.
+#
+# The hook (android15-6.6 commit 4466afd69452, absent from every android13-5.15
+# baseline and from 6.1) hands a module the slowpath gfp by pointer right
+# before __alloc_pages_slowpath(): a rewrite point for high-order allocation
+# policy.  The upstream graft is verbatim upstream-shape (no ABK marker), and
+# the 5.15 slowpath-entry block is byte-identical to 6.6's because the cpuset
+# fast-path series landed on android13-5.15 long ago.  The policy group is the
+# consumer: while memory is low, order >= abk_gfp_fastfail_order (default 9)
+# slowpath attempts gain __GFP_NORETRY|__GFP_NOWARN, so a fragmented
+# near-full phone fails those requests into their callers' fallback (4K
+# fault, -ENOMEM) after one direct-reclaim try instead of stalling the
+# faulting task in the reclaim/compaction loop.  Measured at .167 the
+# default is not a no-op for THP: GFP_TRANSHUGE_LIGHT carries no
+# __GFP_NORETRY, so the defrag=madvise madvised fault and khugepaged's
+# defrag allocations are exactly the retryable class the gate catches (see
+# batch13_core_gfp_customize_vh.py).  Both groups refuse to apply without
+# proof the hook can fire and compile (mm.h declare + page_alloc.c call
+# site + header include), so a blocked hook group never leaves a payload
+# calling an undeclared register_trace_ (compile trap, AGENTS.md trap 4/5).
+# The companion finding -- android_rvh_wake_up_new_task is already present
+# on all four baselines and needs no graft -- is pinned in
+# tests/stable_5_15_test.py.
+# ============================================================================
+import batch13_core_gfp_customize_vh as _b13_gfp  # noqa: E402
+
+
+def _customize_alloc_gfp_vh_apply(ctx):
+    try:
+        pa = ctx.read("mm/page_alloc.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read mm/page_alloc.c: {exc}"
+    # The grafted call line needs the hook header in the same TU; every
+    # probed baseline includes it, but an include drop upstream would turn
+    # the graft into a compile error no text anchor notices (AGENTS.md
+    # trap 5).  Refuse instead of grafting C that cannot compile.
+    if "#include <trace/hooks/mm.h>" not in pa:
+        return "blocked_by_shape", ("mm/page_alloc.c does not include "
+                                    "<trace/hooks/mm.h>; the hook call "
+                                    "grafted there could not compile")
+    status, _results, detail = apply_steps(ctx, _b13_gfp.build_hook_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _gfp_pressure_fastfail_apply(ctx):
+    try:
+        mm_h = ctx.read("include/trace/hooks/mm.h")
+        pa = ctx.read("mm/page_alloc.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read hook files: {exc}"
+    if "android_vh_customize_alloc_gfp" not in mm_h:
+        return "blocked_by_shape", ("customize_alloc_gfp hook not grafted yet "
+                                    "(the policy needs customize_alloc_gfp_vh)")
+    # The declaration alone is not enough for the payload to do anything:
+    # probe the call site (a declared-but-never-called hook is inert) and
+    # the header include the callback's register_trace_ symbol needs.
+    if "trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);" not in pa:
+        return "blocked_by_shape", ("customize_alloc_gfp hook is not called "
+                                    "in mm/page_alloc.c; the policy would be "
+                                    "registered but never fire")
+    if "#include <trace/hooks/mm.h>" not in pa:
+        return "blocked_by_shape", ("mm/page_alloc.c does not include "
+                                    "<trace/hooks/mm.h>; the payload's "
+                                    "register_trace_ could not compile")
+    status, _results, detail = apply_steps(ctx, _b13_gfp.build_policy_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "customize_alloc_gfp_vh",
+        "android_vh_customize_alloc_gfp vendor hook grafted verbatim from android15-6.6 (4466afd69452): slowpath-entry gfp rewrite point (mm.h declare + page_alloc call + vendor_hooks export, no ABK marker)",
+        [
+            "4466afd694520 (android15-6.6, Bug 337192903)",
+        ],
+        ["include/trace/hooks/mm.h", "mm/page_alloc.c",
+         "drivers/android/vendor_hooks.c"],
+        _customize_alloc_gfp_vh_apply,
+    ),
+    PatchGroup(
+        "gfp_pressure_fastfail",
+        "high-order slowpath fast-fail under memory pressure: while available pages < page_alloc.abk_gfp_fastfail_pct% (default 50) of the summed high watermarks, slowpath attempts of order >= abk_gfp_fastfail_order (default 9: THP-class) gain __GFP_NORETRY|__GFP_NOWARN; abk_gfp_fastfail=0 switches off (ABK policy on the Batch 13 hook)",
+        [
+            "ABK Batch 13 policy (plan.md) on android_vh_customize_alloc_gfp",
+        ],
+        ["include/trace/hooks/mm.h", "mm/page_alloc.c"],
+        _gfp_pressure_fastfail_apply,
     ),
 ]
 
