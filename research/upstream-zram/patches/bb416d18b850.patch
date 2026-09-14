@@ -1,0 +1,244 @@
+From bb416d18b850faaa44bd3bb67c9728922c3cce98 Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Fri, 28 Dec 2018 00:36:54 -0800
+Subject: [PATCH] zram: writeback throttle
+
+If there are lots of write IO with flash device, it could have a
+wearout problem of storage. To overcome the problem, admin needs
+to design write limitation to guarantee flash health
+for entire product life.
+
+This patch creates a new knob "writeback_limit" for zram.
+
+writeback_limit's default value is 0 so that it doesn't limit
+any writeback. If admin want to measure writeback count in a
+certain period, he could know it via /sys/block/zram0/bd_stat's
+3rd column.
+
+If admin want to limit writeback as per-day 400M, he could do it
+like below.
+
+	MB_SHIFT=20
+	4K_SHIFT=12
+	echo $((400<<MB_SHIFT>>4K_SHIFT)) > \
+		/sys/block/zram0/writeback_limit.
+
+If admin want to allow further write again, he could do it like below
+
+	echo 0 > /sys/block/zram0/writeback_limit
+
+If admin want to see remaining writeback budget,
+
+	cat /sys/block/zram0/writeback_limit
+
+The writeback_limit count will reset whenever you reset zram (e.g., system
+reboot, echo 1 > /sys/block/zramX/reset) so keeping how many of writeback
+happened until you reset the zram to allocate extra writeback budget in
+next setting is user's job.
+
+[minchan@kernel.org: v4]
+  Link: http://lkml.kernel.org/r/20181203024045.153534-8-minchan@kernel.org
+Link: http://lkml.kernel.org/r/20181127055429.251614-8-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Cc: Joey Pabalinas <joeypabalinas@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ Documentation/ABI/testing/sysfs-block-zram |  9 ++++
+ Documentation/blockdev/zram.txt            | 31 +++++++++++++
+ drivers/block/zram/zram_drv.c              | 52 ++++++++++++++++++++--
+ drivers/block/zram/zram_drv.h              |  2 +
+ 4 files changed, 91 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-block-zram b/Documentation/ABI/testing/sysfs-block-zram
+index 65fc33b2f53b2b..9d2339a485c8ab 100644
+--- a/Documentation/ABI/testing/sysfs-block-zram
++++ b/Documentation/ABI/testing/sysfs-block-zram
+@@ -121,3 +121,12 @@ Description:
+ 		The bd_stat file is read-only and represents backing device's
+ 		statistics (bd_count, bd_reads, bd_writes) in a format
+ 		similar to block layer statistics file format.
++
++What:		/sys/block/zram<id>/writeback_limit
++Date:		November 2018
++Contact:	Minchan Kim <minchan@kernel.org>
++Description:
++		The writeback_limit file is read-write and specifies the maximum
++		amount of writeback ZRAM can do. The limit could be changed
++		in run time and "0" means disable the limit.
++		No limit is the initial state.
+diff --git a/Documentation/blockdev/zram.txt b/Documentation/blockdev/zram.txt
+index 906df97527a7ff..436c5e98e1b603 100644
+--- a/Documentation/blockdev/zram.txt
++++ b/Documentation/blockdev/zram.txt
+@@ -164,6 +164,8 @@ reset             WO    trigger device reset
+ mem_used_max      WO    reset the `mem_used_max' counter (see later)
+ mem_limit         WO    specifies the maximum amount of memory ZRAM can use
+                         to store the compressed data
++writeback_limit   WO    specifies the maximum amount of write IO zram can
++			write out to backing device as 4KB unit
+ max_comp_streams  RW    the number of possible concurrent compress operations
+ comp_algorithm    RW    show and change the compression algorithm
+ compact           WO    trigger memory compaction
+@@ -275,6 +277,35 @@ Admin can request writeback of those idle pages at right timing via
+ 
+ With the command, zram writeback idle pages from memory to the storage.
+ 
++If there are lots of write IO with flash device, potentially, it has
++flash wearout problem so that admin needs to design write limitation
++to guarantee storage health for entire product life.
++To overcome the concern, zram supports "writeback_limit".
++The "writeback_limit"'s default value is 0 so that it doesn't limit
++any writeback. If admin want to measure writeback count in a certain
++period, he could know it via /sys/block/zram0/bd_stat's 3rd column.
++
++If admin want to limit writeback as per-day 400M, he could do it
++like below.
++
++    MB_SHIFT=20
++    4K_SHIFT=12
++    echo $((400<<MB_SHIFT>>4K_SHIFT)) > \
++	    /sys/block/zram0/writeback_limit.
++
++If admin want to allow further write again, he could do it like below
++
++    echo 0 > /sys/block/zram0/writeback_limit
++
++If admin want to see remaining writeback budget since he set,
++
++    cat /sys/block/zram0/writeback_limit
++
++The writeback_limit count will reset whenever you reset zram(e.g.,
++system reboot, echo 1 > /sys/block/zramX/reset) so keeping how many of
++writeback happened until you reset the zram to allocate extra writeback
++budget in next setting is user's job.
++
+ = memory tracking
+ 
+ With CONFIG_ZRAM_MEMORY_TRACKING, user can know information of the
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index f1832fa3ba41b4..33c5cc879f246e 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -330,6 +330,39 @@ static ssize_t idle_store(struct device *dev,
+ }
+ 
+ #ifdef CONFIG_ZRAM_WRITEBACK
++static ssize_t writeback_limit_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t len)
++{
++	struct zram *zram = dev_to_zram(dev);
++	u64 val;
++	ssize_t ret = -EINVAL;
++
++	if (kstrtoull(buf, 10, &val))
++		return ret;
++
++	down_read(&zram->init_lock);
++	atomic64_set(&zram->stats.bd_wb_limit, val);
++	if (val == 0)
++		zram->stop_writeback = false;
++	up_read(&zram->init_lock);
++	ret = len;
++
++	return ret;
++}
++
++static ssize_t writeback_limit_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	u64 val;
++	struct zram *zram = dev_to_zram(dev);
++
++	down_read(&zram->init_lock);
++	val = atomic64_read(&zram->stats.bd_wb_limit);
++	up_read(&zram->init_lock);
++
++	return scnprintf(buf, PAGE_SIZE, "%llu\n", val);
++}
++
+ static void reset_bdev(struct zram *zram)
+ {
+ 	struct block_device *bdev;
+@@ -612,6 +645,11 @@ static ssize_t writeback_store(struct device *dev,
+ 		bvec.bv_len = PAGE_SIZE;
+ 		bvec.bv_offset = 0;
+ 
++		if (zram->stop_writeback) {
++			ret = -EIO;
++			break;
++		}
++
+ 		if (!blk_idx) {
+ 			blk_idx = alloc_block_bdev(zram);
+ 			if (!blk_idx) {
+@@ -694,6 +732,11 @@ static ssize_t writeback_store(struct device *dev,
+ 		zram_set_element(zram, index, blk_idx);
+ 		blk_idx = 0;
+ 		atomic64_inc(&zram->stats.pages_stored);
++		if (atomic64_add_unless(&zram->stats.bd_wb_limit,
++					-1 << (PAGE_SHIFT - 12), 0)) {
++			if (atomic64_read(&zram->stats.bd_wb_limit) == 0)
++				zram->stop_writeback = true;
++		}
+ next:
+ 		zram_slot_unlock(zram, index);
+ 	}
+@@ -1018,6 +1061,7 @@ static ssize_t mm_stat_show(struct device *dev,
+ }
+ 
+ #ifdef CONFIG_ZRAM_WRITEBACK
++#define FOUR_K(x) ((x) * (1 << (PAGE_SHIFT - 12)))
+ static ssize_t bd_stat_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+ {
+@@ -1027,9 +1071,9 @@ static ssize_t bd_stat_show(struct device *dev,
+ 	down_read(&zram->init_lock);
+ 	ret = scnprintf(buf, PAGE_SIZE,
+ 		"%8llu %8llu %8llu\n",
+-		(u64)atomic64_read(&zram->stats.bd_count) * (PAGE_SHIFT - 12),
+-		(u64)atomic64_read(&zram->stats.bd_reads) * (PAGE_SHIFT - 12),
+-		(u64)atomic64_read(&zram->stats.bd_writes) * (PAGE_SHIFT - 12));
++			FOUR_K((u64)atomic64_read(&zram->stats.bd_count)),
++			FOUR_K((u64)atomic64_read(&zram->stats.bd_reads)),
++			FOUR_K((u64)atomic64_read(&zram->stats.bd_writes)));
+ 	up_read(&zram->init_lock);
+ 
+ 	return ret;
+@@ -1767,6 +1811,7 @@ static DEVICE_ATTR_RW(comp_algorithm);
+ #ifdef CONFIG_ZRAM_WRITEBACK
+ static DEVICE_ATTR_RW(backing_dev);
+ static DEVICE_ATTR_WO(writeback);
++static DEVICE_ATTR_RW(writeback_limit);
+ #endif
+ 
+ static struct attribute *zram_disk_attrs[] = {
+@@ -1782,6 +1827,7 @@ static struct attribute *zram_disk_attrs[] = {
+ #ifdef CONFIG_ZRAM_WRITEBACK
+ 	&dev_attr_backing_dev.attr,
+ 	&dev_attr_writeback.attr,
++	&dev_attr_writeback_limit.attr,
+ #endif
+ 	&dev_attr_io_stat.attr,
+ 	&dev_attr_mm_stat.attr,
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index bc477803530d5a..4bd3afd15e833e 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -86,6 +86,7 @@ struct zram_stats {
+ 	atomic64_t bd_count;		/* no. of pages in backing device */
+ 	atomic64_t bd_reads;		/* no. of reads from backing device */
+ 	atomic64_t bd_writes;		/* no. of writes from backing device */
++	atomic64_t bd_wb_limit;		/* writeback limit of backing device */
+ #endif
+ };
+ 
+@@ -113,6 +114,7 @@ struct zram {
+ 	 */
+ 	bool claim; /* Protected by bdev->bd_mutex */
+ 	struct file *backing_dev;
++	bool stop_writeback;
+ #ifdef CONFIG_ZRAM_WRITEBACK
+ 	struct block_device *bdev;
+ 	unsigned int old_block_size;

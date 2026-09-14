@@ -1,0 +1,31 @@
+From 0fc66c9d63143f9437cd57cf5eab50a258fa40ec Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 21 Sep 2020 09:19:50 +0200
+Subject: [PATCH] zram: cleanup backing_dev_store
+
+Use blkdev_get_by_dev instead of bdgrab + blkdev_get.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ drivers/block/zram/zram_drv.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index a356275605b104..91ccfe444525b4 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -491,9 +491,10 @@ static ssize_t backing_dev_store(struct device *dev,
+ 		goto out;
+ 	}
+ 
+-	bdev = bdgrab(I_BDEV(inode));
+-	err = blkdev_get(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL, zram);
+-	if (err < 0) {
++	bdev = blkdev_get_by_dev(inode->i_rdev,
++			FMODE_READ | FMODE_WRITE | FMODE_EXCL, zram);
++	if (IS_ERR(bdev)) {
++		err = PTR_ERR(bdev);
+ 		bdev = NULL;
+ 		goto out;
+ 	}

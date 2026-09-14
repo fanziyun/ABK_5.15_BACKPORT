@@ -1,0 +1,89 @@
+From 30226b69f8767a822f87c2c92bf6d4fbf545cee1 Mon Sep 17 00:00:00 2001
+From: Brian Geffon <bgeffon@google.com>
+Date: Fri, 29 Apr 2022 14:36:59 -0700
+Subject: [PATCH] zram: add a huge_idle writeback mode
+
+Today it's only possible to write back as a page, idle, or huge.  A user
+might want to writeback pages which are huge and idle first as these idle
+pages do not require decompression and make a good first pass for
+writeback.
+
+Idle writeback specifically has the advantage that a refault is unlikely
+given that the page has been swapped for some amount of time without being
+refaulted.
+
+Huge writeback has the advantage that you're guaranteed to get the maximum
+benefit from a single page writeback, that is, you're reclaiming one full
+page of memory.  Pages which are compressed in zram being written back
+result in some benefit which is always less than a page size because of
+the fact that it was compressed.
+
+The primary use of this is for minimizing refaults in situations where the
+device has to be sensitive to storage endurance.  On ChromeOS we have
+devices with slow eMMC and repeated writes and refaults can negatively
+affect performance and endurance.
+
+Link: https://lkml.kernel.org/r/20220322215821.1196994-1-bgeffon@google.com
+Signed-off-by: Brian Geffon <bgeffon@google.com>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ Documentation/admin-guide/blockdev/zram.rst |  5 +++++
+ drivers/block/zram/zram_drv.c               | 10 ++++++----
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/admin-guide/blockdev/zram.rst b/Documentation/admin-guide/blockdev/zram.rst
+index 54fe63745ed8e5..c73b16930449e6 100644
+--- a/Documentation/admin-guide/blockdev/zram.rst
++++ b/Documentation/admin-guide/blockdev/zram.rst
+@@ -343,6 +343,11 @@ Admin can request writeback of those idle pages at right timing via::
+ 
+ With the command, zram will writeback idle pages from memory to the storage.
+ 
++Additionally, if a user choose to writeback only huge and idle pages
++this can be accomplished with::
++
++        echo huge_idle > /sys/block/zramX/writeback
++
+ If an admin wants to write a specific page in zram device to the backing device,
+ they could write a page index into the interface.
+ 
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index e9474b02012deb..8562a7cce558b8 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -639,8 +639,8 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
+ #define PAGE_WB_SIG "page_index="
+ 
+ #define PAGE_WRITEBACK 0
+-#define HUGE_WRITEBACK 1
+-#define IDLE_WRITEBACK 2
++#define HUGE_WRITEBACK (1<<0)
++#define IDLE_WRITEBACK (1<<1)
+ 
+ 
+ static ssize_t writeback_store(struct device *dev,
+@@ -660,6 +660,8 @@ static ssize_t writeback_store(struct device *dev,
+ 		mode = IDLE_WRITEBACK;
+ 	else if (sysfs_streq(buf, "huge"))
+ 		mode = HUGE_WRITEBACK;
++	else if (sysfs_streq(buf, "huge_idle"))
++		mode = IDLE_WRITEBACK | HUGE_WRITEBACK;
+ 	else {
+ 		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
+ 			return -EINVAL;
+@@ -721,10 +723,10 @@ static ssize_t writeback_store(struct device *dev,
+ 				zram_test_flag(zram, index, ZRAM_UNDER_WB))
+ 			goto next;
+ 
+-		if (mode == IDLE_WRITEBACK &&
++		if (mode & IDLE_WRITEBACK &&
+ 			  !zram_test_flag(zram, index, ZRAM_IDLE))
+ 			goto next;
+-		if (mode == HUGE_WRITEBACK &&
++		if (mode & HUGE_WRITEBACK &&
+ 			  !zram_test_flag(zram, index, ZRAM_HUGE))
+ 			goto next;
+ 		/*

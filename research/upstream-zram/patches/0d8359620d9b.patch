@@ -1,0 +1,93 @@
+From 0d8359620d9be9823b6b9b3cf2dbe006cbfec594 Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Mon, 14 Dec 2020 19:14:28 -0800
+Subject: [PATCH] zram: support page writeback
+
+There is demand to writeback specific process pages to backing store
+instead of all idles pages in the system due to storage wear out concerns
+and to launching latency of apps which are most of the time idle but are
+critical for resume latency.
+
+This patch extends the writeback knob to support a specific page
+writeback.
+
+Link: https://lkml.kernel.org/r/20201020190506.3758660-1-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ Documentation/admin-guide/blockdev/zram.rst |  5 +++++
+ drivers/block/zram/zram_drv.c               | 21 +++++++++++++++++----
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/admin-guide/blockdev/zram.rst b/Documentation/admin-guide/blockdev/zram.rst
+index a6fd1f9b5faf52..8f3cfa42e443a7 100644
+--- a/Documentation/admin-guide/blockdev/zram.rst
++++ b/Documentation/admin-guide/blockdev/zram.rst
+@@ -334,6 +334,11 @@ Admin can request writeback of those idle pages at right timing via::
+ 
+ With the command, zram writeback idle pages from memory to the storage.
+ 
++If admin want to write a specific page in zram device to backing device,
++they could write a page index into the interface.
++
++	echo "page_index=1251" > /sys/block/zramX/writeback
++
+ If there are lots of write IO with flash device, potentially, it has
+ flash wearout problem so that admin needs to design write limitation
+ to guarantee storage health for entire product life.
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 1b697208d66157..9a1e6ee4dbeff5 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -620,15 +620,19 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
+ 	return 1;
+ }
+ 
++#define PAGE_WB_SIG "page_index="
++
++#define PAGE_WRITEBACK 0
+ #define HUGE_WRITEBACK 1
+ #define IDLE_WRITEBACK 2
+ 
++
+ static ssize_t writeback_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t len)
+ {
+ 	struct zram *zram = dev_to_zram(dev);
+ 	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+-	unsigned long index;
++	unsigned long index = 0;
+ 	struct bio bio;
+ 	struct bio_vec bio_vec;
+ 	struct page *page;
+@@ -640,8 +644,17 @@ static ssize_t writeback_store(struct device *dev,
+ 		mode = IDLE_WRITEBACK;
+ 	else if (sysfs_streq(buf, "huge"))
+ 		mode = HUGE_WRITEBACK;
+-	else
+-		return -EINVAL;
++	else {
++		if (strncmp(buf, PAGE_WB_SIG, sizeof(PAGE_WB_SIG) - 1))
++			return -EINVAL;
++
++		ret = kstrtol(buf + sizeof(PAGE_WB_SIG) - 1, 10, &index);
++		if (ret || index >= nr_pages)
++			return -EINVAL;
++
++		nr_pages = 1;
++		mode = PAGE_WRITEBACK;
++	}
+ 
+ 	down_read(&zram->init_lock);
+ 	if (!init_done(zram)) {
+@@ -660,7 +673,7 @@ static ssize_t writeback_store(struct device *dev,
+ 		goto release_init_lock;
+ 	}
+ 
+-	for (index = 0; index < nr_pages; index++) {
++	while (nr_pages--) {
+ 		struct bio_vec bvec;
+ 
+ 		bvec.bv_page = page;

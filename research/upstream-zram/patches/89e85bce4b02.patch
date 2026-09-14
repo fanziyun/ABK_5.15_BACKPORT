@@ -1,0 +1,119 @@
+From 89e85bce4b02edb7408aebf69d5d1a6692a05f4f Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Thu, 7 Jun 2018 17:05:42 -0700
+Subject: [PATCH] zram: mark incompressible page as ZRAM_HUGE
+
+Mark incompressible pages so that we could investigate who is the owner
+of the incompressible pages once the page is swapped out via using
+upcoming zram memory tracker feature.
+
+With it, we could prevent such pages to be swapped out by using mlock.
+Otherwise we might remove them.
+
+This patch exposes new stat for huge pages via mm_stat.
+
+Link: http://lkml.kernel.org/r/20180416090946.63057-3-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ Documentation/blockdev/zram.txt |  1 +
+ drivers/block/zram/zram_drv.c   | 17 ++++++++++++++---
+ drivers/block/zram/zram_drv.h   |  2 ++
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/blockdev/zram.txt b/Documentation/blockdev/zram.txt
+index 257e65714c6a21..78db38d02bc9a2 100644
+--- a/Documentation/blockdev/zram.txt
++++ b/Documentation/blockdev/zram.txt
+@@ -218,6 +218,7 @@ line of text and contains the following stats separated by whitespace:
+  same_pages       the number of same element filled pages written to this disk.
+                   No memory is allocated for such pages.
+  pages_compacted  the number of pages freed during compaction
++ huge_pages	  the number of incompressible pages
+ 
+ 9) Deactivate:
+ 	swapoff /dev/zram0
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 18dadeab775b91..777fb3339f598e 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -729,14 +729,15 @@ static ssize_t mm_stat_show(struct device *dev,
+ 	max_used = atomic_long_read(&zram->stats.max_used_pages);
+ 
+ 	ret = scnprintf(buf, PAGE_SIZE,
+-			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu\n",
++			"%8llu %8llu %8llu %8lu %8ld %8llu %8lu %8llu\n",
+ 			orig_size << PAGE_SHIFT,
+ 			(u64)atomic64_read(&zram->stats.compr_data_size),
+ 			mem_used << PAGE_SHIFT,
+ 			zram->limit_pages << PAGE_SHIFT,
+ 			max_used << PAGE_SHIFT,
+ 			(u64)atomic64_read(&zram->stats.same_pages),
+-			pool_stats.pages_compacted);
++			pool_stats.pages_compacted,
++			(u64)atomic64_read(&zram->stats.huge_pages));
+ 	up_read(&zram->init_lock);
+ 
+ 	return ret;
+@@ -805,6 +806,11 @@ static void zram_free_page(struct zram *zram, size_t index)
+ {
+ 	unsigned long handle;
+ 
++	if (zram_test_flag(zram, index, ZRAM_HUGE)) {
++		zram_clear_flag(zram, index, ZRAM_HUGE);
++		atomic64_dec(&zram->stats.huge_pages);
++	}
++
+ 	if (zram_wb_enabled(zram) && zram_test_flag(zram, index, ZRAM_WB)) {
+ 		zram_wb_clear(zram, index);
+ 		atomic64_dec(&zram->stats.pages_stored);
+@@ -973,6 +979,7 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 	}
+ 
+ 	if (unlikely(comp_len >= huge_class_size)) {
++		comp_len = PAGE_SIZE;
+ 		if (zram_wb_enabled(zram) && allow_wb) {
+ 			zcomp_stream_put(zram->comp);
+ 			ret = write_to_bdev(zram, bvec, index, bio, &element);
+@@ -984,7 +991,6 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 			allow_wb = false;
+ 			goto compress_again;
+ 		}
+-		comp_len = PAGE_SIZE;
+ 	}
+ 
+ 	/*
+@@ -1046,6 +1052,11 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 	zram_slot_lock(zram, index);
+ 	zram_free_page(zram, index);
+ 
++	if (comp_len == PAGE_SIZE) {
++		zram_set_flag(zram, index, ZRAM_HUGE);
++		atomic64_inc(&zram->stats.huge_pages);
++	}
++
+ 	if (flags) {
+ 		zram_set_flag(zram, index, flags);
+ 		zram_set_element(zram, index, element);
+diff --git a/drivers/block/zram/zram_drv.h b/drivers/block/zram/zram_drv.h
+index 8d8959ceabd1cd..ff0547bdb58678 100644
+--- a/drivers/block/zram/zram_drv.h
++++ b/drivers/block/zram/zram_drv.h
+@@ -47,6 +47,7 @@ enum zram_pageflags {
+ 	ZRAM_LOCK = ZRAM_FLAG_SHIFT,
+ 	ZRAM_SAME,	/* Page consists the same element */
+ 	ZRAM_WB,	/* page is stored on backing_device */
++	ZRAM_HUGE,	/* Incompressible page */
+ 
+ 	__NR_ZRAM_PAGEFLAGS,
+ };
+@@ -71,6 +72,7 @@ struct zram_stats {
+ 	atomic64_t invalid_io;	/* non-page-aligned I/O requests */
+ 	atomic64_t notify_free;	/* no. of swap slot free notifications */
+ 	atomic64_t same_pages;		/* no. of same element filled pages */
++	atomic64_t huge_pages;		/* no. of huge pages */
+ 	atomic64_t pages_stored;	/* no. of pages currently stored */
+ 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
+ 	atomic64_t writestall;		/* no. of write slow paths */
