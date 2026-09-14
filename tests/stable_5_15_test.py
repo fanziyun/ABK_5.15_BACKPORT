@@ -973,6 +973,47 @@ def test_batch22_psi_oncpu_state_mask():
               all(ctx.read(rel) == snapshot[rel] for rel in files))
 
 
+def test_batch23_zram_writeback_guard():
+    """Batch 23: the compressed-writeback block must survive the config being off."""
+    print("Batch 23: zram compressed writeback inside CONFIG_ZRAM_WRITEBACK")
+    import batch17_core_zram_writeback as b17
+
+    read_new, read_old = b17._C_READ_NEW, b17._C_READ_OLD
+    check("the added read block is inside the writeback gate",
+          read_new.startswith("#ifdef CONFIG_ZRAM_WRITEBACK\n")
+          and "#endif /* CONFIG_ZRAM_WRITEBACK */\n" in read_new
+          and read_new.index("#endif /* CONFIG_ZRAM_WRITEBACK */")
+          < read_new.index("static int zram_bvec_read(struct zram *zram"))
+    check("the gate closes right before the pristine function head",
+          read_new.endswith(read_old))
+    # The helpers touch zram->bdev / zram->wb_compressed / stats.bd_reads, all of
+    # which struct zram only declares under CONFIG_ZRAM_WRITEBACK -- and ABK's
+    # dispatch does not have to enable it (that is how the CI build of this
+    # batch failed: "no member named 'bdev' in 'struct zram'").
+    for needle in ("zram->bdev", "zram->wb_compressed", "zram->stats.bd_reads"):
+        check(f"the gated field {needle} is only reached inside the gate",
+              needle in read_new)
+
+    for name, block, pristine in (("call 1", b17._C_CALL1_NEW, b17._C_CALL1_OLD),
+                                  ("call 2", b17._C_CALL2_NEW, b17._C_CALL2_OLD)):
+        else_at = block.find("#else\n")
+        end_at = block.find("#endif\n", else_at)
+        fallback = block[else_at + len("#else\n"):end_at] if else_at >= 0 else ""
+        check(f"{name} falls back to the pristine read without the gate",
+              "#ifdef CONFIG_ZRAM_WRITEBACK\n" in block and else_at > 0
+              and end_at > else_at and fallback.strip() == pristine.strip(),
+              (name, block))
+
+    # And the audit that catches a regression of this kind is registered: the
+    # four text audits run against a tree and would never see a preprocessor.
+    import implementation_audit as ia
+    check("the config-gated reference audit covers zram_drv.c",
+          "drivers/block/zram/zram_drv.c" in ia.CONFIG_GATED_REFERENCES
+          and any(gate == "CONFIG_ZRAM_WRITEBACK"
+                  for gate, _n in ia.CONFIG_GATED_REFERENCES[
+                      "drivers/block/zram/zram_drv.c"]))
+
+
 def test_sublevel_matrix():
     """The expectation matrix must stay in sync with the registries."""
     print("sublevel expectation matrix")
@@ -2491,7 +2532,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.27.0", "0.27.0"], _versions)
+          _versions == ["0.28.0", "0.28.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3545,6 +3586,7 @@ def main():
     test_sublevel_matrix()
     test_batch21_psi_cgroup_pressure_switch()
     test_batch22_psi_oncpu_state_mask()
+    test_batch23_zram_writeback_guard()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

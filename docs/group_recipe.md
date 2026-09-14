@@ -133,6 +133,29 @@ expected is missing — run the dry-run on all supported baselines to catch it.
 Trap 5 only shows up on the **second** pass, so it is the patched-tree status
 assertion that matters, not the pristine one.
 
+## Config-gate traps (invisible to every tree-level audit)
+
+The audits diff *text*; they never run a preprocessor. So a graft that references a
+symbol the tree declares only inside a `#ifdef` compiles fine wherever that
+config happens to be on -- and destroys every build where it is off. Batch 17's
+compressed-writeback helpers did exactly that with `zram->bdev` /
+`zram->wb_compressed` / `zram->stats.bd_reads` (all inside
+`CONFIG_ZRAM_WRITEBACK`), and the module's own tier treats that symbol as
+optional; CI failed with `no member named 'bdev' in 'struct zram'` while all four
+local audits were green (Batch 23).
+
+Rules:
+- A module-introduced line may only use symbols that exist **regardless of
+  configuration**. If it must touch a gated field or function, wrap the new text
+  in the same gate.
+- A *call site* that has to be redirected carries the gate **and an `#else`**
+  holding the pristine call, so the file degrades to upstream's form rather than to
+  a call of something that is not there.
+- The mechanical check lives in `implementation_audit.py`
+  (`CONFIG_GATED_REFERENCES`): added/replaced lines that mention a gated symbol
+  must sit inside that gate. Extend the table whenever a graft touches a
+  conditionally declared field.
+
 ## Convention traps (compile clean, behave wrong)
 
 A graft lifted from a newer kernel can compile perfectly and still be wrong

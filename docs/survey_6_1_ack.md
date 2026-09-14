@@ -89,11 +89,17 @@ Everything the Batch-3 survey deferred is now resolved (Batch 21 closes the last
 PSI entry); the remaining rows below record what was landed elsewhere and what
 stays out of scope, so a future re-read does not re-open them.
 
-- **per-VMA locks** — present in android14-6.1 (whole 6.4 design
-  grafted onto 6.1); highest raw value (app-launch latency) but a real
-  5.15 project: RCU VMA lifetime + fault-path conversion + `vm_area_struct`
-  KABI slots; the ACK 6.1 series sits on maple-tree storage and is not
-  directly graftable — reference the rbtree-era RFC design.
+- **per-VMA locks** — present in android14-6.1 (whole 6.4 design grafted onto
+  6.1); highest raw value (app-launch latency) and still **not ported**.  The
+  2026-09-14 probe corrected two assumptions: the KMI is *not* the blocker
+  (`struct vm_area_struct` still carries four `ANDROID_KABI_RESERVE` slots —
+  `mm_types.h:431-434` — and the ACK design only needs `int vm_lock_seq` plus a
+  *pointer* to a separately allocated lock), and the ACK code cannot be lifted
+  as-is (it sits on the maple tree: `vma_lookup()`/`mas_walk()`).  The real size
+  is the writer side: 42 `vma_start_write()` call sites in an 11-file sample (83
+  per-VMA-lock API sites in total) and every one of them missing is silent
+  corruption, which no current audit can detect.  Scope, the missing audit
+  class and a read-side-first staging proposal are in `plan.md` ("6.1 来源线后续批次").
 - **per-cgroup PSI toggling** (cgroup.pressure enable/disable) — **landed in
   Batch 21** (`psi_cgroup_pressure_switch`, v0.26.0). It was never actually
   blocked by the psi_group restructure: that restructure only exists to *store*

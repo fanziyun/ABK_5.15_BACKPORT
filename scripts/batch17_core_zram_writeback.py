@@ -893,7 +893,16 @@ _C_READ_OLD = (
     "\tstruct page *page;\n"
 )
 
+# The whole block below is compressed-writeback code: it reads zram->bdev and
+# zram->wb_compressed, and struct zram only declares those under
+# CONFIG_ZRAM_WRITEBACK (zram_drv.h).  ABK's dispatch does not have to enable the
+# symbol -- the ROM tier does, and the option is documented as optional -- so the
+# block carries the same guard the upstream writeback code does.  Without it the
+# module builds a kernel that fails with "no member named 'bdev' in 'struct
+# zram'" the moment the config is off (the smoke build of 2026-09-14 hit exactly
+# that in CI, see CHANGELOG.md#batch-23).
 _C_READ_NEW = (
+    "#ifdef CONFIG_ZRAM_WRITEBACK\n"
     "/*\n"
     " * ABK stable_515_backport: d38fab605c66.  Compressed writeback leaves the\n"
     " * zspool object as-is on the backing device, so reading such a slot back has\n"
@@ -1094,6 +1103,7 @@ _C_READ_NEW = (
     "\treturn abk_zram_read_compressed_bdev(zram, page, index, blk_idx, bio,\n"
     "\t\t\t\t\t     partial_io);\n"
     "}\n"
+    "#endif /* CONFIG_ZRAM_WRITEBACK */\n"
     "\n"
     "static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,\n"
     "\t\t\t\tu32 index, int offset, struct bio *bio)\n"
@@ -1106,9 +1116,17 @@ _C_CALL1_OLD = (
     "\tret = __zram_bvec_read(zram, page, index, bio, is_partial_io(bvec));\n"
 )
 
+# The redirects have to follow the same guard as the code they call: with
+# CONFIG_ZRAM_WRITEBACK off there are no compressed WB slots, so the plain
+# __zram_bvec_read() of the pristine tree is the right call (and the only one
+# that exists).
 _C_CALL1_NEW = (
     "\t/* ABK stable_515_backport: d38fab605c66 -- compressed WB slots */\n"
+    "#ifdef CONFIG_ZRAM_WRITEBACK\n"
     "\tret = abk_zram_bvec_read(zram, page, index, bio, is_partial_io(bvec));\n"
+    "#else\n"
+    "\tret = __zram_bvec_read(zram, page, index, bio, is_partial_io(bvec));\n"
+    "#endif\n"
 )
 
 _C_CALL2_OLD = (
@@ -1122,7 +1140,11 @@ _C_CALL2_NEW = (
     "\t\t * cannot be read raw -- that would splice compressed bytes into\n"
     "\t\t * the page being written.\n"
     "\t\t */\n"
+    "#ifdef CONFIG_ZRAM_WRITEBACK\n"
     "\t\tret = abk_zram_bvec_read(zram, page, index, bio, true);\n"
+    "#else\n"
+    "\t\tret = __zram_bvec_read(zram, page, index, bio, true);\n"
+    "#endif\n"
 )
 
 _C_ATTR_OLD = (

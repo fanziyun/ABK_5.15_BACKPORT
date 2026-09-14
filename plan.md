@@ -4,6 +4,8 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 23(v0.28.0,已落地)→ 详见 CHANGELOG.md#batch-23 — 修 CI 暴露的真问题：zram compressed-writeback 新增块放进 `CONFIG_ZRAM_WRITEBACK` 门内（配置关掉也能编译），并新增"配置门内符号引用"审计
+
 ## Batch 22(v0.27.0,已落地)→ 详见 CHANGELOG.md#batch-22 — PSI 内部同步收口：`TSK_ONCPU` 改为 state mask 的位（去掉 `NR_ONCPU` 计数与 `identical_state` 启发式），仍不引入 `psi_group::parent`
 
 ## Batch 21(v0.26.0,已落地)→ 详见 CHANGELOG.md#batch-21 — android14-6.1 的 per-cgroup PSI 开关（`cgroup.pressure`）：KMI 中性实现（cgroup `flags` 位承载状态，`struct psi_group`/`struct cgroup` 一字节不动），语义与上游逐条对齐；顺带补上「后置组改写前置组新增文本 → 前置组必须有探针」这条陷阱变体
@@ -257,7 +259,30 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 
 ## 6.1 来源线后续批次（backlog）
 
-- [ ] per-VMA locks（android14-6.1 全量移植；5.15 需 RCU VMA 生命周期 + fault 路径改造 + vma KABI 槽位，参照 rbtree 时代 RFC 设计）
+- [~] per-VMA locks（android14-6.1 全量移植；5.15 需 RCU VMA 生命周期 + fault 路径改造 + vma KABI 槽位，参照 rbtree 时代 RFC 设计）
+  - **2026-09-14 可行性探针（Batch 21/22 后，实测）**：三条结论，前两条与旧记载**不同**。
+    1. **KMI 不是阻塞点**：5.15 的 `struct vm_area_struct` 末尾就有 4 个 `ANDROID_KABI_RESERVE` 槽
+       （`include/linux/mm_types.h:431-434`，共 32 字节），而 6.1 的方案只需要 `int vm_lock_seq` +
+       `struct vma_lock *vm_lock`（锁体是**单独分配**的，不内联）——空间够，且用法正是模块已有的
+       `ANDROID_KABI_USE` 规则。
+    2. **真正的工作量在写侧**：6.1 里 `vma_start_write()` 有 **42 处调用点**（仅在本次抽样的 11 个
+       文件里就有），per-VMA 锁 API 合计 **83 处**（`mm/mmap.c` 27、`mm/userfaultfd.c` 17、`mm/memory.c` 14、
+       `include/linux/mm.h` 15、`mmap_lock.h` 5、其余分散）。5.15 侧**一处都没有**（零基础设施）。
+       真实总数还要加上本次未抽样的 `fs/userfaultfd.c`、`mm/mlock.c`、`mm/mempolicy.c`、
+       `arch/arm64/mm/fault.c` 等 —— 也就是**上百处**需要正确插入写锁的 VMA 变更点，漏一处就是
+       **静默的内存损坏**，不是"降级"。
+    3. **6.1 的实现不能直接搬**：它长在 maple tree 上（`vma_lookup()`/`mas_walk()`，`mm.h` 里 4 处），
+       5.15 是 rbtree —— 必须按 rbtree 时代的 RFC 形态写：`find_vma()` 在 RCU 下读 VMA，
+       `vma->vm_lock_seq` 判定可读性，fault 入口仍走 `arch/arm64/mm/fault.c`。
+  - **结论**：不是"能不能"的问题，而是**验证策略**的问题。现有四道门禁里只有 `implementation_audit`
+    能证明"内容在"，没有一道能证明"**没有漏掉写者**"。要动这个项目，得先加一类新审计：
+    枚举树里所有 VMA 变更点（`vm_start`/`vm_end`/`vm_flags`/`vm_pgoff`… 的写者）并与
+    `vma_start_write()` 调用点做集合比对，任何差集即失败。规模估计：`mm/` + `arch/arm64/mm/` +
+    `fs/userfaultfd.c` 约 15-20 个文件、100+ 步，属于"多批次项目"，不是单批 bounded graft。
+  - **建议**：若要推进，先做**只读侧的核**（`lock_vma_under_rcu()` + `vma_start_read/end_read` +
+    `vm_lock` 分配）并让写侧仍走 mmap_lock 写锁（即"per-VMA lock 只用于读，写者暂不 retouch"）——
+    这样可编译、可验证、fault 路径立刻受益，且**没有漏写者的静默风险**；写侧 retouch 作为后续批次，
+    与新审计一起落地。
 - [x] per-cgroup PSI 开关（cgroup.pressure enable/disable）→ **Batch 21(v0.26.0) 已落地**
   （组名 `psi_cgroup_pressure_switch`）。结论：卡点从来不是「cgroup KMI 红线」本身，而是
   **不能给 `struct psi_group` 加成员**（它内嵌在 `struct cgroup` 里，其后还有 `bpf`/

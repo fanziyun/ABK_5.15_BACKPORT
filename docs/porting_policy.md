@@ -137,6 +137,13 @@ suite-preference cross-check.
   (`psi_types.h` must never appear in this group) and
   `implementation_audit.py` pins the absence of the ACK members, so the
   layout promise is machine-checked rather than narrated.
+- **Config-optional symbols are a hard boundary (Batch 23).** The four tree-level
+  audits never preprocess, so a graft that touches a symbol the tree declares only
+  under a `CONFIG_` gate is invisible to them until a build with that gate off
+  fails. The module's tiers make `CONFIG_ZRAM_WRITEBACK` optional, so the zram
+  writeback additions carry that gate with the pristine call in the `#else`
+  branch; `implementation_audit.py`'s `CONFIG_GATED_REFERENCES` table now
+  enforces the rule.
 - **Batch 22 closed the PSI family the same way.** `TSK_ONCPU` becomes a bit of
   `state_mask` instead of the fifth `psi_group_cpu::tasks[]` slot. That struct
   is *percpu-internal* (nobody outside `kernel/sched/psi.c` holds one), so shrinking

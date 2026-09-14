@@ -2,6 +2,70 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-23"></a>
+
+## Batch 23(v0.28.0)
+
+起因：Batch 21/22 的 CI 编译门禁（run 34876820533）**失败**，但失败点不在 PSI —— 而是
+`drivers/block/zram/zram_drv.c` 里 Batch 17 的 compressed-writeback 辅助函数：
+
+```
+zram_drv.c:2098: error: no member named 'bdev' in 'struct zram'
+zram_drv.c:2114: error: no member named 'bd_reads' in 'struct zram_stats'
+zram_drv.c:2163: error: no member named 'wb_compressed' in 'struct zram'
+```
+
+### 1. 根因不是代码，是**调度载荷**
+
+`struct zram` 的 `bdev`/`backing_dev`/`wb_limit_*`/`wb_compressed` 与 `struct zram_stats` 的
+`bd_count/bd_reads/bd_writes` 全都在 `#ifdef CONFIG_ZRAM_WRITEBACK` **里面**（zram_drv.h），
+而树里的 `gki_defconfig` 根本没有 ZRAM 的任何符号 —— 这个配置由 ABK 的 `use_zram` /
+`custom_kernel_options` 注入，**默认不带** `CONFIG_ZRAM_WRITEBACK`。上一次跑绿（run 34871776161）
+的 dispatch 带 `custom_kernel_options: "CONFIG_ZRAM_WRITEBACK=y"`，而仓库里存着的
+`.commandcode/dispatch.json` 是**旧版**（该字段为空），我复用了它 —— 于是模块在一份关闭了
+writeback 的树上编译，Batch 17 加的那几个辅助函数就找不到字段了。
+
+**但这暴露的是模块自己的问题，不是 dispatch 的问题**：模块把 `CONFIG_ZRAM_WRITEBACK` 当作
+**可选 tier**（只有 `ABK_515_DEFCONFIG_ROM=1` 才打开，默认关），那么配置关掉时它应当**照常编译**
+（特性随之消失），而不是把整个内核编译搞坏。上游自己的 writeback 代码就是带着这个 `#ifdef` 的，
+Batch 17 加的三个块漏了。
+
+### 2. 修复（把新增块放进同一道门）
+
+| 位置 | 修复 |
+|---|---|
+| `_C_READ_NEW`（Batch 17 `zram_compressed_writeback`） | 新增的 `struct abk_zram_rb_req` + 四个 helper + `abk_zram_bvec_read()` 调度器整体包进 `#ifdef CONFIG_ZRAM_WRITEBACK` … `#endif`，紧接在**原函数头之前**闭合 |
+| `_C_CALL1_NEW` / `_C_CALL2_NEW` | 两处 `__zram_bvec_read()` → `abk_zram_bvec_read()` 的重定向加 `#ifdef/#else/#endif`：配置关掉时回落到**pristine 那一行**（那时 WB slot 与 `wb_compressed` 都不存在） |
+
+配置**打开**时编译结果与修复前逐字相同（`#ifdef` 透明），配置**关掉**时新增块整体消失、调用点回落
+到上游原句 —— 也就是那份文件在该区域回到 pristine 形态。
+
+### 3. 新增一道门禁：**配置门内的符号引用**
+
+四道文本门禁全都只跑"树"，从不经过预处理器，所以这个失败它们**都看不见**（实测：报错前它们四档全绿）。
+本批在 `tests/implementation_audit.py` 增加一张 `CONFIG_GATED_REFERENCES` 表与一个检查：
+把 pristine 与 patched 做行级 diff，凡是**模块新增/改写**的行里出现只在该 CONFIG 门内声明的符号
+（`zram->bdev`、`zram->wb_compressed`、`zram->stats.bd_*`、`zram->wb_limit_*`、`abk_zram_bvec_read(` …），
+就必须有同一道门包着它，否则审计失败并打印行号。双向验过：修复后的树 0 条；把门故意铲掉后
+立刻报 24 条（含 CI 那 4 行）。
+
+### 4. 验证与后续
+
+- 本地四档：`py_compile`、`stable_5_15_test.py`（新增 `test_batch23_zram_writeback_guard`）、
+  `step_audit`、`implementation_audit`（含新检查）、`smoke.sh` 全绿。
+- 修好的 dispatch 载荷已写回 `.commandcode/dispatch.json`（`custom_kernel_options:
+  "CONFIG_ZRAM_WRITEBACK=y"`），并且**这一次要跑两种配置**才叫验完：带该选项的一次证明新代码与
+  主路径没被改坏，不带该选项的一次证明"配置关掉也能编过"这个修复本身。run 记录见下一批或
+  Batch 21 节末尾。
+- 教训已写进 `AGENTS.md` 与 `docs/group_recipe.md`：**模块可以引用的符号必须是"无论如何都存在"的**，
+  只在某个 CONFIG 门内存在的字段/函数，引用它的新增文本必须自己带上同一道门；树级文本门禁
+  对这类错误没有分辨力。
+- **本批之后 `custom_kernel_options` 不再是"能不能编过"的前提**：带不带 `CONFIG_ZRAM_WRITEBACK`
+  都能编译（差别只是 compressed writeback 特性在与不在）。所以那个陈旧载荷的坑也随之消失，
+  但要**真正跑到**那条 code path，dispatch 里仍需带上该选项（这也是两种配置各跑一次的原因）。
+  dispatch 载荷本身在 `.commandcode/` 下（该目录被 `.gitignore` 排除），需要复现时按上面两行填
+  `custom_kernel_options` 即可。
+
 <a id="batch-22"></a>
 
 ## Batch 22(v0.27.0)
@@ -65,6 +129,17 @@
   而三个使用点（`test_state()`、memstall 判断、switch 探位）必须**在**。
 - 新增 C 只有编译能证明：本批同样以 **ABK CI 编译**为最终门禁，见 Batch 21 节的 run 与本节
   追加的 run。
+
+### 5. PSI 家族结清后的下一步：per-VMA locks 实测结论
+
+backlog 上只剩 **per-VMA locks** 与 DAMON sysfs（§[~]§，价值已经评过）。本轮顺手给它做了
+实测探针（§tmp/ref515mm§ vs §tmp/ref61mm§，同一批文件两边取），三条结论见 §plan.md§ 那一节，
+要点：**KMI 不是阻塞点**（5.15 的 §struct vm_area_struct§ 末尾就有 4 个 §ANDROID_KABI_RESERVE§ 槽，
+而 6.1 只需 §int vm_lock_seq§ + 一个**指针**），**6.1 代码不能直接搬**（长在 maple tree 上），
+**真正的量在写侧**（11 个抽样文件里 §vma_start_write()§ 就 42 处、per-VMA API 83 处，5.15 侧为 0，
+漏一处是静默内存损坏）。给出的推进方式是**先做只读侧**（fault 路径解除 mmap_lock 读竞争，
+写者继续走 mmap_lock 写锁 → 无漏写者风险），写侧 retouch 与"枚举所有 VMA 变更点"的新审计
+放在后续批次。
 
 <a id="batch-21"></a>
 

@@ -20,6 +20,8 @@ Usage:
 
 from __future__ import annotations
 
+import difflib
+import re
 import shutil
 import sys
 import tempfile
@@ -35,6 +37,74 @@ import abk_stable_display  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
 
 MARKER = "ABK stable_515_backport:"
+
+# A module-introduced line may only reference a symbol the tree hides behind a
+# CONFIG gate if the line sits inside that same gate.  The zram writeback fields
+# are the case that bit (Batch 23): struct zram declares bdev / backing_dev /
+# wb_compressed -- and struct zram_stats its bd_* counters -- inside
+# CONFIG_ZRAM_WRITEBACK, and ABK's dispatch does not have to enable that symbol
+# (the module's own ROM tier is the only place that does, and it is off by
+# default).  The Batch-17 compressed-writeback helpers were first added outside
+# the guard, so every build that left the option off died with "no member named
+# 'bdev' in 'struct zram'" while all four text audits stayed green -- they only
+# ever ran against a tree, never through a preprocessor.
+CONFIG_GATED_REFERENCES = {
+    "drivers/block/zram/zram_drv.c": [
+        ("CONFIG_ZRAM_WRITEBACK",
+         ("zram->bdev", "zram->backing_dev", "zram->wb_limit_lock",
+          "zram->wb_limit_enable", "zram->bd_wb_limit", "zram->bitmap",
+          "zram->nr_pages", "zram->wb_compressed", "zram->stats.bd_",
+          "abk_zram_bvec_read(")),
+    ],
+}
+
+
+def _ifdef_regions(lines):
+    """For each line, the conditional expressions enclosing it.
+
+    A stack of #if/#ifdef/#ifndef lines, popped on #endif.  #else/#elif are
+    ignored on purpose: what matters here is whether the gate is *anywhere*
+    around the line, and both branches of a gate are inside it.
+    """
+    stack = []
+    regions = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"#\s*(if|ifdef|ifndef)\b", stripped):
+            stack.append(stripped)
+        regions.append(list(stack))
+        if re.match(r"#\s*endif\b", stripped) and stack:
+            stack.pop()
+    return regions
+
+
+def config_gate_scope_problems(source, patched_root):
+    """Added lines that use a config-gated symbol outside that symbol's gate."""
+    problems = []
+    for rel, gates in CONFIG_GATED_REFERENCES.items():
+        pristine = Path(source) / rel
+        patched = Path(patched_root) / rel
+        if not pristine.is_file() or not patched.is_file():
+            continue
+        before = pristine.read_text().split("\n")
+        after = patched.read_text().split("\n")
+        regions = _ifdef_regions(after)
+        matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+            if tag not in ("insert", "replace"):
+                continue
+            for j in range(j1, j2):
+                line = after[j]
+                if not line.strip():
+                    continue
+                for gate, needles in gates:
+                    if not any(needle in line for needle in needles):
+                        continue
+                    if not any(gate in cond for cond in regions[j]):
+                        problems.append(
+                            f"{rel}:{j + 1}: uses a {gate}-gated symbol "
+                            f"outside the gate: {line.strip()[:90]}")
+    return problems
 
 # Feature content that must survive into the patched text wherever the group
 # reports applied.  Keyed as "child:group".
@@ -978,6 +1048,8 @@ def run_tree(source):
                     print(f"  info: {child}/{group.key}: no module marker "
                           "(upstream-shape idempotency)")
                 print(f"  {child:5s} {group.key:36s} {status}")
+
+        problems.extend(config_gate_scope_problems(src, root))
 
         return problems
 

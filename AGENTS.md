@@ -141,6 +141,18 @@ report `already_present` while the edit never lands — group stays "applied":
    two-name form (plus a `module_param()`-vs-declaration sweep) in the unit test
    and `implementation_audit.py`.
 
+7. A **reference to a symbol that only exists inside a CONFIG gate**, added outside
+   that gate. The four tree-level audits never run a preprocessor, so they cannot
+   see it: Batch 17's compressed-writeback helpers used `zram->bdev` /
+   `zram->wb_compressed` / `stats.bd_reads` -- all declared inside
+   `#ifdef CONFIG_ZRAM_WRITEBACK` in `zram_drv.h` -- while the config is *optional*
+   (only the ROM tier turns it on), and every build that left it off died with
+   `no member named 'bdev' in 'struct zram'` (Batch 23, CI run 34876820533).
+   New text that touches a gated symbol carries the same gate, with the pristine
+   call in the `#else` branch where a call site has to fall back.
+   `implementation_audit.py` now checks this mechanically
+   (`CONFIG_GATED_REFERENCES`).
+
 Also verify every helper the ported code calls against **its own tree**, not the
 source tree (convention traps — compile clean, behave wrong). The pinned example:
 `hugepage_vma_revalidate()` returns **0 on success** on 5.15 but `SCAN_SUCCEED`
