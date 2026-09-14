@@ -255,6 +255,22 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 
 - [ ] per-VMA locks（android14-6.1 全量移植；5.15 需 RCU VMA 生命周期 + fault 路径改造 + vma KABI 槽位，参照 rbtree 时代 RFC 设计）
 - [ ] per-cgroup PSI 开关（cgroup.pressure enable/disable）— 被 psi_group 指针/父链重构（cgroup KMI 红线）卡住
+  - **2026-09-15 可行性探针（Batch 20 后）**：5.15 树上 `struct cgroup` / `struct psi_group` /
+    `psi_group_cpu` **零 KABI 标记**（`cgroup-defs.h` / `psi_types.h` 里都没有 `ANDROID_KABI_*`），
+    对照 `include/linux/sched.h` 的 17 处 —— 也就是说「cgroup KMI 红线」这条理由**没有被机械检查支撑**，
+    它约束的是 out-of-tree 模块对 `struct cgroup` 布局的假设，而不是本模块自己的 KABI 台账。
+    真正要确认的是：`struct psi_group psi;` 在 `struct cgroup` 里是不是**最后一个成员**（若不是，
+    往里加字段会移动后面所有字段的偏移）。同时 5.15 树里已经有现成的抓手：
+    `DEFINE_STATIC_KEY_TRUE(psi_cgroups_enabled)` + `if (static_branch_likely(&psi_cgroups_enabled))`（psi.c:837）
+    —— 全局开关，目前只在 boot 时由 `cgroup_psi_enabled()` 定死；per-cgroup 开关可以做成「该 static key 保留，
+    另加每 cgroup 的布尔」或者「把 charge 路径改成查每 cgroup 位」。
+  - **布局已探明（同日）**：`struct psi_group psi;` 在 `struct cgroup` 里**不是最后一个成员** ——
+    其后还有 `struct cgroup_bpf bpf;`、`atomic_t congestion_count;`、`struct cgroup_freezer_state freezer;`
+    和柔性数组 `u64 ancestor_ids[];`（cgroup-defs.h:479 起）。所以**往 `struct psi_group` 里加字段会移动
+    后续所有成员的偏移**，这正是「cgroup KMI 红线」的实际含义。设计约束因此是：每 cgroup 的开关
+    **不能**长在 `struct psi_group` 里，只能复用 `struct cgroup` 已有的低位宽字段（`u16 flags` 之类的空闲位）
+    或复用 `psi_group` 内部已有的可回收位。下一步：读 6.1 的 `cgroup.pressure` 实现，确认它加在哪一层，
+    以及 5.15 的 `struct cgroup` 有没有现成的空闲位可用。
 - [~] DAMON sysfs 控制面（实测需要 6.1 core 长大：`core.c` 27→46KB + sysfs
   约 10 万字节，不再是"中等体量"，价值一般）
 - [x] MADV_COLLAPSE（Batch 6 已落地，按 5.15 helper 重写，非 UAPI-only）

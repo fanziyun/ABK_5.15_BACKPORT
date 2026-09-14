@@ -97,6 +97,43 @@ KVM/AVF guest 身份启动），并且还在 `static_key_false(paravirt_steal_rq
 
 `step_audit` / `implementation_audit` / `smoke.sh`（两遍幂等 + 回滚字节一致）四档全部通过。
 
+### 6. config_gate_audit：第一次用**真机** `.config` 跑通
+
+`tests/config_gate_audit.py` 是唯一需要**构建产物**的门禁（它 diff 每个文件的 `.abk-orig` 快照，
+把「本模块新增的 CONFIG 门」与「新增代码落在的既有门」逐条归属，再拿 `.config` 判定死活）。
+此前它只在本地 WSL 构建上跑过，而本轮 WSL 已按需求关闭。改用**设备上正在运行的那个内核**的
+`/proc/config.gz` —— 那正是 ABK CI run 34863020987 用当前 tier 构建、并已刷入 `boot_a` 的产物
+（`5.15.216-android13-8-g5bfe2b8c1439`，含 `custom_kernel_options=CONFIG_ZRAM_WRITEBACK=y`）。
+证据文件：`research/config_audit/vermeer-5.15.216-ci.config`（7016 行，8 个 `ABK_*` 符号，
+provenance 见同目录 README）。
+
+针对 `.216` 打过补丁的树运行结果是 **`CONFIG GATE AUDIT OK`**：
+
+- **class A** 36 条本模块新增的门行 —— 符号全部为 on；
+- **class B** 22 个「新增代码落在其中的既有门」—— 全部为 on；
+- 两个 `DARK_GATES` 仍是原样记录（`CONFIG_ZRAM_MEMORY_TRACKING` 的 `#else` 分支、
+  `CONFIG_NO_HZ_FULL` 的掩码细化），都带理由，非失败。
+
+这条门禁的价值不在「又绿了一次」，而在于它**独立于本地构建**：只要手上有一份跑着本模块的
+内核，就能复核「有没有哪段 graft 被 `.config` 编译掉了」。
+
+### 7. 编译门禁（ABK CI run 34871776161，success）
+
+本轮改动推送到 `origin/main` 后（`8a73e95`）用 ABK CI 复跑了一次完整构建，结论 **success**，
+模块报告与本地审计逐条一致：
+
+```
+[ABK stable_515_backport] stable_perf_backport/sched_steal_time_excess_drop: already_present
+[ABK stable_515_backport] stable_perf_backport/randomize_kstack_pertask: applied
+[ABK stable_515_backport] stable_perf_backport/blk_mq_suspend_wakeup_abort: already_present
+[ABK stable_515_backport] stable_perf_backport/blk_mq_quiesced_elevator_switch: already_present
+[ABK stable_515_backport] stable_perf_backport: {"already_present": 8, "applied": 12}
+Applied custom kernel option: CONFIG_ZRAM_WRITEBACK=y
+```
+
+`no member named` 0 条、` error:` 0 条（日志里 7 处 `FAILED` 全部是 workflow 源码/环境变量名，
+不是构建失败）。新组的改名链（`elevator_switch` 三面）与 steal-time 文本都在真实编译里过了。
+
 <a id="batch-19"></a>
 
 ## Batch 19(v0.24.0)
@@ -148,14 +185,26 @@ lts 分支**已经带了** `8fe7de5d1c7f`（5.15.198）的全部 payload：`pm_w
 基线（167/178/194/216）上都必须真的落地或真的是基线自带**，没有任何「已知降级」可以借道。
 `smoke.sh` 的注释同步改写：它过去写着「矩阵记录了 .211 的已知债」，现在这句不再成立。
 
-### 4. 未结项（本批的诚实边界）
+### 4. 编译门禁（ABK CI run 34871776161，success）
 
-- 两组的真判据仍是**编译**：本批改的是 KABI 槽位选择与探针，`kernel/sched/core.c` /
-  `block/blk-mq.c` 的实际文本没有新增 C（kstack 组本就会写 sched.h / randomize_kstack.h /
-  main.c / fork.c），形态分支只有在这条 lts 分支上真正编译过才算证明 —— ABK CI 是本轮
-  唯一的编译门禁。
+ABK CI 在本轮模块树（`8a73e95`）上跑完，**这条 lts 分支真的编译通过**，模块自己的报告与本轮
+本地审计逐条一致：
+
+```
+[ABK stable_515_backport] stable_perf_backport/randomize_kstack_pertask: applied
+[ABK stable_515_backport] stable_perf_backport/blk_mq_suspend_wakeup_abort: already_present
+[ABK stable_515_backport] stable_backport_core: {"already_present": 6, "applied": 29}
+[ABK stable_515_backport] stable_perf_backport: {"already_present": 8, "applied": 12}
+[ABK stable_515_backport] stable_display_fix: {"applied": 1}
+```
+
+`no member named` 0 条、` error:` 0 条 —— 也就是新的 KABI 形态（`ANDROID_KABI_USE(8, u32
+kstack_offset)` 落在这条分支的 2..8 run 上）不只是审计里「结构平衡」，而是**真的编过**。
+
+### 5. 诚实边界
+
 - 本地审计用的是 `build/abk-trees/216` 这份**只含 75 个被触碰文件**的参考树（gitiles 抓取），
-  不是完整的 lts 源码树。
+  不是完整的 lts 源码树；编译证明来自上面的 CI，不是这条参考树。
 
 <a id="batch-18"></a>
 
