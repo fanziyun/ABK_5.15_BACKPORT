@@ -73,6 +73,14 @@ abk_status_report() {
       abk_show "backing_dev" "$(abk_zram_backing_dev)"
       abk_show "writeback_limit" \
         "$(abk_read "$ABK_ZRAM_DIR/writeback_limit" | tr -d '\n') (enable $(abk_read "$ABK_ZRAM_DIR/writeback_limit_enable" | tr -d '\n'))"
+      # bd_stat is the only honest verdict on this path: the kernel-domain rule
+      # the module adds lives inside the policy, not in a readable node, so
+      # "backing device attached, bd_stat 0 0 0" is exactly the shape of a
+      # writeback that is being denied while reporting success.
+      abk_show "bd_stat" "$(abk_read "$ABK_ZRAM_DIR/bd_stat" | tr -d '\n')"
+      _sr_rule="not shipped"
+      [ -f "$MODDIR/sepolicy.rule" ] && _sr_rule="shipped"
+      abk_show "selinux" "$(getenforce 2>/dev/null || echo unknown) (kernel-domain rule $_sr_rule)"
     else
       abk_show "zram writeback" "not built in (CONFIG_ZRAM_WRITEBACK off)"
     fi

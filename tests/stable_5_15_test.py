@@ -1840,7 +1840,8 @@ def test_runtime_tunables_module():
         return
 
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
-                "service.sh", "action.sh", "tunables.conf", "embed.conf", "README.md")
+                "service.sh", "action.sh", "tunables.conf", "embed.conf",
+                "sepolicy.rule", "README.md")
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
@@ -1885,7 +1886,53 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.22.0", "0.22.0"], _versions)
+          _versions == ["0.23.0", "0.23.0"], _versions)
+
+    # The zram writeback data path is kernel-side: the loop worker -- a kernel
+    # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
+    # and writes the backing file, and Android's policy has no rule for that
+    # direction.  Under Enforcing the first page therefore returns -EIO, the
+    # reserved block is freed again, and writeback reports success while moving
+    # nothing: measured on the reference device, where even the ROM's own
+    # loop49 backing store had written 0 pages since boot (bd_stat 0 0 0) until
+    # this rule was submitted.  KernelSU can add the rule from a module, which
+    # is the only route that needs neither a ROM rebuild nor a relaxed boot
+    # policy.  What is pinned here is *narrowness* as much as presence: a
+    # widened rule is a policy change shipped by a kernel flash, so the file is
+    # exactly one least-privilege allow, and no module code gets to relax
+    # SELinux to reach the same end.
+    rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
+    rule_statements = [line.strip() for line in rule.splitlines()
+                       if line.strip() and not line.lstrip().startswith("#")]
+    check("the SELinux rule file carries exactly one statement",
+          rule_statements == ["allow kernel zram_data_file file { read write }"],
+          rule_statements)
+    for forbidden in ("setenforce", "permissive", "neverallow", "dontaudit",
+                      "auditallow", "type_transition", "allowx"):
+        check(f"the SELinux rule never uses {forbidden!r}",
+              forbidden not in rule)
+    check("the SELinux rule names the kernel domain, not a permissive shell",
+          rule_statements and rule_statements[0].startswith("allow kernel "))
+
+    post_fs_data = (module_dir / "post-fs-data.sh").read_text(encoding="utf-8")
+    common_source = (module_dir / "common.sh").read_text(encoding="utf-8")
+    action_source = (module_dir / "action.sh").read_text(encoding="utf-8")
+    selinux_apply = common_source[common_source.index("abk_selinux_apply_rules() {"):
+                                  common_source.index("abk_apply_early_knobs() {")]
+    check("the boot stage submits the shipped rule through ksud",
+          "abk_selinux_apply_rules" in post_fs_data
+          and 'sepolicy apply "$_sa_rule"' in selinux_apply)
+    check("the boot stage submits it before service.sh touches zram",
+          post_fs_data.index("abk_selinux_apply_rules")
+          > post_fs_data.index("abk_apply_early_knobs"))
+    check("a missing manager or a failed apply is reported, never fatal",
+          "abk_warn" in selinux_apply
+          and 'no ksud on PATH' in selinux_apply
+          and post_fs_data.index("abk_selinux_apply_rules")
+          < post_fs_data.index('abk_log "post-fs-data: done"'))
+    check("the status report shows the verdict node, not just the attachment",
+          'abk_show "bd_stat"' in action_source
+          and 'abk_show "selinux"' in action_source)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -2042,7 +2089,10 @@ def test_runtime_tunables_module():
     # it.  With the rule precise, the sweep can and must cover the tools this
     # module ships in bin/ as well: once installed they are module code too.
     ro_path = re.compile(r"/(?:vendor|odm|product)\b|(?<!/devices)/system\b")
-    for script in sorted(module_dir.glob("*.sh")):
+    # sepolicy.rule belongs in this sweep: it is policy shipped by a kernel
+    # flash, so "never relaxes SELinux" has to hold for it as literally as it
+    # does for the scripts.
+    for script in sorted(module_dir.glob("*.sh")) + [module_dir / "sepolicy.rule"]:
         body = script.read_text(encoding="utf-8")
         code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
         check(f"{script.name} never touches a read-only partition",
@@ -2070,6 +2120,10 @@ def test_runtime_tunables_module():
             check("module zip carries the device scripts",
                   {"common.sh", "zram-policy.sh", "post-fs-data.sh",
                    "service.sh", "action.sh"} <= set(names))
+            check("module zip carries the SELinux rule",
+                  "sepolicy.rule" in names
+                  and archive.read("sepolicy.rule")
+                  == (module_dir / "sepolicy.rule").read_bytes())
             check("embedded trigger tool is inside the module",
                   "bin/zram_recompress_trigger.sh" in names)
             check("embedded trigger tool is byte-identical to tools/",

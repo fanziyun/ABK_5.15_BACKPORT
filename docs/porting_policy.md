@@ -324,6 +324,27 @@ a locked kernel whose policy is already in force. Note the overlap with
 flip the Kconfig symbol, never the code, and any build enabling it must be
 verified with that suite injected.
 
+Batch 18 (v0.23.0) closes the last gap between "the node exists" and "a page
+actually moves". The writeback data path runs in the kernel domain: the loop
+worker — a kernel thread in `u:r:kernel:s0`, whichever process attached the
+device — is what reads and writes the backing file, and Android ships no rule
+for that direction. Under Enforcing every page therefore returned `-EIO`, the
+reserved block was freed again, and the store returned success while moving
+nothing; measured on the ROM tier, the ROM's own attachment included
+(`backing_dev` set, `bd_stat` `0 0 0` since boot, a manual 16 MiB budget
+moving 0 pages, and the same budget moving exactly 4096 pages with the rule
+submitted). The companion now ships `sepolicy.rule` — one least-privilege
+`allow kernel zram_data_file file { read write }` — and submits it through
+`ksud sepolicy apply` in the `post-fs-data` stage. The stage boundary is the
+substantive part: the rule has to exist before anything attaches a backing
+device, because from that moment on the denied side is a kernel thread. A
+kernel-tree graft cannot express this (it is device policy, not kernel code),
+and turning the config tier on by itself is what produced the silent no-op, so
+the fix belongs to the distribution asset. It stays additive and non-fatal:
+where the manager already loads module `sepolicy.rule` files the call is a
+no-op, and where no manager can add the rule the module logs it and leaves the
+policy untouched.
+
 ## Report contract
 
 Each child writes `<report_dir>/<child>_report.json` + `.md` (default

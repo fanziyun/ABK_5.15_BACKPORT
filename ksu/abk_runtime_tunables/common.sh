@@ -5,7 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.6.2"
+ABK_VERSION="v0.7.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -616,6 +616,42 @@ abk_apply_readahead_knob() {
       ;;
     *) abk_warn "readahead.dynamic_readahead: '$_ra_val' is not 0|1, ignored" ;;
   esac
+  return 0
+}
+
+# --- the one SELinux rule this module needs -------------------------------
+# The zram writeback data path is kernel-side: the loop worker, a kernel thread
+# in u:r:kernel:s0, is what reads and writes the backing file.  Android's policy
+# has no rule for that direction, so every page returns -EIO and writeback moves
+# nothing -- measured on vermeer / 5.15.216, where even the ROM's own backing
+# store had written 0 pages since boot (bd_stat 0 0 0) while SELinux was
+# Enforcing.  KernelSU can add the rule from a module, which is the only route
+# that does not need a ROM rebuild or a relaxed boot policy; sepolicy.rule ships
+# one deliberately narrow allow (kernel -> zram_data_file, read + write).
+#
+# Nothing here is fatal, and nothing here weakens the policy: where the manager
+# loads module rules itself this call is a redundant no-op, and where the rule
+# cannot be added the device keeps the writeback it had -- which is the silent
+# 0-page one, so the log line matters.
+abk_selinux_apply_rules() {
+  _sa_rule="$MODDIR/sepolicy.rule"
+  if [ ! -f "$_sa_rule" ]; then
+    abk_log "selinux: no sepolicy.rule shipped; leaving policy untouched"
+    return 0
+  fi
+  for _sa_ks in /data/adb/ksud /data/adb/ksu/bin/ksud; do
+    [ -x "$_sa_ks" ] || continue
+    # This ksud reports 0 for a duplicate and even for an unresolvable symbol,
+    # so the status means "statement submitted", never "rule took effect"; the
+    # device-side proof is bd_stat moving off zero (action.sh prints it).
+    if "$_sa_ks" sepolicy apply "$_sa_rule" >/dev/null 2>&1; then
+      abk_log "selinux: submitted $_sa_rule via $_sa_ks"
+    else
+      abk_warn "selinux: $_sa_ks sepolicy apply failed; writeback stays at 0 pages under Enforcing"
+    fi
+    return 0
+  done
+  abk_log "selinux: no ksud on PATH; the manager's own sepolicy.rule loader owns $_sa_rule"
   return 0
 }
 

@@ -1,0 +1,19 @@
+# command: adb shell 'sh /data/local/tmp/b17/b17_rompath.sh'   (rule submitted, SELinux Enforcing)
+# The ROM's OWN writeback path -- zram0 with its mmd-attached loop49 over /data/per_boot/zram --
+# with a 16 MiB (4096 block) budget armed for the test, then the device's original
+# writeback_limit / writeback_limit_enable restored.  No setenforce anywhere.
+selinux=Enforcing backing_dev=/dev/block/loop49 limit=2752512 limit_enable=1
+bd_stat before: [ 0 0 0]  io_stat: [ 0 0 0 0]
+P1 no idle marking     mark=none rc=0 wall=210   ms bd [0 0 0] -> [0 0 0] avc_zram=0
+P2 pages marked idle   mark=all  rc=1 wall=260   ms bd [0 0 0] -> [4096 0 4096] avc_zram=0
+swap_zram0_lines=1
+writeback_limit_now=0
+restored: limit=2752512 limit_enable=1
+# P1 is the ROM's real shape: it never writes /sys/block/zram0/idle, so 'echo idle > writeback'
+# has no candidate page and moves nothing (rc=0).  P2 marks the pages idle first -- what this
+# module's own sweep does -- and then moves EXACTLY the budget: 4096 pages, bd=[4096 0 4096].
+# rc=1 on P2 is the upstream form for an exhausted writeback budget (measured in 04 too:
+# limit=100 moved exactly 100 pages), not a failure.  The device's own limit values were
+# restored, so the ROM's 2752512-block budget is intact.
+# This is the first time this device's own writeback moved a page: bd_stat had been 0 0 0
+# since boot under Enforcing (Batch 17, section 4).

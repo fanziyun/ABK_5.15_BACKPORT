@@ -1,0 +1,22 @@
+# Kernel-domain policy for the zram writeback data path.
+#
+# post-fs-data.sh submits this file through ksud; a KernelSU build that loads
+# module sepolicy.rule files itself may also pick it up, and applying a rule
+# twice is a no-op on this ksud, so both paths are safe.
+#
+# Why the rule is needed: the loop worker is the side that reads and writes the
+# zram backing file, and it runs as a kernel thread (u:r:kernel:s0) no matter
+# which process attached the loop device.  Android's policy has no rule for that
+# direction, so the first page of every writeback returns -EIO, the reserved
+# block is freed again, and writeback reports success while moving nothing.
+# Measured on vermeer / android13-5.15 5.15.216 with SELinux Enforcing: the
+# ROM's own loop49 backing store had written 0 pages since boot (bd_stat
+# 0 0 0), a manual 16 MiB budget moved exactly 0 pages, and the same writeback
+# with the rule below in place moved exactly the 4096 pages of that budget.
+#
+# Least privilege on purpose: read and write are the only permissions the loop
+# worker needs, because the kernel never resolves the path itself -- losetup
+# opened the file in the root domain, and only I/O on the already-open file
+# happens in the kernel domain.  A measured 32 MiB writeback-and-read-back
+# cycle produces no surviving AVC with this rule and nothing else.
+allow kernel zram_data_file file { read write }

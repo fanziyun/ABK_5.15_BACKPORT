@@ -121,12 +121,29 @@ avc: denied { write } for comm="kworker/u16:2" path="/data/per_boot/zram/b17_tes
 - 这台 ROM 上 **zram writeback 在 Enforcing 下不可用**——包括 ROM 自己挂在 zram0 上的
   loop49：它的 `bd_stat` 至今 `0 0 0`，一旦真的被触发也会同样 `-EIO`。
 - 这是 **sepolicy 缺口**（缺 `allow kernel zram_data_file:file { read write }` 一类规则），
-  内核侧无解；要靠 ROM 集成或 KSU 的 sepolicy 补丁（本模块已有 `abk_fido_selinux` 那条
-  分发线）才能打开。
+  内核侧无解；要靠 ROM 集成或 KSU 的 sepolicy 补丁。
 - 因此本节的性能数据是**在 permissive 下测的**：它验证的是内核代码路径与代价，不代表
-  当前设备在 Enforcing 下能获得这个收益。
+  当时设备在 Enforcing 下能获得这个收益。
 
-## 5. 对模块的结论（未改代码，留给决定）
+### 4.1 后续：缺口已由 Batch 18（v0.23.0）用 companion 模块打通并复测
+
+- **方案**：`ksu/abk_runtime_tunables/sepolicy.rule` 只放一条最小权限
+  `allow kernel zram_data_file file { read write }`，由 `post-fs-data.sh` 经
+  `ksud sepolicy apply` 提交 —— **必须在任何东西挂上后备设备之前**，因为从那一刻起被拒的
+  是内核线程。只给 `read`/`write`：内核从不解析路径（文件由 root 域的 `losetup` 打开，
+  内核域只对**已打开的文件**做 I/O），32MiB 写回 + 全量读回零残留 AVC。
+- **复测**（全程 Enforcing；脚本 `b17_enforcing.sh` / `b17_rompath.sh`，原始输出 `raw/08`–`raw/11`）：
+  规则前 `rc=1 bd=[0 0 0]`；提交规则后 `rc=0 bd=[7690 7690 7690]`、写回前后读回 md5 一致、
+  **0 条 zram AVC**。ROM 自己的 zram0 路径：先 `echo all > idle` 再写回，16MiB 预算（4096 块）
+  **恰好写满 4096 页**（`bd=[4096 0 4096]`）、0 条 AVC，随后已把 ROM 的
+  `writeback_limit`/`writeback_limit_enable` 原值（2752512/1）复原。
+- **诚实边界**：`ksud sepolicy apply` 对**不存在的 type / permission 也返回 0**，返回码只代表
+  「语句已提交」，所以判据只能是 `bd_stat` 与 I/O 正确性；规则只在本机这一个 ROM 上验证过。
+- **更正一处失实说法**：本条此前写「本模块已有 `abk_fido_selinux` 那条分发线」——`abk_fido_selinux`
+  是**另一个仓库**（`ABK_FIDO_KEY_MODULE`）的独立 KernelSU 模块（给 `/metadata` 上的 FIDO 存储
+  加 kernel 域规则），本仓库当时**没有任何 sepolicy 分发线**；上面这条 `sepolicy.rule` 是本仓库第一条。
+
+## 5. 对模块的结论（Batch 17 未改代码；Batch 18 只加了上面那条 sepolicy 规则）
 
 1. `zram0` 的 `compressed_writeback=0`：**不是 bug**。后备设备是 ROM 的 mmd 挂的，
    `abk_zram_has_writeback_owner()` 为真，模块按设计只「保留」不重写；而模块自己挂后备设备时

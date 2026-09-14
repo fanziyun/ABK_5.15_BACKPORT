@@ -2,6 +2,69 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-18"></a>
+
+## Batch 18(v0.23.0)
+
+起因：Batch 17 的真机验证在最后发现一个**与本批 graft 无关、但决定它在设备上是否可用**的缺口：
+Enforcing 下 loop worker 读写 zram 后备文件被拒（`avc: denied { write } ... scontext=u:r:kernel:s0
+tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报成功却一页都不搬**。
+本批把这条路径打通。**本批不含任何 `PatchGroup`**：它只改 distribution asset（companion 模块）、
+文档与测试，因此 `GROUP_COUNTS` / `sublevel_matrix.py` 不动，内核树一行不改。
+`module.conf` 0.22.0 → **0.23.0**；companion **v0.6.2 → v0.7.0**（versionCode 8 → 9）。
+
+### 1. 为什么内核侧无解、必须由模块解决
+
+- 被拒的一方是**内核线程**（loop worker）：不论谁 `losetup` 打开文件，读写的 `current` 都是
+  `u:r:kernel:s0`，而 AOSP/ROM 策略里**没有** kernel 域对 `zram_data_file` 的 file 规则。
+- 失败形态是**静默**的：`alloc_block_bdev()` 返回的块在写失败后立刻 `free_block_bdev()` 归还，
+  `writeback_store()` 仍返回成功，`bd_stat` 停在 `0 0 0`。Batch 17 里 ROM 自己挂在 zram0 上的
+  `loop49` 从开机起就是这个状态。
+- 换文件上下文也一样（`shell_data_file` 同样被拒），所以这不是「文件放错地方」，而是策略缺口。
+- 这是**设备策略**，不是内核代码：内核树里的 graft 表达不了它；而「只打开 config tier」正是当初
+  产生这个静默 no-op 的原因。所以修复落在 distribution asset 上，与 Batch 11 起的 companion 定位一致。
+
+### 2. 方案：一条最小权限 allow + post-fs-data 提交
+
+- 新增 `ksu/abk_runtime_tunables/sepolicy.rule`，**只有一条**语句：
+  `allow kernel zram_data_file file { read write }`。只给 `read`/`write` 是因为内核从不解析路径
+  —— 文件由 root 域的 `losetup` 打开，内核域只对**已打开的文件**做 I/O，所以不需要
+  `open`/`getattr`/`search`（32MiB 写回+全量读回，实测零残留 AVC 证实）。
+- `common.sh` 新增 `abk_selinux_apply_rules()`，由 `post-fs-data.sh` 在
+  `abk_apply_early_knobs` 之后调用：**必须在任何东西挂上后备设备之前**，因为从那一刻起被拒的是
+  内核线程。管理器自己会加载模块 `sepolicy.rule` 时，这次提交是幂等 no-op（同一 `ksud` 重复
+  apply 返回 0）；加不上时只记 WARN 继续，**绝不切换 Enforcing/放宽策略**。
+- `action.sh status` 增加 `bd_stat` 与 `selinux` 两行：规则生效与否写在策略里、没有可读节点，
+  所以「backing device 已挂 + `bd_stat` `0 0 0`」才是被拒的形态，之前没有任何一处能看到它。
+
+### 3. 真机证据（2026-09-14，vermeer / `5.15.216-android13-8-g5bfe2b8c1439`，全程 Enforcing）
+
+| 场景 | 结果 |
+|---|---|
+| 独立 zram1 + 32MiB 数据，**规则前** | `rc=1`、`bd=[0 0 0]`、`io=[0 0 0 0]` |
+| 同一脚本，`ksud sepolicy apply` 最小规则后 | `rc=0`、`bd=[7690 7690 7690]`、md5 写回前后一致、**0 条 zram AVC**（batch 1 与 32 各一遍） |
+| ROM 自己的 zram0 路径，16MiB 预算、**未标 idle** | `rc=0`、`bd=[0 0 0]`：没有候选页（ROM 的 daemon 从不写 `idle`，这是它的真实形态） |
+| 同上，先 `echo all > idle`（模块 sweep 的做法） | `rc=1`（预算耗尽）、`bd=[4096 0 4096]`：**恰好 4096 页 = 预算**，0 条 AVC，限流归零，随后已把 ROM 的 `writeback_limit`/`_enable` 原值（2752512/1）复原 |
+| 重复 apply 同一规则 | `rc=0`（幂等，不会让 post-fs-data 失败） |
+| `ksud sepolicy check`（剥注释后） | 通过；`apply` 本身也能正确跳过 `#` 注释行 |
+
+脚本与原始输出：`research/zram/vermeer_batch17_check/b17_enforcing.sh`、`b17_rompath.sh`、
+`raw/08-enforcing-before-rule.txt`、`raw/09-enforcing-after-rule.txt`、
+`raw/10-rom-zram0-writeback.txt`、`raw/11-ksud-sepolicy-probe.txt`。
+
+### 4. 门禁与遗漏
+
+- `tests/stable_5_15_test.py` 新增 12 条断言：规则文件**恰好一条**语句、逐字等于最小 allow、
+  不含 `setenforce`/`permissive`/`neverallow`/`dontaudit`/`auditallow`/`type_transition`/`allowx`、
+  post-fs-data 确实提交、失败非致命、`action.sh` 报 `bd_stat`/`selinux`、规则文件进 zip、
+  以及「relax SELinux」扫描把该文件也纳入。
+- 设备侧 `sh -n`（mksh）通过全部 5 个脚本；`ksud sepolicy check` 解析该规则文件通过。
+- **诚实边界**：`ksud sepolicy apply` 对**无法解析的符号**同样返回 0（实测：不存在的 type、
+  不存在的 permission 都 rc=0），所以返回码只代表「语句已提交」，**不代表规则生效**；真正的
+  判据只有 `bd_stat` 与 I/O 正确性。规则只在 vermeer/HyperOS 这一台设备、这一个 ROM 上验证过；
+  换 ROM 后 `zram_data_file` 类型是否存在、还有哪些权限被拒需重测。Batch 17 的性能数据仍然
+  来自 permissive 那一轮（本轮只证明 Enforcing 下路径可用，没有重测性能）。
+
 <a id="batch-17"></a>
 
 ## Batch 17(v0.22.0)

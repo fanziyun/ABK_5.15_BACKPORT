@@ -4,6 +4,8 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 18(v0.23.0,已落地)→ 详见 CHANGELOG.md#batch-18 — zram writeback 的 Enforcing 策略缺口（companion 模块 sepolicy.rule）
+
 ## Batch 17(v0.22.0,已落地)→ 详见 CHANGELOG.md#batch-17 — zram writeback bio batching + compressed writeback
 
 ### 排除项（结论；原文见 CHANGELOG.md#batch-17）
@@ -28,7 +30,9 @@ vermeer/23113RKC6C，内核 `5.15.216-android13-8-g5bfe2b8c1439`（= 本轮 ROM 
   `avc: denied { write } ... scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0` 拒，
   两种文件上下文都一样 → 这台 ROM 上 **zram writeback 在 Enforcing 下必然 `-EIO`**，
   连 ROM 自己挂在 zram0 上的 loop49 也一样（`bd_stat` 至今 `0 0 0`）；内核侧无解，
-  要靠 ROM 集成或 KSU sepolicy 补丁。上面的性能数据是在 permissive 下测的。
+  要靠 ROM 集成或 KSU sepolicy 补丁 —— **已由 Batch 18（v0.23.0）用 companion 模块的
+  `sepolicy.rule` 打通并复测**（Enforcing 下 `bd=[4096 0 4096]`、零残留 AVC）。
+  上面的性能数据仍是在 permissive 下测的。
 
 ## Batch 16(v0.21.0,已落地)→ 详见 CHANGELOG.md#batch-16 — 空实现审计 + 清理
 

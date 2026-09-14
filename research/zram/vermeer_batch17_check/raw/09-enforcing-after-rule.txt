@@ -1,0 +1,24 @@
+# command: printf the minimal rule -> ksud sepolicy check -> ksud sepolicy apply ->
+#          sh b17_enforcing.sh after-min-rule -> dmesg | grep "avc: *denied" | grep -i zram
+--- check ---
+rc=0
+--- apply ---
+NormalPerm(NormalPerm { op: "allow", source: ["kernel"], target: ["zram_data_file"], class: ["file"], perm: ["read", "write"] })
+apply rc=0
+--- rerun under Enforcing ---
+selinux: Enforcing  config ZRAM_WRITEBACK: 1
+data md5: 37b50f27c746b964491875971679299f  size=33554432
+phase=after-min-rule batch=32   cwb=0 rc=0 wall=330   ms bd=[7690 7690 7690] io=[0 0 0 0] avc=0 md5 37b50f27 EQ 37b50f27
+phase=after-min-rule batch=1    cwb=0 rc=0 wall=1810  ms bd=[7690 7690 7690] io=[0 0 0 0] avc=0 md5 37b50f27 EQ 37b50f27
+    avc: [ 1207.952069] SELinux: avc: denied { find } for pid=3887 uid=1000 name=vendor.qti.snapdragonServices.ISnapdragonServices/default scontext=u:r:system_server:s0 tcontext=u:object_r:default_android_service:s0 tclass=service_manager permissive=0
+selinux after: Enforcing  zram left: /sys/block/zram0
+--- zram avc lines (whole ring) ---
+[ 1196.820074] type=1400 audit(1789396275.566:100477): avc:  denied  { write } for  comm="kworker/u16:14" path="/data/per_boot/zram/b17_test.img" dev="dm-51" ino=288635 scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+[ 1196.820235] type=1400 audit(1789396275.566:100478): avc:  denied  { write } for  comm="kworker/u16:14" path="/data/per_boot/zram/b17_test.img" dev="dm-51" ino=288635 scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+[ 1196.820322] type=1400 audit(1789396275.566:100479): avc:  denied  { write } for  comm="kworker/u16:14" path="/data/per_boot/zram/b17_test.img" dev="dm-51" ino=288635 scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+[ 1196.821152] type=1400 audit(1789396275.566:100480): avc:  denied  { write } for  comm="kworker/u16:14" path="/data/per_boot/zram/b17_test.img" dev="dm-51" ino=288635 scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+[ 1196.821531] type=1400 audit(1789396275.566:100481): avc:  denied  { write } for  comm="kworker/u16:14" path="/data/per_boot/zram/b17_test.img" dev="dm-51" ino=288635 scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+# All five denials are timestamped 1196.82 -- before the 1207.95 system_server line and
+# before the run above: they belong to the rule-less baseline in 08.  After the rule was
+# submitted, a 32 MiB writeback plus a full read-back produced zero zram denials.  The
+# read-back exercises the read permission, so the two-permission set is measured.

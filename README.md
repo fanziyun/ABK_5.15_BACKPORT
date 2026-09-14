@@ -135,9 +135,15 @@ compressor on the dominated `lz4hc` before `disksize` — after which the node i
   do — the backing device lives in that same pre-`disksize` window and `reset`
   drops it, which is why the two used to exclude each other — and attaches a
   sparse backing file itself when writeback is available and unowned
-  (`zram.writeback=auto`). On the reference device writeback is simply absent
-  (`CONFIG_ZRAM_WRITEBACK` off, `vendor.zram.disable=1`, `mmd.setup_complete`
-  unset), so `ABK_515_DEFCONFIG_ROM=1` is the tier that turns it on;
+  (`zram.writeback=auto`). On the reference device's stock kernel writeback is
+  simply absent (`CONFIG_ZRAM_WRITEBACK` off, `vendor.zram.disable=1`,
+  `mmd.setup_complete` unset), so `ABK_515_DEFCONFIG_ROM=1` is the tier that
+  turns it on — and it also ships the one kernel-domain SELinux rule that path
+  needs (`allow kernel zram_data_file file { read write }`, submitted at
+  post-fs-data), because the reads and writes of a backing file happen in the
+  loop worker, a kernel thread in `u:r:kernel:s0`. On the ROM tier under
+  Enforcing the missing rule made writeback report success while moving nothing,
+  the ROM's own backing device included (Batch 18);
 * it drives age-marked recompression sweeps through the kernel's async worker
   (this is the only part that is on by default);
 * it reports — or optionally applies — the remaining runtime knobs: MGLRU, THP,

@@ -4,11 +4,14 @@ The runtime companion of the [ABK 5.15 LTS backport](../..). The kernel grafts
 in that repository ship mechanisms; this module drives them, because a mechanism
 nothing triggers changes nothing.
 
-Two jobs, in order of importance:
+Three jobs, in order of importance:
 
 1. **Keep the zram algorithm policy in force** on every boot (hardcoded, not
    configurable -- see below).
-2. **Drive the recompression sweeps** through the kernel's async worker, follow
+2. **Add the one kernel-domain SELinux rule the zram writeback path needs.**
+   Without it a writeback is denied at the first page and moves nothing while
+   reporting success (see "SELinux" below).
+3. **Drive the recompression sweeps** through the kernel's async worker, follow
    each sweep with a gated zsmalloc compaction pass (see Configuration), and
    report (or optionally tune) the other runtime knobs the grafts expose:
    MGLRU, THP, `vm.swappiness`, the schedutil smart-freq policy, dynamic
@@ -96,11 +99,55 @@ Posture:
   file itself (`zram.writeback=auto`: `/data/per_boot/zram/zram_swap` -- the
   same place Android's `mmd_setup` uses -- behind a loop device, limit bounded,
   compressed writeback on where the kernel has it).
-* Writeback is **not** enabled on the reference device: the kernel has no
-  `CONFIG_ZRAM_WRITEBACK`, the ROM sets `vendor.zram.disable=1` and its `mmd`
-  never completes. `zram.writeback=auto` therefore only acts if you turn the
-  feature on in the kernel (`ABK_515_DEFCONFIG_ROM=1` adds
-  `CONFIG_ZRAM_WRITEBACK=y`).
+* Writeback is **not** enabled on the reference device's stock kernel: that
+  build has no `CONFIG_ZRAM_WRITEBACK`, the ROM sets `vendor.zram.disable=1`
+  and its `mmd` never completes. `zram.writeback=auto` therefore only acts if
+  you turn the feature on in the kernel (`ABK_515_DEFCONFIG_ROM=1` adds
+  `CONFIG_ZRAM_WRITEBACK=y`) -- and once it is on, the SELinux rule below
+  decides whether a writeback moves anything at all.
+
+## SELinux: the one kernel-domain rule writeback needs
+
+The zram writeback data path is kernel-side. Whoever attaches the loop device,
+the reads and writes of the backing file happen in the **loop worker**, a kernel
+thread running as `u:r:kernel:s0`. Android's policy has no rule for that
+direction, so under Enforcing the first page returns `-EIO`,
+`alloc_block_bdev()` frees the reserved block again, and writeback **reports
+success while moving nothing**.
+
+Measured on the target device (vermeer, android13-5.15 5.15.216, ROM-tier
+kernel, SELinux Enforcing, rule submitted at run time):
+
+| observation | number |
+|---|---|
+| the ROM's own backing store (`loop49` over `/data/per_boot/zram`), pages written since boot | `bd_stat = 0 0 0` |
+| a manual 16 MiB writeback budget, no rule | 0 of 4096 pages written |
+| the same budget, rule submitted | exactly 4096 pages (`bd_stat = 4096 0 4096`) |
+| a 32 MiB writeback plus full read-back, rule submitted | `rc=0`, no surviving AVC, md5 identical before/after |
+
+So the module ships `sepolicy.rule` and submits it through
+`ksud sepolicy apply` in the **post-fs-data** stage. That timing is the point:
+the rule has to exist before something attaches a backing device, because from
+that moment on the denied side is a kernel thread. On a manager that loads
+module `sepolicy.rule` files itself the call is a redundant no-op (submitting
+the same rule twice is not an error on this `ksud`), and where no manager can
+add it the module logs the failure and carries on -- it never relaxes the
+policy to get its way.
+
+The rule is deliberately one least-privilege `allow`:
+
+```
+allow kernel zram_data_file file { read write }
+```
+
+`read` and `write` are all the loop worker needs, because the kernel never
+resolves the path itself: `losetup` opened the file from the root domain, and
+only I/O on the already-open file happens in the kernel domain. A 32 MiB
+writeback-and-read-back cycle leaves no other denial.
+
+Read the verdict node, not the attachment, to see whether it took effect:
+`action.sh status` prints `bd_stat`, and "backing device attached, `bd_stat`
+`0 0 0`" is exactly the shape of a writeback that is being denied.
 
 ## Configuration (`tunables.conf`)
 
@@ -227,8 +274,11 @@ The long-running parts are two supervisors started by `service.sh`
   `uid_*` at all, so a per-UID sweep finds nothing here: select the groups to
   sweep with `cfr.group` (or run the tool by hand with `--group NAME --list`
   first).
-* No SELinux rules are shipped: every node the module writes was verified
-  writable from KernelSU's root context with no `avc: denied`.
+* Exactly **one** SELinux rule is shipped (`sepolicy.rule`, submitted at
+  post-fs-data): `allow kernel zram_data_file file { read write }`, for the
+  kernel-domain writeback path described above. Every sysfs/proc node the module
+  writes was verified writable from KernelSU's root context with no `avc:
+  denied`, so no other rule is needed -- and none is added.
 * Nothing outside `/sys`, `/proc`, `/dev`, `/data/per_boot/zram` (the writeback
   backing file, and only when the kernel supports writeback and
   `zram.writeback` is not `off`) and the module's own directory is written. No
@@ -257,9 +307,13 @@ The long-running parts are two supervisors started by `service.sh`
   format that can print a byte count now uses `%.0f`, exact for integers below
   2^53. `abk_gt`/`abk_le` print nothing and `cap_view` prints a capacity
   (≤ 1024), so `%d` is provably safe where they keep it.
-* The writeback path itself (backing file + loop device + `backing_dev`) is
-  **not fully hardware-verified on the reference device**, because that kernel
-  has no `CONFIG_ZRAM_WRITEBACK`. The backing-file half is: the helper creates a
-  sparse 1 GiB file (1 MiB on disk), takes a free loop device and attaches it,
-  measured on device. Every step is best-effort -- a failure logs and continues
-  without writeback rather than blocking the swap bring-up.
+* The writeback path (backing file + loop device + `backing_dev`) is verified
+  on device against the ROM-tier kernel (`ABK_515_DEFCONFIG_ROM=1`,
+  `CONFIG_ZRAM_WRITEBACK=y`): the helper's half creates a sparse 1 GiB file
+  (1 MiB on disk), takes a free loop device and attaches it, and a 32 MiB
+  writeback through a module-shaped attachment moves exactly the pages it should
+  with the payload verified identical before and after. What that same run also
+  exposed is the SELinux dependency above -- without the rule the numbers are
+  bit-identical to "no writeback at all". Every step stays best-effort: a
+  failure logs and continues without writeback rather than blocking the swap
+  bring-up.
