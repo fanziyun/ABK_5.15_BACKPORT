@@ -2,6 +2,116 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-25"></a>
+
+## Batch 25(companion v0.9.0，已落地；两态 A/B 待真机)
+
+Batch 21 把 per-cgroup PSI 开关（`cgroup.pressure`）graft 进内核，Batch 22 收了 PSI 家族的
+内部同步，**但那个开关从落地那天起没被按过一次**。这一批是它的设备侧策略：不加任何
+graft（节点已经在我们自己的树上），只做「谁该关、什么时候关、关掉之后怎么证明」。
+
+### 1. 点名先行
+
+先量再改，结论全部写进新文档 `docs/psi_field_protocol.md`（vermeer / 5.15.216 / v0.29.0）：
+
+| 量到的事实 | 含义 |
+|---|---|
+| 452 个组带 `cgroup.pressure` | Android 每个 uid、每个 pid 一组 |
+| 其中 **314 个当场有任务** | 有任务是常态，不是例外 |
+| 全设备打开着 pressure 文件的只有 `lmkd` / `system_server` / `mimd`，且都是 `/proc/pressure/memory` | 全局账由根组服务，分组开关碰不到它 |
+| **没有任何进程打开过 per-cgroup 的 PSI 文件** | 这份工没有主 |
+
+由此推翻我自己给的第一版默认：`auto`（只关空组）在这台机器上是**零收益的 no-op**——空组里
+没有任务，就永远不会触发 `psi_group_change()` 那段被省的代码。有意义的对照只剩 `keep` vs
+`aggressive`，而后者才是唯一真能省到东西的模式，也顺带是唯一可能拒绝掉「vendor 守护进程
+明天开始 poll 某个组」的模式。所以出厂默认写回 `keep`，`auto` 保留并在工具头里注明它为什么
+不算数。
+
+### 2. 落地明细
+
+| 文件 | 改动 |
+|---|---|
+| `tools/abk_psi_policy.sh`（新，shipped 进 `bin/`） | 一次遍历：根组**无条件**先跳（它的开关驱动 `psi_system`，写下去等于把全设备的压力信号从 lmkd 眼前摘掉）→ 前缀保护名单 → 已关的跳过（重开会白付内核侧 sync，也是周期 pass 的常态分支）→ 按 mode 决定写 `0`。**只写 0，永不写 1** |
+| 同上 | `--selftest`：假树（根 / 受保护子树 / 前缀同名兄弟 / 有任务组 / 空组 / 已关组 / 不可写节点）逐条断言决策表，含「第二遍一个字都不写」。设备不在时这是唯一能证明决策正确的东西 |
+| `tools/abk_psi_bench.sh`（新） | 两态 A/B 工装：固定量的 fork/wake 风暴 + `/proc/stat` 忙 jiffies；每轮用**从树里量出来的状态**贴标签（`state=nodes=N on=X off=Y`），因为一次被拒的写入就能把整轮标错 |
+| `common.sh` | `psi.cgroup` / `.protect` / `.interval_sec` 进 `abk_known_keys`；`abk_psi_mode/protect/interval/pass/supervisor_main`；稳态（`disabled=0`）走 `abk_log_append` 不进 logcat；首轮「全被拒 + 一个没关成 + 一个原本没关」⇒ **自己退出**，而不是每 300 秒重走 452 个节点去再吃一次 EACCES |
+| `service.sh` | `--supervise-psi` 分派；`keep` 时**根本不 spawn**（一个决策点，不留空转循环）。遍历带阻塞写，所以绝不在 `post-fs-data` 里跑 |
+| `action.sh` | 新节 `-- per-cgroup pressure (PSI) --`：配置意图 + 树的实测状态两行都打；supervisors 节多一行 |
+| `tunables.conf` | 三键 + 默认 `keep`；`psi.cgroup.protect=system,protect_memcg`（保护匹配是**字面前缀**，所以 `protect_memcg` 覆盖 ROM 自造的 `protect_memcg_001/002/...`，不必逐个点名） |
+| `embed.conf` | 两只工具进 `bin/`（沿用「设备上只有一份实现」的约定） |
+| `module.prop` | v0.8.0 → **v0.9.0**（versionCode 10 → 11） |
+| `module.conf` | **不动**，仍 0.29.0。先例 `a50df6e fix(companion): ... (v0.6.2)`：companion-only 不 bump 内核版本，单测里钉的 `["0.29.0","0.29.0"]` 因此仍然成立 |
+| `docs/psi_field_protocol.md`（新） | 点名数据 + 复现命令 + 两态协议 + 判定规则 + 明确「没测什么」 |
+| `tests/stable_5_15_test.py` | 新断言 22 条（见 §4） |
+
+### 3. 来源误判（这条最值得留）
+
+我最初在四处注释里写「这个开关是从上游 5.15 继承来的，所以本批只是策略不是 graft」。
+**错**——`git log` 里 `534ede0 feat(perf): Batch 21 -- per-cgroup PSI accounting switch
+(cgroup.pressure)` 一句话就把我顶回来了：那是**我们自己 graft 进去的**（android13-5.15 没有
+这个节点）。写错的代价不只是注释难看：它会让「老内核优雅跳过」这条分支被理解成「照顾十几年
+前的内核」，而它真正照顾的是**没带 Batch 21 的 ABK 构建**和 ROM 自带内核。四处（工具头、
+`common.sh`、`tunables.conf`、`module.prop`）都改了，并且把这件事本身钉成断言：
+`"Batch 21" in tool and "inherited upstream" not in tool`——防止我或下一个人再写回去。
+
+顺带一条同源的更正：上游那版开关的「重开不是可恢复状态」在**我们的移植里并不成立**（Batch 21
+把状态放在 cgroup 自己的 flags 位，什么都没释放，重开有 `psi_cgroup_restart()` 逐 cpu 重建
+state mask）。工具仍然只写 0，但理由换成真理由：companion 会跑在它没构建过的内核上，而它在
+用户态分不清两种实现。
+
+### 4. 验证
+
+- `py_compile` 全量、`bash -n` + `sh -n` 全量（含两只新工具，WSL 下 dash 也过）。
+- `bash tools/abk_psi_policy.sh --selftest` → **PASS**（7 条断言）。
+- `tests/stable_5_15_test.py` → **all checks passed**，新增 22 条里最值钱的几条：
+  `the PSI walk only ever writes 0`（按 `abk_psi_walk()` 切片断言，因为自测里合法地会重开
+  自己的 fixture）、`the root group is skipped before the protect list is consulted`（钉的是
+  两个计数器的先后位置）、`the pass is a supervisor and never runs at the early boot stage`、
+  `psi.cgroup=keep spawns no supervisor at all`、`the PSI tool names Batch 21 as the node
+  origin, not upstream`、`embed.conf contributes exactly the five device tools`。
+- 四档树级审计：`step_audit` / `implementation_audit` / `smoke`。本批无 graft，registry 未动，
+  `GROUP_COUNTS` 与 `sublevel_matrix.py` 不改。
+- **CI 不需要重跑编译门禁**（本批一行 C 都没有）。但 v0.9.0 的 companion 是打进 AK3 zip 的，
+  要让它在设备上生效需要一次**发布构建**（不是验证构建）。
+- 设备侧 `su -c 'sh -n ...'`（mksh 才是真 shell）与两态 A/B **未做**：本轮 adb 掉线。
+
+### 5. 踩过的坑（都有对应修复与闸门）
+
+1. **默认保护名单里放了 `apps`**：看着稳妥，实际把 Android 上数量最大的一批组全保下来，收益
+   直接没了。自测第一轮就因 `protected=3` 对不上而暴露。改成 `system`，并加一条「`--protect`
+   放宽必须被遵守」的断言。
+2. **`echo 0 > node 2>/dev/null` 压不住 `Permission denied`**：重定向失败是 **shell** 报的、
+   不是 `echo` 报的，`2>/dev/null` 作用在命令上而不是重定向的建立过程。WSL 真树上漏出 28 条
+   才发现，改成 `if ( echo 0 > node ) 2>/dev/null`。
+3. **bench 一开始恒报 `cpu_jiffies=0`**：awk 程序写成 `'^cpu  {...}'`，少了正则斜杠，gawk 报
+   语法错——而我给读数函数套了 `2>/dev/null`，于是「测量失败」长得跟「读数为 0」一模一样。现在
+   用 `/^cpu  /`、不吞 stderr、并且**读不到就退出**（`refusing to print a zero as a
+   measurement`）。AGENTS.md 里「绿灯的坏代码」那一类，这次轮到工装自己。
+4. **指标本身要先证明可信**：1000 / 4000 / 16000 次 fork → 145 / 590 / 2330 忙 jiffies，线性、
+   轮间 4%，才敢说 A/B 不是在比噪声。指标也从「总 jiffies」换成「忙 jiffies」（含 idle 的话，
+   8 核手机每秒白送 ~800 tick，信号被埋）。
+5. **打包门禁拦下两只新工具**：`(?<!/devices)/system\b` 命中 `/system/bin/true` 和 fixture 里的
+   `$_st_root/system/uid_0`。仓库里 `tools/*.sh` 一律 `#!/bin/sh` 的原因就在这。改 PATH 查找 +
+   fixture 目录换中性名（前缀匹配机制一模一样），并保留 `ABK_PROTECT="system"` 这个字面值给
+   Python 侧断言。
+6. **zip 命名会造出第二个模块**：顺手打的 `abk_runtime_tunables-v0.9.0.zip` 触发 packager 的
+   warning——KernelSU **按 zip 名命名模块目录**，刷它等于在现有模块旁边再装一份、两份监督器
+   并跑。只打规范产物 `build/ksu/abk_runtime_tunables.zip`。
+7. **`read` 的 2000 行默认上限**：对 1881 行的本文件做「读-改-写」把后 1557 行删掉了（`git diff
+   --numstat` 当场露出来，已回滚重做）。同一条也差点发生在 3745 行的 `stable_5_15_test.py` 上，
+   那两次是写之前抛错才没出事。规则：大文件一律走完整读写的 Python 补丁脚本，改完必查
+   `git diff --numstat`；`scripts/abk_stable_perf.py` 是 CRLF，更不能这么重写。
+
+### 6. 待办
+
+- [ ] 设备回来：`su -c 'sh -n'` 过一遍三只脚本（mksh 是唯一真裁判）。
+- [ ] 模块 root 写 `cgroup.pressure` 到底要不要额外 sepolicy 规则 —— 唯一还没证的前提（Batch 18
+      需要规则是因为被拒方是内核线程；这里写文件的是模块自己的 root）。`--status` 的
+      `refused=` 计数 + `dmesg | grep -i avc | grep cgroup` 就是这条的裁判。
+- [ ] 两态 A/B（`docs/psi_field_protocol.md` §4）→ 按 §5 的判定规则决定出厂值是 `keep` 还是
+      `aggressive`，并把结果回写本文件与 `tunables.conf` 的注释。
+- [ ] 发布构建（把 v0.9.0 companion 打进 AK3 zip）。
+
 <a id="batch-24"></a>
 
 ## Batch 24(v0.29.0)
@@ -106,10 +216,18 @@ trap 5，Batch 21 踩过一次；这是本模块**第一个**故意破「没有�
 - 本批之后 plan.md 的「溯源完成未落地」清单为空；剩下的都是需要新审计类型的多批次项目
   （per-VMA locks 读侧核）、或要新基线才能验的小项。
 
-### 7. CI
+### 7. 编译门禁（ABK CI run 34891009037，success）
 
-见下条运行记录（带 / 不带 `CONFIG_ZRAM_WRITEBACK` 各一次；本批与 writeback 无关，
-但那是 Batch 23 定下的门禁形态）。
+本批引入 C（`kstrtoull` 解析 + 每趟计数），本地四档审计看不到编译，以 ABK CI 为准：
+
+- `编译内核` job run **34891009037**（同批双胞胎 34890998139），22m18s，`success`；
+- 日志里的三件自证：`head_log: bb4c36d feat(core): Batch 24 -- recompression pass cap
+  max_pages (v0.29.0)`（编的就是这个提交）、`[ABK module] version: 0.29.0`（版本进到了产物里）、
+  `stable_backport_core/zram_recompress_max_pages: applied`（本组真的落在树上）。
+
+一条自我更正：本节口述过的另一个号 **34897210323 不存在**，那是笔误。取号的正确方式不是记号，
+是把 run 的日志 grep 一遍、确认 `version:` 与 `head_log:` 跟自己的 HEAD 对得上——对不上就说明
+那次编的不是这份代码，绿灯也无意义。
 
 <a id="batch-23"></a>
 

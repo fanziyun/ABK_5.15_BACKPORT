@@ -153,8 +153,20 @@ compressor on the dominated `lz4hc` before `disksize` — after which the node i
 * it drives age-marked recompression sweeps through the kernel's async worker
   (this is the only part that is on by default);
 * it reports — or optionally applies — the remaining runtime knobs: MGLRU, THP,
-  `vm.swappiness`, the schedutil smart-freq policy, dynamic readahead and
-  cgroup-v1 proactive reclaim;
+  `vm.swappiness`, the schedutil smart-freq policy, dynamic readahead,
+  cgroup-v1 proactive reclaim, and per-cgroup pressure (PSI) accounting;
+* it switches off per-cgroup PSI accounting for the groups nobody reads
+  (`psi.cgroup`, Batch 25 — the `cgroup.pressure` node is this module's own Batch 21
+  graft, so the batch adds a policy and not a graft). Measured on the target before any
+  of it was written: 452 groups carried the node, 314 held tasks, and the only pressure
+  readers on the device (`lmkd`, `system_server`, `mimd`) all had the **global** file
+  open, which the root group serves and this switch does not touch. So the root group is
+  never written, the tool never writes `1` (upstream's version of the switch frees the
+  group's per-cpu windows and the companion cannot tell the kernels apart), and the
+  shipped default stays `keep` until the two-boot A/B in
+  [`docs/psi_field_protocol.md`](docs/psi_field_protocol.md) decides — the same
+  measurement is what proved `auto` (empty groups only) a no-op worth saying out loud,
+  and why `bin/abk_psi_bench.sh` exists to take that measurement in one command;
 * it records **who owns CPU frequency** at boot: one log line per cpufreq policy
   (governor, `cur/min/max`, `total_trans`, DMIPS `arch`, and `cap_view`) plus the
   kernel's FAS registration (`/proc/fas`).  `cap_view` is the policy's capacity as

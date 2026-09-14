@@ -140,9 +140,33 @@ abk_status_report() {
   abk_show_or_absent "transparent_hugepage" \
     "$ABK_SYS_ROOT/kernel/mm/transparent_hugepage/enabled"
 
+  # Per-cgroup PSI: what the policy is meant to do, and what the tree says it
+  # did.  The second is the honest one -- a refused write leaves the first a
+  # statement of intent, which is how Batch 16's dark RCU graft looked healthy.
+  echo "-- per-cgroup pressure (PSI) --"
+  abk_show "psi.cgroup" "$(abk_psi_mode) (protect=$(abk_psi_protect), interval=$(abk_psi_interval)s)"
+  _sr_psi_tool="${ABK_PSI_TOOL:-$MODDIR/bin/abk_psi_policy.sh}"
+  if [ -f "$_sr_psi_tool" ]; then
+    _sr_psi_n=0
+    sh "$_sr_psi_tool" --status --cgroot "$ABK_CGROOT" 2>&1 | while IFS= read -r _sr_psi_line; do
+      [ -n "$_sr_psi_line" ] || continue
+      # One label, then the tool's follow-up hint (a refusal is a different
+      # failure from a missing node, and the tool says which one it saw).
+      if [ "$_sr_psi_n" = 0 ]; then
+        abk_show "cgroup pressure nodes" "$_sr_psi_line"
+        _sr_psi_n=1
+      else
+        printf '%-26s %s\n' "" "$_sr_psi_line"
+      fi
+    done
+  else
+    abk_show "cgroup pressure nodes" "absent ($_sr_psi_tool)"
+  fi
+
   echo "-- supervisors --"
   abk_supervisor_state zram "zram sweeps"
   abk_supervisor_state cfr "proactive reclaim"
+  abk_supervisor_state psi "per-cgroup PSI policy"
 
   # logcat is best-effort on some ROMs, so the module keeps its own log.
   echo "-- module log --"

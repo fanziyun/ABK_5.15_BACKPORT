@@ -2888,6 +2888,42 @@ def test_runtime_tunables_module():
         check(f"{script.name} never relaxes SELinux",
               "setenforce" not in code and "permissive" not in code.lower())
 
+    # --- per-cgroup PSI accounting policy (companion v0.9.0) ---------------
+    # The node comes from this module's own Batch 21 graft, so nothing here is
+    # kernel work.  What can go wrong is the policy: protect so much that the
+    # pass buys nothing, protect so little that a future reader is refused, or
+    # re-enable a group whose per-cpu windows some other kernel already freed.
+    service_source = (module_dir / "service.sh").read_text(encoding="utf-8")
+    readme_source = (module_dir / "README.md").read_text(encoding="utf-8")
+    for key in ("psi.cgroup", "psi.cgroup.protect", "psi.cgroup.interval_sec"):
+        check(f"{key} is registered as a known key", key in common_sh)
+        check(f"{key} is assigned in the shipped tunables.conf",
+              re.search(r"(?m)^" + re.escape(key) + r"=", tunables) is not None)
+    check("the mode vocabulary is exactly keep|auto|aggressive with keep built in",
+          "abk_cfg psi.cgroup keep" in common_sh
+          and "keep|auto|aggressive)" in common_sh)
+    check("an unrecognised psi.cgroup value leaves the kernel alone",
+          "leaving the kernel alone" in common_sh)
+    check("the protect default is the narrow system prefix, not apps",
+          "abk_cfg psi.cgroup.protect system" in common_sh
+          and "system,apps" not in common_sh)
+    check("the pass is a supervisor and never runs at the early boot stage",
+          "abk_psi_supervisor_main" in service_source
+          and "--supervise-psi" in service_source
+          and "abk_psi" not in post_fs_data)
+    check("psi.cgroup=keep spawns no supervisor at all",
+          "= keep ]; then" in service_source)
+    check("a pass that changed nothing stays out of logcat",
+          "abk_log_append INFO" in common_sh)
+    check("the supervisor stops when every write was refused",
+          "stopping the supervisor instead of re-walking" in common_sh)
+    check("status prints what the tree says, not what the config intends",
+          "--status --cgroot" in action_source
+          and "abk_supervisor_state psi" in action_source)
+    check("the companion README records the two-boot rule and the third supervisor",
+          "two boots" in readme_source
+          and "three supervisors" in readme_source)
+
     # --- packaging: the module zip and the AK3 ride-along ---
     sys.path.insert(0, str(repo / "scripts"))
     import ak3_bundle_ksu_module as ak3  # noqa: E402
@@ -2921,11 +2957,48 @@ def test_runtime_tunables_module():
             check("embedded reclaim tool is byte-identical to tools/",
                   archive.read("bin/cached_freeze_reclaim.sh")
                   == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
-            check("embed.conf contributes exactly the three device tools",
+            check("embed.conf contributes exactly the five device tools",
                   sorted(name for name in names if name.startswith("bin/"))
                   == ["bin/abk_fas_check.sh",
+                      "bin/abk_psi_bench.sh",
+                      "bin/abk_psi_policy.sh",
                       "bin/cached_freeze_reclaim.sh",
                       "bin/zram_recompress_trigger.sh"])
+            check("embedded PSI policy tool is byte-identical to tools/",
+                  archive.read("bin/abk_psi_policy.sh")
+                  == (repo / "tools" / "abk_psi_policy.sh").read_bytes())
+            check("embedded PSI bench is byte-identical to tools/",
+                  archive.read("bin/abk_psi_bench.sh")
+                  == (repo / "tools" / "abk_psi_bench.sh").read_bytes())
+            _psi_tool = archive.read("bin/abk_psi_policy.sh").decode("utf-8")
+            check("the shipped PSI tool carries the fixture self test the device lacks",
+                  "abk_psi_selftest" in _psi_tool
+                  and "psi selftest PASS" in _psi_tool)
+            # The one-way rule.  The upstream version of this switch frees the
+            # group per-cpu windows and calls re-enabling not restore safe; the
+            # Batch 21 graft can restart accounting, but the companion cannot
+            # tell the two kernels apart from userspace, so the walk body must
+            # hold no write of 1.  Sliced, because the self test re-arms its own
+            # fixture files on purpose.
+            _psi_walk = _psi_tool.split("abk_psi_walk() {", 1)[1]
+            _psi_walk = _psi_walk.split(chr(10) + "}", 1)[0]
+            check("the PSI walk only ever writes 0",
+                  "echo 0 > " in _psi_walk and "echo 1" not in _psi_walk)
+            check("the root group is skipped before the protect list is consulted",
+                  0 <= _psi_walk.find("ABK_n_root=$((")
+                  < _psi_walk.find("ABK_n_protect=$(("))
+            check("the PSI tool names Batch 21 as the node origin, not upstream",
+                  "Batch 21" in _psi_tool
+                  and "inherited upstream" not in _psi_tool)
+            _psi_bench = archive.read("bin/abk_psi_bench.sh").decode("utf-8")
+            check("the bench reads /proc/stat through a real awk regex, not a caret",
+                  "/^cpu  /" in _psi_bench
+                  and "awk '^cpu" not in _psi_bench)
+            check("the bench refuses an unreadable /proc/stat instead of reporting zero",
+                  "refusing to print a zero" in _psi_bench)
+            check("the bench labels each round by the state measured from the tree",
+                  "state=$(abk_state_probe)" in _psi_bench
+                  and "nodes=" in _psi_bench and "off=" in _psi_bench)
             check("embedded FAS check tool is byte-identical to tools/",
                   archive.read("bin/abk_fas_check.sh")
                   == (repo / "tools" / "abk_fas_check.sh").read_bytes())

@@ -14,6 +14,7 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 case "${1:-}" in
   --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
   --supervise-cfr) abk_cfr_supervisor_main; exit 0 ;;
+  --supervise-psi) abk_psi_supervisor_main; exit 0 ;;
 esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
@@ -72,6 +73,16 @@ fi
 
 if [ "$(abk_cfg cfr.enable 0)" = "1" ]; then
   abk_spawn --supervise-cfr cfr
+fi
+
+# Per-cgroup PSI accounting: a full tree walk with a blocking write per
+# group, so it never belongs in post-fs-data -- it belongs to a supervisor that
+# can take its time and catch the groups the apps create later.  With
+# psi.cgroup=keep nothing is spawned at all: one decision here, no silent loop.
+if [ "$(abk_psi_mode)" = keep ]; then
+  abk_log "psi.cgroup=keep: per-cgroup pressure accounting left as the kernel set it"
+else
+  abk_spawn --supervise-psi psi
 fi
 
 abk_log "service: done"

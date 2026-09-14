@@ -1,8 +1,11 @@
 # plan.md — living backlog
 
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
-每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
+每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。**只有 companion 的批次例外**：只 bump
+`ksu/*/module.prop`（先例 `a50df6e`，Batch 25 同），否则单测里钉的内核版本对不上号。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
+
+## Batch 25(companion v0.9.0,已落地；两态 A/B 待真机)→ 详见 CHANGELOG.md#batch-25 — Batch 21 的 `cgroup.pressure` 开关第一次被按下去：新增 `tools/abk_psi_policy.sh`（`keep`/`auto`/`aggressive`，**只写 0 不写 1**，根组无条件先跳，前缀保护名单）+ `tools/abk_psi_bench.sh`（两态 A/B 工装，忙 jiffies 指标已标定线性）+ 假树 `--selftest`；点名结果 452 组 / 314 有任务 / 读者只有全局 PSI 的 `lmkd`·`system_server`·`mimd` ⇒ **`auto` 是零收益 no-op**，真对照是 `keep` vs `aggressive`，出厂默认因此仍 `keep`，协议与新文档 `docs/psi_field_protocol.md` 的判定规则等真机数据；registry 未动（本批一行 C 都没有），`module.conf` 保持 0.29.0
 
 ## Batch 24(v0.29.0,已落地)→ 详见 CHANGELOG.md#batch-24 — 重压缩每趟上限 `max_pages`（`34efe1c3b688`）+ 拒绝无法识别的 `type=`（`2f529e73d720`），同步与异步两个节点一起；本模块第一个**改写别的组生成文本**的批次，故给 `zram_recompression`/`zram_async_recompress` 各加自身载荷探针（trap 5 解法）；companion v0.8.0 默认 `zram.recomp.max_pages=16384`
 

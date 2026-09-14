@@ -50,7 +50,12 @@ paths under the tree.
 A reference tree is required for the tree-level audits. Fetch one without cloning
 history: `bash tests/fetch_sublevel_tree.sh <branch> <outdir>` (gitiles-encoded,
 only the ~44 files the groups touch). Real branches per baseline are in
-`tests/fetch_sublevel_tree.sh` and `docs/porting_policy.md`.
+`tests/fetch_sublevel_tree.sh` and `docs/porting_policy.md`. `research/fetch_all_trees.sh`
+brings down all four into `build/abk-trees/<sublevel>`, which is where the reference trees
+this repository audits against live -- **`tmp/r167`/`tmp/r216` and friends are report
+directories, not trees**, and every one of the three tree audits fails on them with
+`reference tree is missing Documentation/admin-guide/cgroup-v2.rst`. A tree fetched before
+`FETCH_FILES` grew entries is missing them too; re-fetch rather than working around it.
 
 ```bash
 python3 -m py_compile scripts/*.py tests/*.py     # syntax gate

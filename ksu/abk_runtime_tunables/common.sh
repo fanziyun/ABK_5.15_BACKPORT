@@ -5,7 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.8.0"
+ABK_VERSION="v0.9.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -50,6 +50,10 @@ ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
 # proc_write_fas).  Read-only for this module: it reports who owns DVFS, it is
 # never written here.
 ABK_FAS_NODE="${ABK_FAS_NODE:-/proc/fas}"
+# The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
+# *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
+# not a missing feature.
+ABK_CGROOT="${ABK_CGROOT:-$ABK_SYS_ROOT/fs/cgroup}"
 ABK_SWAPOFF="${ABK_SWAPOFF:-swapoff}"
 ABK_SWAPON="${ABK_SWAPON:-swapon}"
 ABK_MKSWAP="${ABK_MKSWAP:-mkswap}"
@@ -239,6 +243,9 @@ sched.abk_sf_floor_pct
 sched.abk_sf_sustained_ms
 sched.abk_sf_exit_ms
 readahead.dynamic_readahead
+psi.cgroup
+psi.cgroup.protect
+psi.cgroup.interval_sec
 cfr.enable
 cfr.interval_sec
 cfr.freeze
@@ -620,6 +627,149 @@ abk_apply_readahead_knob() {
   return 0
 }
 
+# --- per-cgroup PSI accounting ----------------------------------------------
+# The kernel derives and times pressure for *every* cgroup by default, on each
+# task state change, all the way up the hierarchy.  Android's v2 layout creates a
+# group per uid and per pid, so that is hundreds of groups whose numbers nobody
+# reads.
+#
+# Measured on the target (vermeer / 5.15.216, Batch 24): 452 cgroups carried a
+# cgroup.pressure node; lmkd, system_server and mimd were the only pressure
+# readers and all three had the global /proc/pressure/memory open.  No process
+# held a per-cgroup PSI file open.  The cost was real and the consumer was not.
+#
+# The node is this module's own graft, not the baseline's: Batch 21's
+# psi_cgroup_pressure_switch, ported from the android14-6.1 ACK implementation.
+# android13-5.15 has no such file, so a kernel built without that batch simply
+# has nothing to switch and the pass reports nodes=0.  From how that group was
+# written come the two properties this policy leans on: the switch is not
+# hierarchical (a disabled parent leaves its children accounting), and a
+# disabled group answers -EOPNOTSUPP on its pressure files and refuses poll
+# triggers instead of reporting frozen numbers.  A reader therefore fails loudly
+# rather than tuning on a lie.
+#
+# The tool writes only 0.  Batch 21 frees nothing and can restart accounting, so
+# a round trip works on this kernel; upstream's version of the switch frees the
+# group's per-cpu windows and calls re-enabling not restore safe.  The companion
+# cannot tell the two apart from userspace, so the disabled state is a decision
+# made at boot (psi.cgroup) and the A/B is two boots, not one live flip.
+#
+# keep is the built-in default: a missing key never changes behaviour, and the
+# disabled state stays something that was measured on the device first
+# (docs/psi_field_protocol.md).
+abk_psi_mode() {
+  _pm_val="$(abk_cfg psi.cgroup keep)"
+  case "$_pm_val" in
+    keep|auto|aggressive)
+      printf '%s\n' "$_pm_val"
+      return 0
+      ;;
+  esac
+  abk_warn "psi.cgroup='$_pm_val' is not keep|auto|aggressive; leaving the kernel alone"
+  printf 'keep\n'
+  return 0
+}
+
+# Path prefixes that keep their accounting, matched as a literal prefix of the
+# group path (so protect_memcg covers protect_memcg_001 and friends).  The
+# built-in default is one entry; the shipped tunables.conf widens it for this
+# ROM's own groups.  Deliberately narrow either way: the per-app groups
+# (apps/pid_*, uid_*/pid_*) are the bulk of the count and have no readers, while
+# the system subtree is where a vendor monitor could be hiding.
+abk_psi_protect() {
+  _pp_val="$(abk_cfg psi.cgroup.protect system)"
+  [ -n "$_pp_val" ] || _pp_val=system
+  printf '%s\n' "$_pp_val"
+  return 0
+}
+
+abk_psi_interval() {
+  _pi_val="$(abk_cfg psi.cgroup.interval_sec 300)"
+  abk_is_uint "$_pi_val" || _pi_val=300
+  # A pass is a full tree walk; below a minute it costs more than it saves.
+  [ "$_pi_val" -ge 60 ] || _pi_val=60
+  printf '%s\n' "$_pi_val"
+  return 0
+}
+
+# One pass.  The tool owns every decision (which groups, which mode, what counts
+# as refused); this feeds it the configuration and puts its summary line into the
+# module log.
+abk_psi_pass() {
+  _pa_tool="${ABK_PSI_TOOL:-$MODDIR/bin/abk_psi_policy.sh}"
+  if [ ! -f "$_pa_tool" ]; then
+    abk_warn "$_pa_tool is missing; per-cgroup PSI policy not applied"
+    return 1
+  fi
+  _pa_mode="$(abk_psi_mode)"
+  _pa_protect="$(abk_psi_protect)"
+  _pa_out="$(sh "$_pa_tool" --apply --mode "$_pa_mode" --protect "$_pa_protect" --cgroot "$ABK_CGROOT" 2>&1)"
+  _pa_rc=$?
+  while IFS= read -r _pa_line; do
+    [ -n "$_pa_line" ] || continue
+    # Steady state is a pass that disabled nothing: almost every group is
+    # already off, so the line is bookkeeping.  Keep it in the module log but
+    # out of logcat, which the supervisor would otherwise hit every interval.
+    # Anything else -- a real write, a refusal, no nodes -- is worth seeing.
+    case "$_pa_line" in
+      *"disabled=0 "*) abk_log_append INFO "$_pa_line" ;;
+      *) abk_log "$_pa_line" ;;
+    esac
+  done <<EOF
+$_pa_out
+EOF
+  return $_pa_rc
+}
+
+# Read the last pass line back out of the log, so the give-up rule judges what
+# the tool actually reported instead of a private copy of its output format.
+abk_psi_state_line() {
+  _pl_log="$(abk_log_file)"
+  if [ -f "$_pl_log" ]; then
+    grep 'psi: mode=' "$_pl_log" 2>/dev/null | tail -n 1
+  fi
+  return 0
+}
+
+abk_psi_node_count() {
+  if [ -d "$ABK_CGROOT" ]; then
+    find "$ABK_CGROOT" -name cgroup.pressure 2>/dev/null | wc -l
+  else
+    echo 0
+  fi
+  return 0
+}
+
+abk_psi_supervisor_main() {
+  abk_pid_write psi "$"
+  _ps_interval="$(abk_psi_interval)"
+  abk_log "per-cgroup PSI supervisor up: mode=$(abk_psi_mode) protect=$(abk_psi_protect) interval=${_ps_interval}s"
+  _ps_first=1
+  while :; do
+    abk_psi_pass
+    if [ "$_ps_first" = 1 ]; then
+      _ps_first=0
+      # Stop rather than walk the tree forever when this module cannot touch the
+      # switch.  Three conditions together say that: nothing was already off (no
+      # earlier pass worked), nothing got disabled, and something was refused --
+      # which here means SELinux or a read-only mount.  A kernel without the
+      # switch reports no pass line at all and does not match.
+      _ps_line="$(abk_psi_state_line)"
+      case "$_ps_line" in
+        *"already_off=0"*)
+          case "$_ps_line" in
+            *"disabled=0"*"refused=0"*|"") : ;;
+            *"disabled=0"*)
+              abk_warn "per-cgroup PSI: every write was refused; stopping the supervisor instead of re-walking $(abk_psi_node_count) nodes every ${_ps_interval}s ($_ps_line)"
+              return 0
+              ;;
+          esac
+          ;;
+      esac
+    fi
+    sleep "$_ps_interval"
+  done
+}
 # --- the one SELinux rule this module needs -------------------------------
 # The zram writeback data path is kernel-side: the loop worker, a kernel thread
 # in u:r:kernel:s0, is what reads and writes the backing file.  Android's policy

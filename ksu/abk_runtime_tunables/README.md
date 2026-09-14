@@ -188,6 +188,9 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `sched.abk_sf_sustained_ms` | *(empty)* | 1..60000 |
 | `sched.abk_sf_exit_ms` | *(empty)* | 1..60000 |
 | `readahead.dynamic_readahead` | *(empty)* | `0`/`1` |
+| `psi.cgroup` | `keep` | per-cgroup pressure accounting: `keep` (the built-in default, and the shipped value) leaves every group as the kernel set it; `auto` switches off only groups holding no tasks and no memory, which this device measured to be a no-op; `aggressive` switches off everything outside the protect list |
+| `psi.cgroup.protect` | `system` built-in, `system,protect_memcg` shipped | path **prefixes** that keep their accounting -- narrow on purpose, and the shipped value covers this ROM's own memory-daemon groups |
+| `psi.cgroup.interval_sec` | `300` | seconds between passes; a pass only reaches groups that are still on, so a repeat walk writes nothing (min 60) |
 | `cfr.enable` | `0` | proactive reclaim of cached groups |
 | `cfr.interval_sec` | `300` | sweep interval |
 | `cfr.freeze` | `0` | quiesce a group during its sweep (undone in the same sweep) |
@@ -248,6 +251,60 @@ took under a second on a big core and returned 105 MB. A pass on a healthy
 device (post-compaction overhead measured: 3.3%) is pure CPU for nothing, so
 both gates must call the device fragmented before the module writes anything.
 
+## Per-cgroup pressure accounting (the switch nobody is reading)
+
+Every cgroup derives and times its own pressure numbers on every task state
+change, all the way up the hierarchy. On this device that is **452 groups**,
+because Android's v2 layout creates one per uid and one per pid. Pointed before
+switching anything: the only pressure readers on the device were `lmkd`,
+`system_server` and `mimd`, and all three had the global
+`/proc/pressure/memory` open -- which is served by the root group and is not
+this switch at all. **No process had any per-cgroup PSI file open.** So the work
+was being charged for a consumer that did not exist, and it was charged on the
+state changes of every task in every one of those groups.
+
+`cgroup.pressure` is this module's own graft -- Batch 21's
+`psi_cgroup_pressure_switch`, ported from the android14-6.1 ACK implementation
+(android13-5.15 has no such file). That is why there is no new group here: on a
+kernel built with Batch 21 or later this is policy only, and on one without it
+the pass finds nothing and says `nodes=0`. Two properties of how that group was
+written decide the shape of the policy:
+
+* the switch is **not hierarchical** -- turning off a parent leaves its children
+  accounting, so the pass has to decide group by group, which it does;
+* a group that is off keeps its **task counts** (the levels above and below read
+  them) and stops deriving state masks; its pressure files answer
+  `-EOPNOTSUPP` and a `poll` trigger on it is refused. A monitor therefore gets
+  an explicit error, not a plausible stale zero.
+
+**The root group is never written, whatever the mode says.** In this graft the
+root's switch is not a cgroup flag -- it flips `psi_system`, the global numbers.
+Writing it would take pressure visibility away from the low-memory killer, which
+is the opposite of the point.
+
+**Why `protect=system` and not `system,apps`.** Adding `apps` looks prudent and
+removes most of the win: `apps/pid_*` and `uid_*/pid_*` are the bulk of the
+hierarchy and nothing reads them. The `system` subtree stays because that is
+where a vendor monitor could be hiding, and this is the one failure mode the
+measurement cannot show you -- a reader that does not exist today.
+
+**There is no runtime "turn it back on", and that is a deliberate limit.**
+Batch 21 keeps the state in a flag bit, frees nothing, and has a restart path
+(`psi_cgroup_restart()` rebuilds each CPU's state mask from the counts it kept),
+so a round trip is in fact safe *on this kernel*. Upstream's own version of the
+switch frees the group's per-cpu windows and states that re-enabling is not
+restore safe. This companion also runs on kernels it did not build, and cannot
+tell the two apart from userspace -- so `bin/abk_psi_policy.sh` writes only `0`.
+The accounting state comes from booting with `psi.cgroup=keep`.
+
+That is also why the measurement is **two boots** rather than one live flip: the
+half of a session after a re-enable carries no history for the window it was off.
+`bin/abk_psi_bench.sh` runs a fixed amount of task state change work and reads
+the CPU back out of `/proc/stat`; it labels each round with the state *measured
+from the tree*, not with the config key, because a refused write would otherwise
+mislabel a whole run. The protocol, and what decides the shipped default, is
+`docs/psi_field_protocol.md` in the parent repository.
+
 ## Using it
 
 * `action.sh status` (or the KernelSU action button) prints the policy, the
@@ -257,17 +314,37 @@ both gates must call the device fragmented before the module writes anything.
 * `action.sh takeover` rewrites zram immediately (algorithms, cap, swap,
   writeback) even when the policy is already in force.
 * `action.sh unlock` prints how the kernel-side lock is changed (boot cmdline).
+* `bin/abk_psi_policy.sh --status` reports the per-cgroup PSI tree as it stands
+  (nodes, how many are off, how many are protected, how many were refused);
+  `--apply --mode auto|aggressive` runs one pass by hand, and `--selftest`
+  checks the decision table against a fixture tree with no device at all.
+* `bin/abk_psi_bench.sh --rounds 3` runs the A/B measurement described above.
 * Progress goes to **`state/abk_runtime_tunables.log`** (capped at 64 KiB) and,
   best-effort, to logcat under the tag `ABK-Tunables` -- logcat was measured to
   be unreliable on the target ROM (empty for the `shell` user and for a
   `u:r:ksu:s0` writer), so the file is the source of truth. `report.logcat=0`
   silences only the logcat mirror.
 
-The long-running parts are two supervisors started by `service.sh`
-(`--supervise-zram`, `--supervise-cfr`), each recording its own pid under
-`state/`.
+The long-running parts are three supervisors started by `service.sh`
+(`--supervise-zram`, `--supervise-cfr`, `--supervise-psi`), each recording its
+own pid under `state/`. The PSI one is not started at all when `psi.cgroup=keep`
+-- one decision, no idle loop -- and it stops itself after its first pass if every
+write was refused, because re-walking hundreds of nodes every five minutes to be
+told `EACCES` again is a supervisor that has become the cost it was meant to
+remove.
 
 ## Notes, limits and testing seams
+
+* The PSI pass has seams so its decision table is testable without a device:
+  `ABK_PSI_CGROOT` / `--cgroot` point the walk at a fixture, `ABK_PSI_TOOL`
+  redirects the companion at the tool, `ABK_BENCH_BIN` gives the bench a host
+  binary to fork. `bash tools/abk_psi_policy.sh --selftest` builds a fake tree
+  (root, protected subtree, populated group, empty group, already-off group,
+  unreadable node) and asserts each of them, including that a second pass writes
+  nothing. It caught two real defects while being written: a protect default that
+  covered `apps` (killing most of the win) and a failed `> node` whose
+  `Permission denied` came from the *shell*, not from `echo`, so it escaped
+  `2>/dev/null` and polluted the log.
 
 * cgroup proactive reclaim walks both layouts: v2
   (`/sys/fs/cgroup[/apps]/uid_*` with `memory.current` + `cgroup.freeze`) and v1
