@@ -18,14 +18,14 @@ ABK_ABI_PATCH_SUITE inventory and the KMI red lines.
 
 | candidate | verdict | reason |
 |---|---|---|
-| EEVDF scheduling (PLACE_LAG / PLACE_DEADLINE_INITIAL / RUN_TO_PARITY / HZ_BW / SIS_UTIL) | **suite** | ABK_ABI_PATCH_SUITE EEVDF family owns `sched_entity` KABI slots 1–4; excluded by contract |
+| EEVDF scheduling (PLACE_LAG / PLACE_DEADLINE_INITIAL / RUN_TO_PARITY / HZ_BW / SIS_UTIL) | **absorbed (Batch 15)** | the suite's EEVDF family owned `sched_entity` KABI slots 1–4; Batch 15 retires that red line and this module claims the slots itself — see `docs/survey_suite_absorption.md` |
 | per-VMA locks | **deferred** | ACK 6.6 sits on maple-tree storage with `vm_area_struct` rework; needs RCU VMA lifetime + fault-path conversion + KABI growth — not a bounded anchor graft |
 | per-cgroup PSI toggling / PSI parent-chain sync | **KMI red line** | rewrites `struct cgroup` layout |
 | mm/khugepaged.c, folio, page_alloc, memcg reworks | **infra** | 6.2–6.6 infrastructure rewrites (khugepaged alone ≈ +1300/−925), not bounded grafts |
 | new Android MM vendor hooks (THP gfp orders, alloc slowpath, CMA/contig, compaction, swap) | **hook-only** | additive tracepoints with real call sites but no in-tree mechanism consumer |
 | zram **recompression** | **chosen (Batch 4)** | genuine self-contained mechanism (recompress idle/small pages with a second compressor); not covered by the suite (suite owns zram *writeback*) |
 | binder next-gen perf | **deferred** | 5.15 already carries oneway-spam + frozen state; the 6.6+ generation is a larger driver effort |
-| io_uring 6.2–6.6 growth | **suite** | suite owns io_uring NOWAIT / zcrx / cBPF / non-circular-SQ; the remaining pieces are infra |
+| io_uring 6.2–6.6 growth | **not portable** | the suite's io_uring groups target the post-5.18 split `io_uring/` layout; 5.15 ships an 11,116-line `io_uring/io_uring.c` monolith, and the suite itself classifies the cBPF / non-circular-SQ / zcrx items as `blocked_by_missing_anchor` on that older layout. A hand-port onto the monolith is a separate project — see `docs/survey_suite_absorption.md` |
 
 ## Batch 4 = zram recompression (source form android15-6.6 / 6.6.142)
 
@@ -93,4 +93,7 @@ and leaves that region alone.
 - [ ] `zram_recompression` `PatchGroup` + config/test counts + CI verify
 
 Deferred (unchanged from the 6.1 survey): per-VMA locks, per-cgroup PSI
-toggling, DAMON sysfs, MADV_COLLAPSE, zram-writeback (suite), EEVDF (suite).
+toggling, DAMON sysfs, MADV_COLLAPSE.  The two rows that used to read "(suite)"
+are settled by Batch 15: EEVDF is now absorbed into this module, and the
+io_uring growth is recorded as not portable onto the 5.15 monolith — see
+`docs/survey_suite_absorption.md`.

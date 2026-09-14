@@ -59,12 +59,20 @@ feature *semantics* onto the 5.15 shapes:
   5.15 ACK snapshots already carry, so the group probes the tree shape
   and lands the full mechanism on the baseline.
 
-## Suite-preference rule (per the ABK_ABI_PATCH_SUITE contract)
+## Suite-preference rule — SUPERSEDED by Batch 15
+
+> This section records the rule as it stood when the survey was written.  It is
+> **no longer the policy**: Batch 15 retired it and absorbed the suite's
+> optimization inventory into this module (see "Suite absorption" in
+> `docs/porting_policy.md` and `docs/survey_suite_absorption.md`, which carries
+> the measured evidence for every feature, including the ones that turned out
+> not to be portable onto android13-5.15 at all).  The list below is kept as
+> provenance for *what* was absorbed.
 
 For each candidate the ABK_ABI_PATCH_SUITE inventory was checked first.
 The suite (feature source 7.0.12) does **not** carry any of the five
 landed groups. Suite-covered hotpaths that overlap the 6.1 survey space
-are excluded from this module by policy — rely on the suite's groups:
+were excluded from this module by the old policy — the suite's groups were:
 `fd_alloc_hotpath`, `close_range_hotpath`, `pid_alloc_hotpath_phase2`,
 `slab_alloc_free_hotpath`, `hugepage_fault_alloc_fastpath`,
 `io_uring_nowait_*`, `zram_compressed_writeback`, the EEVDF family and
