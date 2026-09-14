@@ -27,12 +27,28 @@ from __future__ import annotations
 # child id -> total registered groups
 GROUP_COUNTS = {
     # 24 Batch-1..13 groups + the three Batch-14 zram writeback groups
-    # (zram_wb_teardown, zram_writeback_bounds, zram_wb_limit_align).  The
-    # 5.15.167 exception for zram_wb_teardown lives in KNOWN_DEBT below: that
-    # baseline predates the group's precondition be48c412f6eb (see the comment
-    # there).
-    "stable_backport_core": 27,
-    "stable_perf_backport": 13,
+    # (zram_wb_teardown, zram_writeback_bounds, zram_wb_limit_align) + the three
+    # Batch-15 absorbed fs/pid hot-path groups (pid_alloc_hotpath_phase2,
+    # fd_alloc_hotpath, close_range_hotpath) + the two absorbed MM hot-path
+    # groups (slab_alloc_free_hotpath, hugepage_fault_alloc_fastpath).
+    # The 5.15.167 exception for zram_wb_teardown lives in KNOWN_DEBT below:
+    # that baseline predates the group's precondition be48c412f6eb (see the
+    # comment there).
+    #
+    # The three Batch-15 groups apply on every baseline: the part of the suite's
+    # fd work that a baseline might already carry (the alloc_fdtable()
+    # slots_wanted capacity rewrite) is deliberately NOT ported -- this child's
+    # fdtable_alloc_conventions owns that text, and the suite's helper name is
+    # one of this module's suite-detection markers.  What is ported
+    # (abk_expand_files_needed() and the open_fds walk) is absent from all four.
+    "stable_backport_core": 32,
+    # 13 Batch-1..13 groups + the two absorbed EEVDF groups
+    # (sched_eevdf_pick_logic, sched_eevdf_core_fields), the two absorbed
+    # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode)
+    # and the absorbed blk_mq_async_depth.  The EEVDF pair is registered
+    # pick_logic-first so the sched_entity slot claim only happens once the
+    # fair.c logic has really landed.
+    "stable_perf_backport": 18,
     "stable_display_fix": 1,
 }
 

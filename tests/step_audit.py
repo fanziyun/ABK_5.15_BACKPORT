@@ -125,6 +125,32 @@ AUDIT_FILES = [
     # mm/page_alloc.c and exports in drivers/android/vendor_hooks.c.
     "include/trace/hooks/mm.h",
     "drivers/android/vendor_hooks.c",
+    # Batch 15: ABK_ABI_PATCH_SUITE absorption.  The suite's optimization
+    # inventory is this module's own from Batch 15 (see
+    # docs/survey_suite_absorption.md), so its target files join the fixture.
+    # Deliberately absent from this list and from FETCH_FILES:
+    #   mm/swap.h            -- 5.15 has no such file; swap internals live in
+    #                           include/linux/swap.h and mm/swap_state.c
+    #   io_uring/<many>.c    -- the post-5.18 split layout; 5.15 ships an
+    #                           11,116-line io_uring/io_uring.c monolith
+    "kernel/pid.c",
+    "mm/slub.c",
+    "mm/huge_memory.c",
+    "mm/memory.c",
+    "mm/swap_state.c",
+    "include/linux/blkdev.h",
+    "block/blk-core.c",
+    "block/blk-mq-sched.c",
+    "block/blk-sysfs.c",
+    "block/elevator.c",
+    "block/mq-deadline.c",
+    "block/bfq-iosched.c",
+    "block/kyber-iosched.c",
+    "include/linux/sched/nohz.h",
+    "include/linux/tick.h",
+    "kernel/time/tick-sched.c",
+    "kernel/sched/idle.c",
+    "kernel/bpf/helpers.c",
 ]
 
 CHILD_MODULES = [
@@ -249,6 +275,15 @@ def audit_child(name, module, pristine_root, work):
     current_group = [None]
     original = module.apply_steps
 
+    # Batch modules (scripts/batchNN_*.py) do `from abk_backport_engine import
+    # apply_steps`, which binds the *original* function into their own module
+    # globals at import time.  Patching only this child's attribute would let
+    # every group defined in such a module bypass this instrumentation: its steps
+    # would never reach `group_steps`, so the per-step already_present trap (1b),
+    # the comment/brace/#ifdef balance check and the byte-identity idempotency
+    # check would all silently skip every file those groups touch -- while the
+    # group-status assertions still passed, hiding it.  Rebinding the name in
+    # every loaded module that still points at the original closes that hole.
     def wrapper(ctx, steps, _o=original):
         status, results, detail = _o(ctx, steps)
         group_steps.setdefault(current_group[0], []).extend(steps)
@@ -261,7 +296,13 @@ def audit_child(name, module, pristine_root, work):
         )
         return status, results, detail
 
+    rebound = [
+        mod for mod in list(sys.modules.values())
+        if mod is not module and getattr(mod, "apply_steps", None) is original
+    ]
     module.apply_steps = wrapper
+    for _rb in rebound:
+        _rb.apply_steps = wrapper
     pre_applied = sublevel_matrix.pre_applied(SUB_LEVEL, name)
     debts = sublevel_matrix.debt(SUB_LEVEL, name)
     try:
@@ -279,6 +320,8 @@ def audit_child(name, module, pristine_root, work):
                      f"drifted or tests/sublevel_matrix.py is stale")
     finally:
         module.apply_steps = original
+        for _rb in rebound:
+            _rb.apply_steps = original
 
     steps = [s for key in group_steps for s in group_steps[key]]
 

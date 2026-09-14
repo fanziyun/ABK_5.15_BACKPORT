@@ -4014,5 +4014,68 @@ import batch14_core_zram_writeback as _b14_zwb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b14_zwb.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 15: ABK_ABI_PATCH_SUITE absorption -- core fs/pid allocation hot paths.
+# Steps live in scripts/batch15_core_fs_pid_hotpaths.py.
+#
+# Batch 15 retires the suite-preference rule (docs/porting_policy.md, "Suite
+# absorption"), so the suite's optimization inventory is re-registered here
+# instead of being deferred to a second external module.  Three groups:
+#
+#   pid_alloc_hotpath_phase2  retries idr_preload(GFP_KERNEL) once after a
+#                             GFP_ATOMIC -ENOMEM inside alloc_pid().  NOTE: the
+#                             suite's version used `continue;` in
+#                             `for (i = ns->level; i >= 0; i--)`, which runs the
+#                             increment expression -- on the common single-level
+#                             namespace it left the loop and returned a pid whose
+#                             numbers[0].nr was never written.  The absorbed form
+#                             retries the SAME level through a retry_preload:
+#                             label instead.
+#   fd_alloc_hotpath          the abk_expand_files_needed() precheck helper plus
+#                             its two call sites.  The suite's capacity half is
+#                             deliberately NOT ported: this child's
+#                             fdtable_alloc_conventions already owns that text
+#                             (upstream 5.15.191 slots_wanted shape), and the
+#                             suite's helper name is one of this module's own
+#                             suite-detection markers.
+#   close_range_hotpath       walks open_fds under rcu_read_lock() in
+#                             __range_close(), the 5.15 shape.  The suite's
+#                             caller-locked 6.1 helpers are not ported because on
+#                             5.15 pick_file() takes files->file_lock itself, so
+#                             the suite's lockdep assertion would be knowingly
+#                             false.
+#
+# Ordering is load-bearing and enforced by a shape probe in _fd_alloc_apply():
+# these groups must run AFTER fdtable_alloc_conventions (and
+# fdtable_replace_fd_errno), and they report blocked_by_shape rather than
+# half-grafting a precheck onto a table allocator whose shape they do not
+# recognise.  Both fs/file.c groups return skip_suite_processed when the tree
+# already carries ABK_ABI_PATCH_SUITE markers, because the suite inserts the same
+# helper names -- re-grafting would be a duplicate definition.
+# ============================================================================
+import batch15_core_fs_pid_hotpaths as _b15_fspid  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b15_fspid.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 15: ABK_ABI_PATCH_SUITE absorption -- core MM hot paths.
+# Steps live in scripts/batch15_core_mm_hotpaths.py.
+#
+#   slab_alloc_free_hotpath      a shared bulk-free backend, a free-side
+#                                validation split and a bulk-alloc prefetch in
+#                                mm/slub.c.
+#   hugepage_fault_alloc_fastpath a file-local helper split for anonymous THP
+#                                fault-time allocation that keeps the THP
+#                                fault-fallback tracking and the PMD fault
+#                                routing intact (mm/huge_memory.c, mm/memory.c).
+#
+# Both are appended after every pre-existing core group, so their mm/*.c anchors
+# see the output of the khugepaged / MADV_COLLAPSE / THP and page_alloc groups
+# that already touch the same files.
+# ============================================================================
+import batch15_core_mm_hotpaths as _b15_mm  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b15_mm.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

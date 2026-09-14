@@ -92,6 +92,109 @@ REQUIRED_CONTENT = {
         "abk_dra_is_background_task",
         "ABK stable_515_backport: dynamic readahead (Batch 9-1).",
     ],
+    # Batch 15 (ABK_ABI_PATCH_SUITE absorption).  The suite guarded every edit
+    # with `if old in text:` + `text.replace(old, new, 1)`, so a drifted anchor
+    # was a silent no-op reported as success.  These pin the behaviour that
+    # actually lands, so that failure mode cannot come back through this port.
+    "core:pid_alloc_hotpath_phase2": [
+        # Both halves of the retry: the label it jumps to, and the latch that
+        # makes it single-shot per pid-namespace level.
+        "retry_preload:",
+        "retried_preload = true;",
+        "retried_preload = false;",
+    ],
+    "core:fd_alloc_hotpath": [
+        # Only the precheck half is ported; REQUIRED_ABSENT pins the half that is
+        # deliberately not, and why.
+        "abk_expand_files_needed",
+    ],
+    "core:close_range_hotpath": [
+        "ABK stable_515_backport: close_range_hotpath.",
+    ],
+    "core:slab_alloc_free_hotpath": [
+        # The shared helper plus both alloc paths and the single-resolution free.
+        "abk_slab_next_object",
+        "c->freelist = next_object;",
+        "struct page *page = virt_to_head_page(x);",
+        "slab_free(s, page, x, NULL, 1, _RET_IP_);",
+    ],
+    "core:hugepage_fault_alloc_fastpath": [
+        "abk_thp_fault_prepare",
+        "abk_thp_fault_alloc_page",
+        "abk_thp_fault_charge_page",
+        "abk_map_anon_page_pmd",
+        "abk_do_huge_pmd_anonymous_zero_page",
+        "abk_create_anonymous_huge_pmd",
+        # The 5.15 convention trap this port had to respect: khugepaged_enter()
+        # returns int here (non-zero = failure, include/linux/khugepaged.h:56),
+        # where 6.1 renamed it khugepaged_enter_vma() and returns void.  The
+        # int is propagated as VM_FAULT_OOM; see REQUIRED_ABSENT for the form
+        # that must not appear.
+        "khugepaged_enter(vma, vma->vm_flags)",
+    ],
+    "perf:sched_eevdf_core_fields": [
+        # The KABI claim itself -- this is the group that takes ownership of the
+        # sched_entity slots the retired red line used to forbid.  Four scalars,
+        # so each ANDROID_KABI_USE's size/alignment static assert holds and
+        # sizeof(struct sched_entity) is unchanged.
+        "ANDROID_KABI_USE(1, u64 deadline);",
+        "ANDROID_KABI_USE(2, u64 min_vruntime);",
+        "ANDROID_KABI_USE(3, s64 vlag);",
+        "ANDROID_KABI_USE(4, u64 slice);",
+    ],
+    "perf:sched_eevdf_pick_logic": [
+        "abk_pick_eevdf",
+        "abk_eevdf_eligible",
+        "abk_eevdf_vslice",
+        "abk_eevdf_update_lag",
+        "abk_eevdf_take_rel_deadline",
+        "abk_eevdf_store_rel_deadline",
+        "abk_eevdf_scale_rel_deadline",
+        "ABK_EEVDF_REL_DEADLINE_BIT",
+        # Definitions alone would pass even if nothing called them: these are the
+        # three call sites that make the selector live.  They are also what
+        # sched_eevdf_core_fields' anti-drift gate probes before it will claim
+        # the sched_entity KABI slots.
+        "return abk_pick_eevdf(cfs_rq, curr);",
+        "abk_eevdf_refresh_deadline(cfs_rq, se);",
+        "abk_eevdf_place_entity(cfs_rq, se, initial);",
+        "scan-based EEVDF runtime-state graft",
+    ],
+    "perf:nohz_field_refinement": [
+        "enum nohz_cpu_state",
+        "abk_tick_nohz_state_flags",
+        "NOHZ_CPU_STATE_TICK_STOPPED",
+    ],
+    "perf:avg_idle_preemption_mode": [
+        # wake_avg_idle is retired and the SIS_PROP scan budget is re-sourced
+        # from rq->avg_idle directly.  Both strings are absent from the pristine
+        # tree, so they prove the mode really flipped rather than the group
+        # no-op'ing.
+        "ABK stable_515_backport: avg_idle preemption mode simplification.",
+        "avg_idle = this_rq->avg_idle / 2;",
+        # The suite sampled unconditionally: `delta = rq_clock(rq) -
+        # rq->idle_stamp`.  On 5.15 idle_stamp is armed ONLY by
+        # newidle_balance(), so a CPU sitting in the idle task without having
+        # passed that path (boot CPU, idle->idle repick) has idle_stamp == 0 and
+        # the unconditional form samples nanoseconds-since-boot, clamping
+        # straight to 2*max_idle_balance_cost.  Pristine ttwu_do_wakeup() had
+        # exactly this guard.
+        "if (!rq->idle_stamp)",
+    ],
+    "perf:blk_mq_async_depth": [
+        # The new limit_depth op and its routing through alloc_request.
+        "static void blk_mq_limit_depth(unsigned int opf, struct blk_mq_alloc_data *data)",
+        "e->type->ops.limit_depth(opf, data);",
+        "limit_depth = blk_mq_limit_depth;",
+        # The two CONVERTED consumers.  Do not "simplify" these back to the
+        # suite's raw assignments: q->async_depth is a REQUEST count while
+        # kqd->async_depth / bfqd->word_depths[][] are PER-WORD BIT caps
+        # (sbitmap_queue_get_shallow() caps bits within one word), so the raw
+        # assignment is >= one word on a 256-deep queue and never throttles --
+        # dead code.  See REQUIRED_ABSENT.
+        "kqd->async_depth = ((q->async_depth << shift) + q->nr_requests - 1) /",
+        "depth = ((bfqd->queue->async_depth << bt->sb.shift) +",
+    ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
@@ -270,6 +373,46 @@ REQUIRED_ABSENT = {
         ["include/trace/hooks/mm.h", "ABK stable_515_backport:"],
         ["drivers/android/vendor_hooks.c", "ABK stable_515_backport:"],
     ],
+    "core:fd_alloc_hotpath": [
+        # The suite's capacity half must never be shipped from this module.
+        # `abk_fdtable_slots_wanted` is one of this repo's OWN suite-detection
+        # markers (abk_common.SUITE_FD_HELPER, consumed by
+        # GraftContext.suite_touched / suite_fdtable_fallback /
+        # fdtable_upstream_shape), so emitting it here would flip a second pass
+        # to `skip_suite_processed` instead of `already_present`.  The other half
+        # of the pair, the suite's ALIGN()-based capacity line, is what
+        # fdtable_upstream_shape() tests for.  Pinned per file because fs/file.c
+        # legitimately carries this module's other markers.
+        ["fs/file.c", "abk_fdtable_slots_wanted"],
+        ["fs/file.c", "ALIGN(slots_wanted"],
+    ],
+    "core:hugepage_fault_alloc_fastpath": [
+        # The 6.1 spelling of the khugepaged entry.  5.15 has khugepaged_enter()
+        # returning int; copying the 6.1 void-returning khugepaged_enter_vma()
+        # would silently drop the failure path (and not compile).  The needle
+        # carries the call's open paren on purpose: 5.15 legitimately contains
+        # the *different* symbol khugepaged_enter_vma_merge(vma, ...), which a
+        # bare "khugepaged_enter_vma" needle matches as a substring.
+        ["mm/huge_memory.c", "khugepaged_enter_vma(vma,"],
+    ],
+    "perf:sched_eevdf_core_fields": [
+        # The abandoned packing the suite used to upgrade FROM.  If it survives,
+        # two fields share one 8-byte slot and the KABI size assert is wrong.
+        ["include/linux/sched.h", "ANDROID_KABI_USE(3, struct {"],
+        ["include/linux/sched.h", "ANDROID_KABI_USE(4, struct {"],
+    ],
+    "perf:blk_mq_async_depth": [
+        # The suite's unconverted assignments: a request count written into a
+        # per-word bit cap.  Both are the dead-code form this port replaces.
+        ["block/kyber-iosched.c", "kqd->async_depth = q->async_depth;"],
+        ["block/bfq-iosched.c", "depth = bfqd->queue->async_depth;"],
+    ],
+    "perf:avg_idle_preemption_mode": [
+        # The retired wake-side prediction must be gone from the wake path.  The
+        # struct rq fields themselves stay (removing them would move every field
+        # after them and break KMI) -- they are simply dead now.
+        ["kernel/sched/fair.c", "this_rq->wake_avg_idle"],
+    ],
 }
 
 # Function-scoped assertions.  REQUIRED_CONTENT above is whole-file substring
@@ -307,6 +450,32 @@ REQUIRED_IN_FUNCTION = {
         ("kernel/sched/cpufreq_schedutil.c", "abk_sf_cpu_boosting",
          ["time_after(jiffies, c->boost_release)", "abk_sf_clear(c)"],
          []),
+    ],
+    "core:pid_alloc_hotpath_phase2": [
+        # The retry must stay inside alloc_pid() and re-enter the SAME
+        # pid-namespace level.  The suite retried with `continue;` inside
+        # `for (i = ns->level; i >= 0; i--)`, which runs the loop's increment
+        # expression: it retried the PARENT level (re-running the set_tid
+        # bookkeeping), and on ns->level == 0 -- every ordinary fork -- it left
+        # the loop, hit `retval = -ENOMEM;` at the function tail and returned a
+        # fully initialised pid whose numbers[0].nr had never been written.
+        # `continue;` is absent from the pristine alloc_pid(), so this pins it.
+        ("kernel/pid.c", "alloc_pid",
+         ["retry_preload:", "retried_preload = false;", "retried_preload = true;"],
+         ["continue;"]),
+    ],
+    "core:close_range_hotpath": [
+        # The bitmap walk must land in __range_close() itself, not in a helper
+        # nobody calls, and the suite's caller-locked 6.1 helpers must not appear
+        # (on 5.15 pick_file() takes files->file_lock itself, so
+        # abk_pick_file_for_close()'s lockdep assertion would be knowingly
+        # false).  Asserted on in-body text, not on the marker comment: the
+        # marker sits *above* the signature, where function_body() cannot see it.
+        ("fs/file.c", "__range_close",
+         ["n = last_fd(fdt);",
+          "max_fd = min(max_fd, n);",
+          "fd = find_next_bit(fdt->open_fds, max_fd + 1, fd);"],
+         ["abk_pick_file_for_close", "abk_close_range_limit"]),
     ],
     "core:zram_recompression": [
         # The read path must delegate to the shared helper, not carry its own

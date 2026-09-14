@@ -3,6 +3,113 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 15（v0.20.0，撤销 ABK_ABI_PATCH_SUITE 红线 + 收编其优化特性，已落地）
+
+### 政策变更：suite-preference 作废
+
+原规则是「每个候选先查 ABK_ABI_PATCH_SUITE 清单，它覆盖的优化本模块**不**重复实现
+（改为注入套件）」，叠加 KMI 红线「不 claim `sched_entity` 槽 1–4、`request_queue`
+槽 1（套件领地）」以及「不改写套件硬失败组的函数体」。这套规则让本模块**永久依赖
+第二个外部模块**，优化面被拆到两个仓库。Batch 15 全部撤销，改为**收编**：
+
+- 本模块**自己**占用 `sched_entity` 槽 1–4（EEVDF：
+  `deadline`/`min_vruntime`/`vlag`/`slice`）与 `request_queue` 槽 1
+  （`async_depth`）。
+- **两个模块从此互斥**：同一构建不得再注入 ABK_ABI_PATCH_SUITE——双占同一 KMI
+  槽是硬冲突。注入本模块**而不是**套件。
+- 原「不改写套件硬失败组函数体」限制作废：`alloc_pid()`、
+  `pick_file()`/`__range_close()`、`select_idle_cpu()`、`pick_next_entity()`
+  现在由本模块自己接管。
+- F2FS/UFS sibling 边界与「不引入 .patch 载荷」不变。
+
+依据与逐项证据：`docs/survey_suite_absorption.md`（英文，含文件布局探针结果）；
+政策文本见 `docs/porting_policy.md` 的 "Suite absorption"。
+
+### 落地（core 27→32，perf 13→18，共 51 组）
+
+| 组 | 子模块 | 内容 |
+|---|---|---|
+| `pid_alloc_hotpath_phase2` | core | `alloc_pid()` 的 `idr_preload(GFP_KERNEL)` 单次重试 |
+| `fd_alloc_hotpath` | core | `abk_expand_files_needed()` 预检 + 两个调用点 |
+| `close_range_hotpath` | core | `__range_close()` 改走 `open_fds` 位图（5.15 形态） |
+| `slab_alloc_free_hotpath` | core | 共享 `abk_slab_next_object()` + 批量分配预取 + free 侧单次解析 |
+| `hugepage_fault_alloc_fastpath` | core | 匿名 THP fault 路径的 helper 拆分（huge_memory.c + memory.c） |
+| `blk_mq_async_depth` | perf | 真正的 `q->async_depth` 队列深度策略（9 文件） |
+| `sched_eevdf_pick_logic` | perf | 扫描式 EEVDF 选择器（14 步，`kernel/sched/fair.c`） |
+| `sched_eevdf_core_fields` | perf | **KABI 槽认领**（`ANDROID_KABI_USE(1..4)`） |
+| `nohz_field_refinement` | perf | `tick_sched` 状态字段命名化 + 访问器 |
+| `avg_idle_preemption_mode` | perf | 退役 `wake_avg_idle` 唤醒侧预测，SIS_PROP 预算改由 `avg_idle` 直接给 |
+
+注册顺序有两处**是载荷相关**的：`sched_eevdf_pick_logic` 必须排在
+`sched_eevdf_core_fields` **之前**——后者是反漂移闸门，只有 fair.c 真的落地
+（探测本模块 marker + 三个调用点）才认领槽位，否则槽位保持 `RESERVE`。
+`fd_alloc_hotpath`/`close_range_hotpath` 必须在 `fdtable_alloc_conventions`
+之后（`_fd_alloc_apply()` 用形状探针强制）。
+
+### 收编过程中修掉的四个**套件自身缺陷**（都是「编译通过但行为错」类）
+
+1. **`alloc_pid()` 重试用 `continue;`**（`for (i = ns->level; i >= 0; i--)`）——
+   `continue` 会跑循环增量，于是重试的是**父级**（且重跑 `set_tid` 记账）；
+   在 `ns->level == 0`（所有普通 fork）会跳出循环、落到函数尾的
+   `retval = -ENOMEM;` 并返回一个 `numbers[0].nr` **从未写入**的 pid。
+   本线改为 `goto retry_preload`，并加了每级一次的 latch。
+2. **bfq/kyber 的 `async_depth` 量纲错**：`q->async_depth` 是**请求数**，而
+   `kqd->async_depth`/`bfqd->word_depths[][]` 是**每 word 的 bit 上限**
+   （`sbitmap_queue_get_shallow()` 只在一个 word 内限 bit）。套件只给 mq-deadline
+   做了换算，bfq/kyber 直接赋值——256 深的队列上默认 192 ≥ 一个 word，
+   **两个消费者永不限流（死代码）**。本线在两处内联同样换算。
+3. **`update_rq_avg_idle()` 无条件采样**：`delta = rq_clock(rq) - rq->idle_stamp`，
+   而 5.15 的 `idle_stamp` **只由 `newidle_balance()` 装载**，所以没走过那条路的
+   CPU（boot CPU、idle→idle repick）`idle_stamp == 0`，采到的是「开机至今的
+   纳秒数」并直接顶到 `2*max_idle_balance_cost`。原始 `ttwu_do_wakeup()` 正因
+   如此才有 `if (rq->idle_stamp)`。本线恢复该护栏。
+4. **`reweight_entity()` 整函数替换在 194/216 上必静默跳过**：这两个 sublevel 在
+   `update_load_set()` 与 CONFIG_SMP PELT 块之间插了
+   `trace_android_vh_reweight_entity(se);`，套件的整体 old 因此**不匹配任何
+   sublevel**——而它的 `if old in text:` 会静默放过并报成功。本线在该接缝处
+   把锚点拆成 head/tail，hook 留在原位。
+
+另外 5.15 语义坑（已适配，见各组 docstring）：`khugepaged_enter()` 在 5.15 返回
+**int**（非 0 = 失败），6.1 改名 `khugepaged_enter_vma()` 返回 void；`slab_free()`
+在 5.15 是六参数且无 `struct slab`；5.15 没有 `SIS_UTIL`/`nr_idle_scan`，
+套件的 6.1 分支会让 `nr = INT_MAX` 扫整个 LLC。
+
+### 未收编（含证据，不再重议）
+
+- **io_uring NOWAIT / cBPF / non-circular SQ / zcrx**：套件目标是 5.18 之后拆分的
+  `io_uring/*.c` 布局，而 5.15 是**单文件 11,116 行** `io_uring/io_uring.c`；
+  手搬到 monolith 是独立工程，不是收编。套件自己在旧布局上也判
+  `blocked_by_missing_anchor`。
+- **`swap_table_phase2_large_folios`**：`mm/swap.h` 在 5.15 **不存在**，
+  且 5.15 没有 `struct folio`（`grep -rn "struct folio" include/linux mm` = 0）、
+  12 个被调用者全缺、读路径约定不同（5.15 `int swap_readpage(struct page*, bool)`
+  无 plug/unplug）。退化成 page-first 改写只是**行为中性的代码搬移**，按本模块
+  范围规则排除。评估留在 `scripts/batch15_core_swap_table.py`
+  （`REGISTER_AS_CHILD = False`，`build_groups()` 返回 `[]`，**未接线**）。
+- **`bpf_timer_bpf_wq_lockless`**：`defer_timer_wq_op` / `bpf_wq` 在 5.15 **和**
+  6.1 都是 0 命中——该组在套件自己的目标形态上也不成立。
+- **`zram_compressed_writeback`**：套件版本只加 `compressed_wb` 标志 + sysfs 属性，
+  **没有 I/O 实现**；真特性需要 `zs_obj_read_begin/end`（两棵树都没有）。
+  与 Batch 14 审计（`research/zram_writeback_plan.md` §6）结论一致。
+- **marker-only 组**：`sched_eevdf_runtime_state_phase3`、
+  `io_uring_large_rx_buffer_zcrx` 只插一行注释，收编会造出 phantom 组。
+- **`io_uring_support_modules`** 只做分类、不写文件；`tcp_socket_layout_reduction`
+  /`ipv6_tcp_output_path` 套件自己就判 `blocked_by_layout`/`report_only`。
+
+### 顺带修掉一个**审计漏洞**（影响 Batch 14）
+
+`tests/step_audit.py` 通过猴补丁 `module.apply_steps` 采集每步状态，但
+`scripts/batchNN_*.py` 用的是 `from abk_backport_engine import apply_steps`——
+在 import 期就把**原函数**绑进了自己的模块全局，猴补丁够不到。后果：这些组的
+步骤既不进 `group_steps`，于是 trap 1b（步骤级 `already_present`）、注释/括号/
+`#ifdef` 平衡检查、以及**第二遍字节一致性**检查**全部静默跳过**，而组级状态断言
+照常通过——**Batch 14 的三个组一直没被审计过**。修法：把仍指向原函数的已加载
+模块一并重绑（并在 finally 恢复）。修复后 core 步数 151→177、perf 83→114，
+四棵树仍全绿，Batch 14 首次真正过审。
+
+审计基线：`step_audit.py` / `implementation_audit.py` 在 5.15.167/.178/.194/.216
+四棵树全绿（`GROUP_COUNTS` core 27→32、perf 13→18）；`module.conf` 0.19.0→0.20.0。
+
 ## Batch 14（v0.19.0，zram writeback 正确性补齐，已落地）
 
 来源：一次纯审计+上游溯源（`research/zram_writeback_plan.md`，英文，含逐提交
@@ -396,9 +503,16 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   完整证据、上游溯源与全部裁决见
   [`research/zram_writeback_plan.md`](research/zram_writeback_plan.md)，
   上游哈希复核结果见 `research/zram_wb_audit/verified_commits.tsv`。
-- [ ] `zram_recompress_max_pages`（P3，候选小项）— 先溯源 recompress
-  `max_pages` 参数是否已入 mainline；是则可作 `zram_recompression`
-  组的可选追加步
+- [x] `zram_recompress_max_pages`（P3）— **溯源完成，未落地**：参数确在
+  mainline `recompress_store()`——`research/upstream-zram/zram_drv_master.c:2580`
+  解析 `max_pages` 到 `num_recomp_pages`（初值 `ULLONG_MAX`），
+  `recompress_slot()` 逐页递减，扫描循环在归零时 `break`；
+  `research/upstream-zram/zram_drv_linux-5.15.y.c` 与 android13-5.15 都没有。
+  **为什么不当"可选追加步"落地**：该函数在 pristine 5.15 里**根本不存在**
+  （实测 `abk515_ref_167/drivers/block/zram/zram_drv.c` 无 `recompress_store`），
+  它是本模块 `zram_recompression` 组自己生成的文本。所以这里的锚点不是
+  pristine 锚点，按 `docs/group_recipe.md` 的 trap 4，它应当是**注册在
+  `zram_recompression` 之后的独立组**，而不是该组的可选步。留作候选。
 - [x] QPACE / kcompressd 异步压缩：popsicle diff 已抽读完毕（异步骨架 =
   整 bio 提交 + ring + 完成回调，绑定 6.12 形态与 QTI 硬件）→ 选定
   **方案 A**：把同一套"kthread + 队列 + 完成回调"骨架嫁接到本模块已落地的

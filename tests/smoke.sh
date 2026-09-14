@@ -82,6 +82,27 @@ SMOKE_FILES=(
   include/linux/huge_mm.h
   include/uapi/asm-generic/mman-common.h
   drivers/gpu/drm/drm_atomic_helper.c
+  # Batch 15: ABK_ABI_PATCH_SUITE absorption.  The absorbed groups anchor in
+  # these files; without them smoke's fixture reports blocked_by_shape for
+  # pid_alloc_hotpath_phase2, slab_alloc_free_hotpath,
+  # hugepage_fault_alloc_fastpath and every blk_mq_async_depth /
+  # sched-refinement / EEVDF step.
+  kernel/pid.c
+  mm/slub.c
+  mm/huge_memory.c
+  mm/memory.c
+  include/linux/blkdev.h
+  block/blk-core.c
+  block/blk-mq-sched.c
+  block/blk-sysfs.c
+  block/elevator.c
+  block/mq-deadline.c
+  block/bfq-iosched.c
+  block/kyber-iosched.c
+  include/linux/sched/nohz.h
+  include/linux/tick.h
+  kernel/time/tick-sched.c
+  kernel/sched/idle.c
 )
 
 WORK="$(mktemp -d)"
@@ -305,6 +326,49 @@ grep -q "register_trace_android_vh_customize_alloc_gfp(" \
   || fail "gfp fast-fail policy does not register on the hook"
 grep -q "abk_gfp_fastfail" "$KERNEL_ROOT/common/mm/page_alloc.c" \
   || fail "gfp fast-fail knobs missing"
+
+# Batch 15: the absorbed ABK_ABI_PATCH_SUITE features.  Two of them are
+# load-bearing enough to assert here and not only in the audits:
+#   * sched_eevdf_core_fields takes ownership of the sched_entity KABI slots
+#     1-4.  It is an anti-drift gate -- if the fair.c logic did not land the
+#     group refuses and the slots stay ANDROID_KABI_RESERVE -- so the claim is
+#     only expected where the group really applies.
+#   * blk_mq_async_depth must carry the CONVERTED bfq/kyber assignments.  The
+#     suite's raw form writes a request count into a per-word bit cap, which on
+#     any realistic queue depth is >= one word, i.e. a throttle that never
+#     throttles.  Asserting the conversion is what keeps that from regressing.
+if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+sys.exit(0 if sublevel_matrix.applies(sys.argv[2], "stable_perf_backport",
+                                      "sched_eevdf_core_fields") else 1)
+PY
+then
+  grep -q "ANDROID_KABI_USE(1, u64 deadline);" \
+    "$KERNEL_ROOT/common/include/linux/sched.h" \
+    || fail "EEVDF did not claim sched_entity slot 1"
+  grep -q "ANDROID_KABI_USE(4, u64 slice);" \
+    "$KERNEL_ROOT/common/include/linux/sched.h" \
+    || fail "EEVDF did not claim sched_entity slot 4"
+  grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
+    "$KERNEL_ROOT/common/kernel/sched/fair.c" \
+    || fail "EEVDF selector is not wired into pick_next_entity"
+fi
+if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+sys.exit(0 if sublevel_matrix.applies(sys.argv[2], "stable_perf_backport",
+                                      "blk_mq_async_depth") else 1)
+PY
+then
+  grep -q "async_depth << shift" "$KERNEL_ROOT/common/block/kyber-iosched.c" \
+    || fail "kyber async_depth is not unit-converted (throttle never fires)"
+  grep -q "async_depth << bt->sb.shift" \
+    "$KERNEL_ROOT/common/block/bfq-iosched.c" \
+    || fail "bfq async_depth is not unit-converted (throttle never fires)"
+fi
 
 # The drm valid-clones revert must leave no trace of the 5.15.185 check on
 # any baseline: 167/178 never carried it, 194/lts had it removed by the graft.

@@ -1549,6 +1549,53 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 15: ABK_ABI_PATCH_SUITE absorption -- scheduler refinements + EEVDF.
+# Steps live in scripts/batch15_perf_sched_refinements.py and
+# scripts/batch15_perf_eevdf.py.
+#
+# Batch 15 retires the suite-preference rule (docs/porting_policy.md, "Suite
+# absorption"), so the suite's scheduler inventory is re-registered here:
+#
+#   batch15_perf_sched_refinements
+#       nohz_field_refinement    names the legacy tick_sched nohz state fields
+#                                and adds accessors, so the ~8 read sites stop
+#                                open-coding the bit tests.
+#       avg_idle_preemption_mode drops the wake_avg_idle prediction while
+#                                keeping the direct avg_idle newidle thresholds,
+#                                and simplifies the SIS_PROP scan budgeting.
+#
+#   batch15_perf_eevdf
+#       THIS is where this module takes ownership of the sched_entity KABI
+#       slots 1-4 (deadline / min_vruntime / vlag / slice) -- the slots the
+#       retired red line used to forbid.  Its two groups are registered in a
+#       deliberate order, pick_logic BEFORE core_fields, so the slot claim only
+#       happens once the fair.c logic has really landed: on anchor drift the
+#       slots stay ANDROID_KABI_RESERVE instead of being claimed for code that
+#       is not in the tree.
+#
+# Ordering: both modules are appended after every pre-existing perf group, so
+# their fair.c / core.c anchors see the earlier groups' output.  A build that
+# injects ABK_ABI_PATCH_SUITE instead of this module keeps the suite's copies;
+# the suite must never ride the same build (AGENTS.md -- it would double-claim
+# sched_entity 1-4 and request_queue 1).
+# ============================================================================
+import batch15_perf_sched_refinements as _b15_sched  # noqa: E402
+import batch15_perf_eevdf as _b15_eevdf  # noqa: E402
+import batch15_perf_blk_mq_async_depth as _b15_blkdepth  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b15_sched.build_groups(PatchGroup)
+PATCH_GROUPS = PATCH_GROUPS + _b15_eevdf.build_groups(PatchGroup)
+
+# blk_mq_async_depth: the absorbed queue-depth policy.  This is the group that
+# claims request_queue KABI slot 1 (ANDROID_KABI_USE(1, unsigned int async_depth))
+# -- the other half of the retired red line.  It shares no anchor text with
+# blk_mq_suspend_wakeup_abort (that one owns the blk-mq.c #include pair and
+# blk_mq_hctx_notify_offline(); this one owns __blk_mq_alloc_request(),
+# blk_mq_init_allocated_queue() and blk_mq_update_nr_requests()), so their
+# relative order does not matter.
+PATCH_GROUPS = PATCH_GROUPS + _b15_blkdepth.build_groups(PatchGroup)
+
 
 def main():
     args = parse_args("stable_perf_backport: 5.15.y scheduler/net/locking/block optimization grafts")
