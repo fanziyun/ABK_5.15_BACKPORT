@@ -81,6 +81,19 @@ the ``down_write``/``limit_pages``/early-return prefix instead -- the 5.15
 Anchoring on the tail passed in isolation and failed under the real group order
 with ``blocked_by_shape``.  None of the four groups touches text another one
 produces.
+
+Re-anchor note (Batch 17): ``_B_POSTLOCK`` used to reach one line further, to the
+``page = alloc_page(GFP_KERNEL);`` that opens the sweep.  Batch 17
+(``zram_writeback_batching``) replaces that single page with a per-request page
+pool, so it owns that line: a replacement block has to stay *contiguous* for
+``replace_once``'s idempotency test, and two groups editing one span is exactly
+what the graft-boundary contract in ``scripts/batch10_core_zram_async.py``
+forbids.  The anchor now stops at the ``backing_dev`` check's closing brace; the
+group's semantics, statuses and audit needles are unchanged.
+``_B_LOOP_TAIL_NEW``'s comment was reworded for the same reason: after batching
+the sweep no longer blocks in ``submit_bio_wait()`` but in the drain of its own
+in-flight bios, and a marker comment describing a shape the tree no longer has is
+worse than no comment.
 """
 
 from __future__ import annotations
@@ -225,13 +238,19 @@ _B_PARSE_NEW = (
     "\t\t\treturn -EINVAL;"
 )
 
+# The anchor deliberately stops at the backing_dev check's closing brace.  The
+# "page = alloc_page(GFP_KERNEL);" line that follows is owned by
+# "zram_writeback_batching" (Batch 17 replaced the single writeback page with a
+# per-request page pool), and a replacement block has to live on as a
+# *contiguous* string for replace_once()'s idempotency test -- see the
+# graft-boundary contract in scripts/batch10_core_zram_async.py.  Reaching into
+# that line here passed in isolation and made this group report
+# blocked_by_shape on every second pass.
 _B_POSTLOCK = (
     "\tif (!zram->backing_dev) {\n"
     "\t\tret = -ENODEV;\n"
     "\t\tgoto release_init_lock;\n"
-    "\t}\n"
-    "\n"
-    "\tpage = alloc_page(GFP_KERNEL);"
+    "\t}"
 )
 
 _B_POSTLOCK_NEW = (
@@ -246,9 +265,7 @@ _B_POSTLOCK_NEW = (
     "\tif (index >= nr_pages) {\n"
     "\t\tret = -EINVAL;\n"
     "\t\tgoto release_init_lock;\n"
-    "\t}\n"
-    "\n"
-    "\tpage = alloc_page(GFP_KERNEL);"
+    "\t}"
 )
 
 _B_LOOP_TAIL = (
@@ -265,9 +282,10 @@ _B_LOOP_TAIL_NEW = (
     "\t\t/*\n"
     "\t\t * ABK stable_515_backport: 424d0e5828ad.  A sweep can walk every\n"
     "\t\t * slot of a multi-GiB disk, each one with an alloc_page(), a\n"
-    "\t\t * decompression and a blocking submit_bio_wait() while holding\n"
-    "\t\t * init_lock.  Yield so a reset/disksize store waiting on the write\n"
-    "\t\t * lock (and the RCU/watchdog machinery) is not starved.\n"
+    "\t\t * decompression and a blocking wait for in-flight writeback bios\n"
+    "\t\t * while holding init_lock.  Yield so a reset/disksize store\n"
+    "\t\t * waiting on the write lock (and the RCU/watchdog machinery) is\n"
+    "\t\t * not starved.\n"
     "\t\t */\n"
     "\t\tcond_resched();\n"
     "\t}\n"
