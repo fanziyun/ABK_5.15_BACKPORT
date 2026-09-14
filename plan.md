@@ -4,6 +4,16 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 17(v0.22.0,已落地)→ 详见 CHANGELOG.md#batch-17 — zram writeback bio batching + compressed writeback
+
+### 排除项（结论；原文见 CHANGELOG.md#batch-17）
+- `7c929664fddf` / `a4f506c569e1`（wb limit 存写锁改造 / 删 `wb_limit_lock`）——**不移植**：与 batching 机制无关，删锁也违反「不为通过编译而删锁」；batch14 的 `writeback_limit` 对齐护栏正锚在 `wb_limit_lock` 的 store 文本上。
+- `e87ddea34567` 的重命名与 `INVALID_BDEV_BLOCK` 哨兵——只取「返回前释放保留块」的语义；重命名会波及 `zram_free_page()` 的 `ZRAM_WB` 分支（recompression 领地）。
+- `1b1a4e4d6797`（读 slot blk_idx 持锁）——读路径加固，不是本特性的依赖；5.15 的同一理论窗口今天已存在，不是本批引入的回归，留作后续独立候选。
+- `bf989ade270d`（read_from_bdev_async 错误传播）——无 `Fixes:` 指向本特性；本批的读回 dispatcher 自带错误传播。
+- `zs_obj_read_begin/end` 与整个 zsmalloc 重写——**不需要**：5.15 `zs_map_object()` 本来就为跨页对象返回连续副本（`mm/zsmalloc.c` 的 per-cpu `vm_buf` 就是为跨页对象分配的），见 CHANGELOG.md#batch-17 的可行性证明表。
+- huge_idle、6.16 writeback ABI（`cf42d4cccf0d`）、`be48c412f6eb`、Documentation 两处改写——无 5.15 消费者或与本批无关。
+
 ## Batch 16(v0.21.0,已落地)→ 详见 CHANGELOG.md#batch-16 — 空实现审计 + 清理
 
 ### 排除项（结论；原文见 CHANGELOG.md#batch-16）
@@ -28,7 +38,7 @@
 
 ### 已明确不做（结论；原文见 CHANGELOG.md#batch-14）
 - `type=` / `page_indexes=` / 区间（6.16 `cf42d4cccf0d`）——**N/A**：纯现代用户态接口，android13-5.15 没有任何消费者，且它依赖 2024 年的 pp-slot 目标选择重写。
-- writeback bio 分批 + `writeback_batch_size`（v6.19）与 **compressed writeback**（v7.0 `d38fab605c66`）——**延后**：前者要连 pp-slot 机制一起搬且必须同时带上它自己的 UAF/泄漏修复；后者真正阻塞在 5.15 没有现代 zsmalloc 映射 API（`zs_obj_read_begin/end`），且与 `zram_recompression` / 套件的 `compressed_writeback` 同名冲突。
+- writeback bio 分批 + `writeback_batch_size`（v6.19）与 **compressed writeback**（v7.0 `d38fab605c66`）——原判「**延后**」的两条理由已**全部证伪**，两者均已作为 **Batch 17（v0.22.0）**落地：batching 不需要连 pp-slot 机制一起搬（in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE` 表达），compressed writeback 也不卡在现代 zsmalloc 映射 API 上（5.15 `zs_map_object()` 已提供跨页对象的连续副本，`zstrm->buffer` 就是 5.15 版的 bounce buffer）。同名冲突只在共注入 `ABK_ABI_PATCH_SUITE` 时成立，而该套件自 Batch 15 起禁止共注入。
 - `be48c412f6eb`（拒绝零长度 backing device，5.15.168 才进）——**不补**：只有 5.15.167 缺它，而它不是本批的编辑输入，单独成组在 178/194/216 上无法区分“基线自带”与“前面步骤加的”，留作套件候选。
 - 2023+ 的 writeback 重构（`330edc2bc059` / `5e99893444a0` / `b967fa1ba72b`）——**N/A**：换设计而非修 bug，5.15 要关的那个竞态 `idle_store()` 的 `ZRAM_UNDER_WB` 检查已经关掉了。
 

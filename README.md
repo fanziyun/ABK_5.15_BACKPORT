@@ -195,15 +195,20 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 27 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 35 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
 `zram_secondary_comp`, `memcg_v1_reclaim`), Batch 12's `zram_algo_lock`,
 Batch 13's hook + policy pair (`customize_alloc_gfp_vh`,
-`gfp_pressure_fastfail`), and Batch 14's zram writeback correctness trio
-(`zram_wb_teardown`, `zram_writeback_bounds`, `zram_wb_limit_align`)); the
-perf child carries 13; the display child carries 1, for 41 groups in total.
+`gfp_pressure_fastfail`), Batch 14's zram writeback correctness trio
+(`zram_wb_teardown`, `zram_writeback_bounds`, `zram_wb_limit_align`), Batch
+15's five fs/pid/MM hot-path groups, and Batch 17's zram writeback trio
+(`zram_writeback_batching` -- several bios in flight, `ZRAM_UNDER_WB` as the
+in-flight marker, with the upstream `wb_ctl` UAF and blk_idx-leak fixes built
+in -- `zram_wb_batch_size`, and `zram_compressed_writeback`); the perf child
+carries 18, including the five Batch 15 scheduler/block groups; the display
+child carries 1, for 54 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 

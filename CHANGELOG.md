@@ -2,6 +2,174 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-17"></a>
+
+## Batch 17(v0.22.0)
+
+起因：Batch 14 把 zram writeback 的**正确性**补齐后，把「writeback bio 分批 + `writeback_batch_size`」
+与「compressed writeback」两项判为**延后**，理由是前者要连 pp-slot 机制一起搬、后者真正阻塞在
+5.15 没有现代 zsmalloc 映射 API（`zs_obj_read_begin/end`）。本批把这两条理由逐条查证，**两条都被
+证伪**，于是两项一并落地。`module.conf` 0.21.0 → **0.22.0**，`GROUP_COUNTS` core **32 → 35**。
+
+### 1. 上游复核（联网，GitHub API + 真实 patch）
+
+系列一 v6「zram: introduce writeback bio batching」（2025-11-22，6 patch，v6.19）：
+
+| commit | 处置 |
+|---|---|
+| `f405066a1f0d` 机制 | **移植**（组 1） |
+| `e828cccb72ed` `writeback_batch_size`（默认 32） | **移植**（字段/默认值→组 1，sysfs→组 2） |
+| `7c929664fddf` / `a4f506c569e1` wb limit 存写锁 / 删 `wb_limit_lock` | 不移植（§5） |
+| `e87ddea34567` 块分配重写 | 只取「返回前释放保留块」语义 |
+| `1b1a4e4d6797` 读 slot blk_idx 持锁 | 不移植（读路径加固，非本特性依赖） |
+
+该系列后续 Fixes 两条，均 `Cc: stable` 且 `Fixes: f405066a1f0d`：`bf62f69574b1`
+（`zram_writeback_endio()` 里 `wb_ctl` 被提前释放的 UAF，2026-05-12）与 `3e8d8eb8d7f5`
+（循环可带一个「已保留未提交」的 blk_idx 返回 → 该块永久忙，2026-05-26）。
+**两条修复从第一行新代码起内建**，本树里不存在的错误形态自然也不会被引入。
+
+系列二「zram: introduce compressed data writeback」（2025-12-01 投递，2026-01-21 合入 v7.0，
+声明 7 patch）：
+
+| commit | 处置 |
+|---|---|
+| `d38fab605c66` 机制（1/7，227+/53−） | **移植**（写侧→组 1，读侧→组 3） |
+| `4c1d61389e8e` `writeback_compressed` 属性（2/7） | **移植**（组 3） |
+| `ba4c3698e696` 改名 `compressed_writeback`（`Fixes: 4c1d61389e8e`） | 采用最终 ABI 名 |
+| `3bf1c285dc40` 尾字节清零（`Fixes: d38fab605c66`） | **内建**（组 1 的 raw 读） |
+| `bf989ade270d` read_from_bdev_async 错误传播 | 不移植（无 `Fixes:` 指向本特性） |
+
+复核方法与边界：`search/commits?q=repo:torvalds/linux+"Fixes: d38fab605c66"` 得 **total=2**
+（命中 d38fab605c66 自身与 `3bf1c285dc40`），即**唯一后续修复就是尾字节清零**；
+`commits?path=drivers/block/zram/zram_drv.c&since=2026-01-20&until=2026-01-23` 拉出合入窗口
+12 条提交，其中与本特性相关的只有 d38fab605c66 与 4c1d61389e8e（其余属别的系列）；系列另 5 个
+成员不改 `drivers/block/zram/*.c`，属 Documentation/清理，未逐条审计（诚实边界）。
+`since=2026-05-25` 的该文件全部提交（15 条）+ 本地 `research/upstream-zram/zram_drv_master.c`
+（v7.3-rc3 期）逐行核对：`845 kfree_rcu(wb_ctl, rcu)`、`962 rcu_read_lock()`、
+`1123-1124` 未用 blk_idx 释放、`1126` drain、`3091 wb_batch_size = 32` —— 没有更晚的修复。
+研究工件：`research/upstream-zram/patches/` 补齐了此前缺失的 3 个 batching 系列成员。
+
+### 2. 5.15 等价改写（为什么不是 cherry-pick）
+
+| 上游机制 | 5.15 事实 | 本批改写 |
+|---|---|---|
+| batching 由 pp-slot 机制驱动（`zram_pp_ctl`/`zram_pp_slot`/`ZRAM_PP_SLOT`，v6.13） | 5.15 **0 命中** | in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE` 表达：前者让 `recompress_store()` / `abk_zram_recomp_work()` 在 slot lock 下跳过飞行中的槽，后者（`zram_free_page()` 入口清 IDLE、`idle_store()` 拒绝给 UNDER_WB 标 IDLE）就是「这个槽还是我读到的那一个」的可靠判据 |
+| 独立 `zram_writeback_slots()` | 5.15 循环**内联在** `writeback_store()` | 保留内联，不引入上游的函数切分（那是 pp-slot 两阶段选择才需要的） |
+| `zram_read_from_zspool_raw()` 用 `zs_obj_read_begin/end` | 5.15 无此 API | 用 `zs_map_object(..., ZS_MM_RO)`：`mm/zsmalloc.c:1131 __zs_map_object()` **总是**把对象拷进 per-cpu `area->vm_buf` 再返回（`1149-1154` 从两页分别 memcpy，`1156 return area->vm_buf`），而 `vm_buf` 的注释就是 "copy buffer for objects that span pages" ——**映射本身就是 bounce buffer，不需要 zsmalloc 重写** |
+| `zstrm->local_copy` | 5.15 `zcomp_strm` 只有 `void *buffer`（`__get_free_pages(..., 1)` = 2 页） | 解压中转用 `zstrm->buffer` |
+| `zcomp_decompress(comp, zstrm, src, size, dst)` 5 参 | 5.15 是 4 参 `zcomp_decompress(zstrm, src, src_len, dst)` | 按 5.15 4 参调用 |
+| `zcomp_stream_put(zstrm)` | 5.15 是 `zcomp_stream_put(struct zcomp *comp)` | 写 `zcomp_stream_put(zram->comps[prio])` —— 本批最容易踩的「编译干净、行为错」约定 |
+| 压缩槽需同时保存 obj_size + priority + WB 位 + blk_idx | `.element` 是**独立 union 成员**（`zram_set_element()` 直接写 `.element`）；`zram_set_obj_size()` 只动 `flags` 低 24 位且保留高位；priority 在 `flags` 位 30–31 | **无位域冲突**，四项共存（`zram_set_element(zram, index, req->blk_idx)`） |
+| `read_from_bdev()` 增 `index` 参数（改调用点） | 调用点在 `__zram_bvec_read()` 内 = **recompression graft 的替换块**，改它会破坏该组的连续性契约 | 改为在 **pristine 的 `zram_bvec_read()`/`zram_bvec_write()`** 上做两处调用改向，指向本批自己的 dispatcher；`read_from_bdev*` 的 5 参签名**一字不动** |
+| `memset_page()`（6.19 助手） | 5.15 无 | `zero_user(page, 0, PAGE_SIZE)` |
+
+### 3. 三个组
+
+- [x] **`zram_writeback_batching`**（组 1，8 步全 required）——`f405066a1f0d` + `bf62f69574b1` +
+  `3e8d8eb8d7f5` + `e828cccb72ed` 的字段/默认值 + `d38fab605c66` **写侧** + `3bf1c285dc40`。
+  新增 `struct zram_wb_ctl`/`zram_wb_req`（含 `struct rcu_head rcu`）、`init_wb_ctl()`、
+  `release_wb_ctl()`（`kfree_rcu`）、`zram_account_writeback_submit/rollback()`、
+  `zram_writeback_complete()`、`zram_writeback_endio()`（整体 `rcu_read_lock()`）、
+  `zram_submit_wb_request()`、`zram_complete_done_reqs()`、`zram_select_idle_req()`、
+  `zram_read_from_zspool_raw()`；`writeback_store()` 的声明段/页分配段/扫描循环/收尾段四处改写；
+  `zram_drv.h` 增 `bool wb_compressed; u32 wb_batch_size;`（上游字段顺序），`zram_add()` 置
+  `32` / `false`。
+- [x] **`zram_wb_batch_size`**（组 2，3 步）——`e828cccb72ed` 的 sysfs 面 + 上限夹取（见 §5）。
+- [x] **`zram_compressed_writeback`**（组 3，5 步）——`d38fab605c66` **读侧** + `4c1d61389e8e`/
+  `ba4c3698e696`：`struct abk_zram_rb_req`、`abk_zram_decompress_bdev_page()`（锁内重查 `ZRAM_WB`，
+  否则 `zero_user()` 清页 + `-EIO`；`ZRAM_HUGE` 不参与解压）、sync/async 读、
+  `abk_zram_deferred_decompress()`（`system_highpri_wq`，因为解压可睡眠而异步读在 IRQ 完成）、
+  dispatcher `abk_zram_bvec_read()`，以及 `compressed_writeback` 属性。它的 `_apply` 先探测组 1 加的
+  `bool wb_compressed;`，不在则 `blocked_by_shape`——**任一组单独缺失都不会留下编不过的树**。
+
+为什么 compressed writeback 的**写侧**并进组 1：写侧是批处理循环与 completion 里的分支，编辑它们就是
+编辑组 1 的替换块，而 graft 连续性契约（见 `scripts/batch10_core_zram_async.py`）禁止后面的组这么做。
+
+### 4. 试错记录（都留在代码注释里，供后来者避免重犯）
+
+1. **batch14 必须重锚，而且两处都要改**。原来 `_B_POSTLOCK` 一直伸到本批拥有的
+   `page = alloc_page(GFP_KERNEL);`，而 `_B_LOOP_TAIL_NEW` 的注释写着 "a blocking
+   `submit_bio_wait()`"（分批后不再成立）。第一次只缩短了 `_B_POSTLOCK`（old），忘了它的
+   `_B_POSTLOCK_NEW`（new）——结果 batch14 把那一行**又插了一遍**，扫描循环里出现两个
+   `page = alloc_page()`，我的页分配步替换掉了 pristine 那份，留下了刚插入的那份：
+   **所有文本审计全绿**（锚点合法、结构平衡、两遍幂等、实现审计通过），因为这是一个纯 C 级错误。
+   修法是把 `_B_POSTLOCK_NEW` 一并缩短到 `backing_dev` 检查的 `}`，并把这个不变量钉进单元测试：
+   *后面步骤的锚点不得出现在前面步骤的替换文本里*。
+2. **组 3 的 shape probe 必须接受两种形态**（`step_audit` trap 4）。第一版探测 pristine 的
+   `ret = __zram_bvec_read(..., true);`，该组自己把它改向之后，第二遍就报 `blocked_by_shape`。
+   修法是两种形态都接受。
+3. **审计反向 needle 会被自己的注释打败**。`submit_bio_wait`、`zs_obj_read_begin`、
+   `zstrm->local_copy` 作为「不得残留」的 needle 全部被本批的解释性注释误伤（注释里按名字提到了
+   上游 API），而 `submit_bio_wait` 还额外被读回路径合法的同步读命中。同一条 needle 在
+   `implementation_audit.py` 与 `smoke.sh` 里各犯一次（共 4 处），最终全部改成带调用形态
+   （`err = submit_bio_wait(&bio);`、`zs_obj_read_begin(zram->mem_pool`、
+   `, zstrm->local_copy)`），并把「为什么带形态」写进注释与单元测试。
+4. **收尾步重复释放块**（同日，由**真实构建**发现）。`_A_TAIL_OLD` 只从 `__free_page(page);` 起锚，
+   而 batch14 的 `_B_LOOP_TAIL_NEW` 只到 `if (blk_idx)` —— pristine 的
+   `free_block_bdev(zram, blk_idx);` 仍在，它就是那个 `if` 的 body。新文本又写了一遍同一行，于是
+   编译出来的形状是：
+   ```c
+   if (blk_idx)
+       free_block_bdev(zram, blk_idx);   /* pristine 的 body */
+       /* ABK stable_515_backport: 3e8d8eb8d7f5 ... */
+       free_block_bdev(zram, blk_idx);   /* 重复释放 + 缩进误导 */
+   ```
+   clang 以 `-Werror,-Wmisleading-indentation` 报错（`drivers/block/zram/zram_drv.c:1323`），
+   这正是「引入 C 时编译器是唯一的门禁」的字面例证 —— **所有文本审计依旧全绿**。修法是把 pristine
+   那行并入 `_A_TAIL_OLD`，让「注释 + 那一次释放」成为一个替换。
+   两个 C 级错误（本条的重复释放、第 1 条的重复页分配）合起来说明：文本审计能证明锚点与结构，
+   证明不了语义；本批因此把「后面步骤的锚点不得出现在前面步骤的替换文本里」钉成单元测试，并把
+   真实构建写进验收流程。
+
+### 5. 不移植的项目（逐条理由）
+
+- `7c929664fddf` / `a4f506c569e1`：本批不需要动 wb limit 的锁；删 `wb_limit_lock` 违反「不为了
+  编译通过而删锁」，而且 batch14 的 `writeback_limit` 对齐护栏正锚在它的 store 文本上。
+- `e87ddea34567` 的重命名与 `INVALID_BDEV_BLOCK` 哨兵：会波及 `zram_free_page()` 的 `ZRAM_WB` 分支
+  （属 `zram_recompression` 领地）；5.15 的 `0` 哨兵语义自洽，只取「返回前释放保留块」的语义。
+- `1b1a4e4d6797`：读路径加固，与本特性无关；5.15 的同一理论窗口今天已存在，不是本批引入的回归。
+- `bf989ade270d`：无 `Fixes:` 指向本特性；本批读回 dispatcher 自带错误传播（sync 返回 / async `bi_status`）。
+- `zs_obj_read_begin/end` 与 zsmalloc 重写、pp-slot 机制、huge_idle、6.16 writeback ABI、
+  `be48c412f6eb`、Documentation 两处改写：见 §2 与 §5 首条。
+- **对上游的一处有意偏离**：`writeback_batch_size` 夹取到 `ZRAM_WB_BATCH_SIZE_MAX`(256)。上游存任何
+  非零 u32，而 `init_wb_ctl()` 按该值逐个 `GFP_KERNEL` 分配请求与页——即用户态可触发的分配循环；
+  256 个请求在 4 KiB 页下约 1.1 MiB，远超任何后备设备需要的队列深度。
+
+### 6. 验证结果
+
+- [x] `python3 -m py_compile`（scripts+tests 全部）、`bash -n`（setup/scripts/tests/tools）；
+- [x] `python3 tests/stable_5_15_test.py`：**all checks passed**（新增 `test_batch17_zram_writeback()`：
+  注册与顺序、跨组锚点不重叠不变量、两条修复只允许一种形态、5.15 约定（`zram_set_element`、
+  `zcomp_stream_put(zram->comps[prio])`、`zero_user`）、默认值/夹取、并集探测、以及
+  「外来树必须降级且一个字都不写」）；
+- [x] `python3 tests/step_audit.py`：**167/178/194/216 全部 `STEP AUDIT OK`**（core 185–194 步，
+  第二遍全 `already_present` 且字节相同）——这也是 batch14 重锚正确的证明；
+- [x] `python3 tests/implementation_audit.py`：**四个基线全部 `IMPLEMENTATION AUDIT OK`**（新增 3 组
+  `REQUIRED_CONTENT` + 2 组 `REQUIRED_ABSENT`）；
+- [x] `bash tests/smoke.sh build/abk-trees/194`：**SMOKE OK**（pass1 `applied 32 / already_present 3`，
+  pass2 全部 `already_present`，回滚字节一致；新增 5 条 grep 断言 + 2 条反向断言）；
+- [x] **本地 ROM tier 编译**（`ABK_515_DEFCONFIG_ROM=1`，否则 `CONFIG_ZRAM_WRITEBACK` 关闭、本批新代码
+  整块编不到）：`~/kci515` 的 `rebuild.sh --reseed --allow-dirty-template`（模块以 `set:` 形式指向本
+  工作副本）→ `[rebuild] build completed`，日志里 **0 个 `error:`、0 个 zram warning**
+  （`-Werror,-Wmisleading-indentation` 曾在第一轮打断构建，见 §4 第 4 条），
+  `drivers/block/zram/zram_drv.o` 产出，编出的 `.config` 含 `CONFIG_ZRAM=y`、
+  `CONFIG_ZRAM_WRITEBACK=y`、`CONFIG_ZRAM_MULTI_COMP=y`、`CONFIG_ZRAM_TRACK_ENTRY_ACTIME=y`，
+  AnyKernel3 zip 重新产出。**这一轮构建抓到两个文本审计看不见的 C 级错误**（重复页分配、重复块释放，
+  见 §4）——「引入 C 时编译器是唯一的门禁」在本批得到两次实证。
+- [ ] 仍待 ABK CI 复跑：本地构建已证明可编译，CI 用于确认同一 commit 在 CI 工具链/配置下一致。
+- [ ] 待验（刷机后）：`writeback_batch_size`/`compressed_writeback` 节点在/回读；`compressed_writeback=0/1`
+  两种模式下读回页面与原内容逐字节一致；`swapoff`/`reset` 与写回并发无 splat；
+  以及 CPU 侧对照：`writeback_batch_size` 1 vs 32 的写回墙钟与 `bd_stat` 第 2 列，
+  `compressed_writeback` 0 vs 1 的写回 CPU 时间 + 后备设备少写的 4K 页数（压缩写回把解压 CPU
+  从写回搬到读回，在「写回多、读回少」的负载上是净收益，读回密集时可能持平或略增——默认关闭，
+  所以这条取舍不会在未显式启用的设备上发生）。
+
+### 7. 审计基线
+
+- 参考树：`build/abk-trees/{167,178,194,216}`（5.15.167/.178/.194/.216），四者 zram 文本一致；
+- 新增 3 个组后 `GROUP_COUNTS["stable_backport_core"] = 35`（32 + 3），`PRE_APPLIED`/`KNOWN_DEBT` 不变；
+- `tests/sublevel_matrix.py` 的 core 注释已同步。
+
 <a id="batch-16"></a>
 
 ## Batch 16(v0.21.0)
