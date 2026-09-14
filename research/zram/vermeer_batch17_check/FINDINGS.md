@@ -137,6 +137,13 @@ avc: denied { write } for comm="kworker/u16:2" path="/data/per_boot/zram/b17_tes
   **0 条 zram AVC**。ROM 自己的 zram0 路径：先 `echo all > idle` 再写回，16MiB 预算（4096 块）
   **恰好写满 4096 页**（`bd=[4096 0 4096]`）、0 条 AVC，随后已把 ROM 的
   `writeback_limit`/`writeback_limit_enable` 原值（2752512/1）复原。
+- **开机路径复测（2026-09-14 22:41，同机同内核，全程 Enforcing）**：把 v0.7.0 模块装进
+  `modules_update`（当时**运行中的模块目录里还没有 `sepolicy.rule`**）后重启，开机日志出现
+  `selinux: submitted /data/adb/modules/abk_runtime_tunables/sepolicy.rule via /data/adb/ksud`，
+  重启后**不做任何手工 apply**：独立 zram1 上 32MiB 写回 `rc=0 bd=[7690 7690 7690]`、md5 前后一致、
+  0 条 AVC；ROM 自己的 zram0 路径 `rc=0 bd=[0 0 0] → [1 0 1]`（该时刻 swap 里**只有 1 页**：
+  `mm_stat` 首个字段 `orig_data_size=4096`、`/proc/swaps` 用 0 KiB，所以「恰好一页」正是对的）。
+  证据：`raw/12-post-reboot.txt`。
 - **诚实边界**：`ksud sepolicy apply` 对**不存在的 type / permission 也返回 0**，返回码只代表
   「语句已提交」，所以判据只能是 `bd_stat` 与 I/O 正确性；规则只在本机这一个 ROM 上验证过。
 - **更正一处失实说法**：本条此前写「本模块已有 `abk_fido_selinux` 那条分发线」——`abk_fido_selinux`

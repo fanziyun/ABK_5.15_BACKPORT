@@ -149,6 +149,14 @@ Read the verdict node, not the attachment, to see whether it took effect:
 `action.sh status` prints `bd_stat`, and "backing device attached, `bd_stat`
 `0 0 0`" is exactly the shape of a writeback that is being denied.
 
+KernelSU applies a policy patch in memory, so a reboot drops it -- which is why
+this module re-submits the file at every boot instead of once at install. That
+path was verified end to end: with v0.7.0 installed (and the running module
+directory still without a `sepolicy.rule`), a reboot produced the boot-log line
+`selinux: submitted ... via /data/adb/ksud`, after which a 32 MiB writeback and
+read-back moved 7690 pages with an identical payload and zero AVCs, with no
+manual `ksud` call anywhere in that boot.
+
 ## Configuration (`tunables.conf`)
 
 `key=value`, `#` comments, **empty value = leave the kernel alone**. Unknown

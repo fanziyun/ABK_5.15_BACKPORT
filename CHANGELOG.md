@@ -47,10 +47,11 @@ tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报
 | 同上，先 `echo all > idle`（模块 sweep 的做法） | `rc=1`（预算耗尽）、`bd=[4096 0 4096]`：**恰好 4096 页 = 预算**，0 条 AVC，限流归零，随后已把 ROM 的 `writeback_limit`/`_enable` 原值（2752512/1）复原 |
 | 重复 apply 同一规则 | `rc=0`（幂等，不会让 post-fs-data 失败） |
 | `ksud sepolicy check`（剥注释后） | 通过；`apply` 本身也能正确跳过 `#` 注释行 |
+| **重启后不手工 apply**（v0.7.0 装进 `modules_update` 后 `adb reboot`） | 开机日志出现 `selinux: submitted … via /data/adb/ksud`；独立 zram1 32MiB 写回 `rc=0 bd=[7690 7690 7690]`、md5 一致、0 AVC；zram0 `bd=[0 0 0] → [1 0 1]`（该时刻 swap 内只有 1 页，`orig_data_size=4096`） —— 规则由模块在 post-fs-data 重新提交，**全程无手工 apply** |
 
 脚本与原始输出：`research/zram/vermeer_batch17_check/b17_enforcing.sh`、`b17_rompath.sh`、
 `raw/08-enforcing-before-rule.txt`、`raw/09-enforcing-after-rule.txt`、
-`raw/10-rom-zram0-writeback.txt`、`raw/11-ksud-sepolicy-probe.txt`。
+`raw/10-rom-zram0-writeback.txt`、`raw/11-ksud-sepolicy-probe.txt`、`raw/12-post-reboot.txt`。
 
 ### 4. 门禁与遗漏
 
@@ -61,9 +62,14 @@ tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报
 - 设备侧 `sh -n`（mksh）通过全部 5 个脚本；`ksud sepolicy check` 解析该规则文件通过。
 - **诚实边界**：`ksud sepolicy apply` 对**无法解析的符号**同样返回 0（实测：不存在的 type、
   不存在的 permission 都 rc=0），所以返回码只代表「语句已提交」，**不代表规则生效**；真正的
-  判据只有 `bd_stat` 与 I/O 正确性。规则只在 vermeer/HyperOS 这一台设备、这一个 ROM 上验证过；
-  换 ROM 后 `zram_data_file` 类型是否存在、还有哪些权限被拒需重测。Batch 17 的性能数据仍然
-  来自 permissive 那一轮（本轮只证明 Enforcing 下路径可用，没有重测性能）。
+  判据只有 `bd_stat` 与 I/O 正确性（`action.sh status` 因此新增 `bd_stat` 一行）。规则只在
+  vermeer/HyperOS 这一台设备、这一个 ROM 上验证过；换 ROM 后 `zram_data_file` 类型是否存在、
+  还有哪些权限被拒需重测。
+- KernelSU 的策略补丁是**内存态**，重启即失效 —— 这正是模块必须每个 boot 重新提交一次
+  `sepolicy.rule` 的原因，也是本批把提交放在 `post-fs-data` 的原因（重启验证见 §3 末行）。
+- Batch 17 的性能数据仍然来自 permissive 那一轮：本轮只证明 Enforcing 下路径**可用**，
+  **没有**在 Enforcing 下重测 batching/compressed writeback 的墙钟与 CPU（写回路径本身没变，
+  但这是推断，不是测量）。
 
 <a id="batch-17"></a>
 
