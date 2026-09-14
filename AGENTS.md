@@ -134,10 +134,12 @@ required strings.
 - **KMI**: new exported-struct fields only reuse a free `ANDROID_KABI_RESERVE`
   slot via `ANDROID_KABI_USE`. This module uses `task_struct` slot 8; if ABK's
   kernel-specific patch has reused slots 6/7/8 (SysVIPC), move to slot 5. From
-  Batch 15 this module **owns** `sched_entity` slots 1–4 (the absorbed EEVDF
+  Batch 15 this module **owns** `sched_entity` slots 1–3 (the absorbed EEVDF
   family) and `request_queue` slot 1 (the absorbed `blk_mq_async_depth`): the
   old "never claim these — ABI-suite territory" rule is retired, so they are
-  claimed here.
+  claimed here. Batch 16 released `sched_entity` slot 4, which the suite claimed
+  as `u64 slice`: nothing in the tree ever read that field, so it is
+  `ANDROID_KABI_RESERVE(4)` again rather than dead frozen-ABI space.
 - **Scope**: features/optimizations/refactors only. Security-only fixes (they
   arrive with newer sublevels) are excluded.
 - **Family gate**: a non-`android13-5.15` lineage produces `report_only` for every
@@ -147,9 +149,11 @@ required strings.
 - **Composition order** (all `after_patch`): storage-rollback modules first, this
   module second. **ABK_ABI_PATCH_SUITE must NOT be co-injected with a Batch 15
   build** — it claims the same `sched_entity` 1–4 / `request_queue` 1 slots this
-  module now owns, and a double-claimed slot is a hard KMI break.  Batch 15
-  absorbed that suite's optimization inventory (see "Suite absorption" in
-  `docs/porting_policy.md`), so inject this module *instead of* it. Not a load
+  module now owns (slot 4 included: the suite claims it unconditionally, this
+  module only stopped *using* it), and a double-claimed slot is a hard KMI break.
+  Batch 15 absorbed that suite's optimization inventory
+  (see "Suite absorption" in `docs/porting_policy.md`), so inject this module
+  *instead of* it. Not a load
   order for the display child (drm-only, order-independent).
 
 ## Source-of-truth docs

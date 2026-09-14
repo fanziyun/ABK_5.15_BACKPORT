@@ -87,15 +87,6 @@ def replace_once(text, old, new):
     return text, "missing_anchor"
 
 
-def replace_once_any(text, variants_old, new):
-    """Apply :func:`replace_once` with the first matching old-block variant."""
-    for old in variants_old:
-        text, status = replace_once(text, old, new)
-        if status != "missing_anchor":
-            return text, status
-    return text, "missing_anchor"
-
-
 def ensure_after(text, anchor, snippet):
     """Insert ``snippet`` directly after the ``anchor`` line (once).
 

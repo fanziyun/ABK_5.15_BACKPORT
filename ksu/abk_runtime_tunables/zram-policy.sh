@@ -37,10 +37,6 @@ ABK_ZRAM_DIR="$ABK_SYS_ROOT/block/zram$ABK_ZRAM_DEV"
 ABK_ZRAM_LOCK_PARAM="$ABK_SYS_ROOT/module/zram/parameters/abk_lock_algo"
 ABK_ZRAM_COMP_PARAM="$ABK_SYS_ROOT/module/zram/parameters/abk_comp_algo"
 
-abk_zram_dir() {
-  printf '%s\n' "$ABK_ZRAM_DIR"
-}
-
 abk_zram_present() {
   [ -d "$ABK_ZRAM_DIR" ] && [ -e "$ABK_ZRAM_DIR/disksize" ]
 }

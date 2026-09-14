@@ -2266,6 +2266,12 @@ _MODULE_CONFIGS = [
     # this module-owned symbol is on, mirroring the OPLUS/Xiaomi module's
     # opt-in enablement.
     ("ABK_DYNAMIC_READAHEAD", "y"),
+    # RCU_NOCB_CPU_DEFAULT_ALL (Batch 8): the graft adds the Kconfig symbol and
+    # the ``offload_all`` machinery in kernel/rcu/tree_nocb.h, but every path
+    # that sets ``offload_all = true`` is inside ``#if defined(CONFIG_...)``.
+    # With the symbol unset the whole graft reduced to an always-false branch
+    # (found by Batch 16's emptiness audit), so the tier has to enable it.
+    ("RCU_NOCB_CPU_DEFAULT_ALL", "y"),
 ]
 
 _ALIGN_CONFIGS = [
@@ -2296,6 +2302,22 @@ _ROM_CONFIGS = [
     # that, so the writeback owner and the algorithm policy now coexist.
     ("ZRAM_WRITEBACK", "y"),
 ]
+
+# Every Kconfig symbol this module introduces into a baseline tree, mapped to
+# the tier that enables it.  ``None`` means Kconfig itself supplies a workable
+# default (a bool defaulting to ``y``, or a non-bool), so no tier is needed.
+# tests/stable_5_15_test.py asserts this table and the tier lists agree, which
+# is what stops a graft from being added with no way to ever compile: the
+# Batch 8 RCU graft sat behind a symbol no tier enabled, so its whole payload
+# compiled out and the group still reported "applied".
+_INTRODUCED_KCONFIG = {
+    "ZRAM_TRACK_ENTRY_ACTIME": "module",
+    "ZRAM_MULTI_COMP": "module",
+    "ABK_DYNAMIC_READAHEAD": "module",
+    "RCU_NOCB_CPU_DEFAULT_ALL": "module",
+    "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
+    "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
+}
 
 
 def _config_enablement_apply(ctx):

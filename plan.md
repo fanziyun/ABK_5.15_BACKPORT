@@ -3,6 +3,78 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 16（v0.21.0，空实现审计 + 清理，已落地）
+
+起因：Batch 15 收编完成后复查「有没有空实现的东西」。方法不是读代码，而是拿**完整
+GKI 树**当消费者语料做静态反查，再把结果与 **CI 复刻构建真实产出的 `.config`** 对齐。
+
+语料与工具：
+- 消费者语料 = `~/kci515/AOSP_Kernel_A13_5.15/common`（完整 GKI 树，30,481 个 `.c`，
+  Makefile `SUBLEVEL=216`，0 个 ABK 标记 = 干净）∪ 施加后的 194 子集。子集只有 74 个
+  文件，单用它判「零调用者」会有假阴性，必须用全树。
+- 可达性判据 = CI 复刻构建自己的 `.config`（module 检出在 `a016643`，v0.20.0）。
+- 探针脚本留在 `tmp/`（未跟踪）：`empty_impl_audit.py`、`config_gate_probe.py`、
+  `reachability_probe.py`、`python_deadcode_probe.py`。
+
+### 查出并修掉的四处真空实现
+
+- [x] **`se->slice` 只写不读（KMI 级）**。`include/linux/sched.h:582` 用
+  `ANDROID_KABI_USE(4, u64 slice)` 占槽 4；全树里该字段只出现两次——声明，
+  以及 `kernel/sched/fair.c:746` 的 `se->slice = slice;`。`abk_eevdf_slice()` 写它
+  然后 `return slice;` 返回的是**局部变量**，全树 0 个读取点。修法：槽 4 退回
+  `ANDROID_KABI_RESERVE(4)`，删掉那次写入，并修正 fair.c 里「四个字段它都读」的错误
+  注释。另三个字段（`deadline`/`vlag`/`min_vruntime`）逐个查过，都有真实读点。
+- [x] **nohz 四个谓词 + 两个 `EXPORT_SYMBOL_GPL` 全树零消费者**。
+  `nohz_cpu_state_test()` / `nohz_cpu_inidle()` / `nohz_cpu_idle_active()` /
+  `nohz_cpu_tick_stopped()` 在完整 GKI 树里文件外调用者为 0，而
+  `nohz_cpu_state_test()` 的唯一调用者就是另外三个；`nohz_cpu_state_flags()` 的树内
+  消费链整条终结在这堆死代码上，`nohz_cpu_idle_calls()` 的调用点全在定义它的文件里。
+  Batch 15 当时是**有意**照抄套件的「surface parity」，本轮判定为死 KMI 面：删掉
+  四个谓词与两个导出，`nohz_cpu_idle_calls()` 降为 file-local `static`（它确实还被
+  两个 debugfs reader 用）。真正在干活的部分保留：`enum nohz_cpu_state` +
+  `abk_tick_nohz_state_flags()` + tick-sched.c 的五个读取点。
+- [x] **`offload_all` 恒为 false（Batch 8 的 rcu_nocb 嫁接被编译掉）**。
+  `kernel/rcu/tree_nocb.h`：`bool offload_all = false;`，两处赋值分别落在
+  `#if defined(CONFIG_RCU_NOCB_CPU_DEFAULT_ALL)` 与 `#if defined(CONFIG_NO_HZ_FULL)`
+  里而**两个宏都没开**，于是 `if (offload_all) cpumask_setall(...)` 编译得进去、
+  永远不执行。根因很具体：该组往 `kernel/rcu/Kconfig` 加了
+  `config RCU_NOCB_CPU_DEFAULT_ALL`（`default n`），但**没有任何 tier 启用它**。
+  修法：加进 `_MODULE_CONFIGS`，让嫁接真正生效。
+- [x] **Batch 14 在出厂配置下等于调用一个空函数**。Batch 14 的 34 行新增代码全部落在
+  `#ifdef CONFIG_ZRAM_WRITEBACK` 内，而实测 `.config` 是
+  `# CONFIG_ZRAM_WRITEBACK is not set`（原始 gki_defconfig 只有 `CONFIG_ZRAM=m`，
+  能打开它的是 `ABK_515_DEFCONFIG_ROM=1`）。唯一穿过预处理器的 Batch 14 产物是
+  `zram_remove()` 里的 `reset_bdev(zram);`，而该配置下 `reset_bdev` 就是
+  `zram_drv.c:1003` 的空 inline 桩。
+  **处置：保持 ROM tier opt-in，不改默认行为**，依据是模块自己已经记录的实测结论
+  （`ksu/abk_runtime_tunables/tunables.conf:47-50`：目标设备上 writeback 未启用——
+  内核无该 config、ROM 设 `vendor.zram.disable=1`、其 mmd 从不完成）。默认打开只会
+  在任何**别的** ROM 上白送一个吃闪存寿命的能力，在目标机上毫无收益。
+
+### 另外三处小项
+
+- [x] `scripts/abk_common.py` 的 `replace_once_any()`：全仓库只有定义，无调用者，删。
+- [x] 运行时伴侣两个死函数：`common.sh: abk_checkpoint()`、`zram-policy.sh: abk_zram_dir()`，删。
+- [-] `scripts/batch15_core_swap_table.py` 仍是 `REGISTER_AS_CHILD = False`、只被
+  docstring 提到。这是 Batch 15 有意的「评估留档、不接线」，不属于空实现，保持原样。
+
+### 新增的防回归闸门
+
+- [x] `scripts/abk_stable_core.py` 新增 `_INTRODUCED_KCONFIG`：本模块引入基线树的每个
+  Kconfig 符号 → 启用它的 tier（`None` 表示 Kconfig 自带可用默认值）。
+- [x] `tests/stable_5_15_test.py::test_introduced_kconfig_tiers()`：正反双向断言该表与
+  `_MODULE_CONFIGS`/`_ALIGN_CONFIGS`/`_ROM_CONFIGS` 一致。**这正是能提前抓住
+  Batch 8 那条的闸门**——「引入了符号但没有任何 tier 能打开它」以后会直接红。
+  （反向检查只覆盖 module tier：align tier 的符号来自 6.6 GKI defconfig，不是本模块引入的。）
+- [x] `tests/implementation_audit.py` 增加 `REQUIRED_ABSENT`：上述被删符号不得回归；
+  `tests/smoke.sh` 的槽位断言由「必须占槽 4」改为「必须退回 `ANDROID_KABI_RESERVE(4)`」。
+
+### 验证
+
+- 四棵基线树（167/178/194/216）`step_audit` + `implementation_audit` + `smoke` 全绿；
+  `py_compile`、`bash -n`、`sh -n`、单测全绿。
+- 编译验证见本批次末尾（CI 复刻构建）。
+
 ## Batch 15（v0.20.0，撤销 ABK_ABI_PATCH_SUITE 红线 + 收编其优化特性，已落地）
 
 ### 政策变更：suite-preference 作废
@@ -1300,10 +1372,12 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 **Batch 15 起 ABI 套件红线已撤销**（依据见 `docs/porting_policy.md` 的
 "Suite absorption"）：套件的优化特性全部并入本模块，因此下面两条原红线作废。
 
-- 本模块**自己**占用 `sched_entity` KABI 槽 1–4（EEVDF：
-  `deadline`/`min_vruntime`/`vlag`/`slice`）与 `request_queue` 槽 1
-  （`async_depth`）。同一构建**不得**再注入 ABK_ABI_PATCH_SUITE，否则两个
-  模块争同一槽位（KMI 硬冲突）。
+- 本模块**自己**占用 `sched_entity` KABI 槽 1–3（EEVDF：
+  `deadline`/`min_vruntime`/`vlag`）与 `request_queue` 槽 1
+  （`async_depth`）。槽 4 已在 Batch 16 退回 `ANDROID_KABI_RESERVE`（套件原把它
+  占成 `u64 slice`，而全树从无读取）。同一构建**不得**再注入
+  ABK_ABI_PATCH_SUITE，否则两个模块争同一槽位（KMI 硬冲突）——注意套件是无条件
+  占 1–4 的，所以「本模块不再用槽 4」并不等于可以共存。
 - 原「不改写 ABI 套件硬失败组函数体」的限制作废：`alloc_pid()`、
   `pick_file()`/`__range_close()`、`select_idle_cpu()`、`pick_next_entity()`
   现在由本模块自己接管。

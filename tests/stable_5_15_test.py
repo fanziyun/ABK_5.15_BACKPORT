@@ -455,9 +455,10 @@ def test_kabi_slot_policy():
         check("slot 8 present", "ANDROID_KABI_RESERVE(8);" in text)
         perf_ctx_texts = perf  # noqa: F841 - import proves the module loads
         # Batch 15 retired the ABK_ABI_PATCH_SUITE red line: this module now
-        # claims sched_entity slots 1-4 itself.  task_struct slot 1 was never
-        # this group's to take and still is not -- the kstack rewrite lands on
-        # slot 8 (or slot 5 on a SysVIPC-patched tree, see the test below).
+        # claims sched_entity slots 1-3 itself (Batch 16 released slot 4, which
+        # nothing read).  task_struct slot 1 was never this group's to take and
+        # still is not -- the kstack rewrite lands on slot 8 (or slot 5 on a
+        # SysVIPC-patched tree, see the test below).
         check("kstack group claims no task_struct slot 1",
               "ANDROID_KABI_USE(1" not in text)
 
@@ -1360,6 +1361,45 @@ def test_config_tiers():
           status == "applied" and "ROM integration" in detail, (status, detail))
 
 
+def test_introduced_kconfig_tiers():
+    """Every Kconfig symbol this module introduces must have a way to compile.
+
+    The failure this guards against is not hypothetical: Batch 8 added
+    ``config RCU_NOCB_CPU_DEFAULT_ALL`` (bool, ``default n``) plus the
+    ``offload_all`` machinery in ``kernel/rcu/tree_nocb.h``, but no tier ever
+    enabled the symbol -- so both assignments that could set ``offload_all``
+    compiled out, ``if (offload_all)`` was provably always false, and the group
+    still reported "applied".  A graft that compiles to nothing is not a graft.
+    """
+    print("introduced Kconfig symbols: each one has a way to compile")
+    import abk_stable_core as core
+
+    tiers = {
+        "module": dict(core._MODULE_CONFIGS),
+        "align": dict(core._ALIGN_CONFIGS),
+        "rom": dict(core._ROM_CONFIGS),
+    }
+
+    for symbol, tier in sorted(core._INTRODUCED_KCONFIG.items()):
+        if tier is None:
+            # Kconfig itself supplies a workable default (a non-bool, or a bool
+            # defaulting to y), so no tier has to name it.
+            continue
+        check(f"{symbol} is named by the {tier} tier",
+              symbol in tiers[tier], f"{tier} has {sorted(tiers[tier])}")
+        check(f"{symbol} is enabled (=y) in the {tier} tier",
+              tiers[tier].get(symbol) == "y", tiers[tier].get(symbol))
+
+    # Reverse direction, module tier only: a symbol this module turns on without
+    # documenting it in the table is a symbol nobody checked has a Kconfig
+    # declaration at all.  (The align tier is deliberately exempt -- those
+    # symbols come from the 6.6 GKI defconfig, not from this module's Kconfig.)
+    for symbol in tiers["module"]:
+        check(f"module-tier symbol {symbol} is recorded in _INTRODUCED_KCONFIG",
+              symbol in core._INTRODUCED_KCONFIG,
+              "add it to _INTRODUCED_KCONFIG in scripts/abk_stable_core.py")
+
+
 def test_batch10_memcg_v1_reclaim():
     print("Batch 10-4 memcg_v1_reclaim")
     import abk_stable_core as core
@@ -1845,7 +1885,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.20.0", "0.20.0"], _versions)
+          _versions == ["0.21.0", "0.21.0"], _versions)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -2684,6 +2724,7 @@ def main():
     test_batch13_gfp_pressure_fastfail()
     test_batch13_wake_up_new_task_excluded()
     test_config_tiers()
+    test_introduced_kconfig_tiers()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()
     test_batch10_daemon_script()

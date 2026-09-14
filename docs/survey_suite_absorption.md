@@ -27,14 +27,15 @@ anchor step and proves uniqueness against four pristine trees.
 
 ## 2. What the suite claimed (KABI)
 
-Exactly two structs, five slots:
+Exactly two structs, five slots claimed by the suite; four are still claimed here
+(Batch 16 released the `sched_entity` slot-4 row):
 
 | struct | slot | field | file |
 |---|---|---|---|
 | `struct sched_entity` | 1 | `u64 deadline` | `include/linux/sched.h` |
 | `struct sched_entity` | 2 | `u64 min_vruntime` | `include/linux/sched.h` |
 | `struct sched_entity` | 3 | `s64 vlag` | `include/linux/sched.h` |
-| `struct sched_entity` | 4 | `u64 slice` | `include/linux/sched.h` |
+| ~~`struct sched_entity`~~ | ~~4~~ | ~~`u64 slice`~~ | released by Batch 16: written once at `abk_eevdf_slice()`, read nowhere |
 | `struct request_queue` | 1 | `unsigned int async_depth` | `include/linux/blkdev.h` |
 
 Slots 2-4 of `request_queue` stay `ANDROID_KABI_RESERVE`.  The suite also
@@ -91,7 +92,7 @@ trees before any porting: `common-5.15-2024-11` (5.15.167) vs `common-6.1-src`.
 | `slab_alloc_free_hotpath` | `mm/slub.c` | bulk-free backend, free-side validation split, bulk-alloc prefetch |
 | `hugepage_fault_alloc_fastpath` | `mm/huge_memory.c`, `mm/memory.c` | anon THP fault-time helper split |
 | `blk_mq_async_depth` | `include/linux/blkdev.h` + 8 block files | `request_queue` slot 1 |
-| EEVDF family | `include/linux/sched.h`, `kernel/sched/fair.c` | `sched_entity` slots 1-4 |
+| EEVDF family | `include/linux/sched.h`, `kernel/sched/fair.c` | `sched_entity` slots 1-3 (slot 4 released by Batch 16) |
 | `nohz_field_refinement` | `include/linux/sched/nohz.h`, `kernel/time/tick-sched.c` | tick state accessors |
 | `avg_idle_preemption_mode` | `kernel/sched/{core,fair,idle,sched.h}` | drops `wake_avg_idle` prediction |
 

@@ -37,12 +37,17 @@ What was deliberately NOT ported (recorded so it is not relitigated):
   skipped and the file is left half-converted.  Here the two rewrites are
   textually distinct, so both land (that is also why ``_A_CPU_STOPPED_NEW``
   carries its own marker line).
-* the suite's ``EXPORT_SYMBOL_GPL`` pair is kept verbatim (it is the suite's
-  out-of-tree surface), but note that no in-tree caller outside
-  ``tick-sched.c`` uses either symbol: the two exports are new KMI *additions*,
-  not a reuse of anything.  ``kernel/sched/cpufreq_schedutil.c:314`` keeps
-  calling ``tick_nohz_get_idle_calls_cpu()``, which now fronts
-  ``nohz_cpu_idle_calls()``; ``kernel/irq_work.c:58``,
+* the suite's ``EXPORT_SYMBOL_GPL`` pair and its four per-state predicates
+  are **not** carried.  They were inherited verbatim in Batch 15 for "surface
+  parity", but Batch 16's empty-implementation audit measured them against the
+  full GKI tree and found no consumer at all: ``nohz_cpu_state_flags()`` was
+  reachable only from ``nohz_cpu_state_test()``, which was itself reachable only
+  from the other three predicates, and ``nohz_cpu_idle_calls()``'s only callers
+  live in the file that defines it.  Two new exported symbols plus a five-entry
+  header API with zero callers is KMI surface, not a graft.  The exports are
+  gone and ``nohz_cpu_idle_calls()`` is file-local again.
+  ``kernel/sched/cpufreq_schedutil.c:314`` keeps calling
+  ``tick_nohz_get_idle_calls_cpu()``; ``kernel/irq_work.c:58``,
   ``kernel/sched/core.c:1106`` and ``kernel/sched/idle.c:234`` keep calling
   ``tick_nohz_tick_stopped()``.
 * ``struct rq``'s ``wake_stamp`` / ``wake_avg_idle`` fields are **not**
@@ -51,11 +56,13 @@ What was deliberately NOT ported (recorded so it is not relitigated):
   them in ``struct rq``.  ``struct rq`` is not an exported/KMI struct, so this
   is a risk choice rather than a red line; keeping them costs 16 bytes per CPU
   and keeps the diff anchor-local.  A later batch may reclaim them.
-* ``nohz_field_refinement``'s enum/accessors are wired into
-  ``kernel/time/tick-sched.c`` only.  The suite declares
-  ``nohz_cpu_inidle()`` / ``nohz_cpu_idle_active()`` / ``nohz_cpu_tick_stopped()``
-  and never calls them anywhere; they are ported as declared-but-unused static
-  inlines for surface parity, not as a scheduler-policy hook.
+* ``nohz_field_refinement``'s enum is wired into ``kernel/time/tick-sched.c``
+  only, and that is the whole header payload (Batch 16 removed the unused
+  predicate block described above).  The state mask is consumed by
+  ``abk_tick_nohz_state_flags()`` and the five tick-sched.c read sites
+  (``tick_nohz_tick_stopped()``, ``tick_nohz_tick_stopped_cpu()``,
+  ``tick_nohz_irq_exit()``, ``tick_nohz_get_sleep_length()``,
+  ``tick_nohz_idle_exit()``), all of which are live.
 
 5.15 shape adaptations that the suite's 6.1 assumption gets wrong (each one was
 checked against ``common-5.15-2024-11`` before being written):
@@ -184,79 +191,15 @@ _A_ENUM_NEW = (
     "#if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)\n"
 )
 
-# Trap 1 note: the accessor block keeps the header's own ``#endif`` in both the
-# anchor and the replacement.  A pure "insert before the guard" step whose
-# ``new`` is just the inserted text is fine here, but a *deletion-style* step
-# would report already_present -- see the ``_B_*`` steps below for the
-# surrounding-context discipline that avoids that.
-_A_ACCESSORS = "\n#endif /* _LINUX_SCHED_NOHZ_H */\n"
-
-_A_ACCESSORS_NEW = (
-    "\n"
-    "/*\n"
-    " * ABK stable_515_backport: nohz tick_sched state field consistency\n"
-    " * helpers.  nohz_cpu_state_flags() is the only reader of the legacy\n"
-    " * bitfields outside kernel/time/tick-sched.c; the per-state predicates\n"
-    " * exist so a caller states which bit it needs instead of open-coding a\n"
-    " * mask test.\n"
-    " */\n"
-    "#ifdef CONFIG_NO_HZ_COMMON\n"
-    "extern unsigned int nohz_cpu_state_flags(int cpu);\n"
-    "extern unsigned long nohz_cpu_idle_calls(int cpu);\n"
-    "\n"
-    "static inline bool nohz_cpu_state_test(int cpu, unsigned int state)\n"
-    "{\n"
-    "\treturn nohz_cpu_state_flags(cpu) & state;\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_inidle(int cpu)\n"
-    "{\n"
-    "\treturn nohz_cpu_state_test(cpu, NOHZ_CPU_STATE_INIDLE);\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_idle_active(int cpu)\n"
-    "{\n"
-    "\treturn nohz_cpu_state_test(cpu, NOHZ_CPU_STATE_IDLE_ACTIVE);\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_tick_stopped(int cpu)\n"
-    "{\n"
-    "\treturn nohz_cpu_state_test(cpu, NOHZ_CPU_STATE_TICK_STOPPED);\n"
-    "}\n"
-    "#else\n"
-    "static inline unsigned int nohz_cpu_state_flags(int cpu)\n"
-    "{\n"
-    "\treturn 0;\n"
-    "}\n"
-    "\n"
-    "static inline unsigned long nohz_cpu_idle_calls(int cpu)\n"
-    "{\n"
-    "\treturn 0;\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_state_test(int cpu, unsigned int state)\n"
-    "{\n"
-    "\treturn false;\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_inidle(int cpu)\n"
-    "{\n"
-    "\treturn false;\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_idle_active(int cpu)\n"
-    "{\n"
-    "\treturn false;\n"
-    "}\n"
-    "\n"
-    "static inline bool nohz_cpu_tick_stopped(int cpu)\n"
-    "{\n"
-    "\treturn false;\n"
-    "}\n"
-    "#endif\n"
-    "\n"
-    "#endif /* _LINUX_SCHED_NOHZ_H */\n"
-)
+# Batch 16: the suite's exported accessor pair (``nohz_cpu_state_flags()`` /
+# ``nohz_cpu_idle_calls()``) and its four per-state predicates used to be
+# inserted here.  A consumer sweep over the full GKI tree found zero callers
+# for every predicate (``nohz_cpu_state_test()``'s only callers were the other
+# three) and no consumer outside ``tick-sched.c`` for either export, so the
+# block was dead KMI surface rather than a graft.  It is no longer carried:
+# the enum inserted above is the part ``tick-sched.c`` actually reads, and
+# ``nohz_cpu_idle_calls()`` survives as a file-local helper because the two
+# debugfs readers below call it.  See plan.md Batch 16.
 
 # The helper insert and the ``tick_nohz_tick_stopped()`` rewrite are one step:
 # the amendment to that function lives inside text the same anchor reproduces,
@@ -292,17 +235,10 @@ _A_TICK_STOPPED_NEW = (
     "\treturn state;\n"
     "}\n"
     "\n"
-    "unsigned int nohz_cpu_state_flags(int cpu)\n"
-    "{\n"
-    "\treturn abk_tick_nohz_state_flags(tick_get_tick_sched(cpu));\n"
-    "}\n"
-    "EXPORT_SYMBOL_GPL(nohz_cpu_state_flags);\n"
-    "\n"
-    "unsigned long nohz_cpu_idle_calls(int cpu)\n"
+    "static unsigned long nohz_cpu_idle_calls(int cpu)\n"
     "{\n"
     "\treturn tick_get_tick_sched(cpu)->idle_calls;\n"
     "}\n"
-    "EXPORT_SYMBOL_GPL(nohz_cpu_idle_calls);\n"
     "\n"
     "bool tick_nohz_tick_stopped(void)\n"
     "{\n"
@@ -735,16 +671,15 @@ _B_SCHED_H_NEW = (
 def build_nohz_steps():
     """``nohz_field_refinement``: the legacy tick_sched state triplet, named.
 
-    Order matters: the enum lands in the header (step 1), the accessors land
-    after it (step 2), and only then does tick-sched.c start using them, so
-    every intermediate state is a compilable tree.  Step 3 both inserts the
-    implementation and rewrites ``tick_nohz_tick_stopped()`` -- they share one
-    anchor and splitting them would make one ``new`` a prefix of the other
-    step's ``old`` (step-authoring trap 1).
+    Order matters: the enum lands in the header (step 1) and only then does
+    tick-sched.c start using it, so every intermediate state is a compilable
+    tree.  Step 2 both inserts the implementation and rewrites
+    ``tick_nohz_tick_stopped()`` -- they share one anchor and splitting them
+    would make one ``new`` a prefix of the other step's ``old``
+    (step-authoring trap 1).
     """
     return [
         (NOHZ_H, _A_ENUM, _A_ENUM_NEW, T),
-        (NOHZ_H, _A_ACCESSORS, _A_ACCESSORS_NEW, T),
         (TICK_SCHED_C, _A_TICK_STOPPED, _A_TICK_STOPPED_NEW, T),
         (TICK_SCHED_C, _A_CPU_STOPPED, _A_CPU_STOPPED_NEW, T),
         (TICK_SCHED_C, _A_IRQ_EXIT, _A_IRQ_EXIT_NEW, T),
@@ -799,9 +734,9 @@ def _nohz_apply(ctx):
     # tick-sched.c; the accessor without the marker is a shape this module
     # cannot name (re-defining it would collide), so refuse instead of
     # half-writing the enum.
-    if "nohz_cpu_state_flags" in nohz_text and _MARK_NOHZ not in tick_text:
+    if "enum nohz_cpu_state" in nohz_text and _MARK_NOHZ not in tick_text:
         return "blocked_by_shape", (
-            "nohz.h already declares nohz_cpu_state_flags() without the ABK "
+            "nohz.h already declares enum nohz_cpu_state without the ABK "
             "marker in tick-sched.c: the tree carries an unrecognised nohz "
             "state-helper owner; nothing was written")
     status, _results, detail = apply_steps(ctx, build_nohz_steps())

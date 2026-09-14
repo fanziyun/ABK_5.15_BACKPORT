@@ -366,23 +366,6 @@ abk_mem_pct_bytes() {
   return 0
 }
 
-abk_checkpoint() { # <first> <step> <limit>
-  _cp_first="$1"
-  _cp_step="$2"
-  _cp_limit="$3"
-  _cp_attempt=0
-  while [ "$_cp_attempt" -lt "$_cp_limit" ]; do
-    if [ "$_cp_attempt" -eq 0 ]; then
-      "$_cp_first"
-    else
-      "$_cp_step"
-    fi
-    _cp_attempt=$(( _cp_attempt + 1 ))
-    [ "$_cp_attempt" -ge "$_cp_limit" ] || sleep 3
-  done
-  return 0
-}
-
 # --- non-zram runtime knobs ----------------------------------------------
 # Every knob is applied only when the matching key is non-empty, so an
 # unconfigured module changes nothing outside its own zram policy.

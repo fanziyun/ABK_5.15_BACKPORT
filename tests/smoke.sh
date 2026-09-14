@@ -348,9 +348,18 @@ then
   grep -q "ANDROID_KABI_USE(1, u64 deadline);" \
     "$KERNEL_ROOT/common/include/linux/sched.h" \
     || fail "EEVDF did not claim sched_entity slot 1"
-  grep -q "ANDROID_KABI_USE(4, u64 slice);" \
+  grep -q "ANDROID_KABI_USE(3, s64 vlag);" \
     "$KERNEL_ROOT/common/include/linux/sched.h" \
-    || fail "EEVDF did not claim sched_entity slot 4"
+    || fail "EEVDF did not claim sched_entity slot 3"
+  # Batch 16 released slot 4: the suite's u64 slice was written once and read
+  # nowhere, so it goes back to a reserve instead of staying dead KABI space.
+  if grep -q "ANDROID_KABI_USE(4, u64 slice);" \
+       "$KERNEL_ROOT/common/include/linux/sched.h"; then
+    fail "EEVDF still claims the write-only sched_entity slot 4"
+  fi
+  grep -q "ANDROID_KABI_RESERVE(4);" \
+    "$KERNEL_ROOT/common/include/linux/sched.h" \
+    || fail "sched_entity slot 4 was not released back to ANDROID_KABI_RESERVE"
   grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
     "$KERNEL_ROOT/common/kernel/sched/fair.c" \
     || fail "EEVDF selector is not wired into pick_next_entity"

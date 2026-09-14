@@ -18,7 +18,7 @@ ABK_ABI_PATCH_SUITE inventory and the KMI red lines.
 
 | candidate | verdict | reason |
 |---|---|---|
-| EEVDF scheduling (PLACE_LAG / PLACE_DEADLINE_INITIAL / RUN_TO_PARITY / HZ_BW / SIS_UTIL) | **absorbed (Batch 15)** | the suite's EEVDF family owned `sched_entity` KABI slots 1–4; Batch 15 retires that red line and this module claims the slots itself — see `docs/survey_suite_absorption.md` |
+| EEVDF scheduling (PLACE_LAG / PLACE_DEADLINE_INITIAL / RUN_TO_PARITY / HZ_BW / SIS_UTIL) | **absorbed (Batch 15)** | the suite's EEVDF family owned `sched_entity` KABI slots 1–4; Batch 15 retires that red line and this module claims slots 1–3 itself (Batch 16 released slot 4 — its `u64 slice` was write-only) — see `docs/survey_suite_absorption.md` |
 | per-VMA locks | **deferred** | ACK 6.6 sits on maple-tree storage with `vm_area_struct` rework; needs RCU VMA lifetime + fault-path conversion + KABI growth — not a bounded anchor graft |
 | per-cgroup PSI toggling / PSI parent-chain sync | **KMI red line** | rewrites `struct cgroup` layout |
 | mm/khugepaged.c, folio, page_alloc, memcg reworks | **infra** | 6.2–6.6 infrastructure rewrites (khugepaged alone ≈ +1300/−925), not bounded grafts |

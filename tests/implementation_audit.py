@@ -134,13 +134,15 @@ REQUIRED_CONTENT = {
     ],
     "perf:sched_eevdf_core_fields": [
         # The KABI claim itself -- this is the group that takes ownership of the
-        # sched_entity slots the retired red line used to forbid.  Four scalars,
+        # sched_entity slots the retired red line used to forbid.  Three scalars,
         # so each ANDROID_KABI_USE's size/alignment static assert holds and
-        # sizeof(struct sched_entity) is unchanged.
+        # sizeof(struct sched_entity) is unchanged.  Batch 16 released slot 4
+        # (see REQUIRED_ABSENT): the suite claimed it as ``u64 slice`` and a
+        # full-tree consumer sweep found the field written and never read.
         "ANDROID_KABI_USE(1, u64 deadline);",
         "ANDROID_KABI_USE(2, u64 min_vruntime);",
         "ANDROID_KABI_USE(3, s64 vlag);",
-        "ANDROID_KABI_USE(4, u64 slice);",
+        "ANDROID_KABI_RESERVE(4);",
     ],
     "perf:sched_eevdf_pick_logic": [
         "abk_pick_eevdf",
@@ -400,6 +402,32 @@ REQUIRED_ABSENT = {
         # two fields share one 8-byte slot and the KABI size assert is wrong.
         ["include/linux/sched.h", "ANDROID_KABI_USE(3, struct {"],
         ["include/linux/sched.h", "ANDROID_KABI_USE(4, struct {"],
+        # Batch 16 released slot 4.  It was claimed as ``u64 slice`` and the
+        # only occurrence of the field anywhere in the tree was the single
+        # store in abk_eevdf_slice() -- dead frozen-ABI space.  It must not
+        # come back as a claim.
+        ["include/linux/sched.h", "ANDROID_KABI_USE(4, u64 slice);"],
+    ],
+    "perf:sched_eevdf_pick_logic": [
+        # The consumer end of the released field: the helper wrote it and read
+        # its own local instead.
+        ["kernel/sched/fair.c", "se->slice = slice;"],
+    ],
+    "perf:nohz_field_refinement": [
+        # Batch 16 removed the suite's exported accessor pair and its four
+        # per-state predicates.  A consumer sweep over the full GKI tree (52k
+        # files) found zero callers for every predicate -- the only callers of
+        # nohz_cpu_state_test() were the other three -- and no consumer outside
+        # tick-sched.c for either export, so they were dead KMI surface rather
+        # than a graft.  The enum and abk_tick_nohz_state_flags() are the live
+        # part and stay.
+        ["include/linux/sched/nohz.h", "nohz_cpu_state_test"],
+        ["include/linux/sched/nohz.h", "nohz_cpu_inidle"],
+        ["include/linux/sched/nohz.h", "nohz_cpu_idle_active"],
+        ["include/linux/sched/nohz.h", "nohz_cpu_tick_stopped"],
+        ["include/linux/sched/nohz.h", "extern unsigned int nohz_cpu_state_flags"],
+        ["kernel/time/tick-sched.c", "EXPORT_SYMBOL_GPL(nohz_cpu_state_flags)"],
+        ["kernel/time/tick-sched.c", "EXPORT_SYMBOL_GPL(nohz_cpu_idle_calls)"],
     ],
     "perf:blk_mq_async_depth": [
         # The suite's unconverted assignments: a request count written into a

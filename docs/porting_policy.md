@@ -14,10 +14,13 @@
      `ANDROID_KABI_RESERVE` slot via `ANDROID_KABI_USE` (current free set in
      android13-5.15: task_struct slots 1–8; this module uses slot 8 for
      `kstack_offset`).
-   - **This module now owns `sched_entity` slots 1–4 and `request_queue`
+   - **This module now owns `sched_entity` slots 1–3 and `request_queue`
      slot 1 itself.**  Batch 15 absorbed the ABK_ABI_PATCH_SUITE EEVDF and
      `blk_mq_async_depth` claims, so the old "never claim these" rule is
-     retired -- it existed only to keep the suite composable.  The rule that
+     retired -- it existed only to keep the suite composable.  Batch 16
+     released `sched_entity` slot 4 back to `ANDROID_KABI_RESERVE`: the suite's
+     `u64 slice` field was written once at `abk_eevdf_slice()` and read nowhere
+     in the tree, so the claim was pure KMI cost.  The rule that
      replaces it is stronger, not weaker: because two modules claiming one
      slot is a hard KMI break, **ABK_ABI_PATCH_SUITE must not be injected
      into a build that carries the Batch 15 groups**.  See "Suite

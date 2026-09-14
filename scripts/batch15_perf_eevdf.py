@@ -8,10 +8,11 @@ Two groups, both rewritten as ``required`` anchor steps:
   ``place_entity()``, ``check_preempt_tick()``, ``set_next_entity()``,
   ``put_prev_entity()`` and ``entity_tick()`` onto a scan-based EEVDF
   runtime state machine.
-* ``sched_eevdf_core_fields`` -- ``include/linux/sched.h``: the four
+* ``sched_eevdf_core_fields`` -- ``include/linux/sched.h``: the three
   ``ANDROID_KABI_USE`` claims in ``struct sched_entity``
-  (slot 1 ``u64 deadline``, slot 2 ``u64 min_vruntime``, slot 3 ``s64 vlag``,
-  slot 4 ``u64 slice``) that the fair.c half reads.
+  (slot 1 ``u64 deadline``, slot 2 ``u64 min_vruntime``, slot 3 ``s64 vlag``)
+  that the fair.c half reads.  Batch 16 released slot 4 (``u64 slice``) back to
+  ``ANDROID_KABI_RESERVE(4)``: nothing ever read it.
 
 Provenance.  Every anchor and every replacement below is the payload of
 ``ABK_ABI_PATCH_SUITE/scripts/abk_feature_porting.py``,
@@ -166,8 +167,8 @@ Verification performed while writing this module (all of it re-runnable):
 
 Runtime caveat inherited from the suite (not a porting defect, recorded so it is
 not mistaken for one): the graft does not touch ``__sched_fork()``, so
-``se->deadline`` / ``se->vlag`` / ``se->min_vruntime`` / ``se->slice`` begin as a
-copy of the parent's ``struct sched_entity`` (zero for ``init_task``).  The
+``se->deadline`` / ``se->vlag`` / ``se->min_vruntime`` begin as a copy of the
+parent's ``struct sched_entity`` (zero for ``init_task``).  The
 lifecycle closes at ``task_fork_fair()`` -> ``place_entity(cfs_rq, se, 1)``,
 which is called unconditionally and overwrites ``deadline``, ``vlag`` and
 ``slice`` on both of ``abk_eevdf_place_entity()``'s paths, so the inherited
@@ -324,15 +325,20 @@ _SCHED_H_SE_TAIL_NEW = (
     "\t * absorbed by Batch 15; kernel/sched/fair.c (group\n"
     "\t * sched_eevdf_pick_logic of this same module) is the only consumer.\n"
     "\t *\n"
-    "\t * Android KABI reserve slots 1-4 become the four EEVDF fields.  Each\n"
-    "\t * replacement is one 8-byte, 8-byte-aligned scalar, so\n"
-    "\t * ANDROID_KABI_USE's own size and alignment static asserts both hold\n"
-    "\t * and sizeof(struct sched_entity) is unchanged on every baseline.\n"
+    "\t * Android KABI reserve slots 1-3 become the three EEVDF fields the\n"
+    "\t * fair.c half really reads.  Each replacement is one 8-byte,\n"
+    "\t * 8-byte-aligned scalar, so ANDROID_KABI_USE's own size and alignment\n"
+    "\t * static asserts both hold and sizeof(struct sched_entity) is\n"
+    "\t * unchanged on every baseline.  Batch 16 released slot 4: the suite\n"
+    "\t * also claimed it as ``u64 slice``, but a consumer sweep over the full\n"
+    "\t * tree found abk_eevdf_slice()'s single write and no reader anywhere,\n"
+    "\t * so the slot went back to ANDROID_KABI_RESERVE(4) instead of staying\n"
+    "\t * dead frozen-ABI space.\n"
     "\t */\n"
     "\tANDROID_KABI_USE(1, u64 deadline);\n"
     "\tANDROID_KABI_USE(2, u64 min_vruntime);\n"
     "\tANDROID_KABI_USE(3, s64 vlag);\n"
-    "\tANDROID_KABI_USE(4, u64 slice);\n"
+    "\tANDROID_KABI_RESERVE(4);\n"
     "};"
 )
 
@@ -363,9 +369,10 @@ _FAIR_HELPERS = "\n" + """/* ABK stable_515_backport: scan-based EEVDF runtime-s
  * ordering and re-derives the EEVDF quantities by scanning the tree, because
  * 5.15 has no augmented cfs_rq (no sum_weight / sum_w_vruntime /
  * zero_vruntime) and the sibling suite defers that augmentation explicitly.
- * The four sched_entity fields it reads (deadline, min_vruntime, vlag, slice)
- * are claimed from the Android KABI reserve slots by the core-fields group of
- * this same module.
+ * The three sched_entity fields it reads (deadline, min_vruntime, vlag) are
+ * claimed from the Android KABI reserve slots by the core-fields group of this
+ * same module.  Batch 16 dropped the suite's fourth field (``slice``): it was
+ * written here and read nowhere.
  */
 #define ABK_EEVDF_REL_DEADLINE_BIT (1ULL << 63)
 #define ABK_EEVDF_REL_DEADLINE_MASK (ABK_EEVDF_REL_DEADLINE_BIT - 1)
@@ -374,7 +381,6 @@ static inline u64 abk_eevdf_slice(struct cfs_rq *cfs_rq, struct sched_entity *se
 {
 \tu64 slice = sched_slice(cfs_rq, se);
 
-\tse->slice = slice;
 \treturn slice;
 }
 
@@ -1132,9 +1138,9 @@ def _eevdf_core_fields_apply(ctx):
     except FileNotFoundError:
         return "blocked_by_shape", f"{SCHED_H}: file absent"
 
-    # Anti-drift gate.  The four slots encode state that only the fair.c half of
-    # this family reads; claiming them without the logic would leave four dead
-    # members in a frozen-struct ABI.  Require the *payload* -- the marker, the
+    # Anti-drift gate.  The three slots encode state that only the fair.c half of
+    # this family reads; claiming them without the logic would leave dead members
+    # in a frozen-struct ABI.  Require the *payload* -- the marker, the
     # deadline refresh, the placement hook and the selector routing -- not just
     # the marker, because the marker alone is written by the first step of the
     # pick-logic group.
@@ -1143,14 +1149,14 @@ def _eevdf_core_fields_apply(ctx):
     except FileNotFoundError:
         return "blocked_by_shape", (
             f"{FAIR_C}: file absent, so the EEVDF fair.c half cannot have "
-            "landed; sched_entity reserve slots 1-4 stay ANDROID_KABI_RESERVE"
+            "landed; sched_entity reserve slots stay ANDROID_KABI_RESERVE"
         )
     absent = [probe for probe in _FAIR_LANDED_PROBES if probe not in fair]
     if absent:
         return "blocked_by_shape", (
             f"{FAIR_C} does not carry the EEVDF payload "
             f"({len(absent)}/{len(_FAIR_LANDED_PROBES)} probe(s) missing, "
-            f"first: {absent[0]!r}); sched_entity reserve slots 1-4 stay "
+            f"first: {absent[0]!r}); sched_entity reserve slots stay "
             "ANDROID_KABI_RESERVE so the KABI slots are never claimed without "
             "the scheduler logic that consumes them"
         )
@@ -1160,7 +1166,7 @@ def _eevdf_core_fields_apply(ctx):
         return "blocked_by_shape", (
             f"{SCHED_H}: struct sched_entity reserve slots 1-4 are in none of "
             "the three recognised shapes (pristine ANDROID_KABI_RESERVE(1..4) "
-            "run, the pre-release packed draft, the claimed form)"
+            "run, the pre-release packed draft, the claimed 1-3 form)"
         )
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
@@ -1235,10 +1241,10 @@ def build_groups(PatchGroup):
         ),
         PatchGroup(
             "sched_eevdf_core_fields",
-            "claim Android KABI reserve slots 1-4 of struct sched_entity for the "
+            "claim Android KABI reserve slots 1-3 of struct sched_entity for the "
             "EEVDF fields the fair.c half reads (u64 deadline, u64 min_vruntime, "
-            "s64 vlag, u64 slice); sizeof(struct sched_entity) is unchanged and "
-            "the slots stay ANDROID_KABI_RESERVE unless the fair.c logic landed",
+            "s64 vlag); sizeof(struct sched_entity) is unchanged and the slots "
+            "stay ANDROID_KABI_RESERVE unless the fair.c logic landed",
             [
                 "ABK_ABI_PATCH_SUITE feature_porting/sched_eevdf_core_fields",
                 "KABI ownership: AGENTS.md red lines (Batch 15), "
