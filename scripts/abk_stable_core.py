@@ -3975,5 +3975,44 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 14: zram writeback correctness fixes.
+# Steps live in scripts/batch14_core_zram_writeback.py.
+#
+# android13-5.15 froze its zram writeback code around 2022: the writeback
+# correctness work that followed in mainline never reached the branch, and it
+# never reached linux-5.15.y either (verified against the linux-5.15.y tree at
+# SUBLEVEL 220, which differs from the 5.15.194 baseline only by the
+# zero-sized-backing-device hunk that arrived through ACK).
+#
+# Three independent defects, all confined to drivers/block/zram/zram_drv.c:
+#
+#   zram_wb_teardown       a backing device attached before `disksize` is never
+#                          released (74363ec674cb), pinning the backing block
+#                          device and zram itself until the module is unloaded.
+#                          The NULL-table guard that keeps the reset path safe
+#                          ships in the same transaction.
+#   zram_writeback_bounds  the writeback scan bound comes from zram->disksize
+#                          before init_lock, so a reset that re-initialises a
+#                          smaller disksize lets the loop index past the new
+#                          table (894913e2d35c, Cc: stable), plus the missing
+#                          cond_resched() in the sweep (424d0e5828ad).
+#   zram_wb_limit_align    writeback_limit underflows on PAGE_SIZE > 4KiB and
+#                          silently stops capping flash wear.
+#
+# Ordering is load-bearing: registered after zram_recompression (whose graft
+# rewrites writeback_store()'s callee and the comps teardown inside
+# zram_reset_device()) and after zram_algo_lock (which owns the neighbouring
+# comp_algorithm stores).  zram_wb_teardown deliberately does NOT edit
+# zram_reset_device(): that function belongs to the recompression group, and
+# removing its early return here made the recompression group miss its own
+# anchor on every second pass (it anchors on the *whole* pristine body of the
+# function, guard included).  The leak is therefore closed in zram_remove() --
+# same effect, no shared text.
+# ============================================================================
+import batch14_core_zram_writeback as _b14_zwb  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b14_zwb.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

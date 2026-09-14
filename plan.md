@@ -3,6 +3,76 @@
 状态词：`[ ]` 候选 / `[~]` 延后（需更大 rebase）/ `[x]` 已落地 / `[-]` 无收获或按政策排除。
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 
+## Batch 14（v0.19.0，zram writeback 正确性补齐，已落地）
+
+来源：一次纯审计+上游溯源（`research/zram_writeback_plan.md`，英文，含逐提交
+证据、依赖图、N/A 裁决与性能分轴评估；上游哈希复核见
+`research/zram_wb_audit/verified_commits.tsv`）。结论：android13-5.15 的 zram
+**writeback 原语是完整的**（backing_dev + 空闲块位图、huge/idle writeback、
+`writeback_limit`/`_enable`、`bd_stat`、零长度设备拒绝都有），缺的是 2022 年
+之后上游对这些代码的三处**修正**——而且 `linux-5.15.y`（SUBLEVEL 220）同样没有。
+
+落地三组，全部只在 `drivers/block/zram/zram_drv.c`：
+
+- [x] `zram_wb_teardown`（`74363ec674cb`，v6.16，Cc: stable）——**P0**：
+  在 `disksize` 之前挂上 backing_dev 后，若设备从未 init 就 reset/移除，
+  `zram_reset_device()` 的 `if (!init_done(zram))` 提前返回会跳过 `reset_bdev()`，
+  于是独占的 `blkdev_get_by_dev` 持有者与 `struct file` 一直不释放，
+  把 backing 块设备和 zram 自己钉死到模块卸载。上游删掉了那个提前返回；
+  **本线不能照做**（见下），改为在 `zram_remove()` 里紧跟
+  `zram_reset_device(zram);` 调一次 `reset_bdev(zram);`——语义等价
+  （提前返回唯一漏掉的正是这一次释放），且 `CONFIG_ZRAM_WRITEBACK=n` 时
+  `reset_bdev()` 是内联空实现，无条件调用安全。同事务带上
+  `zram_meta_free()` 的 `if (!zram->table) return;` 护栏与 `zram->table = NULL;`
+  （防止该函数被以未初始化设备进入时 `zs_destroy_pool(NULL)` 解引用）。
+- [x] `zram_writeback_bounds`（`894913e2d35c`，v7.3，Cc: stable，Fixes:
+  a939888ec38b + `424d0e5828ad`，v6.14）——**P0/P1**：`writeback_store()` 在
+  `down_read(init_lock)` **之前**就把 `nr_pages` 从 `zram->disksize` 算好，
+  而 `zram_reset_device()` 是在写锁下改写 `disksize` 并重建 `zram->table` 的；
+  两者之间夹一次「reset 成更小 disksize」就会让扫描边界描述旧表、
+  循环越界访问新表（Android 的 mmd/recompress 守护进程正好是这个模式）。
+  上游补丁是写给 2024 年 `dev_lock` + `lo/hi` 形态的，本组按 5.15 的
+  `init_lock` + `index/nr_pages` 形态逻辑移植：拆掉锁前的初值与范围检查，
+  在 `init_done()` 检查之后、读锁内重新取边界并复检；同组带上
+  `cond_resched()`（一次扫描可能遍历数 GiB 磁盘的全部 slot，且每页一次
+  `alloc_page` + 解压 + 阻塞 `submit_bio_wait`）。
+- [x] `zram_wb_limit_align`（主线 `writeback_limit_store()` 的对齐护栏）——
+  **P1**：`bd_wb_limit` 每页扣 `1UL << (PAGE_SHIFT - 12)`，所以
+  `PAGE_SIZE > 4KiB` 时预算 1..3 会在第一次成功回写后 u64 回绕成无限，
+  磨损上限静默失效；加 `val = rounddown(val, PAGE_SIZE / 4096);`。
+  当前 4K 页构建上不可触发，属保险（Android GKI 正在往 16K 页走）。
+
+**一个必须记住的锚点冲突（不要"修回去"）**：`zram_recompression` 组注册在本批
+**之前**，它重写 `zram_reset_device()` 且锚点就是该函数的**整段原始函数体**。
+按上游删掉提前返回，等于改掉那个锚点 → 第二遍 `step_audit` 里
+`zram_recompression` 报 `blocked_by_shape`（文件字节没变，但"可证幂等"不再成立）。
+两个方向都试过（在 teardown 侧删、在 recompression 侧留标记），互相破坏。
+所以本批**不动 `zram_reset_device()`**，改在 `zram_remove()` 闭环。
+
+**已明确不做、不再重议**（理由逐条见 §4/§5/§10.5）：
+
+- `type=` / `page_indexes=` / 区间（6.16 `cf42d4cccf0d`）——**N/A**：
+  纯现代用户态接口，android13-5.15 没有任何消费者，且它依赖 2024 年的
+  pp-slot 目标选择重写。
+- writeback bio 分批 + `writeback_batch_size`（v6.19）与
+  **compressed writeback**（v7.0 `d38fab605c66`）——**延后**：前者要连
+  pp-slot 机制一起搬（4 个 series），且必须同时带上它自己的 UAF/泄漏修复
+  （`bf62f69574b1`、`3e8d8eb8d7f5`）；后者的真实阻塞是 5.15 没有现代
+  zsmalloc 映射 API（`zs_obj_read_begin/end`），并且与本模块
+  `zram_recompression` 的 `zram_read_from_zspool()`、以及
+  ABK_ABI_PATCH_SUITE 的 `compressed_writeback` 控制面**同名冲突**。
+- `be48c412f6eb`（拒绝零长度 backing device，5.15.168 才进）——**不补**：
+  5.15.167 是唯一缺它的基线，而它**不是**本批的编辑输入（teardown 不依赖它），
+  单独成组也做不干净（替换文本必然包含原始护栏块，在 178/194/216 上无法区分
+  "基线自带"与"前面步骤加的"，会误报 `applied`）。留作套件候选。
+- 2023+ 的 writeback 重构（`330edc2bc059` / `5e99893444a0` / `b967fa1ba72b`）——
+  **N/A**：换设计而非修 bug，5.15 要关的那个竞态 `idle_store()` 的
+  `ZRAM_UNDER_WB` 检查已经关掉了。
+
+审计基线：`step_audit.py` / `implementation_audit.py` / `smoke.sh` 在
+5.15.167/.178/.194/.216 四棵树上全绿；`GROUP_COUNTS` core 24→27；
+`module.conf` 0.18.0→0.19.0。
+
 ## Batch 11（v0.14.0，运行时伴随模块 + zram 算法策略）
 
 真机勘查（vermeer / Redmi K70，`5.15.215-android13-8-g6c35ef5f7a13`，KernelSU
@@ -318,9 +388,14 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 - 与模块现状的交集：`zsmalloc_chain_size`、`zram_recompression`
   （多压缩 + TRACK_ENTRY_ACTIME）已在 Batch 4/6 落地。
 
-- [ ] `zram_writeback_limit_audit`（P3，候选小项）— 核对 android13-5.15
-  目标树是否自带上游 zram `writeback_limit`；无则补上游小 hunk，
-  先与 ABK_ABI_PATCH_SUITE 的 zram-writeback 领地做重叠排查
+- [x] `zram_writeback_limit_audit`（P3，候选小项）— **已核对并落地**：
+  android13-5.15 目标树**自带**上游 zram `writeback_limit` / `_enable` / `bd_stat`
+  （与 5.16 原始形态逐字节等价），缺的只是主线 `writeback_limit_store()` 里的
+  `val = rounddown(val, PAGE_SIZE / 4096);` 对齐护栏；已作为 Batch 14
+  `zram_wb_limit_align` 落地（`GROUP_COUNTS` core 24→27，v0.19.0）。
+  完整证据、上游溯源与全部裁决见
+  [`research/zram_writeback_plan.md`](research/zram_writeback_plan.md)，
+  上游哈希复核结果见 `research/zram_wb_audit/verified_commits.tsv`。
 - [ ] `zram_recompress_max_pages`（P3，候选小项）— 先溯源 recompress
   `max_pages` 参数是否已入 mainline；是则可作 `zram_recompression`
   组的可选追加步

@@ -26,7 +26,12 @@ from __future__ import annotations
 
 # child id -> total registered groups
 GROUP_COUNTS = {
-    "stable_backport_core": 24,
+    # 24 Batch-1..13 groups + the three Batch-14 zram writeback groups
+    # (zram_wb_teardown, zram_writeback_bounds, zram_wb_limit_align).  The
+    # 5.15.167 exception for zram_wb_teardown lives in KNOWN_DEBT below: that
+    # baseline predates the group's precondition be48c412f6eb (see the comment
+    # there).
+    "stable_backport_core": 27,
     "stable_perf_backport": 13,
     "stable_display_fix": 1,
 }
@@ -99,8 +104,14 @@ PRE_APPLIED = {
 
 # sublevel -> child -> group key -> expected degraded status.
 # Disjoint from PRE_APPLIED: a group either arrives upstream-clean or is a
-# tracked debt; never both.  Only used to keep auditing the lts row honest
-# about the two Batch-2-era blockers instead of failing the whole tree.
+# tracked debt; never both.
+#
+# Empty for the three Batch-14 zram writeback groups: each one lands on a
+# pristine 167/178/194/216 tree.  zram_wb_teardown does not depend on the series
+# partner be48c412f6eb (zero-sized backing device rejection, 5.15.168+) -- that
+# hunk is not editable input to the fix -- and the leak is closed in
+# zram_remove() rather than by deleting zram_reset_device()'s early return, so
+# 5.15.167 is covered like the rest.
 KNOWN_DEBT = {
     "216": {
         "stable_perf_backport": {

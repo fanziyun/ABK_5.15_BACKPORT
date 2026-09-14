@@ -203,6 +203,44 @@ REQUIRED_CONTENT = {
         # The THP-class default: order 9 on 4K-page arm64.
         "static unsigned int abk_gfp_fastfail_order = 9;",
     ],
+    # --- Batch 14: zram writeback correctness ------------------------------
+    "core:zram_wb_teardown": [
+        # 74363ec674cb.  The NULL guard is the load-bearing half: zram_remove()
+        # now always reaches reset_bdev(), and zram_meta_free() may be entered
+        # for a device that never had a table/pool.
+        "if (!zram->table)\n\t\treturn;",
+        "zram->table = NULL;",
+        # The leak close itself, in zram_remove() -- not by deleting
+        # zram_reset_device()'s early return, which zram_recompression owns.
+        "\tzram_reset_device(zram);\n\t/*\n\t * ABK stable_515_backport: 74363ec674cb.",
+        "\treset_bdev(zram);\n\n\tpr_info(\"Removed device: %s\\n\"",
+    ],
+    "core:zram_writeback_bounds": [
+        # 894913e2d35c: the bound and the range check must both be derived under
+        # the read lock, not before it.
+        "ABK stable_515_backport: 894913e2d35c",
+        "\tunsigned long nr_pages;\n\tunsigned long index = 0;",
+        # The marker is load-bearing for unambiguity: the bare
+        # `nr_pages = ...; if (index >= nr_pages) {` sequence is the *upstream*
+        # 2026 shape, so a baseline that ever backports 894913e2d35c itself
+        # would satisfy a marker-less needle while this group reports
+        # already_present.  Anchor on the comment the step actually writes.
+        "\t * freed table and the loop would index past the new one.\n"
+        "\t */\n"
+        "\tunsigned long nr_pages;",
+        # ...and the post-lock region still derives the bound and re-checks.
+        "ABK stable_515_backport: 894913e2d35c -- bound and range check",
+        "\tnr_pages = zram->disksize >> PAGE_SHIFT;\n"
+        "\tif (index >= nr_pages) {\n"
+        "\t\tret = -EINVAL;\n"
+        "\t\tgoto release_init_lock;",
+        # 424d0e5828ad: the reschedule point in the sweep.
+        "\t\tcond_resched();",
+    ],
+    "core:zram_wb_limit_align": [
+        # Mainline writeback_limit_store()'s alignment guard.
+        "val = rounddown(val, PAGE_SIZE / 4096);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever

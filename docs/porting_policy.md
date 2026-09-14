@@ -124,17 +124,27 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 19 applied | 12 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 19 applied | 11 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 16 applied + 3 present | 10 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 27 applied | 13 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 27 applied | 12 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 24 applied + 3 present | 11 applied + 2 present |
 
-A second pass is `already_present` for every group on all three. Groups the
-baseline pre-empts:
+A second pass is `already_present` for every group on all three (the untracked
+`android13-5.15-lts` row, keyed to the fetched tree's `SUBLEVEL = 216`, carries
+the two Batch-2-era perf debts — see `KNOWN_DEBT` in `tests/sublevel_matrix.py`).
+Groups the baseline pre-empts:
 
 - **178** — `sched_nohz_idle_balance_series` (5.15.174).
 - **194** — the 178 set plus `fdtable_alloc_conventions` (5.15.191),
   `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194)
   and `semaphore_wake_q` (5.15.180).
+
+Batch 14's three zram writeback groups (`zram_wb_teardown`,
+`zram_writeback_bounds`, `zram_wb_limit_align`) apply on **all** of them and add
+no `PRE_APPLIED`/`KNOWN_DEBT` row. Note what they do *not* do: they deliberately
+leave `zram_reset_device()` alone, because the earlier `zram_recompression` group
+anchors on that function's whole pristine body — see
+`research/zram_writeback_plan.md` §10.5 and the `batch14_core_zram_writeback`
+module docstring before editing either one.
 
 The expectations live in `tests/sublevel_matrix.py`, which both `tests/smoke.sh`
 and `tests/step_audit.py` read (keyed by the tree's Makefile `SUBLEVEL`, or

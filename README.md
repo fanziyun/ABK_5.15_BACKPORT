@@ -28,6 +28,7 @@ is left byte-identical rather than touched up with a comment.
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 | `stable_backport_core` (Batch 9-1) | `dynamic_readahead_lowmem`: dynamic readahead (OPLUS/Xiaomi `mi_dynamic_readahead`) as a GKI built-in — a `core_initcall` in `mm/readahead.c` registers the `android_vh_ra_tuning_max_page` / `android_vh_tune_mmap_readaround` vendor-hook callbacks so low-memory background (cpuset "background") tasks get halved readahead windows and shrunk mmap read-around, behind `CONFIG_ABK_DYNAMIC_READAHEAD` with a `readahead.dynamic_readahead=0` runtime disable |
 | `stable_backport_core` (Batch 13) | `customize_alloc_gfp_vh` + `gfp_pressure_fastfail`: the `android_vh_customize_alloc_gfp` vendor hook grafted verbatim from android15-6.6 (commit `4466afd69452`; declare in `include/trace/hooks/mm.h`, call between the nodemask restore and `__alloc_pages_slowpath()`, export in `drivers/android/vendor_hooks.c`), plus its ABK consumer: while `si_mem_available()` sits below `abk_gfp_fastfail_pct`% (default 50) of the summed high watermarks, slowpath attempts of order >= `abk_gfp_fastfail_order` (default 9 — the THP class) gain `__GFP_NORETRY|__GFP_NOWARN`, so a fragmented, nearly-full phone fails those requests into their callers' fallback after one direct-reclaim/compaction try instead of stalling the faulting task; knobs at `/sys/module/page_alloc/parameters/`, off with `page_alloc.abk_gfp_fastfail=0` |
+| `stable_backport_core` (Batch 14) | zram **writeback correctness** (the branch froze this code in 2022 and never got the later fixes — `linux-5.15.y` at SUBLEVEL 220 does not have them either): `zram_wb_teardown` releases a backing device that was attached before `disksize` (upstream `74363ec674cb`; the upstream form deletes `zram_reset_device()`'s early return, this line calls `reset_bdev()` from `zram_remove()` instead, because `zram_reset_device()` is the anchor of the earlier recompression group), with the `zram_meta_free()` NULL-table guard; `zram_writeback_bounds` derives the `writeback_store()` scan bound and the `page_index=` range check **under** `init_lock` (upstream `894913e2d35c`, Cc: stable) so a racing reset that re-initialises a smaller `disksize` cannot walk past the new table, plus `cond_resched()` in the sweep (`424d0e5828ad`); `zram_wb_limit_align` adds mainline's `rounddown(val, PAGE_SIZE / 4096)` guard so a 16 KiB-page build cannot underflow `bd_wb_limit` and silently switch the flash-wear cap off. Evidence, dependency graph and the explicit not-ported list (6.16 writeback ABI rework, bio batching, compressed writeback, `huge_idle`) are in `research/zram_writeback_plan.md` |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
@@ -187,14 +188,15 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 24 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 27 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
-`zram_secondary_comp`, `memcg_v1_reclaim`), Batch 12's `zram_algo_lock`, and
+`zram_secondary_comp`, `memcg_v1_reclaim`), Batch 12's `zram_algo_lock`,
 Batch 13's hook + policy pair (`customize_alloc_gfp_vh`,
-`gfp_pressure_fastfail`); the
-perf child carries 13; the display child carries 1, for 38 groups in total.
+`gfp_pressure_fastfail`), and Batch 14's zram writeback correctness trio
+(`zram_wb_teardown`, `zram_writeback_bounds`, `zram_wb_limit_align`)); the
+perf child carries 13; the display child carries 1, for 41 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 
