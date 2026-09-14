@@ -2,6 +2,70 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-22"></a>
+
+## Batch 22(v0.27.0)
+
+起因：Batch 21 之后，6.1 来源线 backlog 上只剩两条 —— per-VMA locks（真·架构项目）与本批这条
+**PSI 内部同步**。本批把后者结掉：**TSK_ONCPU 从"任务计数"改成 state mask 里的一位**
+（android14-6.1）。（未发布前就已推送的 `psi_oncpu_state_mask` 组，见 `GROUP_COUNTS` perf 21 → 22，
+`module.conf` 0.26.0 → **0.27.0**。）
+
+### 1. 为什么这不是"纯 refactor"
+
+5.15 把 ONCPU 当成第 5 个任务计数（`psi_group_cpu::tasks[NR_ONCPU]`），于是：
+
+- **它本来就不是计数**：一个 CPU 上只可能有一个任务在跑，计数器的唯一用途是让
+  `test_state()` 能算"有 runnable 但没人跑"；一旦中途迁移/重排，计数就可能与事实不一致 ——
+  这正是「`psi: task underflow!`」那类 splat 的来源；
+- **它逼出了一个谎**：`psi_task_switch()` 设置 @next 的 ONCPU 时，无法从计数本身判断"这个祖先
+  是不是 @prev 也占着"，于是 5.15 额外比较 `prev->psi_flags == next->psi_flags`（`identical_state`）
+  来决定是否提前停 —— 状态相同才敢停，不同就一路设到根，靠 prev 分支再把计数减回去。
+  ONCPU 变成位之后**不需要这个比较**：位是幂等的，设到已经置位的组就说明到了共同祖先，直接停。
+
+换句话说：Batch 22 消掉的是一个真实的不一致窗口 + 一处为绕过它而写的启发式，而不是换个写法。
+
+### 2. 落地明细
+
+| 文件 | 改动 |
+|---|---|
+| `include/linux/psi_types.h` | 删 `NR_ONCPU` 枚举项与其注释；`NR_PSI_TASK_COUNTS` 5 → **4**；`TSK_ONCPU` 改为 `(1 << NR_PSI_TASK_COUNTS)`；新增 `PSI_ONCPU (1 << NR_PSI_STATES)` |
+| `kernel/sched/psi.c` | `test_state()` 增 `bool oncpu` 形参（CPU_SOME/FULL 改问它）；`psi_group_change()` 开头按 clear/set/carry 三态设置 ONCPU 位并从计数循环里摘掉；underflow splat 少一个计数；memstall FULL 改看 `state_mask & PSI_ONCPU`；`psi_task_switch()` 去掉 `identical_state`、改探 state mask 的位；尾部条件 `if (sleep)` → `if ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU)` |
+
+三条设计点：
+
+1. **仍然不引入 `psi_group::parent`**：5.15 的 `iterate_groups()` 就是 cgroup 树走查，位化之后
+   "提前停"只需要探位，父链依旧没有存在理由（`struct psi_group` 内嵌在 `struct cgroup` 里，
+   加成员会移动布局）。
+2. **尾部条件必须一起改**。提前停变得更容易命中（不再要求状态相同），所以"除 ONCPU 之外的
+   差异"必须继续向共同祖先之上传播 —— 这正是 6.1 把 `if (sleep)` 换成
+   `(prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU` 的原因；只改前半段会丢状态。
+3. **与 Batch 21 的开关同一处文本**：`cgroup.pressure` 关账分支原本写 `groupc->state_mask = 0;`，
+   位化后 ONCPU 是"状态"的一部分吗？——**要保留**（重开时靠它重建，6.1 同样写
+   `groupc->state_mask = state_mask;`）。这条跨组编辑是安全的，因为 Batch 21 的组自带形状探针
+   （`cgroup.pressure` 在 cgroup.c 里），第二遍不会重复注入 —— 也正是 Batch 21 那条陷阱 5 的
+   第一个实际用例。
+
+### 3. 未移植的一处（有意）
+
+6.1 的 `psi_group_change()` 里还有一句 `lockdep_assert_rq_held(cpu_rq(cpu));`。它属于另一处
+上游改动（把"调用者必须持 rq 锁"变成机械断言），本模块的调用点里 `psi_cgroup_restart()` 持锁、
+`psi_task_change/switch` 由 scheduler 持锁，但把这条断言一起搬进来等于给全部路径加一个我无法在
+本仓库内证明的前置条件 —— 故记录在案、不移植。
+
+### 4. 验证
+
+- 本地四档（167/178/194/216）`step_audit`/`implementation_audit`/`smoke` 全绿；本组四档都
+  `applied`（无 `PRE_APPLIED`/`KNOWN_DEBT` 变化）。
+- 新增单测 `test_batch22_psi_oncpu_state_mask`：**合成 fixture 里先跑 Batch 21 再跑本组**，断言
+  ONCPU 位化、四个计数、`identical_state` 与 `tasks[NR_ONCPU]` 双消失、尾部传播条件、以及
+  "关账组仍保留 ONCPU 位"，最后验两遍幂等。
+- `implementation_audit` 侧新增 `REQUIRED_CONTENT`/`REQUIRED_ABSENT`/`REQUIRED_IN_FUNCTION`
+  三张表：`NR_ONCPU`/`tasks[NR_ONCPU]`/`identical_state` 必须**不在**（这是本组的存在意义），
+  而三个使用点（`test_state()`、memstall 判断、switch 探位）必须**在**。
+- 新增 C 只有编译能证明：本批同样以 **ABK CI 编译**为最终门禁，见 Batch 21 节的 run 与本节
+  追加的 run。
+
 <a id="batch-21"></a>
 
 ## Batch 21(v0.26.0)

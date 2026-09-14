@@ -37,6 +37,7 @@ the anchor-script philosophy of this module).
 | `sched_lazy_preemption_hooks` (perf) | ACK android14-6.1 lazy preemption via vendor hooks (`resched_curr_lazy` / `clear_curr_lazy` / `lock_delay_schedule` / `set_tsk_need_resched_lazy`) | include/trace/hooks/dtask.h, core.c, fair.c |
 | `locking_wakeup_patch_hooks` (perf) | ACK android14-6.1 mutex/rwsem post-wakeup fixup hooks | dtask.h, rwsem.h, mutex.c, rwsem.c |
 
+| `psi_oncpu_state_mask` (perf, Batch 22) | ACK android14-6.1 PSI internal sync: TSK_ONCPU becomes a state-mask bit, so `psi_group_cpu::tasks[]` drops to 4 counters and `psi_task_switch()` stops guessing with `identical_state`; still no `psi_group::parent` (the 5.15 walk is reused) | psi_types.h, psi.c |
 | `psi_cgroup_pressure_switch` (perf, Batch 21) | ACK android14-6.1 `cgroup.pressure`: per-cgroup PSI accounting switch, re-based on the cgroup's `CGRP_PSI_DISABLED` flag bit instead of `psi_group::enabled` (the embedded psi_group cannot grow) | cgroup-defs.h, psi.h, psi.c, cgroup.c, cgroup-v2.rst |
 
 ### KMI decisions (why the full 6.1 PSI shape was NOT ported)
@@ -106,12 +107,15 @@ stays out of scope, so a future re-read does not re-open them.
 - **DAMON sysfs control plane** — moderate size, modest phone value.
 - **MADV_COLLAPSE** — 6.1 UAPI-only, value conditional on THP.
 - **zram recompression** — 6.2-origin, not in 6.1.y.
-- **PSI full sync (NR_ONCPU removal, TSK_ONCPU mask, parent chain)** — the
-  6.1 internal rework. The parent-chain half is now provably unnecessary on this
-  baseline (Batch 21's port needs no `psi_group::parent`); what is left is
-  turning ONCPU from a task *count* into a bit of `state_mask`, which is a pure
-  internal refactor with no user-visible feature, so it is not a candidate on
-  its own — it would ride along if another group ever needs that shape.
+- **PSI full sync (NR_ONCPU removal, TSK_ONCPU mask, parent chain)** — **landed in
+  Batch 22** (`psi_oncpu_state_mask`, v0.27.0). It turned out not to be a
+  "pure refactor with no user-visible effect": the counter could disagree with
+  itself across a migration (the `psi: task underflow!` splats) and forced the
+  `identical_state` heuristic into the switch. The parent-chain half stayed out
+  (5.15 already walks the cgroup tree).  One deliberate omission: the ACK tree
+  also asserts `lockdep_assert_rq_held(cpu_rq(cpu))` in `psi_group_change()`,
+  which is a separate upstream change and would impose a precondition this repo
+  cannot prove for every caller.
 
 ## Excluded (no action)
 

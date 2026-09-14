@@ -6,8 +6,8 @@ migration flags micro-optimization (5.15.179), the RT scan optimizations
 __release_sock() cond_resched reduction (5.15.197), the semaphore wake_q
 offload (5.15.180), the blk-mq suspend wakeup abort (5.15.198), and the
 android14-6.1 line (lazy preemption + mutex/rwsem wakeup vendor hooks,
-PSI IRQ pressure tracking, PSI trigger kernfs polling, and the per-cgroup PSI
-accounting switch `cgroup.pressure`).
+PSI IRQ pressure tracking, PSI trigger kernfs polling, the per-cgroup PSI
+accounting switch `cgroup.pressure`, and the PSI ONCPU state-mask sync).
 
 KMI notes: the per-task kstack offset reuses task_struct's
 ANDROID_KABI_RESERVE(8) slot instead of growing the struct, and the PSI group
@@ -1975,6 +1975,257 @@ def _psi_cgroup_pressure_apply(ctx):
     return status, detail
 
 
+# ---------------------------------------------------------------------------
+# android14-6.1 line: TSK_ONCPU becomes a bit of the state mask
+# ---------------------------------------------------------------------------
+
+# The last PSI item on the 6.1 backlog (plan.md: "PSI 内部全量同步").  Upstream
+# counts ONCPU like any other task state, which is one counter more than the
+# hardware can justify -- only one task is ever scheduled on a CPU -- and makes
+# the scheduler/psi hand-off racy: psi_task_switch() has to guess when to stop
+# setting ONCPU on @next's ancestors (the old code needed an "identical state"
+# comparison to decide), and a mismatch shows up as the "psi: task underflow!"
+# splat.  The ACK 6.1 shape drops the counter: TSK_ONCPU is a flag carried in
+# the same state mask that holds the derived states, so setting it where it is
+# already set is idempotent and the switch can stop at the first ancestor that
+# already has it.
+#
+# The ancestor walk stays the 5.15 iterate_groups() cgroup-tree walk (the ACK
+# tree's psi_group::parent pointer is still not needed and must not be added --
+# struct psi_group is embedded in struct cgroup).  psi_group_cpu is
+# percpu-internal, so dropping tasks[NR_ONCPU] changes no KMI-visible layout.
+
+def _psi_oncpu_state_mask_apply(ctx):
+    try:
+        text = ctx.read("include/linux/psi_types.h")
+    except FileNotFoundError:
+        text = ""
+    if "PSI_ONCPU" in text:
+        return "already_present", (
+            "TSK_ONCPU is already a state-mask bit")
+    steps = [
+        # psi_types.h: NR_ONCPU is not a task count any more
+        ("include/linux/psi_types.h",
+         "\tNR_RUNNING,\n"
+         "\t/*\n"
+         "\t * This can't have values other than 0 or 1 and could be\n"
+         "\t * implemented as a bit flag. But for now we still have room\n"
+         "\t * in the first cacheline of psi_group_cpu, and this way we\n"
+         "\t * don't have to special case any state tracking for it.\n"
+         "\t */\n"
+         "\tNR_ONCPU,\n"
+         "\t/*\n"
+         "\t * For IO and CPU stalls the presence of running/oncpu tasks\n"
+         "\t * in the domain means a partial rather than a full stall.\n",
+         "\tNR_RUNNING,\n"
+         "\t/*\n"
+         "\t * For IO and CPU stalls the presence of running/oncpu tasks\n"
+         "\t * in the domain means a partial rather than a full stall.\n",
+         T),
+        ("include/linux/psi_types.h",
+         "\tNR_MEMSTALL_RUNNING,\n"
+         "\tNR_PSI_TASK_COUNTS = 5,\n"
+         "};",
+         "\tNR_MEMSTALL_RUNNING,\n"
+         "\tNR_PSI_TASK_COUNTS = 4,\n"
+         "};",
+         T),
+        ("include/linux/psi_types.h",
+         "#define TSK_ONCPU\t(1 << NR_ONCPU)\n",
+         "/* ABK stable_515_backport: only one task can be scheduled on a CPU, so\n"
+         " * TSK_ONCPU is a flag in the state mask rather than a task count\n"
+         " * (android14-6.1).\n"
+         " */\n"
+         "#define TSK_ONCPU\t(1 << NR_PSI_TASK_COUNTS)\n",
+         T),
+        ("include/linux/psi_types.h",
+         "\t/* Only per-CPU, to weigh the CPU in the global average: */\n"
+         "\tPSI_NONIDLE,\n"
+         "\tNR_PSI_STATES,\n"
+         "};",
+         "\t/* Only per-CPU, to weigh the CPU in the global average: */\n"
+         "\tPSI_NONIDLE,\n"
+         "\tNR_PSI_STATES,\n"
+         "};\n"
+         "\n"
+         "/* ABK stable_515_backport: use one bit in the state mask to track\n"
+         " * TSK_ONCPU (android14-6.1).\n"
+         " */\n"
+         "#define PSI_ONCPU\t(1 << NR_PSI_STATES)\n",
+         T),
+        # psi.c: test_state asks the mask instead of counting
+        ("kernel/sched/psi.c",
+         "static bool test_state(unsigned int *tasks, enum psi_states state)\n"
+         "{\n"
+         "\tswitch (state) {\n"
+         "\tcase PSI_IO_SOME:\n",
+         "static bool test_state(unsigned int *tasks, enum psi_states state, bool oncpu)\n"
+         "{\n"
+         "\tswitch (state) {\n"
+         "\tcase PSI_IO_SOME:\n",
+         T),
+        ("kernel/sched/psi.c",
+         "\tcase PSI_CPU_SOME:\n"
+         "\t\treturn unlikely(tasks[NR_RUNNING] > tasks[NR_ONCPU]);\n"
+         "\tcase PSI_CPU_FULL:\n"
+         "\t\treturn unlikely(tasks[NR_RUNNING] && !tasks[NR_ONCPU]);\n",
+         "\tcase PSI_CPU_SOME:\n"
+         "\t\treturn unlikely(tasks[NR_RUNNING] > oncpu);\n"
+         "\tcase PSI_CPU_FULL:\n"
+         "\t\treturn unlikely(tasks[NR_RUNNING] && !oncpu);\n",
+         T),
+        # psi.c: the flag is set, cleared or carried before the counts are
+        # touched, so it never reaches the count loops
+        ("kernel/sched/psi.c",
+         "\twrite_seqcount_begin(&groupc->seq);\n"
+         "\n"
+         "\trecord_times(groupc, now);\n"
+         "\n"
+         "\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n",
+         "\twrite_seqcount_begin(&groupc->seq);\n"
+         "\n"
+         "\trecord_times(groupc, now);\n"
+         "\n"
+         "\t/*\n"
+         "\t * ABK stable_515_backport: TSK_ONCPU has no task count -- only one\n"
+         "\t * task can be scheduled on a CPU, so it is a flag carried in the\n"
+         "\t * state mask (android14-6.1).  Set, clear or carry it, then keep it\n"
+         "\t * out of the count update below.\n"
+         "\t */\n"
+         "\tif (unlikely(clear & TSK_ONCPU)) {\n"
+         "\t\tstate_mask = 0;\n"
+         "\t\tclear &= ~TSK_ONCPU;\n"
+         "\t} else if (unlikely(set & TSK_ONCPU)) {\n"
+         "\t\tstate_mask = PSI_ONCPU;\n"
+         "\t\tset &= ~TSK_ONCPU;\n"
+         "\t} else {\n"
+         "\t\tstate_mask = groupc->state_mask & PSI_ONCPU;\n"
+         "\t}\n"
+         "\n"
+         "\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n",
+         T),
+        # psi.c: four counters left in the underflow splat
+        ("kernel/sched/psi.c",
+         "\t\t\tprintk_deferred(KERN_ERR \"psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u %u] clear=%x set=%x\\n\",\n"
+         "\t\t\t\t\tcpu, t, groupc->tasks[0],\n"
+         "\t\t\t\t\tgroupc->tasks[1], groupc->tasks[2],\n"
+         "\t\t\t\t\tgroupc->tasks[3], groupc->tasks[4],\n"
+         "\t\t\t\t\tclear, set);\n",
+         "\t\t\tprintk_deferred(KERN_ERR \"psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u] clear=%x set=%x\\n\",\n"
+         "\t\t\t\t\tcpu, t, groupc->tasks[0],\n"
+         "\t\t\t\t\tgroupc->tasks[1], groupc->tasks[2],\n"
+         "\t\t\t\t\tgroupc->tasks[3], clear, set);\n",
+         T),
+        # psi.c: the cgroup.pressure switch keeps the flag, not just the counts
+        ("kernel/sched/psi.c",
+         "\t * ABK stable_515_backport: cgroup.pressure -- with the accounting\n"
+         "\t * switched off, keep the task counts current (the levels above and\n"
+         "\t * below consult them) but stop deriving and timing states.  The\n"
+         "\t * record_times() above already concluded the state that was live when\n"
+         "\t * the switch was turned off.\n"
+         "\t */\n"
+         "\tif (unlikely(!psi_group_enabled(group))) {\n"
+         "\t\tgroupc->state_mask = 0;\n",
+         "\t * ABK stable_515_backport: cgroup.pressure -- with the accounting\n"
+         "\t * switched off, keep the task counts and the ONCPU flag current (the\n"
+         "\t * levels above and below consult them) but stop deriving and timing\n"
+         "\t * states.  The record_times() above already concluded the state that\n"
+         "\t * was live when the switch was turned off.\n"
+         "\t */\n"
+         "\tif (unlikely(!psi_group_enabled(group))) {\n"
+         "\t\tgroupc->state_mask = state_mask;\n",
+         T),
+        ("kernel/sched/psi.c",
+         "\t/* Calculate state mask representing active states */\n"
+         "\tfor (s = 0; s < NR_PSI_STATES; s++) {\n"
+         "\t\tif (test_state(groupc->tasks, s))\n"
+         "\t\t\tstate_mask |= (1 << s);\n"
+         "\t}\n",
+         "\t/* Calculate state mask representing active states */\n"
+         "\tfor (s = 0; s < NR_PSI_STATES; s++) {\n"
+         "\t\tif (test_state(groupc->tasks, s, state_mask & PSI_ONCPU))\n"
+         "\t\t\tstate_mask |= (1 << s);\n"
+         "\t}\n",
+         T),
+        ("kernel/sched/psi.c",
+         "\tif (unlikely(groupc->tasks[NR_ONCPU] && cpu_curr(cpu)->in_memstall))\n",
+         "\tif (unlikely((state_mask & PSI_ONCPU) && cpu_curr(cpu)->in_memstall))\n",
+         T),
+        # psi.c: the switch stops at the first ancestor that already carries the
+        # flag, which is the common ancestor -- no state comparison needed
+        ("kernel/sched/psi.c",
+         "\tif (next->pid) {\n"
+         "\t\tbool identical_state;\n"
+         "\n"
+         "\t\tpsi_flags_change(next, 0, TSK_ONCPU);\n"
+         "\t\t/*\n"
+         "\t\t * When switching between tasks that have an identical\n"
+         "\t\t * runtime state, the cgroup that contains both tasks\n"
+         "\t\t * runtime state, the cgroup that contains both tasks\n"
+         "\t\t * we reach the first common ancestor. Iterate @next's\n"
+         "\t\t * ancestors only until we encounter @prev's ONCPU.\n"
+         "\t\t */\n"
+         "\t\tidentical_state = prev->psi_flags == next->psi_flags;\n"
+         "\t\titer = NULL;\n"
+         "\t\twhile ((group = iterate_groups(next, &iter))) {\n"
+         "\t\t\tif (identical_state &&\n"
+         "\t\t\t    per_cpu_ptr(group->pcpu, cpu)->tasks[NR_ONCPU]) {\n"
+         "\t\t\t\tcommon = group;\n"
+         "\t\t\t\tbreak;\n"
+         "\t\t\t}\n"
+         "\n"
+         "\t\t\tpsi_group_change(group, cpu, 0, TSK_ONCPU, now, true);\n"
+         "\t\t}\n"
+         "\t}\n",
+         "\tif (next->pid) {\n"
+         "\t\tpsi_flags_change(next, 0, TSK_ONCPU);\n"
+         "\t\t/*\n"
+         "\t\t * Set TSK_ONCPU on @next's cgroups. If @next shares any\n"
+         "\t\t * ancestors with @prev, those will already have @prev's\n"
+         "\t\t * TSK_ONCPU bit set, and we can stop the iteration there.\n"
+         "\t\t */\n"
+         "\t\titer = NULL;\n"
+         "\t\twhile ((group = iterate_groups(next, &iter))) {\n"
+         "\t\t\tif (per_cpu_ptr(group->pcpu, cpu)->state_mask &\n"
+         "\t\t\t    PSI_ONCPU) {\n"
+         "\t\t\t\tcommon = group;\n"
+         "\t\t\t\tbreak;\n"
+         "\t\t\t}\n"
+         "\n"
+         "\t\t\tpsi_group_change(group, cpu, 0, TSK_ONCPU, now, true);\n"
+         "\t\t}\n"
+         "\t}\n",
+         T),
+        # psi.c: ... so everything else has to keep propagating above it
+        ("kernel/sched/psi.c",
+         "\t\t/*\n"
+         "\t\t * TSK_ONCPU is handled up to the common ancestor. If we're tasked\n"
+         "\t\t * with dequeuing too, finish that for the rest of the hierarchy.\n"
+         "\t\t */\n"
+         "\t\tif (sleep) {\n"
+         "\t\t\tclear &= ~TSK_ONCPU;\n"
+         "\t\t\tfor (; group; group = iterate_groups(prev, &iter))\n"
+         "\t\t\t\tpsi_group_change(group, cpu, clear, set, now, true);\n"
+         "\t\t}\n",
+         "\t\t/*\n"
+         "\t\t * TSK_ONCPU is handled up to the common ancestor. If there are\n"
+         "\t\t * any other differences between the two tasks (e.g. prev goes\n"
+         "\t\t * to sleep, or only one task is memstall), finish propagating\n"
+         "\t\t * those differences all the way up to the root.\n"
+         "\t\t */\n"
+         "\t\tif ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU) {\n"
+         "\t\t\tclear &= ~TSK_ONCPU;\n"
+         "\t\t\tfor (; group; group = iterate_groups(prev, &iter))\n"
+         "\t\t\t\tpsi_group_change(group, cpu, clear, set, now, true);\n"
+         "\t\t}\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 PATCH_GROUPS = [
     PatchGroup(
         "sched_nohz_idle_balance_series",
@@ -2081,6 +2332,13 @@ PATCH_GROUPS = [
         ["include/linux/cgroup-defs.h", "include/linux/psi.h", "kernel/sched/psi.c",
          "kernel/cgroup/cgroup.c", "Documentation/admin-guide/cgroup-v2.rst"],
         _psi_cgroup_pressure_apply,
+    ),
+    PatchGroup(
+        "psi_oncpu_state_mask",
+        "PSI: TSK_ONCPU becomes a flag in the state mask instead of a task count, so the switch walks ancestors until the flag is already set (android14-6.1)",
+        ["ACK android14-6.1 PSI ONCPU state-mask rework (psi_group_cpu::tasks[] 5 -> 4)"],
+        ["include/linux/psi_types.h", "kernel/sched/psi.c"],
+        _psi_oncpu_state_mask_apply,
     ),
 ]
 

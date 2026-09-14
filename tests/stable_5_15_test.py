@@ -447,6 +447,7 @@ _BATCH21_PSI_C = (
     "\n"
     "\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n"
     "\twrite_seqcount_begin(&groupc->seq);\n"
+    "\n"
     "\trecord_times(groupc, now);\n"
     "\n"
     "\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n"
@@ -454,6 +455,14 @@ _BATCH21_PSI_C = (
     "\t\t\tcontinue;\n"
     "\t\tif (groupc->tasks[t])\n"
     "\t\t\tgroupc->tasks[t]--;\n"
+    "\t\telse if (!psi_bug) {\n"
+    "\t\t\tprintk_deferred(KERN_ERR \"psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u %u] clear=%x set=%x\\n\",\n"
+    "\t\t\t\t\tcpu, t, groupc->tasks[0],\n"
+    "\t\t\t\t\tgroupc->tasks[1], groupc->tasks[2],\n"
+    "\t\t\t\t\tgroupc->tasks[3], groupc->tasks[4],\n"
+    "\t\t\t\t\tclear, set);\n"
+    "\t\t\tpsi_bug = 1;\n"
+    "\t\t}\n"
     "\t}\n"
     "\n"
     "\tfor (t = 0; set; set &= ~(1 << t), t++)\n"
@@ -465,6 +474,17 @@ _BATCH21_PSI_C = (
     "\t\tif (test_state(groupc->tasks, s))\n"
     "\t\t\tstate_mask |= (1 << s);\n"
     "\t}\n"
+    "\n"
+    "\t/*\n"
+    "\t * Since we care about lost potential, a memstall is FULL\n"
+    "\t * when there are no other working tasks, but also when\n"
+    "\t * the CPU is actively reclaiming and nothing productive\n"
+    "\t * could run even if it were runnable. So when the current\n"
+    "\t * task in a cgroup is in_memstall, the corresponding groupc\n"
+    "\t * on that cpu is in PSI_MEM_FULL state.\n"
+    "\t */\n"
+    "\tif (unlikely(groupc->tasks[NR_ONCPU] && cpu_curr(cpu)->in_memstall))\n"
+    "\t\tstate_mask |= (1 << PSI_MEM_FULL);\n"
     "\n"
     "\tgroupc->state_mask = state_mask;\n"
     "\twrite_seqcount_end(&groupc->seq);\n"
@@ -722,6 +742,235 @@ def test_batch21_psi_cgroup_pressure_switch():
           [g.key for g in perf.PATCH_GROUPS].index(
               "psi_cgroup_pressure_switch")
           > [g.key for g in perf.PATCH_GROUPS].index("psi_irq_tracking"))
+
+
+# The psi_types.h shape the ONCPU group lands on: the 5.15 counter-based task
+# states (psi_irq_tracking has already turned NR_PSI_STATES into an auto-sized
+# enum by then, which is what the PSI_ONCPU anchor expects).
+_BATCH22_PSI_TYPES = (
+    "#ifdef CONFIG_PSI\n"
+    "\n"
+    "/* Tracked task states */\n"
+    "enum psi_task_count {\n"
+    "\tNR_IOWAIT,\n"
+    "\tNR_MEMSTALL,\n"
+    "\tNR_RUNNING,\n"
+    "\t/*\n"
+    "\t * This can't have values other than 0 or 1 and could be\n"
+    "\t * implemented as a bit flag. But for now we still have room\n"
+    "\t * in the first cacheline of psi_group_cpu, and this way we\n"
+    "\t * don't have to special case any state tracking for it.\n"
+    "\t */\n"
+    "\tNR_ONCPU,\n"
+    "\t/*\n"
+    "\t * For IO and CPU stalls the presence of running/oncpu tasks\n"
+    "\t * in the domain means a partial rather than a full stall.\n"
+    "\t * For memory it's not so simple because of page reclaimers:\n"
+    "\t */\n"
+    "\tNR_MEMSTALL_RUNNING,\n"
+    "\tNR_PSI_TASK_COUNTS = 5,\n"
+    "};\n"
+    "\n"
+    "/* Task state bitmasks */\n"
+    "#define TSK_IOWAIT\t(1 << NR_IOWAIT)\n"
+    "#define TSK_MEMSTALL\t(1 << NR_MEMSTALL)\n"
+    "#define TSK_RUNNING\t(1 << NR_RUNNING)\n"
+    "#define TSK_ONCPU\t(1 << NR_ONCPU)\n"
+    "#define TSK_MEMSTALL_RUNNING\t(1 << NR_MEMSTALL_RUNNING)\n"
+    "\n"
+    "enum psi_states {\n"
+    "\tPSI_IO_SOME,\n"
+    "\tPSI_IO_FULL,\n"
+    "\tPSI_MEM_SOME,\n"
+    "\tPSI_MEM_FULL,\n"
+    "\tPSI_CPU_SOME,\n"
+    "\tPSI_CPU_FULL,\n"
+    "\t/* Only per-CPU, to weigh the CPU in the global average: */\n"
+    "\tPSI_NONIDLE,\n"
+    "\tNR_PSI_STATES,\n"
+    "};\n"
+    "\n"
+    "struct psi_group_cpu {\n"
+    "\tunsigned int tasks[NR_PSI_TASK_COUNTS];\n"
+    "\tu32 state_mask;\n"
+    "};\n"
+)
+
+# psi.c pieces the Batch 21 fixture does not carry: test_state() and
+# psi_task_switch() in their pristine 5.15 (counter-based) form.
+_BATCH22_PSI_EXTRA = (
+    "static bool test_state(unsigned int *tasks, enum psi_states state)\n"
+    "{\n"
+    "\tswitch (state) {\n"
+    "\tcase PSI_IO_SOME:\n"
+    "\t\treturn unlikely(tasks[NR_IOWAIT]);\n"
+    "\tcase PSI_IO_FULL:\n"
+    "\t\treturn unlikely(tasks[NR_IOWAIT] && !tasks[NR_RUNNING]);\n"
+    "\tcase PSI_MEM_SOME:\n"
+    "\t\treturn unlikely(tasks[NR_MEMSTALL]);\n"
+    "\tcase PSI_MEM_FULL:\n"
+    "\t\treturn unlikely(tasks[NR_MEMSTALL] &&\n"
+    "\t\t\ttasks[NR_RUNNING] == tasks[NR_MEMSTALL_RUNNING]);\n"
+    "\tcase PSI_CPU_SOME:\n"
+    "\t\treturn unlikely(tasks[NR_RUNNING] > tasks[NR_ONCPU]);\n"
+    "\tcase PSI_CPU_FULL:\n"
+    "\t\treturn unlikely(tasks[NR_RUNNING] && !tasks[NR_ONCPU]);\n"
+    "\tcase PSI_NONIDLE:\n"
+    "\t\treturn tasks[NR_IOWAIT] || tasks[NR_MEMSTALL] ||\n"
+    "\t\t\ttasks[NR_RUNNING];\n"
+    "\tdefault:\n"
+    "\t\treturn false;\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "void psi_task_switch(struct task_struct *prev, struct task_struct *next,\n"
+    "\t\t     bool sleep)\n"
+    "{\n"
+    "\tstruct psi_group *group, *common = NULL;\n"
+    "\tint cpu = task_cpu(prev);\n"
+    "\tvoid *iter;\n"
+    "\tu64 now = cpu_clock(cpu);\n"
+    "\n"
+    "\tif (next->pid) {\n"
+    "\t\tbool identical_state;\n"
+    "\n"
+    "\t\tpsi_flags_change(next, 0, TSK_ONCPU);\n"
+    "\t\t/*\n"
+    "\t\t * When switching between tasks that have an identical\n"
+    "\t\t * runtime state, the cgroup that contains both tasks\n"
+    "\t\t * runtime state, the cgroup that contains both tasks\n"
+    "\t\t * we reach the first common ancestor. Iterate @next's\n"
+    "\t\t * ancestors only until we encounter @prev's ONCPU.\n"
+    "\t\t */\n"
+    "\t\tidentical_state = prev->psi_flags == next->psi_flags;\n"
+    "\t\titer = NULL;\n"
+    "\t\twhile ((group = iterate_groups(next, &iter))) {\n"
+    "\t\t\tif (identical_state &&\n"
+    "\t\t\t    per_cpu_ptr(group->pcpu, cpu)->tasks[NR_ONCPU]) {\n"
+    "\t\t\t\tcommon = group;\n"
+    "\t\t\t\tbreak;\n"
+    "\t\t\t}\n"
+    "\n"
+    "\t\t\tpsi_group_change(group, cpu, 0, TSK_ONCPU, now, true);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\tif (prev->pid) {\n"
+    "\t\tint clear = TSK_ONCPU, set = 0;\n"
+    "\n"
+    "\t\t/*\n"
+    "\t\t * When we're going to sleep, psi_dequeue() lets us\n"
+    "\t\t * handle TSK_RUNNING, TSK_MEMSTALL_RUNNING and\n"
+    "\t\t * TSK_IOWAIT here, where we can combine it with\n"
+    "\t\t * TSK_ONCPU and save walking common ancestors twice.\n"
+    "\t\t */\n"
+    "\t\tif (sleep) {\n"
+    "\t\t\tclear |= TSK_RUNNING;\n"
+    "\t\t\tif (prev->in_memstall)\n"
+    "\t\t\t\tclear |= TSK_MEMSTALL_RUNNING;\n"
+    "\t\t\tif (prev->in_iowait)\n"
+    "\t\t\t\tset |= TSK_IOWAIT;\n"
+    "\t\t}\n"
+    "\n"
+    "\t\tpsi_flags_change(prev, clear, set);\n"
+    "\n"
+    "\t\titer = NULL;\n"
+    "\t\twhile ((group = iterate_groups(prev, &iter)) && group != common)\n"
+    "\t\t\tpsi_group_change(group, cpu, clear, set, now, true);\n"
+    "\n"
+    "\t\t/*\n"
+    "\t\t * TSK_ONCPU is handled up to the common ancestor. If we're tasked\n"
+    "\t\t * with dequeuing too, finish that for the rest of the hierarchy.\n"
+    "\t\t */\n"
+    "\t\tif (sleep) {\n"
+    "\t\t\tclear &= ~TSK_ONCPU;\n"
+    "\t\t\tfor (; group; group = iterate_groups(prev, &iter))\n"
+    "\t\t\t\tpsi_group_change(group, cpu, clear, set, now, true);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "}\n"
+)
+
+
+def test_batch22_psi_oncpu_state_mask():
+    print("Batch 22 psi_oncpu_state_mask (TSK_ONCPU as a state-mask bit)")
+    import abk_stable_perf as perf
+
+    group = next((g for g in perf.PATCH_GROUPS
+                  if g.key == "psi_oncpu_state_mask"), None)
+    check("psi_oncpu_state_mask group registered", group is not None)
+    if group is None:
+        return
+    keys = [g.key for g in perf.PATCH_GROUPS]
+    check("registered after the switch whose branch it rewrites",
+          keys.index("psi_oncpu_state_mask")
+          > keys.index("psi_cgroup_pressure_switch"))
+    check("still no psi_group::parent (the 5.15 walk is used)",
+          group.files == ["include/linux/psi_types.h", "kernel/sched/psi.c"]
+          and "NR_ONCPU" not in repr(group.commits))
+
+    files = {
+        "include/linux/cgroup-defs.h": _BATCH21_CGROUP_DEFS,
+        "include/linux/psi.h": _BATCH21_PSI_H,
+        "include/linux/psi_types.h": _BATCH22_PSI_TYPES,
+        "kernel/sched/psi.c": _BATCH21_PSI_C + _BATCH22_PSI_EXTRA,
+        "kernel/cgroup/cgroup.c": _BATCH21_GROUP_C,
+        "Documentation/admin-guide/cgroup-v2.rst": _BATCH21_DOC,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, files)
+        switch = next(g for g in perf.PATCH_GROUPS
+                      if g.key == "psi_cgroup_pressure_switch")
+        s21, d21 = switch.apply_fn(ctx)
+        check("cgroup.pressure is in place first", s21 == "applied", (s21, d21))
+        status, detail = group.apply_fn(ctx)
+        check("all steps land on the composed shape", status == "applied",
+              (status, detail))
+
+        types = ctx.read("include/linux/psi_types.h")
+        check("ONCPU is a flag in the state mask, not a task count",
+              "NR_PSI_TASK_COUNTS = 4," in types
+              and "#define TSK_ONCPU\t(1 << NR_PSI_TASK_COUNTS)" in types
+              and "#define PSI_ONCPU\t(1 << NR_PSI_STATES)" in types
+              and "NR_ONCPU" not in types,
+              [ln for ln in types.split("\n") if "ONCPU" in ln])
+        # The bit has to sit above the state enum, not take a state bit: the
+        # trigger path indexes states by PSI_IO_SOME + res * 2 and would read
+        # someone else's counter otherwise.
+        check("the flag sits above the state enum",
+              "NR_PSI_STATES,\n};\n\n/* ABK stable_515_backport: use one bit "
+              "in the state mask to track" in types
+              and types.index("#define PSI_ONCPU") > types.index("PSI_NONIDLE,"))
+
+        psi_c = ctx.read("kernel/sched/psi.c")
+        check("test_state asks the mask instead of a counter",
+              "enum psi_states state, bool oncpu)" in psi_c
+              and "tasks[NR_RUNNING] > oncpu" in psi_c
+              and "tasks[NR_RUNNING] && !oncpu" in psi_c
+              and "tasks[NR_ONCPU]" not in psi_c)
+        check("the flag is set, cleared or carried before the counts",
+              psi_c.index("if (unlikely(clear & TSK_ONCPU)) {")
+              < psi_c.index("for (t = 0, m = clear; m; m &= ~(1 << t), t++)"))
+        check("the underflow splat counts four states",
+              "tasks=[%u %u %u %u] clear=%x" in psi_c)
+        check("a cgroup with accounting off still carries the flag",
+              "groupc->state_mask = state_mask;" in psi_c
+              and "captured" not in psi_c)
+        check("the switch stops at the first ancestor holding the flag",
+              "per_cpu_ptr(group->pcpu, cpu)->state_mask &\n"
+              "\t\t\t    PSI_ONCPU" in psi_c
+              and "identical_state" not in psi_c)
+        check("other state differences still propagate above that stop",
+              "if ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU) {"
+              in psi_c
+              and "if (sleep) {\n\t\t\tclear &= ~TSK_ONCPU;" not in psi_c)
+
+        snapshot = {rel: ctx.read(rel) for rel in files}
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass is a no-op", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical",
+              all(ctx.read(rel) == snapshot[rel] for rel in files))
 
 
 def test_sublevel_matrix():
@@ -2242,7 +2491,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.26.0", "0.26.0"], _versions)
+          _versions == ["0.27.0", "0.27.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3295,6 +3544,7 @@ def main():
     test_display_valid_clones_revert()
     test_sublevel_matrix()
     test_batch21_psi_cgroup_pressure_switch()
+    test_batch22_psi_oncpu_state_mask()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

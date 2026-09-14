@@ -54,11 +54,14 @@ GROUP_COUNTS = {
     # the absorbed blk_mq_async_depth and blk_mq_quiesced_elevator_switch (the
     # last upstream 5.15.y backlog item, 5.15.209), plus
     # sched_steal_time_excess_drop (5.15.179, the other one), plus the Batch-21
-    # psi_cgroup_pressure_switch (android14-6.1 cgroup.pressure).  The EEVDF pair
-    # is registered pick_logic-first so the sched_entity slot claim only happens
-    # once the fair.c logic has really landed, and the PSI switch is registered
-    # last: it patches text psi_irq_tracking adds to the same file.
-    "stable_perf_backport": 21,
+    # psi_cgroup_pressure_switch (android14-6.1 cgroup.pressure) and
+    # psi_oncpu_state_mask (android14-6.1: TSK_ONCPU becomes a state-mask bit).
+    # The EEVDF pair is registered pick_logic-first so the sched_entity slot
+    # claim only happens once the fair.c logic has really landed; the three PSI
+    # groups are registered in dependency order -- psi_irq_tracking first (the
+    # switch patches the walk it appends), psi_cgroup_pressure_switch next (the
+    # ONCPU group edits its disabled branch).
+    "stable_perf_backport": 22,
     "stable_display_fix": 1,
 }
 

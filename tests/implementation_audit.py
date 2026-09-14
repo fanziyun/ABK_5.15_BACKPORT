@@ -221,6 +221,26 @@ REQUIRED_CONTENT = {
         # User-visible, so documented.
         "  cgroup.pressure\n",
     ],
+    "perf:psi_oncpu_state_mask": [
+        # ONCPU is a flag in the state mask, and the four counters are all that
+        # is left of psi_group_cpu::tasks[].
+        "NR_PSI_TASK_COUNTS = 4,",
+        "#define TSK_ONCPU\t(1 << NR_PSI_TASK_COUNTS)",
+        "#define PSI_ONCPU\t(1 << NR_PSI_STATES)",
+        "static bool test_state(unsigned int *tasks, enum psi_states state, bool oncpu)",
+        "return unlikely(tasks[NR_RUNNING] > oncpu);",
+        "return unlikely(tasks[NR_RUNNING] && !oncpu);",
+        # The flag is set/cleared/carried before the counts, and asked for in
+        # every place the counter used to be.
+        "if (unlikely(clear & TSK_ONCPU)) {",
+        "state_mask = PSI_ONCPU;",
+        "state_mask = groupc->state_mask & PSI_ONCPU;",
+        "if (test_state(groupc->tasks, s, state_mask & PSI_ONCPU))",
+        "if (unlikely((state_mask & PSI_ONCPU) && cpu_curr(cpu)->in_memstall))",
+        "if (per_cpu_ptr(group->pcpu, cpu)->state_mask &",
+        "if ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU) {",
+        "tasks=[%u %u %u %u] clear=%x",
+    ],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
     "core:zram_async_recompress": [
         "Batch 10-1 async recompress engine (plan A)",
@@ -462,6 +482,13 @@ REQUIRED_CONTENT = {
 # file only, for absence claims a *neighbouring* group's legitimate content
 # in a shared file would otherwise defeat).
 REQUIRED_ABSENT = {
+    "perf:psi_oncpu_state_mask": [
+        # The counter and the old "identical state makes the walk safe" trick
+        # have to be gone, not merely bypassed: both were the failure mode.
+        ["include/linux/psi_types.h", "NR_ONCPU"],
+        ["kernel/sched/psi.c", "tasks[NR_ONCPU]"],
+        ["kernel/sched/psi.c", "identical_state"],
+    ],
     "perf:psi_cgroup_pressure_switch": [
         # The ACK 6.1 shape grows struct psi_group (bool enabled) and struct
         # cgroup (struct psi_group *psi, psi_files[]).  Both are KMI-visible
@@ -622,6 +649,25 @@ REQUIRED_ABSENT = {
 # fails the audit.  Keyed as "child:group" -> list of
 # (rel, function_name, must_contain, must_not_contain).
 REQUIRED_IN_FUNCTION = {
+    "perf:psi_oncpu_state_mask": [
+        # The flag must be handled where the mask is built, and it must never
+        # reach the task counters.
+        ("kernel/sched/psi.c", "psi_group_change",
+         ["if (unlikely(clear & TSK_ONCPU)) {",
+          "clear &= ~TSK_ONCPU;",
+          "state_mask = PSI_ONCPU;",
+          "state_mask = groupc->state_mask & PSI_ONCPU;",
+          "test_state(groupc->tasks, s, state_mask & PSI_ONCPU)",
+          "groupc->state_mask = state_mask;"],
+         ["tasks[NR_ONCPU]"]),
+        # Both halves of the switch: the early stop needs the flag, and every
+        # other state difference has to keep propagating above that stop.
+        ("kernel/sched/psi.c", "psi_task_switch",
+         ["per_cpu_ptr(group->pcpu, cpu)->state_mask &",
+          "if ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU) {",
+          "group = iterate_groups(prev, &iter)"],
+         ["tasks[NR_ONCPU]", "identical_state"]),
+    ],
     "perf:psi_cgroup_pressure_switch": [
         # Accounting off has to be handled where the state mask is derived, not
         # in a helper the hot path never reaches, and it has to release the

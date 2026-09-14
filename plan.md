@@ -4,6 +4,8 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 22(v0.27.0,已落地)→ 详见 CHANGELOG.md#batch-22 — PSI 内部同步收口：`TSK_ONCPU` 改为 state mask 的位（去掉 `NR_ONCPU` 计数与 `identical_state` 启发式），仍不引入 `psi_group::parent`
+
 ## Batch 21(v0.26.0,已落地)→ 详见 CHANGELOG.md#batch-21 — android14-6.1 的 per-cgroup PSI 开关（`cgroup.pressure`）：KMI 中性实现（cgroup `flags` 位承载状态，`struct psi_group`/`struct cgroup` 一字节不动），语义与上游逐条对齐；顺带补上「后置组改写前置组新增文本 → 前置组必须有探针」这条陷阱变体
 
 ## Batch 20(v0.25.0,已落地)→ 详见 CHANGELOG.md#batch-20 — 上游 5.15.y 剩余候选清账：`blk_mq_quiesced_elevator_switch`（`9646443f28f3`）与 `sched_steal_time_excess_drop`（`56135262c1f9`）落地，`64d9b734b6fe` 按 arm64 no-op 排除 —— 这条来源线至此无未结候选
@@ -281,11 +283,15 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 - [x] MADV_COLLAPSE（Batch 6 已落地，按 5.15 helper 重写，非 UAPI-only）
 - [x] zram recompression（Batch 4 落地）+ zsmalloc chain-size（Batch 6 落地；
   6.2 来源、6.1.y 未收，来源线取 android15-6.6）
-- [ ] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）— 6.1 把 ONCPU 从"任务计数"改成
-  `state_mask` 里的一位（`TSK_ONCPU = 1 << NR_PSI_TASK_COUNTS`、`PSI_ONCPU = 1 << NR_PSI_STATES`、
-  `test_state(tasks, s, oncpu)`），Batch 21 已证明**父链部分不需要移植**（5.15 的 `iterate_groups()`
-  走 cgroup 树即可）；剩下的 ONCPU 位化是纯内部重构，但要与 Batch 21 的开关分支同一批改（那时
-  `groupc->state_mask = 0` 要跟着变成"只保留 ONCPU 位"），价值需再评估
+- [x] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）→ **Batch 22(v0.27.0) 已落地**
+  （组名 `psi_oncpu_state_mask`）：ONCPU 从"任务计数"改成 state mask 的一位，`NR_ONCPU` 枚举项与
+  `psi_group_cpu::tasks[]` 的第 5 个计数一起消失；`psi_task_switch()` 的 `identical_state` 启发式
+  （"状态相同才敢在共同祖先提前停"）随之作废 —— 位是幂等的，探到已置位的组就是共同祖先。
+  **父链依旧不移植**（也没有移植理由）：5.15 的 `iterate_groups()` 本来就是 cgroup 树走查，
+  位化之后"提前停"只需要探位。尾部条件必须一起改（`if (sleep)` →
+  `(prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU`），否则提前停止会吞掉其它状态差异。
+  6.1 同处的 `lockdep_assert_rq_held(cpu_rq(cpu));` 属另一处上游改动，**有意未移植**
+  （见 CHANGELOG.md#batch-22）。
 
 ## 禁区清单（与 sibling 模块的硬边界）
 

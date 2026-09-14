@@ -137,6 +137,14 @@ suite-preference cross-check.
   (`psi_types.h` must never appear in this group) and
   `implementation_audit.py` pins the absence of the ACK members, so the
   layout promise is machine-checked rather than narrated.
+- **Batch 22 closed the PSI family the same way.** `TSK_ONCPU` becomes a bit of
+  `state_mask` instead of the fifth `psi_group_cpu::tasks[]` slot. That struct
+  is *percpu-internal* (nobody outside `kernel/sched/psi.c` holds one), so shrinking
+  the array is not a KMI event — the same reasoning that allowed the PSI_IRQ state
+  and the heap-only trigger wrapper. What it buys is correctness, not tidiness: a
+  counter cannot be right about "who is on this CPU" across a migration, and the
+  `identical_state` comparison the old `psi_task_switch()` needed was a way to
+  avoid having to know.
 - **Shape probes handle lineage drift.** e.g. the lazy-preemption group
   detects whether the tree already carries
   `android_vh_set_tsk_need_resched_lazy` (newer 5.15 ACK snapshots do) and
