@@ -229,8 +229,13 @@ abk_zram_attach_writeback() {
     return 1
   fi
 
-  # Newer kernels can store the written-back pages still compressed, which
-  # halves the flash traffic for the same RAM win.
+  # Newer kernels can store the written-back pages still compressed, so the
+  # decompression is deferred to whoever reads the slot back instead of being
+  # paid by the sweep.  It does NOT reduce the flash traffic: the bio is still
+  # one full PAGE_SIZE per slot (the tail is zero-padded), so the backing
+  # device sees the same 4 KiB writes either way -- measured on vermeer,
+  # research/zram/vermeer_batch17_check/FINDINGS.md section 3.2.  The win is
+  # CPU on the write path; the cost is CPU on the read path.
   if [ -e "$ABK_ZRAM_DIR/compressed_writeback" ]; then
     abk_write "$ABK_ZRAM_DIR/compressed_writeback" 1 || true
   fi

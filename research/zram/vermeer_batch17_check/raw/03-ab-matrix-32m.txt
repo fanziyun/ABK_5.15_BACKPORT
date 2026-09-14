@@ -1,0 +1,26 @@
+# b17_ab.sh —— 32MiB、data=cat /system/lib64/*.so|head -c 32M（页页不同且可压缩）
+# md5(data)=37b50f27c746b964491875971679299f；每例校验写回前/写回后读回值
+# 同一批里 bd 恒为 7690 页 → 各例工作量相同，可比
+# 7690 = 8192 - 502(same_pages)：same-page 槽被跳过，读回仍逐字节正确
+
+selinux before: Enforcing
+selinux during: Permissive
+data md5: 37b50f27c746b964491875971679299f  size=33554432
+
+### matrix A: compressed_writeback=0
+batch=1    cwb=0 | rc=0 wall=1560ms vcs=7673   ivcs=45   cpu_j=63 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+batch=32   cwb=0 | rc=0 wall=220ms  vcs=2159   ivcs=17   cpu_j=10 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+batch=256  cwb=0 | rc=0 wall=220ms  vcs=439    ivcs=14   cpu_j=7  | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+
+### matrix B: compressed_writeback=1
+batch=1    cwb=1 | rc=0 wall=1430ms vcs=7624   ivcs=94   cpu_j=52 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+batch=32   cwb=1 | rc=0 wall=240ms  vcs=2898   ivcs=8    cpu_j=11 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+batch=256  cwb=1 | rc=0 wall=160ms  vcs=298    ivcs=17   cpu_j=7  | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27 | orig/compr=33554432 14853013
+
+### 重复：两个关键格子
+batch=1    cwb=0 | rc=0 wall=1640ms vcs=7575   ivcs=168  cpu_j=62 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27
+batch=32   cwb=0 | rc=0 wall=180ms  vcs=2051   ivcs=5    cpu_j=10 | bd=[7690 7690 7690] | md5 37b50f27 EQ 37b50f27
+
+selinux after: Enforcing
+zram devices left: /sys/block/zram0
+loops on test img: 0

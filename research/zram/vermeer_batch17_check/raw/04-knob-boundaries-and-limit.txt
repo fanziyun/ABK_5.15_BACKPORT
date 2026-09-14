@@ -1,0 +1,25 @@
+# b17_limits.sh —— 节点边界（设备已 init，正是 compressed_writeback 该报 -EBUSY 的形态）
+
+=== knob boundaries (device /sys/block/zram1) ===
+  writeback_batch_size <- 0        rc=1 now=32      # 显式拒绝 0
+  writeback_batch_size <- 1        rc=0 now=1
+  writeback_batch_size <- 32       rc=0 now=32
+  writeback_batch_size <- 256      rc=0 now=256
+  writeback_batch_size <- 257      rc=0 now=256     # 夹取到 ZRAM_WB_BATCH_SIZE_MAX
+  writeback_batch_size <- 1000000  rc=0 now=256
+  writeback_batch_size <- abc      rc=1 now=256
+  writeback_batch_size <- -1       rc=1 now=256
+  compressed_writeback  <- 0    rc=1 now=0          # init 之后一律 -EBUSY（zram_drv.c:3006）
+  compressed_writeback  <- 1    rc=1 now=0
+  compressed_writeback  <- 2    rc=1 now=0
+  compressed_writeback  <- abc  rc=1 now=0
+
+=== batch=0 那条是无效样本 ===
+（0 被 EINVAL 拒掉，实际仍是 32，所以 bd=[7690 0 7690] 是 batch=32 的结果）
+
+=== 写回上限记账：limit=100 块 ===
+  batch=1    limit=100 -> rc=1 bd=[ 100 0 100] io=[ 0 0 0 0] limit_now=0 wall=40ms
+  batch=32   limit=100 -> rc=1 bd=[ 100 0 100] io=[ 0 0 0 0] limit_now=0 wall=20ms
+  batch=256  limit=100 -> rc=1 bd=[ 100 0 100] io=[ 0 0 0 0] limit_now=0 wall=30ms
+# 三种批大小都恰好 100 页 —— 「提交前扣费」不因批大而超发
+# rc=1(-EIO) 是上游形态：预算耗尽 ret = -EIO; break;

@@ -157,18 +157,82 @@
   AnyKernel3 zip 重新产出。**这一轮构建抓到两个文本审计看不见的 C 级错误**（重复页分配、重复块释放，
   见 §4）——「引入 C 时编译器是唯一的门禁」在本批得到两次实证。
 - [ ] 仍待 ABK CI 复跑：本地构建已证明可编译，CI 用于确认同一 commit 在 CI 工具链/配置下一致。
-- [ ] 待验（刷机后）：`writeback_batch_size`/`compressed_writeback` 节点在/回读；`compressed_writeback=0/1`
-  两种模式下读回页面与原内容逐字节一致；`swapoff`/`reset` 与写回并发无 splat；
-  以及 CPU 侧对照：`writeback_batch_size` 1 vs 32 的写回墙钟与 `bd_stat` 第 2 列，
-  `compressed_writeback` 0 vs 1 的写回 CPU 时间 + 后备设备少写的 4K 页数（压缩写回把解压 CPU
-  从写回搬到读回，在「写回多、读回少」的负载上是净收益，读回密集时可能持平或略增——默认关闭，
-  所以这条取舍不会在未显式启用的设备上发生）。
+- [x] **真机已验证**（2026-09-14，vermeer / 23113RKC6C，原文见 §8）：两个节点在且语义正确
+  （含边界与 `-EBUSY` 窗口）；`compressed_writeback=0/1` 两种模式读回页面与原内容**逐字节一致**；
+  batch 1 vs 32 的墙钟/上下文切换/写回 CPU 全部量化；`writeback_limit` 记账在三种批大小下都不超发。
+  **其中一条预期被证伪**：compressed writeback **不减少**后备设备的 4K 写次数（bio 长度恒为
+  `PAGE_SIZE`，尾部 `memzero_page()` 补零，上游 master 同形），它省的是**写侧 CPU**并把解压搬到
+  读侧 —— 所以「读回密集时可能持平或略增」这半句成立，「后备设备少写的 4K 页数」那半句不成立。
+- [ ] 未覆盖：`swapoff`/`reset` 与写回**并发**的竞态、以及多日稳定性（边界见 §8 末）。
 
 ### 7. 审计基线
 
 - 参考树：`build/abk-trees/{167,178,194,216}`（5.15.167/.178/.194/.216），四者 zram 文本一致；
 - 新增 3 个组后 `GROUP_COUNTS["stable_backport_core"] = 35`（32 + 3），`PRE_APPLIED`/`KNOWN_DEBT` 不变；
 - `tests/sublevel_matrix.py` 的 core 注释已同步。
+
+### 8. 真机验证（vermeer / 23113RKC6C，2026-09-14）
+
+内核 `5.15.216-android13-8-g5bfe2b8c1439`（= 本轮 ROM tier 构建），伴随模块 v0.6.2。完整原文、
+脚本与原始输出：**`research/zram/vermeer_batch17_check/`**。全部实验在 `hot_add` 出来的独立
+zram1 上做（zram0 是在用的 swap，不碰；实验期间 zram0 的 `bd_stat` 保持 `0 0 0`），
+数据用 `cat /system/lib64/*.so`（页页不同且可压缩），每例校验写回前/写回后读回的 md5 与原数据一致。
+
+**节点与语义**：`CONFIG_ZRAM_WRITEBACK=y`；`writeback_batch_size` 默认 32，`0`→EINVAL、
+`257/1000000`→**夹取到 256**、`abc/-1`→EINVAL；`compressed_writeback` **只能在 `disksize` 之前写**，
+已 init 一律 `-EBUSY`（上游形态）——模块 `abk_zram_attach_writeback()` 的写入顺序正因此是对的。
+顺带把 Batch 12 的三条待验一并结了：`abk_{comp,lock,recomp}_algo` 存在、0444、读出 `lz4kd`/`Y`；
+dmesg 有 `comp_algorithm is locked, ignoring a write of 'lzo-rle'`；`backing_dev=loop49` 已挂且
+`writeback_limit` 生效。
+
+**batching（batching 是本批的收益主体）**，64MiB × 3 次，每例 `bd=[15379 0 15379]` 完全一致：
+
+| batch | 墙钟 | voluntary ctx switches | 写回任务 CPU（jiffy，1 j = 4 ms） |
+|---|---|---|---|
+| 1 | 4457 ms | 15186 | 90.7（363 ms） |
+| 32 | 263 ms | 1246 | 14.0（56 ms） |
+
+→ **17× 墙钟 / 12× 上下文切换 / 6.5× CPU**；32MiB 那轮同向（7.3–9.1× / 3.6× / 6.2×）。
+batch 256 把上下文切换再压到 1/17（439 vs 7673），但墙钟不再改善 —— 瓶颈已转到 loop/闪存。
+
+**compressed writeback：写侧省、读侧花**（64MiB，batch=32，3 次，系统级数为 8 核 jiffy、噪声较大）：
+
+| 阶段 | cwb=0 | cwb=1 |
+|---|---|---|
+| 写回：任务自身 CPU（中位） | 20 j | 17 j |
+| 读回：系统级 CPU（中位） | 67 j | 99 j |
+| 读回：任务自身 CPU | 1 j | 1 j（解压不在读者上下文） |
+
+即：写侧省掉那次解压（任务 CPU 低 15–25%），但把 64MiB 全部读回时**读侧系统级 CPU 高约 48%**
+（解压被搬到 `system_highpri_wq`，所以不计在读者 syscall 上，但机器要付）。上游的立论是
+「写回的页大多不会被读回」，按这里的量级盈亏平衡点约在**读回率 25–30%** —— 因此**默认 0 是正确取舍**，
+模块不应强行替用户打开（`zram0` 上 `compressed_writeback=0` 是因为后备设备由 ROM 的 mmd 挂、
+`abk_zram_has_writeback_owner()` 为真，模块按设计只保留不重写）。
+
+**写回上限记账**：`writeback_limit=100` 块，batch 1/32/256 都**恰好写 100 页**（`bd=[100 0 100]`，
+`limit` 归零）—— 这就是「提交前扣费」在真机上的证明：按完成扣费时 batch=256 最多可超发 256 页。
+`rc=1`（`-EIO`）是上游形态（预算耗尽即 `break`），与 bio 错误同码。
+
+**必须记录的平台缺口**：Enforcing 下 loop worker（`u:r:kernel:s0`）读写后备文件被 SELinux 拒，
+`shell_data_file` 与 ROM 自己的 `zram_data_file` **两种上下文都一样被拒**：
+
+```
+avc: denied { write } for comm="kworker/u16:2" path="/data/per_boot/zram/b17_test.img"
+     scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0 tclass=file permissive=0
+```
+
+每一页都退化成 `-EIO`，`alloc_block_bdev()` 随即归还 → `bd_stat` 全 0、写回返回 rc=1。切换
+permissive 后同一脚本同一文件立刻全绿（`rc=0`、`bd=[7690 0 7690]`、md5 一致），实验结束已复原
+Enforcing。含义：**这台 ROM 上 zram writeback 在 Enforcing 下不可用**，包括 ROM 自己挂在 zram0 上的
+loop49（它至今没写回过一页）；这是 sepolicy 缺口，内核侧无解，要靠 ROM 集成或 KSU sepolicy 补丁。
+**上面的性能数据是在 permissive 下测的** —— 它证明的是内核代码路径与代价，不代表当前设备在
+Enforcing 下能拿到这个收益。
+
+边界（没做到的也写清楚）：没在真实 swap 负载（zram0、多 GiB）下写回；没触发 `swapoff`/`reset`
+与写回并发的竞态，也没做多日稳定性观察 —— bf62f69574b1 的 UAF 修复本轮**只验证了「不出错」**
+（dmesg 全程无 zram 相关 splat；仅有的 5 条 `enable_irq` WARNING 是周期性设备问题，其中 2 条
+早于本实验 200 秒以上）。写侧 `zram-policy.sh` 里「compressed writeback … halves the flash traffic」
+的注释与实测不符，已改成 CPU 口径（纯注释，不改行为、不动版本号）。
 
 <a id="batch-16"></a>
 

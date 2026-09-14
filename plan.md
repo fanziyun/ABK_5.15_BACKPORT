@@ -14,6 +14,22 @@
 - `zs_obj_read_begin/end` 与整个 zsmalloc 重写——**不需要**：5.15 `zs_map_object()` 本来就为跨页对象返回连续副本（`mm/zsmalloc.c` 的 per-cpu `vm_buf` 就是为跨页对象分配的），见 CHANGELOG.md#batch-17 的可行性证明表。
 - huge_idle、6.16 writeback ABI（`cf42d4cccf0d`）、`be48c412f6eb`、Documentation 两处改写——无 5.15 消费者或与本批无关。
 
+### 真机验证（2026-09-14 已跑完 → `research/zram/vermeer_batch17_check/`）
+vermeer/23113RKC6C，内核 `5.15.216-android13-8-g5bfe2b8c1439`（= 本轮 ROM tier 构建）。
+在 hot_add 出来的独立 zram1 上做（不碰在用的 zram0），每例都校验写回前/写回后读回的 md5 与原数据一致：
+- **batching**：batch 1→32，64MiB×3 次 → **墙钟 17×、上下文切换 12×、写回任务 CPU 6.5×**
+  （90.7→14.0 jiffy = 363→56 ms）；batch 256 再压上下文切换但不压墙钟（瓶颈转到 loop/闪存）。
+- **compressed writeback**：写侧省、读侧花 —— 写回任务 CPU 低 15–25%，但把 64MiB 全部读回时
+  读侧**系统级** CPU 高约 48%（解压被搬到 `system_highpri_wq`，不计在读者 syscall 上）。
+  按量级盈亏平衡点约在**读回率 25–30%**，故**默认 0 是正确取舍**，模块不应强行打开。
+  同时**证伪**了「后备设备少写 4K 页」：bio 恒为 `PAGE_SIZE`，`bd_writes` 两模式完全相同。
+- **写回上限记账**：`writeback_limit=100` 块，batch 1/32/256 都**恰好写 100 页**（提交前扣费不超发）。
+- **平台缺口（与本批无关但影响可用性）**：Enforcing 下 loop worker 读写后备文件被
+  `avc: denied { write } ... scontext=u:r:kernel:s0 tcontext=u:object_r:zram_data_file:s0` 拒，
+  两种文件上下文都一样 → 这台 ROM 上 **zram writeback 在 Enforcing 下必然 `-EIO`**，
+  连 ROM 自己挂在 zram0 上的 loop49 也一样（`bd_stat` 至今 `0 0 0`）；内核侧无解，
+  要靠 ROM 集成或 KSU sepolicy 补丁。上面的性能数据是在 permissive 下测的。
+
 ## Batch 16(v0.21.0,已落地)→ 详见 CHANGELOG.md#batch-16 — 空实现审计 + 清理
 
 ### 排除项（结论；原文见 CHANGELOG.md#batch-16）
@@ -53,9 +69,12 @@
 ## Batch 12(v0.15.0,已落地)→ 详见 CHANGELOG.md#batch-12 — 内核侧算法锁 + writeback 并存
 
 ### 未结项（原文见 CHANGELOG.md#batch-12）
-- [ ] 待验（需刷入新内核）：`zram.abk_lock_algo` / `zram.abk_comp_algo` 出现且 0444；
-  root 写 `comp_algorithm=deflate` 后节点仍为 `[lz4kd]`（dmesg 有 "is locked to" 一行）；
-  `ABK_515_DEFCONFIG_ROM=1` build 上 `backing_dev` 被模块挂上且 `writeback_limit` 生效。
+- [x] **已验**（2026-09-14，vermeer / 内核 `5.15.216-android13-8-g5bfe2b8c1439`）：
+  `/sys/module/zram/parameters/abk_{comp,lock,recomp}_algo` 三节点存在且 **0444**（读出 `lz4kd` / `Y`）；
+  dmesg 有 `zram: comp_algorithm is locked, ignoring a write of 'lzo-rle'`（开机时 ROM 自己试写被拒）；
+  `ABK_515_DEFCONFIG_ROM=1` build 上 `backing_dev=/dev/block/loop49` 已挂，且
+  `writeback_limit=2752512` + `writeback_limit_enable=1` 生效。
+  证据：`research/zram/vermeer_batch17_check/raw/01-capability-and-nodes.txt`。
 - [ ] 待验（本模块刷入即可，无需新内核）：60 s 内把被改掉的算法改回；日志出现
   `rewrite: size=…`；`action.sh status` 的 `policy` 行。
 
