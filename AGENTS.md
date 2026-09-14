@@ -59,7 +59,18 @@ python3 tests/stable_5_15_test.py                 # unit tests (no kernel tree n
 python3 tests/step_audit.py <tree>                # per-step: anchors land, structure balanced, idempotent
 python3 tests/implementation_audit.py <tree>      # content: no phantom groups, features really present
 bash tests/smoke.sh <tree>                        # end-to-end: 2-pass idempotency + rollback
+python3 tests/config_gate_audit.py <patched-tree> --config <.config>  # nothing added compiles out
 ```
+
+The last one is the only audit that needs a **build artefact** instead of just a
+tree: it diffs every file against its `.abk-orig` snapshot to attribute the CONFIG
+gates this module added, then resolves each symbol against the `.config` the build
+produced, failing on any gate that is off and not recorded in its `DARK_GATES`
+table. A symbol a tier claims to enable but whose `.config` says `not set` is a
+hard failure too — that is the signature of an unmet Kconfig dependency, which is
+how Batch 8's RCU `offload_all` graft stayed dead while reporting `applied`
+(see `CHANGELOG.md#batch-16`). Run it against a build made from the current tiers,
+or a stale `.config` will (correctly) report the tier/config contradiction.
 
 `bash -n` is **not** the shell that runs this code on the phone. Anything that
 ships into the module (`tools/*.sh`, `ksu/**/*.sh`) must also pass `sh -n` under the

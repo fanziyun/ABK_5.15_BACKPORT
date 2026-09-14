@@ -58,6 +58,13 @@ batch is three steps.
   that can catch a graft that compiles but behaves like the source kernel.
 - Full smoke (two-pass idempotency + rollback):
   `bash tests/smoke.sh <tree>`.
+- If the group introduces a Kconfig symbol, map it in
+  `scripts/abk_stable_core.py`'s `_INTRODUCED_KCONFIG` to the tier that enables
+  it (`None` when Kconfig's own default is workable) — a symbol nothing enables
+  means the whole group compiles out while reporting `applied`.  If the group's
+  code is gated on an **existing** symbol instead, that side is covered by
+  `python3 tests/config_gate_audit.py <patched-tree> --config <.config>`, which
+  needs a build artefact and therefore runs at release time, not per group.
 - Extend `tests/smoke.sh` grep assertions if the group lands a load-bearing
   marker — gate the assertion on `sublevel_matrix.applies()` when the marker
   only exists on baselines where the group really rewrites the file.  Then tick
