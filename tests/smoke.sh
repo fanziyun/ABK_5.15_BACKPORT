@@ -303,6 +303,38 @@ grep -q 'abk_zram_recomp_algo\[CRYPTO_MAX_ALG_NAME\] = "zstd"' \
 grep -q 'sizeof(abk_zram_recomp_algo), 0444);' \
   "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
   || fail "zram secondary compressor parameter is writable"
+# Batch 17: the batched writeback sweep, the two fixes it ships with (the
+# wb_ctl UAF and the reserved-block leak) and the compressed-writeback halves.
+grep -q "zram_writeback_endio" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram writeback bio batching missing"
+grep -q "kfree_rcu(wb_ctl, rcu)" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "wb_ctl use-after-free fix (kfree_rcu) missing"
+grep -q "zram_read_from_zspool_raw" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram compressed writeback raw-object read missing"
+grep -q "dev_attr_writeback_batch_size.attr" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "writeback_batch_size attribute missing"
+grep -q "dev_attr_compressed_writeback.attr" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "compressed_writeback attribute missing"
+# Negative side: the one-page synchronous submit has to be gone, and the 6.x
+# zsmalloc mapping API the upstream patch uses must not have been copied in.
+# Both needles carry their call shape: the new read path legitimately waits for
+# its own read bio, and the comments name the upstream API.
+if grep -q "err = submit_bio_wait(&bio);" \
+     "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c"; then
+  fail "zram writeback sweep still submits one page synchronously"
+fi
+# The needle carries its call shape: the new helper block *documents* the 6.x
+# API by name in a comment, so a bare symbol needle would match that comment and
+# fail the assertion it exists to protect.
+if grep -q "zs_obj_read_begin(zram->mem_pool" \
+     "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c"; then
+  fail "zram compressed writeback copied the 6.x zsmalloc mapping API"
+fi
 grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 cfr_reclaim counters missing"
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \

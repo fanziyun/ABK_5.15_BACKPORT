@@ -4099,5 +4099,47 @@ import batch15_core_mm_hotpaths as _b15_mm  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b15_mm.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 17: zram writeback bio batching + compressed writeback.
+# Steps live in scripts/batch17_core_zram_writeback.py.
+#
+# android13-5.15 froze its zram writeback code around 2022, so neither the
+# v6.19 batching series (f405066a1f0d + e828cccb72ed, plus the two post-merge
+# fixes bf62f69574b1 and 3e8d8eb8d7f5) nor the v7.0 compressed-writeback series
+# (d38fab605c66 + 4c1d61389e8e, renamed by ba4c3698e696, fixed by 3bf1c285dc40)
+# ever reached the branch.  Three groups:
+#
+#   zram_writeback_batching    several writeback bios in flight instead of one
+#                              submit_bio_wait() per page.  Upstream drives the
+#                              batch from its post-processing slot machinery,
+#                              which 5.15 does not have, so the in-flight state
+#                              is expressed with ZRAM_UNDER_WB + ZRAM_IDLE.
+#                              The wb_ctl UAF fix (kfree_rcu + rcu_read_lock in
+#                              the completion callback) and the blk_idx leak fix
+#                              are written in from the first new line, so the
+#                              buggy shapes never exist in this tree.  Carries
+#                              the write half of compressed writeback, because
+#                              a later group may not edit this group s
+#                              replacement blocks (see the graft-boundary
+#                              contract in batch10_core_zram_async.py).
+#   zram_wb_batch_size         the sysfs surface of e828cccb72ed, with a
+#                              bounded pool (upstream stores any non-zero u32
+#                              and allocates per unit).
+#   zram_compressed_writeback  store raw zspool objects and decompress on
+#                              demand on the read path; probes for the flag
+#                              field the first group adds and degrades rather
+#                              than half-patching a tree that cannot compile.
+#
+# Ordering is load-bearing: these run AFTER batch14, whose
+# zram_writeback_bounds anchors inside writeback_store() -- and batch14 was
+# re-anchored in the same change (its _B_POSTLOCK used to reach the
+# page = alloc_page() line this batch owns) so that no group edits another
+# group s replacement block.  They also run after zram_recompression, whose
+# comps[]/priority bits and zram_read_from_zspool() these groups build on.
+# ============================================================================
+import batch17_core_zram_writeback as _b17_zwb  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b17_zwb.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

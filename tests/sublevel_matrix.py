@@ -30,7 +30,13 @@ GROUP_COUNTS = {
     # (zram_wb_teardown, zram_writeback_bounds, zram_wb_limit_align) + the three
     # Batch-15 absorbed fs/pid hot-path groups (pid_alloc_hotpath_phase2,
     # fd_alloc_hotpath, close_range_hotpath) + the two absorbed MM hot-path
-    # groups (slab_alloc_free_hotpath, hugepage_fault_alloc_fastpath).
+    # groups (slab_alloc_free_hotpath, hugepage_fault_alloc_fastpath) + the three
+    # Batch-17 zram writeback groups (zram_writeback_batching,
+    # zram_wb_batch_size, zram_compressed_writeback).  The Batch-17 three apply
+    # on every baseline too: they are re-anchored onto the 5.15 writeback shape
+    # (ZRAM_UNDER_WB/ZRAM_IDLE rather than pp-slots), and the compressed-read
+    # group probes for the field the batching group adds, so a missing shape
+    # degrades instead of half-patching.
     # The 5.15.167 exception for zram_wb_teardown lives in KNOWN_DEBT below:
     # that baseline predates the group's precondition be48c412f6eb (see the
     # comment there).
@@ -41,7 +47,7 @@ GROUP_COUNTS = {
     # fdtable_alloc_conventions owns that text, and the suite's helper name is
     # one of this module's suite-detection markers.  What is ported
     # (abk_expand_files_needed() and the open_fds walk) is absent from all four.
-    "stable_backport_core": 32,
+    "stable_backport_core": 35,
     # 13 Batch-1..13 groups + the two absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields), the two absorbed
     # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode)

@@ -1885,7 +1885,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.21.0", "0.21.0"], _versions)
+          _versions == ["0.22.0", "0.22.0"], _versions)
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -2698,6 +2698,154 @@ def test_madvise_collapse_revalidate_convention():
           "if (result != SCAN_SUCCEED) {" not in body)
 
 
+def test_batch17_zram_writeback():
+    """Batch 17 registry, anchor hygiene and the C-level shape of the graft."""
+    print("Batch 17: zram writeback batching + compressed writeback")
+    import batch14_core_zram_writeback as b14
+    import batch17_core_zram_writeback as b17
+    import abk_stable_core as core
+
+    keys = [g.key for g in core.PATCH_GROUPS]
+    for key in ("zram_writeback_batching", "zram_wb_batch_size",
+                "zram_compressed_writeback"):
+        check(f"batch17 group {key} registered", key in keys)
+    check("batching runs after zram_writeback_bounds",
+          keys.index("zram_writeback_batching")
+          > keys.index("zram_writeback_bounds"))
+    check("the three batch17 groups keep their order",
+          keys.index("zram_writeback_batching")
+          < keys.index("zram_wb_batch_size")
+          < keys.index("zram_compressed_writeback"))
+
+    steps = []
+    for key, group_steps in (
+        ("b14:writeback_bounds", b14.build_writeback_bounds_steps()),
+        ("b17:batching", b17.build_batching_steps()),
+        ("b17:batch_size", b17.build_batch_size_steps()),
+        ("b17:compressed", b17.build_compressed_steps()),
+    ):
+        for _rel, old, new, _req in group_steps:
+            steps.append((key, old, new))
+
+    # A later anchor that occurs inside an earlier replacement is how
+    # replace_once edits the wrong occurrence or leaves a duplicated copy
+    # behind: no group status and no brace/comment balance check can see it.
+    # This is the exact shape that shipped a stray page = alloc_page() into the
+    # sweep while this batch was being written (the batching group then
+    # replaced the *pristine* copy and left the one Batch 14 had just inserted,
+    # because _B_POSTLOCK_NEW still carried that line while _B_POSTLOCK no
+    # longer did).
+    collisions = []
+    for i, (k1, _o1, n1) in enumerate(steps):
+        for k2, o2, _n2 in steps[i + 1:]:
+            if k1 == k2:
+                # within one group the per-step audit (trap 2) covers it
+                continue
+            if o2 in n1:
+                collisions.append((k1, k2, o2.strip()[:60]))
+    check("no later anchor sits inside an earlier replacement",
+          not collisions, collisions)
+
+    def joined(prefix):
+        return "".join(n for k, _o, n in steps if k == prefix)
+
+    g1 = joined("b17:batching")
+    g2 = joined("b17:batch_size")
+    g3 = joined("b17:compressed")
+
+    # bf62f69574b1: the UAF fix is the only form that may ship.
+    check("wb_ctl is freed through RCU", "kfree_rcu(wb_ctl, rcu)" in g1)
+    check("the buggy kfree(wb_ctl) form is not shipped",
+          "kfree(wb_ctl);" not in g1)
+    check("the completion callback runs inside an RCU read section",
+          "rcu_read_lock();" in g1 and "rcu_read_unlock();" in g1)
+    # 3e8d8eb8d7f5: release the reservation *before* draining.
+    tail = b17._A_TAIL_NEW
+    check("the reserved blk_idx is released before the drain",
+          tail.index("free_block_bdev(zram, blk_idx);")
+          < tail.index("while (atomic_read(&wb_ctl->num_inflight) > 0)"))
+    check("a recycled request drops its block index",
+          "req->blk_idx = 0;" in g1)
+    # 5.15 slot metadata: the block index lives in .element, not in a handle.
+    check("the block index is stored through zram_set_element()",
+          "zram_set_element(zram, index, req->blk_idx)" in g1
+          and "zram_set_handle(zram, index, req->blk_idx)" not in g1)
+    # The sweep must not wait synchronously and must still yield.
+    loop = b17._A_LOOP_NEW
+    check("the sweep no longer submits synchronously",
+          "submit_bio_wait" not in loop)
+    check("the sweep yields once per iteration",
+          loop.count("cond_resched();") == 1)
+    # The gate only *reads* the budget; charging moved into the submission
+    # helper (before submit_bio), or a batch of in-flight bios would overshoot
+    # the configured limit by up to wb_batch_size pages.
+    check("the sweep only reads the writeback budget",
+          loop.count("spin_lock(&zram->wb_limit_lock);") == 1
+          and "zram->bd_wb_limit -=" not in loop)
+    check("the in-flight window is marked with ZRAM_UNDER_WB",
+          "zram_set_flag(zram, index, ZRAM_UNDER_WB)" in loop
+          and "zram_clear_flag(zram, index, ZRAM_UNDER_WB)" in loop)
+    # d38fab605c66 (+ 3bf1c285dc40) write half.
+    # The needle carries its call shape on purpose: the helper block documents
+    # the upstream API by name in a comment, and a bare needle would match the
+    # comment and fail the assertion it is supposed to protect.
+    check("the raw object read uses the 5.15 mapping API",
+          "zs_map_object(zram->mem_pool, handle, ZS_MM_RO)" in g1
+          and "zs_obj_read_begin(zram->mem_pool" not in g1)
+    check("trailing bytes are zeroed before writeback",
+          "memzero_page(page, size, PAGE_SIZE - size)" in g1)
+    check("compressed writeback preserves the slot metadata",
+          "zram_set_obj_size(zram, index, size)" in g1
+          and "zram_set_priority(zram, index, prio)" in g1)
+    check("the write half is gated on the flag", "zram->wb_compressed" in g1)
+    # d38fab605c66 read half, 5.15 zcomp convention included.
+    check("decompression uses the 5.15 stream API",
+          "zcomp_stream_put(zram->comps[prio])" in g3
+          and "zcomp_stream_put(zstrm)" not in g3
+          and "zcomp_decompress(zstrm, src, size, zstrm->buffer)" in g3)
+    check("async read-back decompression is deferred",
+          "queue_work(system_highpri_wq" in g3
+          and "bio_inc_remaining(parent)" in g3)
+    check("a stale read-back zeroes through zero_user()",
+          "zero_user(page, 0, PAGE_SIZE)" in g3
+          and "memset_page(" not in g3)
+    # Defaults, the attribute surface and the bounded pool.
+    check("the batch size defaults to upstream 32 and compressed is off",
+          "zram->wb_batch_size = 32;" in g1
+          and "zram->wb_compressed = false;" in g1)
+    check("the pool is bounded and 0 is rejected",
+          "ZRAM_WB_BATCH_SIZE_MAX" in g2 and "if (!val)" in g2)
+    check("both attributes are published",
+          "dev_attr_writeback_batch_size.attr" in g2
+          and "dev_attr_compressed_writeback.attr" in g3)
+    check("compressed writeback refuses a live device",
+          "return -EBUSY;" in g3 and "zram->wb_compressed = val;" in g3)
+    # step_audit trap 4: the third group shape probe must accept both the
+    # pristine and the already-redirected call site, or it reports
+    # blocked_by_shape on every second pass.
+    src = (Path(__file__).resolve().parent.parent / "scripts"
+           / "batch17_core_zram_writeback.py").read_text()
+    check("the compressed-writeback probe accepts both call shapes",
+          "ret = __zram_bvec_read(zram, page, index, bio, true);" in src
+          and "ret = abk_zram_bvec_read(zram, page, index, bio, true);" in src)
+    # Degradation on a foreign tree: no half-patched writes.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "drivers/block/zram/zram_drv.c": "static int zram_bvec_read(void);\n",
+            "drivers/block/zram/zram_drv.h": "struct zram { int x; };\n",
+        })
+        status, _detail = b17._batching_apply(ctx)
+        check("batching degrades on a foreign tree",
+              status == "blocked_by_shape", status)
+        status, _detail = b17._compressed_apply(ctx)
+        check("compressed writeback degrades without the batching group",
+              status == "blocked_by_shape", status)
+        body = (Path(tmp) / "common" / "drivers/block/zram"
+                / "zram_drv.c").read_text()
+        check("a degraded run writes nothing",
+              body == "static int zram_bvec_read(void);\n", repr(body))
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -2733,6 +2881,7 @@ def main():
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()
+    test_batch17_zram_writeback()
     test_display_valid_clones_revert()
     test_sublevel_matrix()
     test_f2fs_shape_probe()

@@ -346,6 +346,54 @@ REQUIRED_CONTENT = {
         # Mainline writeback_limit_store()'s alignment guard.
         "val = rounddown(val, PAGE_SIZE / 4096);",
     ],
+    # --- Batch 17: zram writeback batching + compressed writeback ----------
+    "core:zram_writeback_batching": [
+        # f405066a1f0d.  The point of the change is the *absence* of the
+        # synchronous single-page submit (asserted in REQUIRED_ABSENT); these
+        # pin the in-flight machinery that replaces it.
+        "struct zram_wb_ctl", "struct zram_wb_req",
+        "zram_writeback_endio", "zram_submit_wb_request",
+        "zram_complete_done_reqs", "zram_select_idle_req",
+        "atomic_read(&wb_ctl->num_inflight)", "wait_event(wb_ctl->done_wait",
+        # bf62f69574b1: the UAF fix must be in the shipped shape, not "fixed
+        # later" -- kfree_rcu() plus an RCU read section in the callback.
+        "kfree_rcu(wb_ctl, rcu)", "rcu_read_lock()",
+        # 3e8d8eb8d7f5: the reserved-but-unused index is released before the
+        # drain, and a recycled request cannot free the slot block twice.
+        "free_block_bdev(zram, blk_idx)", "req->blk_idx = 0;",
+        # 5.15 re-anchor: ZRAM_UNDER_WB/ZRAM_IDLE are the in-flight protocol
+        # that keeps recompression and idle marking off the slot.
+        "zram_set_flag(zram, index, ZRAM_UNDER_WB)",
+        "zram_clear_flag(zram, index, ZRAM_UNDER_WB)",
+        "zram_set_element(zram, index, req->blk_idx)",
+        # d38fab605c66 write half + 3bf1c285dc40: raw object copy with the
+        # 5.15 mapping API (no zs_obj_read_begin), trailing bytes zeroed.
+        "zs_map_object(zram->mem_pool, handle, ZS_MM_RO)",
+        "zs_unmap_object(zram->mem_pool, handle)",
+        "memzero_page(page, size, PAGE_SIZE - size)",
+    ],
+    "core:zram_wb_batch_size": [
+        "wb_batch_size", "zram->wb_batch_size = 32;",
+        "writeback_batch_size_store", "writeback_batch_size_show",
+        "ZRAM_WB_BATCH_SIZE_MAX",
+        "dev_attr_writeback_batch_size.attr",
+    ],
+    "core:zram_compressed_writeback": [
+        # d38fab605c66 read half: the dispatcher and its deferred
+        # decompression, plus the attribute of 4c1d61389e8e/ba4c3698e696.
+        "abk_zram_bvec_read(", "abk_zram_decompress_bdev_page",
+        "abk_zram_deferred_decompress", "system_highpri_wq",
+        "bio_inc_remaining(parent)", "compressed_writeback_store",
+        "zram->wb_compressed = val;",
+        "dev_attr_compressed_writeback.attr",
+        # 5.15 conventions, each a compile-or-behave trap if the 6.x patch is
+        # copied verbatim: the stream put takes the comp, decompress takes
+        # four arguments, and the stale-page path zeroes instead of using
+        # 6.19's memset_page().
+        "zcomp_stream_put(zram->comps[prio])",
+        "zcomp_decompress(zstrm, src, size, zstrm->buffer)",
+        "zero_user(page, 0, PAGE_SIZE)",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -440,6 +488,28 @@ REQUIRED_ABSENT = {
         # struct rq fields themselves stay (removing them would move every field
         # after them and break KMI) -- they are simply dead now.
         ["kernel/sched/fair.c", "this_rq->wake_avg_idle"],
+    ],
+    "core:zram_writeback_batching": [
+        # The synchronous single-page submit is exactly the shape this batch
+        # replaces.  The needle is the *assignment* form, not the bare symbol:
+        # the compressed read-back path (a later group) legitimately waits for
+        # its own read bio, so a bare "submit_bio_wait" needle would be a false
+        # positive.  The old loop comment is pinned for the same reason.
+        ["drivers/block/zram/zram_drv.c", "err = submit_bio_wait(&bio);"],
+        ["drivers/block/zram/zram_drv.c",
+         "A single page IO would be inefficient for write"],
+    ],
+    "core:zram_compressed_writeback": [
+        # The 6.x spellings of the pieces 5.15 does not have.  A verbatim copy
+        # of the upstream patch would drag one of these in, and each is either
+        # a build failure here (zs_obj_read_begin/end, local_copy) or a silent
+        # behaviour difference (memset_page vs zero_user).  The needles carry
+        # their call shape so this file can still *document* the difference in
+        # a comment without tripping its own absence assertion.
+        ["drivers/block/zram/zram_drv.c", "zs_obj_read_begin(zram->mem_pool"],
+        ["drivers/block/zram/zram_drv.c", ", zstrm->local_copy)"],
+        ["drivers/block/zram/zram_drv.c", "zcomp_stream_put(zstrm)"],
+        ["drivers/block/zram/zram_drv.c", "memset_page("],
     ],
 }
 
