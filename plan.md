@@ -32,7 +32,15 @@ vermeer/23113RKC6C，内核 `5.15.216-android13-8-g5bfe2b8c1439`（= 本轮 ROM 
   连 ROM 自己挂在 zram0 上的 loop49 也一样（`bd_stat` 至今 `0 0 0`）；内核侧无解，
   要靠 ROM 集成或 KSU sepolicy 补丁 —— **已由 Batch 18（v0.23.0）用 companion 模块的
   `sepolicy.rule` 打通并复测**（Enforcing 下 `bd=[4096 0 4096]`、零残留 AVC）。
-  上面的性能数据仍是在 permissive 下测的。
+  上面的性能数据仍是在 permissive 下测的——**已于同日用 `b17_inflight.sh` 在 Enforcing 下
+  重测**（FINDINGS.md §7）：在飞并发峰值精确等于 batch（1/8/32；batch=256 被 loop 的
+  `nr_requests=128` 封顶），请求数/扇区数/`bd_stat` 全部不变（7690 / 61520），上下文切换与
+  任务 CPU 各降到约 1/3.7；墙钟在本机波动 430–1970ms，**不是可靠判据**。cwb 只复现方向
+  （读侧系统级 CPU 中位 +39%，写侧落在 jiffy 分辨率内），`bd_writes` 两模式仍完全相同。
+- **可用性现实（同次会话发现，FINDINGS.md §8）**：本机 writeback **根本不会被触发**——
+  `mmd` 不在运行、`vendor.zram.disable=1`、zram0 的 loop49 后备文件已被 unlink
+  （`losetup -a` 显示空目标），companion 也只挂/保后备设备、从不写 `writeback` 节点。
+  这两个特性在本机是**未被执行过的代码**；「连续打开 20 个应用」不可能测到它们。
 
 ## Batch 16(v0.21.0,已落地)→ 详见 CHANGELOG.md#batch-16 — 空实现审计 + 清理
 

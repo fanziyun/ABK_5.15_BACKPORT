@@ -171,3 +171,110 @@ avc: denied { write } for comm="kworker/u16:2" path="/data/per_boot/zram/b17_tes
 - §3.2 的**系统级 CPU 噪声较大**（8 核 jiffy，窗口 ~0.5s），结论主要依据**任务自身 CPU**
   这一tight 指标；读侧的 +50% 用中位数判断，未做统计显著性检验。
 - 换机/换 ROM 后 §2 的节点与 §4 的策略都需重测。
+
+## 7. 直接测量 bio batching：并发深度（同日复测，**全程 Enforcing**）
+
+仪器：本目录 `b17_inflight.sh`（mksh 语法、`sh -n` 通过；**从不调用 setenforce**，开头
+直接对非 Enforcing 退出；只用 hot_add 出来的 zram1，zram0 一行未碰）。原始输出
+`raw/13-inflight-and-cwb-enforcing.txt`（3 次完整重复 + 1 轮 cwb）。
+
+### 7.1 为什么不能靠数 bio / 数 I/O 来验证 batching
+
+移植后的路径**每页仍然只建一个请求**（`scripts/batch17_core_zram_writeback.py`：
+`bio_init(&req->bio, &req->bio_vec, 1)` + `bio_add_page(&req->bio, req->page, PAGE_SIZE, 0)`），
+只是异步提交、最多 `wb_batch_size` 个同时在飞。因此**请求数、bio 数、总扇区数在
+batch=1 与 batch=256 下逐字节相同**——实测 7690 请求 / 61520 扇区 / `bd_stat` 相同，
+6 次重复无一例外。**batching 买的是并发深度，不是更少的 I/O**；能区分两者的唯一直接
+观测量是「同时有多少个请求在飞」。这也纠正了「打开 20 个应用看 bd_stat」这类测法：
+它连方向都指错了。
+
+测法：`block_rq_issue` + `block_rq_complete` tracepoint，按测试 loop 设备算出的
+`dev` 原始值（`major*1048576+minor`，见 tracepoint `print fmt` 的 `huge_encode_dev` 编码）
+过滤；每行 µs 时间戳拆成整数（时间戳恒 6 位小数），键取 `µs*2`（issue 再 +1），使一次
+`sort -n` 既排序又让同微秒的 completion 先于 issue（对峰值偏保守），再单次扫描出在飞
+峰值与时间加权平均，另取相邻 issue 间隔分位数。`block_bio_complete` 在这里**不可用**：
+它只对带 `BIO_TRACE_COMPLETION` 的 bio 触发，即只有 blktrace 在跑时才出现
+（实测 0 条，而 `block_rq_*` 7690 条）。
+
+### 7.2 结果（32MiB、cwb=0；下表为 `raw/13` 那一轮）
+
+| batch | 在飞峰值 | 时间加权平均 | issue 间隔 p50 | p90 | 请求数 | 扇区 | 墙钟(traced) | vcs | 任务 CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | **1** | 0.60 | 90 µs | 118 µs | 7690 | 61520 | 740 ms | 7693 | 29 j |
+| 8 | **8** | 6.36 | 8 µs | 38 µs | 7690 | 61520 | 140 ms | 1897 | 6 j |
+| 32 | **32** | 28.69 | 10 µs | 47 µs | 7690 | 61520 | 210 ms | 1812 | 11 j |
+| 256 | **128** | 108.07 | 9 µs | 17 µs | 7690 | 61520 | 240 ms | 324 | 9 j |
+
+6 次重复下，**在飞峰值恒等于 1 / 8 / 32**，无一次例外——batching 的机制到此不再依赖墙钟
+推断。三点必须一起读：
+
+1. **峰值 == batch，而请求数与扇区数完全不变**：这是「并发、未合并」的判据。
+2. **batch=256 的峰值只有 128**：loop 设备的 `queue/nr_requests` 实测为 **128**，所以
+   `wb_batch_size` 再往上加也压不进更深的队列。这是设备属性，不是移植缺陷；真实旋钮
+   上限应视作 `min(wb_batch_size, 128)`。
+3. **issue 间隔 p50 从 ~90–220 µs 掉到 4–13 µs**：batch=1 每页要等一个完整来回，
+   batch>=8 是连续灌入。
+
+### 7.3 墙钟不是这台设备上的可靠判据（方法论，重要）
+
+同一配置 batch=1 在 6 次运行里墙钟为 **430–1970 ms**（相差 4.6 倍），batch=32 为
+**140–420 ms**——设备自身的负载波动远大于待测差异。稳定的判据是三个：自愿上下文切换
+（batch=1 中位 ~7590，约等于页数；batch=32 中位 ~2043，**3.7x**）、任务 CPU jiffy
+（中位 41 -> 12 j，**3.6x**）、以及上面的 trace 指标；墙钟中位 1200 ms -> 240 ms（**5x**）。
+
+因此**不要**把 §3.1 的「17x」当作可复现的规格：那是 64MiB 数据集、当时较空闲的设备、且
+permissive 下的数字。本轮既没有复现也没有推翻它——条件不同。可复现的说法是「上下文切换
+与任务 CPU 各降到约 1/3.7」。
+
+### 7.4 compressed writeback：只复现了方向（32MiB、batch=32、3+3 次）
+
+- **写侧**：任务自身 CPU cwb=0 中位 6.5 j、cwb=1 中位 6.0 j；6 次里 2 次低 ~20%、2 次无
+  差别、2 次反向。**方向正确但被 jiffy 分辨率吃掉**。
+- **读侧**：系统级 CPU（8 核 jiffy）cwb=0 中位 28.5、cwb=1 中位 39.5（**+39%**），两轮
+  方向一致；而 `dd` 子进程自身的 user/sys 都落在 1 jiffy（4ms）量化噪声内，看不出差别
+  ——与「解压被搬到 `system_highpri_wq`、不记在读者账上」的设计一致。§3.2 的 **+50%**
+  方向复现，量级无法在本轮分辨。
+- **I/O 完全不变**：`bd=[7690 7690 7690]` 两模式相同，**§3.2「cwb 不减少 4K 写次数」
+  再次成立**。
+- **方法论结论**：batch=32 之后一次 32MiB 写回只有 ~60–70 ms / 4–10 jiffy，**jiffy 分辨率
+  不足以分辨 cwb 的解压节省**。要量出 §3.2 量级的差异必须放大数据集（Batch 17 用 64MiB）
+  或把重复提到几十次。换句话说：**batching 生效之后 cwb 的收益变得更难测**，因为被省掉的
+  那部分只是写回总代价里固定的一小段。
+- **12 个单元格全部** `rc=0`、`md5=EQ`、**`zram_avc=0`**：Batch 18 那条规则在
+  Enforcing 下覆盖整个矩阵（§4.1 只验过 2 个单元格，这里补全）。
+
+## 8. 运行期现实：这台设备上 writeback 根本不会被触发
+
+§7 证明了代码路径正确，但它同时暴露出一个更基础的事实——**当前配置下没有任何东西会去
+触发 writeback**，所以这两个特性在本机是「不可达」的，而不是「收益小」：
+
+| 证据 | 观察值 |
+|---|---|
+| `mmd` 进程 | **不存在**（`ps -A` 只有 `vendor.xiaomi.hardware.swap@1.0-service`） |
+| `init.svc.mmd_setup` | `stopped`（开机 33.8s 跑过一次 oneshot 后退出） |
+| `vendor.zram.disable` | **`1`** |
+| `losetup -a` 的 loop49（zram0 的后备设备） | `/dev/block/loop49: [64819]:313194 ()` —— **文件名是空的**，即后备文件已被 unlink，loop 设备还挂着那个孤立 inode |
+| `/data/per_boot/zram/` | 只剩本次实验的 `b17_probe.img`，**ROM 自己的后备文件不在** |
+| zram0 本次开机 615 秒后 `bd_stat` | `[1 0 1]` —— 那 1 块来自我们自己的实验 |
+| companion 侧 | `zram_recompress_trigger.sh` 只写 `idle` 与 `recompress*`；`abk_zram_attach_writeback()` 只**挂/保**后备设备，**没有任何一处写 `writeback` 节点**（§5.1 的设计） |
+
+含义：
+
+- **「连续打开 20 个应用」不可能测到这两个特性**：应用启动走的是 zram 压缩/换出热路径，而
+  batching 与 cwb 都在 `writeback_store()` 里；本机连一次 writeback 都不会发生，预期差异
+  恒等于 0。这不是测法不够灵敏，而是**被测路径没有被进入**。
+- 因此 Batch 17/18 的代码在本机当前配置下是**未被执行过的代码**（除我们的实验）。它是否
+  值得保留，取决于是否要让 writeback 真的跑起来——这是产品决策，不是性能决策：
+  要跑起来必须有人 (a) 让 ROM 的 mmd 回来（其后备文件现在已被 unlink），或 (b) 让 companion
+  自己按预算发 sweep（`echo <age> > idle` + `echo idle > writeback`，受 `writeback_limit`
+  约束）。后者会给闪存写入量，且 cwb 的盈亏平衡点在 §3.2 的读回率 ~25–30%——而**真实读回率
+  目前无人测过**。
+- 本轮**没有改任何内核或模块代码**，因此版本号不动（仍是 module 0.23.0 / companion v0.7.0），
+  本批只新增一个测量脚本与本节记录。
+
+### 8.1 下一个该测的东西（如果要把 §8 变成收益）
+
+不是启动 20 个应用，而是一次**计数研究**：在真实使用的一段时间里记录 `bd_stat` /
+`io_stat` / `/proc/swaps` 的增量，以及写回后**被读回的页比例**。读回率是 cwb 唯一的
+决策参数，且只能在真实负载下测——而它必须在 writeback 真的被触发之后才有意义。
+
