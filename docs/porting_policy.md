@@ -119,6 +119,24 @@ suite-preference cross-check.
   `psi_group_cpu` states, enum additions). Vendor tracepoints are additive
   and may be introduced; new struct members never grow KMI-visible
   structs.
+- **Batch 21 resolved the last "blocked on a restructure" PSI item without
+  one.** `cgroup.pressure` (the per-cgroup PSI accounting switch) looked
+  blocked because ACK 6.1 stores its state in `struct psi_group::enabled` and
+  walks ancestors through `struct psi_group::parent`. On this baseline
+  `struct psi_group` is *embedded* in `struct cgroup`, so either member would
+  move `bpf`/`congestion_count`/`freezer`/`ancestor_ids[]`. The port keeps the
+  semantics and drops the layout change: the state is the existing
+  `CGRP_PSI_DISABLED` bit of the cgroup's own `flags` word
+  (`unsigned long`, so no member moves), the ancestor walk stays the 5.15
+  `iterate_groups()` cgroup-tree walk, and the root cgroup's switch — whose
+  pressure files are backed by `psi_system` rather than by an embedded group —
+  lives in a psi.c flag.  Deliberate deviation: 5.15 predates
+  `kernfs_show()`/`KERNFS_HIDDEN` (they arrived with this very feature), so the
+  pressure files are not hidden; a disabled group reports `-EOPNOTSUPP`
+  instead of frozen numbers.  `tests/stable_5_15_test.py` pins the file list
+  (`psi_types.h` must never appear in this group) and
+  `implementation_audit.py` pins the absence of the ACK members, so the
+  layout promise is machine-checked rather than narrated.
 - **Shape probes handle lineage drift.** e.g. the lazy-preemption group
   detects whether the tree already carries
   `android_vh_set_tsk_need_resched_lazy` (newer 5.15 ACK snapshots do) and

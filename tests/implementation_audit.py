@@ -199,6 +199,28 @@ REQUIRED_CONTENT = {
     ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
+    "perf:psi_cgroup_pressure_switch": [
+        # The switch itself: a cgroup flag bit, the query the accounting paths
+        # ask, the re-enable sync and the knob that drives them.
+        "CGRP_PSI_DISABLED",
+        "static bool psi_group_enabled(struct psi_group *group)",
+        "&container_of(group, struct cgroup, psi)->flags",
+        "bool psi_cgroup_accounting_enabled(struct cgroup *cgrp)",
+        "void psi_cgroup_accounting_set(struct cgroup *cgrp, bool enable)",
+        "void psi_cgroup_restart(struct psi_group *group)",
+        "static int cgroup_pressure_show(struct seq_file *seq, void *v)",
+        "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of,",
+        '\t\t.name = "cgroup.pressure",',
+        "\t\t.seq_show = cgroup_pressure_show,",
+        # The trigger writer has to have yielded the name, or the base-file entry
+        # above would route cgroup.pressure writes into the trigger path.
+        "static ssize_t pressure_write(struct kernfs_open_file *of, char *buf,",
+        "\treturn pressure_write(of, buf, nbytes, PSI_IO);",
+        "\treturn pressure_write(of, buf, nbytes, PSI_MEM);",
+        "\treturn pressure_write(of, buf, nbytes, PSI_CPU);",
+        # User-visible, so documented.
+        "  cgroup.pressure\n",
+    ],
     "perf:sched_lazy_preemption_hooks": ["resched_curr_lazy"],
     "core:zram_async_recompress": [
         "Batch 10-1 async recompress engine (plan A)",
@@ -440,6 +462,20 @@ REQUIRED_CONTENT = {
 # file only, for absence claims a *neighbouring* group's legitimate content
 # in a shared file would otherwise defeat).
 REQUIRED_ABSENT = {
+    "perf:psi_cgroup_pressure_switch": [
+        # The ACK 6.1 shape grows struct psi_group (bool enabled) and struct
+        # cgroup (struct psi_group *psi, psi_files[]).  Both are KMI-visible
+        # layouts on android13-5.15, so this port must not have grown them: the
+        # state lives in the cgroup's flags word instead.
+        ["include/linux/psi_types.h", "\tbool enabled;"],
+        ["include/linux/cgroup-defs.h", "struct psi_group *psi;"],
+        ["include/linux/cgroup-defs.h", "struct cgroup_file psi_files["],
+        # ... and the old trigger-writer name must be gone, or cgroup.pressure
+        # would be wired to the trigger path instead of to the switch.
+        ["kernel/cgroup/cgroup.c",
+         "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, "
+         "char *buf,\n\t\t\t\t\t  size_t nbytes, enum psi_res res)"],
+    ],
     "display:drm_valid_clones_revert": [
         "drm_atomic_check_valid_clones",
         "drm_atomic_check_valid_clones(state, crtc)",
@@ -586,6 +622,34 @@ REQUIRED_ABSENT = {
 # fails the audit.  Keyed as "child:group" -> list of
 # (rel, function_name, must_contain, must_not_contain).
 REQUIRED_IN_FUNCTION = {
+    "perf:psi_cgroup_pressure_switch": [
+        # Accounting off has to be handled where the state mask is derived, not
+        # in a helper the hot path never reaches, and it has to release the
+        # sequence counter it still holds.
+        ("kernel/sched/psi.c", "psi_group_change",
+         ["if (unlikely(!psi_group_enabled(group)))",
+          "groupc->state_mask = 0;",
+          "write_seqcount_end(&groupc->seq);"],
+         []),
+        # Re-enabling rebuilds every CPU's mask under that CPU's rq lock, the
+        # only place the counts and cpu_curr() are stable.
+        ("kernel/sched/psi.c", "psi_cgroup_restart",
+         ["if (!psi_group_enabled(group))",
+          "rq_lock_irq(rq, &rf);",
+          "psi_group_change(group, cpu, 0, 0, cpu_clock(cpu), true);",
+          "rq_unlock_irq(rq, &rf);"],
+         # Every possible CPU, not just the online ones: the masks of offline
+         # CPUs have to be rebuilt too, or they stay stale across the switch.
+         ["for_each_online_cpu"]),
+        # The knob writes the flag and, only when turning accounting back on,
+        # resyncs the group; the root cgroup's files are backed by psi_system.
+        ("kernel/cgroup/cgroup.c", "cgroup_pressure_write",
+         ["psi_cgroup_accounting_enabled(cgrp) != enable",
+          "psi_cgroup_accounting_set(cgrp, enable);",
+          "psi_cgroup_restart(cgroup_ino(cgrp) == 1 ?",
+          "cgroup_kn_unlock(of->kn);"],
+         ["psi_trigger_create"]),
+    ],
     "perf:schedutil_smart_policy": [
         # The ownership gate has to sit in the resolve path itself: a gate that
         # lands in a helper nobody calls is exactly the "compiles but behaves

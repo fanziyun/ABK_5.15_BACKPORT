@@ -2,6 +2,88 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-21"></a>
+
+## Batch 21(v0.26.0)
+
+起因：Batch 20 结清上游 5.15.y 来源线后，backlog 上剩下的**全是架构级**候选。本批啃掉第一条
+—— android14-6.1 的 **per-cgroup PSI 开关（`cgroup.pressure`）**。Batch 20 留下的可行性探针
+已经把布局结论写进 `plan.md`：`struct psi_group` 是 `struct cgroup` 的**内嵌成员**（其后还有
+`bpf`/`congestion_count`/`freezer`/柔性数组 `ancestor_ids[]`），所以 ACK 6.1 的 `bool enabled`
+加不进任何一方；但 5.15 的 `iterate_groups()` 本来就走 cgroup 树，6.1 新加的 `parent` 指针也
+不需要。于是「cgroup KMI 红线」剩下的唯一约束就是**别动布局**：本批用 cgroup 自己的 `flags`
+（`unsigned long`）承载状态位 `CGRP_PSI_DISABLED`，两个结构体一个字节都不动。
+`module.conf` 0.25.0 → **0.26.0**，`GROUP_COUNTS` perf **20 → 21**。
+
+### 1. 落地：psi_cgroup_pressure_switch（android14-6.1）
+
+语义按 ACK/上游 cgroup-v2.rst `cgroup.pressure` **逐条对齐**：
+
+- **非层级**：关一个 cgroup 不影响其后代，也不需要从 root 逐级开启；
+- **关掉后仍然数任务**：`psi_group_change()` 保留 `groupc->tasks[]` 更新（上层与下层都要读这些
+  计数），只跳过 `test_state()` 推导与 `record_times()` 计时，然后 `write_seqcount_end()` 直接
+  返回；开关是在 state mask 推导处生效的，不是在某个热路径到不了的 helper 里；
+- **重新打开要重建**：`psi_cgroup_restart()` 对**每个 possible CPU**加 rq 锁，调
+  `psi_group_change(group, cpu, 0, 0, cpu_clock(cpu), true)`，用留下来的计数重算 state mask 并
+  重启状态时钟（与 6.1 同形，`for_each_possible_cpu` 而不是 online，否则关掉期间离线的 CPU
+  会带着旧 mask 复活）；
+- **关掉就没有压力数据**：`psi_show()` 与 `psi_trigger_create()` 返回 `-EOPNOTSUPP`。
+
+| 位置 | 改动 |
+|---|---|
+| `include/linux/cgroup-defs.h` | `CGRP_KILL` 之后新增 `CGRP_PSI_DISABLED`（**位**，不动任何偏移） |
+| `kernel/sched/psi.c` | `psi_system_accounting_disabled` + `psi_group_enabled()`（`container_of` 反查 cgroup）；`psi_group_change()` 开关分支；`psi_account_irqtime()` IRQ 走查跳过；`psi_show()`/`psi_trigger_create()` 拒绝；`psi_cgroup_accounting_enabled/set()` + `psi_cgroup_restart()` |
+| `include/linux/psi.h` | 三个新入口声明（`#ifdef CONFIG_CGROUPS` 内，与 `psi_cgroup_alloc()` 同块） |
+| `kernel/cgroup/cgroup.c` | 改名 `cgroup_pressure_write()` → `pressure_write()`（与 6.1 同名，4 步全部 required）；新增 `cgroup_pressure_show()/cgroup_pressure_write()`；`cgroup_base_files[]` 增加 `cgroup.pressure` 条目 |
+| `Documentation/admin-guide/cgroup-v2.rst` | 新增 `cgroup.pressure` 手册节（上游措辞 + 本实现的两条差异说明） |
+
+三条设计判断，以及为什么：
+
+1. **root cgroup 走 `psi_system`**。5.15 的 `cgroup_psi()` 只是 `&cgrp->psi`，
+   `iterate_groups()` 又**永不返回 root 自己的组**（root 没有 parent），root 的 `*.pressure`
+   文件由 `cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi` 兜住。因此 `psi_system` 没有
+   cgroup 可挂旗标，它的开关状态落在 psi.c 的静态变量上 —— 这是 6.1 `psi_system.enabled` 的
+   等价物，不是第二条真值来源（cgroup 侧只有一个 bit）。
+2. **不隐藏压力文件，改为 `-EOPNOTSUPP`**。6.1 用 `kernfs_show()` + `KERNFS_HIDDEN` +
+   `cgroup_file_show()` 把 `*.pressure` 从目录里摘掉，而这三个机制**正是随本特性一起进树的**
+   （5.15 的 kernfs 里没有它们，已核对 `fs/kernfs/dir.c` 与 `include/linux/kernfs.h`）。为了一个
+   目录可见性的 nicety 去移植 VFS 层隐藏机制，收益与风险不成比例；读一个关了账的 cgroup 得到
+   `EOPNOTSUPP` 而不是**冻结的旧数字**，对消费者是同一个信号。手册节把这条写明。
+3. **`psi_types.h` 保持不动**，并把它钉进单测与审计：本组 `files` 里**没有**
+   `include/linux/psi_types.h`（单测直接断言这一条），`REQUIRED_ABSENT` 再钉死
+   `psi_types.h` 不得出现 `\tbool enabled;`、`cgroup-defs.h` 不得出现 `struct psi_group *psi;`
+   与 `psi_files[`。
+
+### 2. 这次改动暴露出的**陷阱 2 变体**（已写进 `docs/group_recipe.md`）
+
+本组要改写 `psi_irq_tracking`（Batch 3）**自己加进去**的那段 IRQ 走查文本，于是它的 `new` 块
+在第二遍扫描时不再逐字存在，而 `old` 锚点仍在 —— 它**又追加了一遍整个函数**，树里出现两份
+`psi_account_irqtime()`。`step_audit.py` 的第二遍断言当场抓住（`psi_irq_tracking reported
+applied on the patched tree, expected already_present`）。修法是给 `psi_irq_tracking` 加形状探针
+（`psi_account_irqtime` 在 `psi.c` 里即 `already_present`）：`apply_steps` 是事务性的，「函数在」
+就等于「本组全在」。规则：**后置组只要改写前置组新增的文本，前置组就必须有探针**，否则第二遍
+不是幂等而是重复注入。
+
+### 3. 验证
+
+本地四档（167/178/194/216）全绿：`python3 -m py_compile scripts/*.py tests/*.py`、
+`stable_5_15_test.py`（新增 `test_batch21_psi_cgroup_pressure_switch`：合成 fixture 跑满 15 步 +
+KMI/顺序/幂等断言）、`step_audit.py`、`implementation_audit.py`、`smoke.sh` 各四遍；
+`smoke.sh` 四档 pass1 本组都 `applied`（216 行整体 `13 applied + 8 already_present`），两遍
+幂等且回滚字节一致。`config_gate_audit.py` **不需要复跑**：本组没有引入任何新的 CONFIG 门
+（唯一新增的 `#ifdef` 是既有的 `CONFIG_CGROUPS`），门禁结论不变。
+
+顺手修掉两处存量缺口（都是这套门禁自己藏着的）：
+
+1. `tests/stable_5_15_test.py` 的「released version」钉子还停在 **0.23.0** —— Batch 19/20 各升
+   一次版本都没跟，也就是这套单测**已经红了两批**而没被当成失败读；本批跟到 0.26.0。
+2. `step_audit.py` 的 `/* */` 平衡检查对**所有**被改文件生效。本批第一次改 `.rst` 文档，
+   而文档里的 `/proc/pressure/*` 会贡献一个未闭合的 `/*` —— 检查已限定在 `.c/.h/.S`：该检查
+   的语义只对 C 源码成立，对纯文本文档是噪声。
+
+新增 C 只有编译能证明，所以本批次仍以 **ABK CI 编译**为最终门禁（本地 WSL 已按需关闭），
+run 记录见 Batch 22 前后追加的 `CI 编译门禁`条目。
+
 <a id="batch-20"></a>
 
 ## Batch 20(v0.25.0)

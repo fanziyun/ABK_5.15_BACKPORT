@@ -31,6 +31,7 @@ FETCH_FILES=(
   Makefile
   arch/arm64/configs/gki_defconfig
   Documentation/admin-guide/kernel-parameters.txt
+  Documentation/admin-guide/cgroup-v2.rst
   fs/file.c
   mm/page_alloc.c
   mm/compaction.c

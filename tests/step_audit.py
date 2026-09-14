@@ -67,6 +67,8 @@ SUB_LEVEL = sublevel_matrix.DEFAULT_SUB_LEVEL
 AUDIT_FILES = [
     "fs/file.c",
     "Documentation/admin-guide/kernel-parameters.txt",
+    # Batch 21: cgroup.pressure documents itself in the cgroup v2 manual.
+    "Documentation/admin-guide/cgroup-v2.rst",
     "kernel/rcu/Kconfig",
     "kernel/rcu/tree_nocb.h",
     "mm/page_alloc.c",
@@ -223,6 +225,9 @@ def record_steps(module, sink, status_sink=None):
     return original
 
 
+C_SUFFIXES = (".c", ".h", ".S")
+
+
 def comment_delta(text):
     return text.count("/*") - text.count("*/")
 
@@ -362,7 +367,12 @@ def audit_child(name, module, pristine_root, work):
                  "step's replacement text")
 
     # Trap 2: comment, brace and #ifdef structure must stay balanced per file.
-    for rel in sorted({rel for rel, _o, _n, _r in steps}):
+    # Only C sources are balanced this way: the module also edits plain-text
+    # documentation (Documentation/admin-guide/*.rst, *.txt), where /* and */
+    # are ordinary characters and a "/proc/pressure/*" glob legitimately adds
+    # an unbalanced "/*".
+    for rel in sorted({rel for rel, _o, _n, _r in steps
+                       if rel.endswith(C_SUFFIXES)}):
         after_text = common.read_text(tree / rel)
         for label, delta, why in STRUCTURE_CHECKS:
             before = delta(pristine_texts[rel])

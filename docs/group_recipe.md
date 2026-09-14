@@ -105,14 +105,33 @@ time; `tests/step_audit.py` catches them on a pristine tree:
    own group — this is why the 5.15.195 `replace_fd()` fix is
    `fdtable_replace_fd_errno` rather than a step inside
    `fdtable_alloc_conventions` (which returns early from 5.15.191 onwards).
+5. **A later group editing an earlier group's added text (trap-2, one group
+   removed).** Idempotency for a step means "my `new` block is already in the
+   file". If a *later* group rewrites text an earlier group appended, the
+   earlier group's `new` no longer matches while its `old` anchor still does —
+   so on the second pass it appends its payload **again**. Batch 21 hit this
+   from the other side: `psi_cgroup_pressure_switch` adds the accounting switch
+   to the IRQ walk `psi_irq_tracking` appends, and the second pass produced two
+   `psi_account_irqtime()` definitions — caught by `step_audit.py`'s second-pass
+   status assertion (`psi_irq_tracking reported applied on the patched tree,
+   expected already_present`), not by the first pass.  The fix is a **shape
+   probe** in the earlier group (`if "psi_account_irqtime" in psi.c: return
+   "already_present"`): `apply_steps` is transactional, so the presence of any
+   one of its own payload functions means the whole group is already in.
+   Before editing text that another group contributed, add that probe (and
+   register the two groups in dependency order).
 
 Traps 1–3 are enforced per step by `tests/step_audit.py`: every step of a
 group that must really apply reports `applied` on the pristine tree (never
 `already_present` — the audit consumes `apply_steps`' per-step return values,
 so a mid-group collision fails too), and the `/*`/`*/`, `{`/`}` and
-`#if`/`#endif` balance of each touched file is unchanged.  Trap 4 shows up as a
+`#if`/`#endif` balance of each touched file is unchanged (C sources only:
+the module also edits plain-text documentation, where those are ordinary
+characters).  Trap 4 shows up as a
 group reporting `already_present` on a newer baseline while the hunk you
 expected is missing — run the dry-run on all supported baselines to catch it.
+Trap 5 only shows up on the **second** pass, so it is the patched-tree status
+assertion that matters, not the pristine one.
 
 ## Convention traps (compile clean, behave wrong)
 

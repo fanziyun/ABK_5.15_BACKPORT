@@ -6,7 +6,8 @@ migration flags micro-optimization (5.15.179), the RT scan optimizations
 __release_sock() cond_resched reduction (5.15.197), the semaphore wake_q
 offload (5.15.180), the blk-mq suspend wakeup abort (5.15.198), and the
 android14-6.1 line (lazy preemption + mutex/rwsem wakeup vendor hooks,
-PSI IRQ pressure tracking, PSI trigger kernfs polling).
+PSI IRQ pressure tracking, PSI trigger kernfs polling, and the per-cgroup PSI
+accounting switch `cgroup.pressure`).
 
 KMI notes: the per-task kstack offset reuses task_struct's
 ANDROID_KABI_RESERVE(8) slot instead of growing the struct, and the PSI group
@@ -14,7 +15,11 @@ only removes a bitfield member whose word is force-aligned by ``unsigned :0``
 (upstream-verified no-op for struct layout).  The android14-6.1 groups only
 add vendor tracepoints and heap-internal struct members, so the stable KMI is
 preserved; the ACK 6.1 psi_group pointer/parent rework is deliberately NOT
-ported (it changes struct cgroup layout).
+ported (it changes struct cgroup layout).  The Batch 21 `cgroup.pressure` switch
+keeps its state in the cgroup's own `flags` word (CGRP_PSI_DISABLED) for the same
+reason -- `struct psi_group` is embedded in `struct cgroup`, so the ACK
+`psi_group::enabled` member cannot be added without moving `bpf`/`congestion_count`/
+`freezer`/`ancestor_ids[]`.
 
 Every group degrades to a reported status when its anchor shape is absent.
 From Batch 15 this child is the owner of the sched_entity 1-4 slots (the
@@ -1025,6 +1030,20 @@ def _locking_wakeup_patch_apply(ctx):
 # ---------------------------------------------------------------------------
 
 def _psi_irq_tracking_apply(ctx):
+    # Shape probe.  psi_cgroup_pressure_switch (registered below) adds the
+    # per-cgroup accounting switch to the walk this group appends, so its
+    # psi.c replacement block no longer appears verbatim on the second pass:
+    # without this probe the group would re-append the whole function and the
+    # tree would end up with two psi_account_irqtime() definitions (the module's
+    # trap 2, one group removed).  The function's presence in psi.c is the
+    # group's own all-or-nothing marker -- apply_steps is transactional.
+    try:
+        text = ctx.read("kernel/sched/psi.c")
+    except FileNotFoundError:
+        text = ""
+    if "psi_account_irqtime" in text:
+        return "already_present", (
+            "PSI IRQ accounting is already in the tree")
     steps = [
         # psi_types.h: PSI_IRQ resource and state, gated like the ACK tree
         ("include/linux/psi_types.h",
@@ -1565,6 +1584,397 @@ def _psi_kernfs_polling_apply(ctx):
     return status, detail
 
 
+# ---------------------------------------------------------------------------
+# android14-6.1 line: the per-cgroup PSI accounting switch (cgroup.pressure)
+# ---------------------------------------------------------------------------
+
+# Upstream keeps the switch in struct psi_group::enabled and reaches the
+# ancestor chain through a newly added struct psi_group::parent.  Neither is
+# available on 5.15: struct psi_group is embedded in struct cgroup
+# (cgroup-defs.h), so a new member -- at the front as much as at the back --
+# moves bpf/congestion_count/freezer/ancestor_ids[] and breaks the cgroup KMI.
+# The 5.15 walk (iterate_groups()) already reaches every ancestor level through
+# the cgroup tree, so no parent pointer is needed either.  What the port keeps is
+# the semantics:
+#
+#   * the switch is per cgroup and NOT hierarchical (cgroup-v2.rst: disabling
+#     accounting in a cgroup does not affect its descendants),
+#   * a disabled group keeps counting tasks -- the levels above and below consult
+#     those counts -- but stops deriving state masks and timing them,
+#   * re-enabling rebuilds each CPU's state mask from those counts
+#     (psi_cgroup_restart()), and
+#   * a disabled group has no pressure data to report.
+#
+# The state is therefore the CGRP_PSI_DISABLED bit of the cgroup's own
+# (unsigned long) flags word, and the root cgroup's switch -- whose pressure
+# files are backed by psi_system rather than by an embedded group -- drives a
+# flag in psi.c.  One deviation is deliberate: 5.15 has no kernfs_show() and no
+# KERNFS_HIDDEN (that mechanism arrived with this very series), so the pressure
+# files are not hidden; reading one reports -EOPNOTSUPP instead of frozen
+# numbers, which is the same signal to a consumer.
+
+def _psi_cgroup_pressure_apply(ctx):
+    try:
+        text = ctx.read("kernel/cgroup/cgroup.c")
+    except FileNotFoundError:
+        text = ""
+    if "cgroup.pressure" in text:
+        return "already_present", (
+            "cgroup.pressure is already in the cgroup base files")
+    steps = [
+        # cgroup-defs.h: a flag bit, so no struct offset moves
+        ("include/linux/cgroup-defs.h",
+         "\t/* Control group has to be killed. */\n"
+         "\tCGRP_KILL,\n"
+         "};",
+         "\t/* Control group has to be killed. */\n"
+         "\tCGRP_KILL,\n"
+         "\n"
+         "\t/*\n"
+         "\t * ABK stable_515_backport: PSI accounting is switched off for this\n"
+         "\t * cgroup (cgroup.pressure, android14-6.1).  struct psi_group is\n"
+         "\t * embedded in struct cgroup, so the ACK \"enabled\" member cannot be\n"
+         "\t * added to it; a flag bit moves no member.\n"
+         "\t */\n"
+         "\tCGRP_PSI_DISABLED,\n"
+         "};",
+         T),
+        # psi.h: what the cgroup file needs from psi.c
+        ("include/linux/psi.h",
+         "#ifdef CONFIG_CGROUPS\n"
+         "int psi_cgroup_alloc(struct cgroup *cgrp);\n"
+         "void psi_cgroup_free(struct cgroup *cgrp);\n"
+         "void cgroup_move_task(struct task_struct *p, struct css_set *to);\n"
+         "#endif",
+         "#ifdef CONFIG_CGROUPS\n"
+         "int psi_cgroup_alloc(struct cgroup *cgrp);\n"
+         "void psi_cgroup_free(struct cgroup *cgrp);\n"
+         "void cgroup_move_task(struct task_struct *p, struct css_set *to);\n"
+         "\n"
+         "/* ABK stable_515_backport: per-cgroup PSI accounting switch\n"
+         " * (cgroup.pressure, android14-6.1).\n"
+         " */\n"
+         "bool psi_cgroup_accounting_enabled(struct cgroup *cgrp);\n"
+         "void psi_cgroup_accounting_set(struct cgroup *cgrp, bool enable);\n"
+         "void psi_cgroup_restart(struct psi_group *group);\n"
+         "#endif",
+         T),
+        # psi.c: the helper every accounting path asks, plus the system group's
+        # own switch (psi_system has no cgroup to carry a flag)
+        ("kernel/sched/psi.c",
+         "static void psi_group_change(struct psi_group *group, int cpu,\n"
+         "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
+         "\t\t\t     bool wake_clock)\n",
+         "/* ABK stable_515_backport: per-cgroup PSI accounting switch\n"
+         " * (cgroup.pressure, android14-6.1).  struct psi_group is embedded in\n"
+         " * struct cgroup, so the flag cannot live in the group itself -- a new\n"
+         " * member would move struct cgroup's members.  psi_system has no cgroup\n"
+         " * of its own (the root cgroup's pressure files are backed by it), so the\n"
+         " * root's switch is kept here.\n"
+         " */\n"
+         "static bool psi_system_accounting_disabled;\n"
+         "\n"
+         "static bool psi_group_enabled(struct psi_group *group)\n"
+         "{\n"
+         "#ifdef CONFIG_CGROUPS\n"
+         "\tif (group != &psi_system)\n"
+         "\t\treturn !test_bit(CGRP_PSI_DISABLED,\n"
+         "\t\t\t\t &container_of(group, struct cgroup, psi)->flags);\n"
+         "#endif\n"
+         "\treturn !psi_system_accounting_disabled;\n"
+         "}\n"
+         "\n"
+         "static void psi_group_change(struct psi_group *group, int cpu,\n"
+         "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
+         "\t\t\t     bool wake_clock)\n",
+         T),
+        # psi.c: accounting off -- counts stay live, states stop
+        ("kernel/sched/psi.c",
+         "\tfor (t = 0; set; set &= ~(1 << t), t++)\n"
+         "\t\tif (set & (1 << t))\n"
+         "\t\t\tgroupc->tasks[t]++;\n"
+         "\n"
+         "\t/* Calculate state mask representing active states */\n",
+         "\tfor (t = 0; set; set &= ~(1 << t), t++)\n"
+         "\t\tif (set & (1 << t))\n"
+         "\t\t\tgroupc->tasks[t]++;\n"
+         "\n"
+         "\t/*\n"
+         "\t * ABK stable_515_backport: cgroup.pressure -- with the accounting\n"
+         "\t * switched off, keep the task counts current (the levels above and\n"
+         "\t * below consult them) but stop deriving and timing states.  The\n"
+         "\t * record_times() above already concluded the state that was live when\n"
+         "\t * the switch was turned off.\n"
+         "\t */\n"
+         "\tif (unlikely(!psi_group_enabled(group))) {\n"
+         "\t\tgroupc->state_mask = 0;\n"
+         "\n"
+         "\t\twrite_seqcount_end(&groupc->seq);\n"
+         "\n"
+         "\t\treturn;\n"
+         "\t}\n"
+         "\n"
+         "\t/* Calculate state mask representing active states */\n",
+         T),
+        # psi.c: the IRQ accounting walk (added by psi_irq_tracking) honours it
+        ("kernel/sched/psi.c",
+         "\twhile ((group = iterate_groups(curr, &iter))) {\n"
+         "\t\tu64 now;\n"
+         "\n"
+         "\t\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n",
+         "\twhile ((group = iterate_groups(curr, &iter))) {\n"
+         "\t\tu64 now;\n"
+         "\n"
+         "\t\tif (!psi_group_enabled(group))\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n",
+         T),
+        # psi.c: reports
+        ("kernel/sched/psi.c",
+         "\tif (static_branch_likely(&psi_disabled))\n"
+         "\t\treturn -EOPNOTSUPP;\n"
+         "\n"
+         "\t/* Update averages before reporting them */\n",
+         "\tif (static_branch_likely(&psi_disabled))\n"
+         "\t\treturn -EOPNOTSUPP;\n"
+         "\n"
+         "\t/* ABK stable_515_backport: cgroup.pressure -- a cgroup with the\n"
+         "\t * accounting switched off has no pressure data to report.  5.15 has\n"
+         "\t * no kernfs_show(), so the file stays visible and says so instead of\n"
+         "\t * being hidden with the ACK 6.1 shape.\n"
+         "\t */\n"
+         "\tif (!psi_group_enabled(group))\n"
+         "\t\treturn -EOPNOTSUPP;\n"
+         "\n"
+         "\t/* Update averages before reporting them */\n",
+         T),
+        # psi.c: no new trigger on a group that does not account
+        ("kernel/sched/psi.c",
+         "\tif (static_branch_likely(&psi_disabled))\n"
+         "\t\treturn ERR_PTR(-EOPNOTSUPP);\n"
+         "\n"
+         "\tif (sscanf(buf, \"some %u %u\", &threshold_us, &window_us) == 2)\n",
+         "\tif (static_branch_likely(&psi_disabled))\n"
+         "\t\treturn ERR_PTR(-EOPNOTSUPP);\n"
+         "\n"
+         "\t/* ABK stable_515_backport: cgroup.pressure -- a group with the\n"
+         "\t * accounting switched off never grows a state to trigger on.\n"
+         "\t */\n"
+         "\tif (!psi_group_enabled(group))\n"
+         "\t\treturn ERR_PTR(-EOPNOTSUPP);\n"
+         "\n"
+         "\tif (sscanf(buf, \"some %u %u\", &threshold_us, &window_us) == 2)\n",
+         T),
+        # psi.c: the accessors and the re-enable sync
+        ("kernel/sched/psi.c",
+         "\ttask_rq_unlock(rq, task, &rf);\n"
+         "}\n"
+         "#endif /* CONFIG_CGROUPS */",
+         "\ttask_rq_unlock(rq, task, &rf);\n"
+         "}\n"
+         "\n"
+         "/* ABK stable_515_backport: cgroup.pressure accessors (android14-6.1).\n"
+         " * The root cgroup's pressure files are backed by psi_system, not by an\n"
+         " * embedded group, so its switch lives in this file rather than in a\n"
+         " * cgroup flag.\n"
+         " */\n"
+         "bool psi_cgroup_accounting_enabled(struct cgroup *cgrp)\n"
+         "{\n"
+         "\tif (cgroup_ino(cgrp) == 1)\n"
+         "\t\treturn !psi_system_accounting_disabled;\n"
+         "\n"
+         "\treturn !test_bit(CGRP_PSI_DISABLED, &cgrp->flags);\n"
+         "}\n"
+         "\n"
+         "void psi_cgroup_accounting_set(struct cgroup *cgrp, bool enable)\n"
+         "{\n"
+         "\tif (cgroup_ino(cgrp) == 1) {\n"
+         "\t\tpsi_system_accounting_disabled = !enable;\n"
+         "\t\treturn;\n"
+         "\t}\n"
+         "\n"
+         "\tif (enable)\n"
+         "\t\tclear_bit(CGRP_PSI_DISABLED, &cgrp->flags);\n"
+         "\telse\n"
+         "\t\tset_bit(CGRP_PSI_DISABLED, &cgrp->flags);\n"
+         "}\n"
+         "\n"
+         "void psi_cgroup_restart(struct psi_group *group)\n"
+         "{\n"
+         "\tint cpu;\n"
+         "\n"
+         "\t/*\n"
+         "\t * Switching the accounting off needs no sync: psi_group_change() sees\n"
+         "\t * the switch and only keeps the task accounting.  Switching it back on\n"
+         "\t * has to rebuild every CPU's state mask from the counts that were kept,\n"
+         "\t * and restart the state clock, or the group stays silent.\n"
+         "\t */\n"
+         "\tif (!psi_group_enabled(group))\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tfor_each_possible_cpu(cpu) {\n"
+         "\t\tstruct rq *rq = cpu_rq(cpu);\n"
+         "\t\tstruct rq_flags rf;\n"
+         "\n"
+         "\t\trq_lock_irq(rq, &rf);\n"
+         "\t\tpsi_group_change(group, cpu, 0, 0, cpu_clock(cpu), true);\n"
+         "\t\trq_unlock_irq(rq, &rf);\n"
+         "\t}\n"
+         "}\n"
+         "#endif /* CONFIG_CGROUPS */",
+         T),
+        # cgroup.c: the trigger writer yields its name to the switch, as it does
+        # in the ACK tree (where it became pressure_write())
+        ("kernel/cgroup/cgroup.c",
+         "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,\n"
+         "\t\t\t\t\t  size_t nbytes, enum psi_res res)\n",
+         "/* ABK stable_515_backport: renamed for the cgroup.pressure switch below,\n"
+         " * which takes the cgroup_pressure_write() name as in android14-6.1.\n"
+         " */\n"
+         "static ssize_t pressure_write(struct kernfs_open_file *of, char *buf,\n"
+         "\t\t\t      size_t nbytes, enum psi_res res)\n",
+         T),
+        ("kernel/cgroup/cgroup.c",
+         "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_IO);\n",
+         "\treturn pressure_write(of, buf, nbytes, PSI_IO);\n",
+         T),
+        ("kernel/cgroup/cgroup.c",
+         "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_MEM);\n",
+         "\treturn pressure_write(of, buf, nbytes, PSI_MEM);\n",
+         T),
+        ("kernel/cgroup/cgroup.c",
+         "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_CPU);\n",
+         "\treturn pressure_write(of, buf, nbytes, PSI_CPU);\n",
+         T),
+        # cgroup.c: the knob itself
+        ("kernel/cgroup/cgroup.c",
+         "static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,\n"
+         "\t\t\t\t\t  poll_table *pt)\n",
+         "/* ABK stable_515_backport: cgroup.pressure -- the per-cgroup PSI\n"
+         " * accounting switch of android14-6.1.  Upstream keeps the state in\n"
+         " * struct psi_group; here it is the cgroup's CGRP_PSI_DISABLED flag bit\n"
+         " * (see psi.c), which leaves both struct layouts alone.  Upstream also\n"
+         " * hides the pressure files while accounting is off; 5.15 has no\n"
+         " * kernfs_show(), so they report EOPNOTSUPP instead of being hidden.\n"
+         " */\n"
+         "static int cgroup_pressure_show(struct seq_file *seq, void *v)\n"
+         "{\n"
+         "\tstruct cgroup *cgrp = seq_css(seq)->cgroup;\n"
+         "\n"
+         "\tseq_printf(seq, \"%d\\n\", psi_cgroup_accounting_enabled(cgrp));\n"
+         "\n"
+         "\treturn 0;\n"
+         "}\n"
+         "\n"
+         "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of,\n"
+         "\t\t\t\t     char *buf, size_t nbytes,\n"
+         "\t\t\t\t     loff_t off)\n"
+         "{\n"
+         "\tssize_t ret;\n"
+         "\tint enable;\n"
+         "\tstruct cgroup *cgrp;\n"
+         "\n"
+         "\tret = kstrtoint(strstrip(buf), 0, &enable);\n"
+         "\tif (ret)\n"
+         "\t\treturn ret;\n"
+         "\n"
+         "\tif (enable < 0 || enable > 1)\n"
+         "\t\treturn -ERANGE;\n"
+         "\n"
+         "\tcgrp = cgroup_kn_lock_live(of->kn, false);\n"
+         "\tif (!cgrp)\n"
+         "\t\treturn -ENOENT;\n"
+         "\n"
+         "\tif (psi_cgroup_accounting_enabled(cgrp) != enable) {\n"
+         "\t\tpsi_cgroup_accounting_set(cgrp, enable);\n"
+         "\t\tif (enable)\n"
+         "\t\t\tpsi_cgroup_restart(cgroup_ino(cgrp) == 1 ?\n"
+         "\t\t\t\t\t   &psi_system : &cgrp->psi);\n"
+         "\t}\n"
+         "\n"
+         "\tcgroup_kn_unlock(of->kn);\n"
+         "\n"
+         "\treturn nbytes;\n"
+         "}\n"
+         "\n"
+         "static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,\n"
+         "\t\t\t\t\t  poll_table *pt)\n",
+         T),
+        # cgroup.c: the file, next to the pressure files it controls
+        ("kernel/cgroup/cgroup.c",
+         "\t{\n"
+         "\t\t.name = \"cpu.pressure\",\n"
+         "\t\t.flags = CFTYPE_PRESSURE,\n"
+         "\t\t.seq_show = cgroup_cpu_pressure_show,\n"
+         "\t\t.write = cgroup_cpu_pressure_write,\n"
+         "\t\t.poll = cgroup_pressure_poll,\n"
+         "\t\t.release = cgroup_pressure_release,\n"
+         "\t},\n",
+         "\t{\n"
+         "\t\t.name = \"cpu.pressure\",\n"
+         "\t\t.flags = CFTYPE_PRESSURE,\n"
+         "\t\t.seq_show = cgroup_cpu_pressure_show,\n"
+         "\t\t.write = cgroup_cpu_pressure_write,\n"
+         "\t\t.poll = cgroup_pressure_poll,\n"
+         "\t\t.release = cgroup_pressure_release,\n"
+         "\t},\n"
+         "\t{\n"
+         "\t\t/* ABK stable_515_backport: per-cgroup PSI accounting switch\n"
+         "\t\t * (android14-6.1).  CFTYPE_PRESSURE makes it appear and\n"
+         "\t\t * disappear together with the pressure files it controls.\n"
+         "\t\t */\n"
+         "\t\t.name = \"cgroup.pressure\",\n"
+         "\t\t.flags = CFTYPE_PRESSURE,\n"
+         "\t\t.seq_show = cgroup_pressure_show,\n"
+         "\t\t.write = cgroup_pressure_write,\n"
+         "\t},\n",
+         T),
+        # Documentation: the knob is user-visible, so it is documented
+        ("Documentation/admin-guide/cgroup-v2.rst",
+         "\tIn a threaded cgroup, writing this file fails with EOPNOTSUPP as\n"
+         "\tkilling cgroups is a process directed operation, i.e. it affects\n"
+         "\tthe whole thread-group.\n"
+         "\n"
+         "Controllers\n"
+         "===========\n",
+         "\tIn a threaded cgroup, writing this file fails with EOPNOTSUPP as\n"
+         "\tkilling cgroups is a process directed operation, i.e. it affects\n"
+         "\tthe whole thread-group.\n"
+         "\n"
+         "  cgroup.pressure\n"
+         "\tA read-write single value file that allowed values are \"0\" and \"1\".\n"
+         "\tThe default is \"1\".\n"
+         "\n"
+         "\tWriting \"0\" to the file will disable the cgroup PSI accounting.\n"
+         "\tWriting \"1\" to the file will re-enable the cgroup PSI accounting.\n"
+         "\n"
+         "\tThis control attribute is not hierarchical, so disable or enable PSI\n"
+         "\taccounting in a cgroup does not affect PSI accounting in descendants\n"
+         "\tand doesn't need pass enablement via ancestors from root.\n"
+         "\n"
+         "\tThe reason this control attribute exists is that PSI accounts stalls for\n"
+         "\teach cgroup separately and aggregates it at each level of the hierarchy.\n"
+         "\tThis may cause non-negligible overhead for some workloads when under\n"
+         "\tdeep level of the hierarchy, in which case this control attribute can\n"
+         "\tbe used to disable PSI accounting in the non-leaf cgroups.\n"
+         "\n"
+         "\tWritten on the root cgroup it controls the system-wide pressure\n"
+         "\taccounting reported by the /proc/pressure files.\n"
+         "\n"
+         "\tWhile the accounting of a cgroup is disabled, its pressure files report\n"
+         "\t\"operation not supported\" instead of a stale value.\n"
+         "\n"
+         "Controllers\n"
+         "===========\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 PATCH_GROUPS = [
     PatchGroup(
         "sched_nohz_idle_balance_series",
@@ -1663,6 +2073,14 @@ PATCH_GROUPS = [
         ["ACK android14-6.1 kernfs PSI polling backport (c1496f6 family)"],
         ["include/linux/psi_types.h", "include/linux/psi.h", "kernel/sched/psi.c", "kernel/cgroup/cgroup.c"],
         _psi_kernfs_polling_apply,
+    ),
+    PatchGroup(
+        "psi_cgroup_pressure_switch",
+        "cgroup.pressure: per-cgroup PSI accounting switch, kept off the struct layouts the ACK 6.1 psi_group pointer would move (android14-6.1)",
+        ["ACK android14-6.1 cgroup.pressure switch (psi_group.enabled family)"],
+        ["include/linux/cgroup-defs.h", "include/linux/psi.h", "kernel/sched/psi.c",
+         "kernel/cgroup/cgroup.c", "Documentation/admin-guide/cgroup-v2.rst"],
+        _psi_cgroup_pressure_apply,
     ),
 ]
 

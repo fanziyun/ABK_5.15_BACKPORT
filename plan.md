@@ -4,6 +4,8 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 21(v0.26.0,已落地)→ 详见 CHANGELOG.md#batch-21 — android14-6.1 的 per-cgroup PSI 开关（`cgroup.pressure`）：KMI 中性实现（cgroup `flags` 位承载状态，`struct psi_group`/`struct cgroup` 一字节不动），语义与上游逐条对齐；顺带补上「后置组改写前置组新增文本 → 前置组必须有探针」这条陷阱变体
+
 ## Batch 20(v0.25.0,已落地)→ 详见 CHANGELOG.md#batch-20 — 上游 5.15.y 剩余候选清账：`blk_mq_quiesced_elevator_switch`（`9646443f28f3`）与 `sched_steal_time_excess_drop`（`56135262c1f9`）落地，`64d9b734b6fe` 按 arm64 no-op 排除 —— 这条来源线至此无未结候选
 
 ## Batch 19(v0.24.0,已落地)→ 详见 CHANGELOG.md#batch-19 — 关闭 lts 行的两个降级组（kstack KABI 槽形态分支 + blk-mq suspend 的 already_present 探针），`KNOWN_DEBT` 清空：四档基线上不再有任何「已知降级」
@@ -254,29 +256,36 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 ## 6.1 来源线后续批次（backlog）
 
 - [ ] per-VMA locks（android14-6.1 全量移植；5.15 需 RCU VMA 生命周期 + fault 路径改造 + vma KABI 槽位，参照 rbtree 时代 RFC 设计）
-- [ ] per-cgroup PSI 开关（cgroup.pressure enable/disable）— 被 psi_group 指针/父链重构（cgroup KMI 红线）卡住
-  - **2026-09-15 可行性探针（Batch 20 后）**：5.15 树上 `struct cgroup` / `struct psi_group` /
+- [x] per-cgroup PSI 开关（cgroup.pressure enable/disable）→ **Batch 21(v0.26.0) 已落地**
+  （组名 `psi_cgroup_pressure_switch`）。结论：卡点从来不是「cgroup KMI 红线」本身，而是
+  **不能给 `struct psi_group` 加成员**（它内嵌在 `struct cgroup` 里，其后还有 `bpf`/
+  `congestion_count`/`freezer`/`ancestor_ids[]`）。最终实现用 cgroup 自己的 `flags`（`unsigned long`）
+  承载 `CGRP_PSI_DISABLED` 位，`struct psi_group`/`struct cgroup` 一个字节不动；ACK 6.1 的
+  `psi_group::parent` 也不需要（5.15 的 `iterate_groups()` 本来就走 cgroup 树）。唯一有意的
+  行为差异：5.15 没有 `kernfs_show()`/`KERNFS_HIDDEN`（那套机制随本特性一起进树），所以关掉账的
+  cgroup **不隐藏** `*.pressure`，而是让读取返回 `-EOPNOTSUPP`（不返回冻结旧数字）。详见
+  CHANGELOG.md#batch-21
+  - 探针结论（Batch 20 后记录）保留如下，作为设计输入：5.15 树上 `struct cgroup` / `struct psi_group` /
     `psi_group_cpu` **零 KABI 标记**（`cgroup-defs.h` / `psi_types.h` 里都没有 `ANDROID_KABI_*`），
     对照 `include/linux/sched.h` 的 17 处 —— 也就是说「cgroup KMI 红线」这条理由**没有被机械检查支撑**，
     它约束的是 out-of-tree 模块对 `struct cgroup` 布局的假设，而不是本模块自己的 KABI 台账。
-    真正要确认的是：`struct psi_group psi;` 在 `struct cgroup` 里是不是**最后一个成员**（若不是，
-    往里加字段会移动后面所有字段的偏移）。同时 5.15 树里已经有现成的抓手：
-    `DEFINE_STATIC_KEY_TRUE(psi_cgroups_enabled)` + `if (static_branch_likely(&psi_cgroups_enabled))`（psi.c:837）
-    —— 全局开关，目前只在 boot 时由 `cgroup_psi_enabled()` 定死；per-cgroup 开关可以做成「该 static key 保留，
-    另加每 cgroup 的布尔」或者「把 charge 路径改成查每 cgroup 位」。
-  - **布局已探明（同日）**：`struct psi_group psi;` 在 `struct cgroup` 里**不是最后一个成员** ——
-    其后还有 `struct cgroup_bpf bpf;`、`atomic_t congestion_count;`、`struct cgroup_freezer_state freezer;`
-    和柔性数组 `u64 ancestor_ids[];`（cgroup-defs.h:479 起）。所以**往 `struct psi_group` 里加字段会移动
-    后续所有成员的偏移**，这正是「cgroup KMI 红线」的实际含义。设计约束因此是：每 cgroup 的开关
-    **不能**长在 `struct psi_group` 里，只能复用 `struct cgroup` 已有的低位宽字段（`u16 flags` 之类的空闲位）
-    或复用 `psi_group` 内部已有的可回收位。下一步：读 6.1 的 `cgroup.pressure` 实现，确认它加在哪一层，
-    以及 5.15 的 `struct cgroup` 有没有现成的空闲位可用。
+    真正的约束是布局：`struct psi_group psi;` 在 `struct cgroup` 里不是最后一个成员
+    （其后还有 `struct cgroup_bpf bpf;`、`atomic_t congestion_count;`、`struct cgroup_freezer_state
+    freezer;` 和柔性数组 `u64 ancestor_ids[];`），所以开关只能复用已有的位宽空间。
+  - 落地时发现的额外面：5.15 的 `cgroup_psi()` 只是 `&cgrp->psi`，而 root 的 `*.pressure` 由
+    `cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi` 兜住（`iterate_groups()` 永不返回 root 自己的组），
+    所以 root 的开关要落在 `psi_system` 上 —— 即 psi.c 里的一个静态布尔（等价于 6.1 的
+    `psi_system.enabled`）。
 - [~] DAMON sysfs 控制面（实测需要 6.1 core 长大：`core.c` 27→46KB + sysfs
   约 10 万字节，不再是"中等体量"，价值一般）
 - [x] MADV_COLLAPSE（Batch 6 已落地，按 5.15 helper 重写，非 UAPI-only）
 - [x] zram recompression（Batch 4 落地）+ zsmalloc chain-size（Batch 6 落地；
   6.2 来源、6.1.y 未收，来源线取 android15-6.6）
-- [ ] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）— 与 KMI 卡点纠缠
+- [ ] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）— 6.1 把 ONCPU 从"任务计数"改成
+  `state_mask` 里的一位（`TSK_ONCPU = 1 << NR_PSI_TASK_COUNTS`、`PSI_ONCPU = 1 << NR_PSI_STATES`、
+  `test_state(tasks, s, oncpu)`），Batch 21 已证明**父链部分不需要移植**（5.15 的 `iterate_groups()`
+  走 cgroup 树即可）；剩下的 ONCPU 位化是纯内部重构，但要与 Batch 21 的开关分支同一批改（那时
+  `groupc->state_mask = 0` 要跟着变成"只保留 ONCPU 位"），价值需再评估
 
 ## 禁区清单（与 sibling 模块的硬边界）
 

@@ -29,6 +29,7 @@ fi
 SMOKE_FILES=(
   Makefile
   Documentation/admin-guide/kernel-parameters.txt
+  Documentation/admin-guide/cgroup-v2.rst
   fs/file.c
   mm/page_alloc.c
   mm/compaction.c
@@ -256,6 +257,23 @@ else
 fi
 grep -q "struct psi_trigger_ext" "$KERNEL_ROOT/common/include/linux/psi_types.h" \
   || fail "kernfs polling trigger wrapper missing"
+# psi_cgroup_pressure_switch: the knob, the flag it drives, and the KMI promise
+# that neither struct grew (a "bool enabled" in psi_group, or a psi_group
+# pointer plus psi_files[] in struct cgroup, is the ACK 6.1 shape that cannot be
+# ported onto a 5.15 psi_group embedded in struct cgroup).
+grep -q 'name = "cgroup.pressure"' "$KERNEL_ROOT/common/kernel/cgroup/cgroup.c" \
+  || fail "cgroup.pressure file missing"
+grep -q "CGRP_PSI_DISABLED" "$KERNEL_ROOT/common/include/linux/cgroup-defs.h" \
+  || fail "cgroup PSI accounting flag missing"
+grep -q "psi_group_enabled" "$KERNEL_ROOT/common/kernel/sched/psi.c" \
+  || fail "per-cgroup PSI accounting query missing"
+grep -q "static ssize_t pressure_write(struct kernfs_open_file \*of, char \*buf," \
+  "$KERNEL_ROOT/common/kernel/cgroup/cgroup.c" \
+  || fail "trigger writer did not yield the cgroup_pressure_write name"
+if grep -q "struct psi_group \*psi;" "$KERNEL_ROOT/common/include/linux/cgroup-defs.h" \
+   || grep -q "psi_files\[" "$KERNEL_ROOT/common/include/linux/cgroup-defs.h"; then
+  fail "the ACK 6.1 struct cgroup growth leaked into the port"
+fi
 grep -q "calculate_zspage_chain_size" "$KERNEL_ROOT/common/mm/zsmalloc.c" \
   || fail "zsmalloc chain sizing missing"
 grep -q "config RCU_NOCB_CPU_DEFAULT_ALL" \

@@ -385,6 +385,345 @@ def test_display_valid_clones_revert():
         check("degraded tree untouched", ctx.read(rel) == before)
 
 
+_BATCH21_CGROUP_DEFS = (
+    "enum {\n"
+    "\t/* Control Group requires release notifications to userspace */\n"
+    "\tCGRP_NOTIFY_ON_RELEASE,\n"
+    "\t/*\n"
+    "\t * Clone the parent's configuration when creating a new child\n"
+    "\t * cpuset cgroup.  For historical reasons, this option can be\n"
+    "\t * specified at mount time and thus is implemented here.\n"
+    "\t */\n"
+    "\tCGRP_CPUSET_CLONE_CHILDREN,\n"
+    "\n"
+    "\t/* Control group has to be frozen. */\n"
+    "\tCGRP_FREEZE,\n"
+    "\n"
+    "\t/* Cgroup is frozen. */\n"
+    "\tCGRP_FROZEN,\n"
+    "\n"
+    "\t/* Control group has to be killed. */\n"
+    "\tCGRP_KILL,\n"
+    "};\n"
+    "\n"
+    "struct cgroup {\n"
+    "\tunsigned long flags;\t\t/* \"unsigned long\" so bitops work */\n"
+    "\tstruct kernfs_node *kn;\t\t/* cgroup kernfs entry */\n"
+    "\tstruct cgroup_file procs_file;\t/* handle for \"cgroup.procs\" */\n"
+    "\tstruct cgroup_file events_file;\t/* handle for \"cgroup.events\" */\n"
+    "\n"
+    "\t/* used to track pressure stalls */\n"
+    "\tstruct psi_group psi;\n"
+    "\n"
+    "\t/* used to store eBPF programs */\n"
+    "\tstruct cgroup_bpf bpf;\n"
+    "\n"
+    "\t/* ids of the ancestors at each level including self */\n"
+    "\tu64 ancestor_ids[];\n"
+    "};\n"
+)
+
+_BATCH21_PSI_H = (
+    "#ifdef CONFIG_CGROUPS\n"
+    "int psi_cgroup_alloc(struct cgroup *cgrp);\n"
+    "void psi_cgroup_free(struct cgroup *cgrp);\n"
+    "void cgroup_move_task(struct task_struct *p, struct css_set *to);\n"
+    "#endif\n"
+)
+
+# The psi.c shape this group lands on: the 5.15 psi_group_change() before the
+# state-mask loop, the IRQ walk psi_irq_tracking adds ahead of it (the switch
+# patches that text), psi_show/psi_trigger_create, and the end of the
+# CONFIG_CGROUPS block.
+_BATCH21_PSI_C = (
+    "static void psi_group_change(struct psi_group *group, int cpu,\n"
+    "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
+    "\t\t\t     bool wake_clock)\n"
+    "{\n"
+    "\tstruct psi_group_cpu *groupc;\n"
+    "\tu32 state_mask = 0;\n"
+    "\tunsigned int t, m;\n"
+    "\tenum psi_states s;\n"
+    "\n"
+    "\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n"
+    "\twrite_seqcount_begin(&groupc->seq);\n"
+    "\trecord_times(groupc, now);\n"
+    "\n"
+    "\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n"
+    "\t\tif (!(m & (1 << t)))\n"
+    "\t\t\tcontinue;\n"
+    "\t\tif (groupc->tasks[t])\n"
+    "\t\t\tgroupc->tasks[t]--;\n"
+    "\t}\n"
+    "\n"
+    "\tfor (t = 0; set; set &= ~(1 << t), t++)\n"
+    "\t\tif (set & (1 << t))\n"
+    "\t\t\tgroupc->tasks[t]++;\n"
+    "\n"
+    "\t/* Calculate state mask representing active states */\n"
+    "\tfor (s = 0; s < NR_PSI_STATES; s++) {\n"
+    "\t\tif (test_state(groupc->tasks, s))\n"
+    "\t\t\tstate_mask |= (1 << s);\n"
+    "\t}\n"
+    "\n"
+    "\tgroupc->state_mask = state_mask;\n"
+    "\twrite_seqcount_end(&groupc->seq);\n"
+    "}\n"
+    "\n"
+    "void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_struct *prev)\n"
+    "{\n"
+    "\tvoid *iter = NULL;\n"
+    "\n"
+    "\twhile ((group = iterate_groups(curr, &iter))) {\n"
+    "\t\tu64 now;\n"
+    "\n"
+    "\t\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n"
+    "\n"
+    "\t\twrite_seqcount_begin(&groupc->seq);\n"
+    "\t\tnow = cpu_clock(cpu);\n"
+    "\t\trecord_times(groupc, now);\n"
+    "\t\tgroupc->times[PSI_IRQ_FULL] += delta;\n"
+    "\t\twrite_seqcount_end(&groupc->seq);\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "void cgroup_move_task(struct task_struct *task, struct css_set *to)\n"
+    "{\n"
+    "\tstruct rq_flags rf;\n"
+    "\tstruct rq *rq;\n"
+    "\n"
+    "\trq = task_rq_lock(task, &rf);\n"
+    "\n"
+    "\ttask_rq_unlock(rq, task, &rf);\n"
+    "}\n"
+    "#endif /* CONFIG_CGROUPS */\n"
+    "\n"
+    "int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)\n"
+    "{\n"
+    "\tint full;\n"
+    "\tu64 now;\n"
+    "\n"
+    "\tif (static_branch_likely(&psi_disabled))\n"
+    "\t\treturn -EOPNOTSUPP;\n"
+    "\n"
+    "\t/* Update averages before reporting them */\n"
+    "\tmutex_lock(&group->avgs_lock);\n"
+    "\tnow = sched_clock();\n"
+    "\tmutex_unlock(&group->avgs_lock);\n"
+    "\n"
+    "\treturn 0;\n"
+    "}\n"
+    "\n"
+    "struct psi_trigger *psi_trigger_create(struct psi_group *group,\n"
+    "\t\t\tchar *buf, size_t nbytes, enum psi_res res)\n"
+    "{\n"
+    "\tstruct psi_trigger *t;\n"
+    "\tenum psi_states state;\n"
+    "\tu32 threshold_us;\n"
+    "\tu32 window_us;\n"
+    "\n"
+    "\tif (static_branch_likely(&psi_disabled))\n"
+    "\t\treturn ERR_PTR(-EOPNOTSUPP);\n"
+    "\n"
+    "\tif (sscanf(buf, \"some %u %u\", &threshold_us, &window_us) == 2)\n"
+    "\t\tstate = PSI_IO_SOME + res * 2;\n"
+    "\telse\n"
+    "\t\treturn ERR_PTR(-EINVAL);\n"
+    "\n"
+    "\treturn t;\n"
+    "}\n"
+)
+
+# cgroup.c after psi_trigger_kernfs_polling: the trigger writer (which this
+# group renames), its three wrappers, the poll hook the switch is inserted
+# before, and the base-file table the knob joins.
+_BATCH21_GROUP_C = (
+    "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,\n"
+    "\t\t\t\t\t  size_t nbytes, enum psi_res res)\n"
+    "{\n"
+    "\tstruct cgroup_file_ctx *ctx = of->priv;\n"
+    "\tstruct psi_trigger *new;\n"
+    "\tstruct cgroup *cgrp;\n"
+    "\tstruct psi_group *psi;\n"
+    "\n"
+    "\tpsi = cgroup_ino(cgrp) == 1 ? &psi_system : &cgrp->psi;\n"
+    "\tnew = psi_trigger_create(psi, buf, res, of->file, of);\n"
+    "\tif (IS_ERR(new))\n"
+    "\t\treturn PTR_ERR(new);\n"
+    "\n"
+    "\treturn nbytes;\n"
+    "}\n"
+    "\n"
+    "static ssize_t cgroup_io_pressure_write(struct kernfs_open_file *of,\n"
+    "\t\t\t\t\t  char *buf, size_t nbytes,\n"
+    "\t\t\t\t\t  loff_t off)\n"
+    "{\n"
+    "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_IO);\n"
+    "}\n"
+    "\n"
+    "static ssize_t cgroup_memory_pressure_write(struct kernfs_open_file *of,\n"
+    "\t\t\t\t\t  char *buf, size_t nbytes,\n"
+    "\t\t\t\t\t  loff_t off)\n"
+    "{\n"
+    "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_MEM);\n"
+    "}\n"
+    "\n"
+    "static ssize_t cgroup_cpu_pressure_write(struct kernfs_open_file *of,\n"
+    "\t\t\t\t\t  char *buf, size_t nbytes,\n"
+    "\t\t\t\t\t  loff_t off)\n"
+    "{\n"
+    "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_CPU);\n"
+    "}\n"
+    "\n"
+    "static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,\n"
+    "\t\t\t\t\t  poll_table *pt)\n"
+    "{\n"
+    "\treturn 0;\n"
+    "}\n"
+    "\n"
+    "static struct cftype cgroup_base_files[] = {\n"
+    "#ifdef CONFIG_PSI\n"
+    "\t{\n"
+    "\t\t.name = \"io.pressure\",\n"
+    "\t\t.flags = CFTYPE_PRESSURE,\n"
+    "\t\t.seq_show = cgroup_io_pressure_show,\n"
+    "\t\t.write = cgroup_io_pressure_write,\n"
+    "\t\t.poll = cgroup_pressure_poll,\n"
+    "\t\t.release = cgroup_pressure_release,\n"
+    "\t},\n"
+    "\t{\n"
+    "\t\t.name = \"cpu.pressure\",\n"
+    "\t\t.flags = CFTYPE_PRESSURE,\n"
+    "\t\t.seq_show = cgroup_cpu_pressure_show,\n"
+    "\t\t.write = cgroup_cpu_pressure_write,\n"
+    "\t\t.poll = cgroup_pressure_poll,\n"
+    "\t\t.release = cgroup_pressure_release,\n"
+    "\t},\n"
+    "#endif /* CONFIG_PSI */\n"
+    "\t{ }\t/* terminate */\n"
+    "};\n"
+)
+
+_BATCH21_DOC = (
+    "  cgroup.kill\n"
+    "\tA write-only single value file which exists in non-root cgroups.\n"
+    "\tThe only allowed value is \"1\".\n"
+    "\n"
+    "\tIn a threaded cgroup, writing this file fails with EOPNOTSUPP as\n"
+    "\tkilling cgroups is a process directed operation, i.e. it affects\n"
+    "\tthe whole thread-group.\n"
+    "\n"
+    "Controllers\n"
+    "===========\n"
+)
+
+
+def test_batch21_psi_cgroup_pressure_switch():
+    print("Batch 21 psi_cgroup_pressure_switch (cgroup.pressure, KMI-neutral)")
+    import abk_stable_perf as perf
+
+    group = next((g for g in perf.PATCH_GROUPS
+                  if g.key == "psi_cgroup_pressure_switch"), None)
+    check("psi_cgroup_pressure_switch group registered", group is not None)
+
+    # The whole point of this port is not growing a KMI-visible struct: the ACK
+    # 6.1 shape lives in psi_types.h, so touching that file at all would be the
+    # regression.  Pin the file list, not just the resulting text.
+    check("the group does not touch include/linux/psi_types.h",
+          group is not None and "include/linux/psi_types.h" not in group.files,
+          group is not None and group.files)
+
+    files = {
+        "include/linux/cgroup-defs.h": _BATCH21_CGROUP_DEFS,
+        "include/linux/psi.h": _BATCH21_PSI_H,
+        "kernel/sched/psi.c": _BATCH21_PSI_C,
+        "kernel/cgroup/cgroup.c": _BATCH21_GROUP_C,
+        "Documentation/admin-guide/cgroup-v2.rst": _BATCH21_DOC,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, files)
+        status, detail = group.apply_fn(ctx)
+        check("all steps land on the 5.15 shape", status == "applied",
+              (status, detail))
+
+        psi_c = ctx.read("kernel/sched/psi.c")
+        check("accounting paths ask the per-cgroup switch",
+              "static bool psi_group_enabled(struct psi_group *group)" in psi_c
+              and "&container_of(group, struct cgroup, psi)->flags" in psi_c,
+              [ln for ln in psi_c.split("\n") if "psi_group_enabled" in ln][:4])
+        check("a disabled group keeps counting tasks but stops timing states",
+              "if (unlikely(!psi_group_enabled(group))) {" in psi_c
+              and "groupc->state_mask = 0;" in psi_c
+              and psi_c.index("if (unlikely(!psi_group_enabled(group))) {")
+              < psi_c.index("/* Calculate state mask representing active "
+                            "states */"))
+        check("the IRQ walk honours the switch",
+              "\t\tif (!psi_group_enabled(group))\n\t\t\tcontinue;\n" in psi_c)
+        # Four queries on purpose: the state-mask branch, the IRQ walk, the
+        # restart guard and the report path (the trigger path adds a fifth on
+        # the ERR_PTR form below).
+        check("reporting and trigger creation refuse a disabled group",
+              psi_c.count("if (!psi_group_enabled(group))") == 4
+              and "\tif (!psi_group_enabled(group))\n\t\treturn -EOPNOTSUPP;"
+              in psi_c
+              and "\tif (!psi_group_enabled(group))\n"
+                  "\t\treturn ERR_PTR(-EOPNOTSUPP);" in psi_c
+              and "if (unlikely(!psi_group_enabled(group)))" in psi_c)
+        check("re-enabling rebuilds every possible CPU under its rq lock",
+              "void psi_cgroup_restart(struct psi_group *group)" in psi_c
+              and "for_each_possible_cpu(cpu) {" in psi_c
+              and "rq_lock_irq(rq, &rf);" in psi_c
+              and "psi_group_change(group, cpu, 0, 0, cpu_clock(cpu), true);"
+              in psi_c
+              and "for_each_online_cpu" not in psi_c)
+
+        defs = ctx.read("include/linux/cgroup-defs.h")
+        check("the switch is a flag bit, so no member moves",
+              "\tCGRP_PSI_DISABLED," in defs
+              and "CGRP_KILL,\n\n" in defs)
+        check("struct cgroup did not grow the ACK 6.1 members",
+              defs.count("struct psi_group psi;") == 1
+              and "struct psi_group *psi;" not in defs
+              and "psi_files[" not in defs)
+
+        cgroup_c = ctx.read("kernel/cgroup/cgroup.c")
+        check("the trigger writer yielded the cgroup_pressure_write name",
+              "static ssize_t pressure_write(struct kernfs_open_file *of, "
+              "char *buf," in cgroup_c
+              and cgroup_c.count("return pressure_write(of, buf, nbytes, PSI_")
+              == 3
+              and "static ssize_t cgroup_pressure_write(struct "
+              "kernfs_open_file *of, char *buf," not in cgroup_c)
+        check("cgroup.pressure is the new owner of that name",
+              'name = "cgroup.pressure"' in cgroup_c
+              and ".write = cgroup_pressure_write," in cgroup_c
+              and 'name = "cgroup.pressure",\n'
+              '\t\t.flags = CFTYPE_PRESSURE,' in cgroup_c)
+        check("the root cgroup's switch drives psi_system",
+              "psi_cgroup_restart(cgroup_ino(cgrp) == 1 ?" in cgroup_c
+              and "void psi_cgroup_accounting_set(struct cgroup *cgrp, "
+              "bool enable)" in psi_c
+              and "\tif (cgroup_ino(cgrp) == 1) {\n\t\tpsi_system_"
+              "accounting_disabled = !enable;" in psi_c)
+        check("the knob is documented",
+              "  cgroup.pressure\n" in ctx.read(
+                  "Documentation/admin-guide/cgroup-v2.rst"))
+
+        snapshot = {rel: ctx.read(rel) for rel in files}
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass is a no-op", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical",
+              all(ctx.read(rel) == snapshot[rel] for rel in files))
+
+    # It patches text psi_irq_tracking adds (the IRQ walk), so it has to be
+    # registered after it.
+    check("registered after psi_irq_tracking",
+          [g.key for g in perf.PATCH_GROUPS].index(
+              "psi_cgroup_pressure_switch")
+          > [g.key for g in perf.PATCH_GROUPS].index("psi_irq_tracking"))
+
+
 def test_sublevel_matrix():
     """The expectation matrix must stay in sync with the registries."""
     print("sublevel expectation matrix")
@@ -1903,7 +2242,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.23.0", "0.23.0"], _versions)
+          _versions == ["0.26.0", "0.26.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -2955,6 +3294,7 @@ def main():
     test_batch17_zram_writeback()
     test_display_valid_clones_revert()
     test_sublevel_matrix()
+    test_batch21_psi_cgroup_pressure_switch()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

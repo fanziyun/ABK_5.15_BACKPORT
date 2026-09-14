@@ -122,7 +122,15 @@ report `already_present` while the edit never lands — group stays "applied":
    run *any* of its steps on that shape. A hunk from a later sublevel than the
    shape probe recognizes needs its **own group** (why the 5.15.195 `replace_fd()`
    fix is a separate group, not a step in `fdtable_alloc_conventions`).
-5. A **C-level** error no text audit can see. `module_param(name, type, perm)`
+5. A **later group that rewrites text an earlier group appended**. Idempotency
+   means "my `new` block is already in the file": if another group edits it, the
+   earlier group's `new` stops matching while its `old` anchor still does, so the
+   second pass appends its payload **again** (Batch 21 produced two
+   `psi_account_irqtime()` definitions that way — caught by `step_audit.py`'s
+   *patched-tree* status assertion, not the pristine pass). Give the earlier group
+   a shape probe on one of its own added symbols (`apply_steps` is transactional,
+   so one is enough) and register the two in dependency order.
+6. A **C-level** error no text audit can see. `module_param(name, type, perm)`
    compiles `name` as the *variable*, so a knob whose sysfs name differs from its
    variable must use `module_param_named(name, variable, type, perm)` or
    `module_param_string(name, var, len, perm)`. Batch 12 shipped
@@ -143,7 +151,11 @@ required strings.
 ## Red lines
 
 - **KMI**: new exported-struct fields only reuse a free `ANDROID_KABI_RESERVE`
-  slot via `ANDROID_KABI_USE`. This module uses `task_struct` slot 8; if ABK's
+  slot via `ANDROID_KABI_USE`; a group may instead carry state in an existing bit of
+  a field it does not own (`cgroup.pressure` uses the cgroup's own `flags` word,
+  because `struct psi_group` is embedded in `struct cgroup` on 5.15 and the ACK's
+  `psi_group::enabled` member would move every member after it). This module uses
+  `task_struct` slot 8; if ABK's
   kernel-specific patch has reused slots 6/7/8 (SysVIPC), move to slot 5. From
   Batch 15 this module **owns** `sched_entity` slots 1–3 (the absorbed EEVDF
   family) and `request_queue` slot 1 (the absorbed `blk_mq_async_depth`): the

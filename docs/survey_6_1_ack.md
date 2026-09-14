@@ -37,6 +37,8 @@ the anchor-script philosophy of this module).
 | `sched_lazy_preemption_hooks` (perf) | ACK android14-6.1 lazy preemption via vendor hooks (`resched_curr_lazy` / `clear_curr_lazy` / `lock_delay_schedule` / `set_tsk_need_resched_lazy`) | include/trace/hooks/dtask.h, core.c, fair.c |
 | `locking_wakeup_patch_hooks` (perf) | ACK android14-6.1 mutex/rwsem post-wakeup fixup hooks | dtask.h, rwsem.h, mutex.c, rwsem.c |
 
+| `psi_cgroup_pressure_switch` (perf, Batch 21) | ACK android14-6.1 `cgroup.pressure`: per-cgroup PSI accounting switch, re-based on the cgroup's `CGRP_PSI_DISABLED` flag bit instead of `psi_group::enabled` (the embedded psi_group cannot grow) | cgroup-defs.h, psi.h, psi.c, cgroup.c, cgroup-v2.rst |
+
 ### KMI decisions (why the full 6.1 PSI shape was NOT ported)
 
 android14-6.1 changed `struct cgroup`'s `psi_group` from embedded to a
@@ -80,20 +82,36 @@ were excluded from this module by the old policy — the suite's groups were:
 (`suite_touched`) guard the injection-order contract documented in
 `porting_policy.md`.
 
-## Deferred backlog (recorded for future batches)
+## Deferred backlog
+
+Everything the Batch-3 survey deferred is now resolved (Batch 21 closes the last
+PSI entry); the remaining rows below record what was landed elsewhere and what
+stays out of scope, so a future re-read does not re-open them.
 
 - **per-VMA locks** — present in android14-6.1 (whole 6.4 design
   grafted onto 6.1); highest raw value (app-launch latency) but a real
   5.15 project: RCU VMA lifetime + fault-path conversion + `vm_area_struct`
   KABI slots; the ACK 6.1 series sits on maple-tree storage and is not
   directly graftable — reference the rbtree-era RFC design.
-- **per-cgroup PSI toggling** (cgroup.pressure enable/disable) —
-  blocked on the psi_group pointer/parent restructure (KMI red line).
+- **per-cgroup PSI toggling** (cgroup.pressure enable/disable) — **landed in
+  Batch 21** (`psi_cgroup_pressure_switch`, v0.26.0). It was never actually
+  blocked by the psi_group restructure: that restructure only exists to *store*
+  the switch and to walk ancestors, and neither is needed here. The switch is
+  the cgroup's own `CGRP_PSI_DISABLED` flag bit (no member moves), the 5.15
+  `iterate_groups()` already walks the cgroup tree, and the root cgroup's switch
+  — its `*.pressure` files are backed by `psi_system` — lives in psi.c. The one
+  behaviour that is *not* ported is file hiding (`kernfs_show()`/`KERNFS_HIDDEN`
+  arrive with this feature upstream and do not exist on 5.15); a disabled group
+  reports `-EOPNOTSUPP` instead of frozen numbers.
 - **DAMON sysfs control plane** — moderate size, modest phone value.
 - **MADV_COLLAPSE** — 6.1 UAPI-only, value conditional on THP.
 - **zram recompression** — 6.2-origin, not in 6.1.y.
-- **PSI full sync (NR_ONCPU removal, TSK_ONCPU mask, parent chain)** —
-  the 6.1 internal rework; entangled with the KMI-blocked restructure.
+- **PSI full sync (NR_ONCPU removal, TSK_ONCPU mask, parent chain)** — the
+  6.1 internal rework. The parent-chain half is now provably unnecessary on this
+  baseline (Batch 21's port needs no `psi_group::parent`); what is left is
+  turning ONCPU from a task *count* into a bit of `state_mask`, which is a pure
+  internal refactor with no user-visible feature, so it is not a candidate on
+  its own — it would ride along if another group ever needs that shape.
 
 ## Excluded (no action)
 
