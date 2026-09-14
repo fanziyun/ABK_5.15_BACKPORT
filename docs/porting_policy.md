@@ -9,13 +9,19 @@
 2. **Upstream-faithful forms.** Group content mirrors the 5.15.y backport
    text (not the mainline version) so trees land in the exact shape newer
    5.15.y sublevels expect.
-3. **KMI red lines.**
-   - Never claim `sched_entity` KABI slots 1–4 (ABK_ABI_PATCH_SUITE EEVDF)
-     or `request_queue` slot 1 (ABI suite async_depth).
+3. **KMI rules.**
    - New `task_struct`/exported-struct fields must reuse a free
      `ANDROID_KABI_RESERVE` slot via `ANDROID_KABI_USE` (current free set in
      android13-5.15: task_struct slots 1–8; this module uses slot 8 for
      `kstack_offset`).
+   - **This module now owns `sched_entity` slots 1–4 and `request_queue`
+     slot 1 itself.**  Batch 15 absorbed the ABK_ABI_PATCH_SUITE EEVDF and
+     `blk_mq_async_depth` claims, so the old "never claim these" rule is
+     retired -- it existed only to keep the suite composable.  The rule that
+     replaces it is stronger, not weaker: because two modules claiming one
+     slot is a hard KMI break, **ABK_ABI_PATCH_SUITE must not be injected
+     into a build that carries the Batch 15 groups**.  See "Suite
+     absorption" below.
    - Bitfield removals are only accepted when a following `unsigned :0`
      force-alignment pins the layout (PSI `sched_psi_wake_requeue` case).
 4. **Degrade, never half-patch.** Required-anchor misses abort the whole
@@ -71,10 +77,38 @@ suite-preference cross-check.
   android14-6.1 shape (including its stable-backports of later mainline
   features, e.g. the kernfs PSI polling rework), adapted to the 5.15
   baseline shapes where the ACK form sits on 6.1-only infrastructure.
-- **Suite preference.** For every candidate the ABK_ABI_PATCH_SUITE
-  inventory is checked first; suite-covered optimizations are NOT
-  re-implemented here (build with the suite instead). The exclusion list
-  is recorded in the survey doc.
+- **Suite absorption (Batch 15) — supersedes the old suite-preference rule.**
+  The rule used to be: check the ABK_ABI_PATCH_SUITE inventory first and do
+  *not* re-implement anything it covers (build with the suite instead).  That
+  made this module permanently dependent on a second external module and left
+  its optimization surface split across two repositories.  Batch 15 retires
+  it: the suite's optimization inventory is **absorbed into this module**, so
+  this module alone delivers those features.
+
+  Absorbed (the suite's own group ids, kept as provenance):
+  `fd_alloc_hotpath`, `close_range_hotpath`, `pid_alloc_hotpath_phase2`,
+  `slab_alloc_free_hotpath`, `hugepage_fault_alloc_fastpath`,
+  `io_uring_nowait_core`, `io_uring_nowait_rw_net`,
+  `io_uring_support_modules` (classification), `blk_mq_async_depth`,
+  `zram_compressed_writeback`, the EEVDF family
+  (`sched_eevdf_core_fields` / `sched_eevdf_pick_logic` /
+  `sched_eevdf_runtime_state_phase3`), `nohz_field_refinement`,
+  `avg_idle_preemption_mode`, `swap_table_phase2_large_folios`,
+  `io_uring_cbpf_filters`, `io_uring_non_circular_sq`,
+  `io_uring_large_rx_buffer_zcrx`, `bpf_timer_bpf_wq_lockless`.
+
+  Two consequences that must not be lost:
+
+  1. **ABK_ABI_PATCH_SUITE and this module are now mutually exclusive.**  The
+     suite claims `sched_entity` 1–4 and `request_queue` 1; so does this module
+     from Batch 15.  Co-injecting them double-claims those KMI slots.  Inject
+     this module *instead of* the suite, not alongside it.
+  2. **Not everything the suite "carried" was a feature.**  Two of its groups
+     (`sched_eevdf_runtime_state_phase3`, `io_uring_large_rx_buffer_zcrx`) only
+     insert a comment marker while reporting `applied`/`partial`; the real
+     phase-3 EEVDF semantics live inside `sched_eevdf_pick_logic`.  Absorption
+     reproduces *behaviour*, so those marker-only rows are recorded here as
+     provenance and are not ported as groups.
 - **KMI red lines, extended.** The ACK 6.1 `psi_group` pointer/parent
   restructure (which rewrites `struct cgroup`) is NOT portable to
   android13-5.15 — PSI features are grafted onto the embedded-psi_group

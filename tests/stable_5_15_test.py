@@ -454,7 +454,12 @@ def test_kabi_slot_policy():
         text = ctx.read("include/linux/sched.h")
         check("slot 8 present", "ANDROID_KABI_RESERVE(8);" in text)
         perf_ctx_texts = perf  # noqa: F841 - import proves the module loads
-        check("suite slots untouched", "ANDROID_KABI_USE(1" not in text)
+        # Batch 15 retired the ABK_ABI_PATCH_SUITE red line: this module now
+        # claims sched_entity slots 1-4 itself.  task_struct slot 1 was never
+        # this group's to take and still is not -- the kstack rewrite lands on
+        # slot 8 (or slot 5 on a SysVIPC-patched tree, see the test below).
+        check("kstack group claims no task_struct slot 1",
+              "ANDROID_KABI_USE(1" not in text)
 
 
 def test_kstack_slot_shape_selection():

@@ -83,6 +83,29 @@ FETCH_FILES=(
   include/linux/huge_mm.h
   include/uapi/asm-generic/mman-common.h
   drivers/gpu/drm/drm_atomic_helper.c
+  # Batch 15 (ABK_ABI_PATCH_SUITE absorption): the files the absorbed
+  # optimization groups anchor in.  Note io_uring/io_uring.c is the 5.15
+  # monolith (~11k lines) -- 6.1 split it into 56 files, so the suite's
+  # io_uring/*.c groups target a layout that does not exist here.
+  kernel/pid.c
+  mm/slub.c
+  mm/huge_memory.c
+  mm/memory.c
+  mm/swap_state.c
+  include/linux/blkdev.h
+  block/blk-core.c
+  block/blk-mq-sched.c
+  block/blk-sysfs.c
+  block/elevator.c
+  block/mq-deadline.c
+  block/bfq-iosched.c
+  block/kyber-iosched.c
+  include/linux/sched/nohz.h
+  include/linux/tick.h
+  kernel/time/tick-sched.c
+  kernel/sched/idle.c
+  kernel/bpf/helpers.c
+  io_uring/io_uring.c
 )
 
 decode() {

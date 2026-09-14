@@ -34,9 +34,15 @@ Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
 PSI IRQ tracking, PSI trigger kernfs polling, and the lazy-preemption /
 lock-wakeup vendor-hook families.  Those groups mirror the ACK 6.1 form
-adapted to the 5.15 baseline shapes, keep the KMI untouched (heap-internal
-wrappers, percpu states, additive tracepoints only), and skip anything the
-ABK_ABI_PATCH_SUITE already covers (see `docs/survey_6_1_ack.md`).
+adapted to the 5.15 baseline shapes and keep the KMI untouched (heap-internal
+wrappers, percpu states, additive tracepoints only).
+
+**Batch 15 absorbs the ABK_ABI_PATCH_SUITE optimization inventory**, so this
+module no longer defers to that suite — it carries the features itself and the
+suite must not be co-injected (both would claim `sched_entity` 1–4 and
+`request_queue` 1).  See "Suite absorption" in `docs/porting_policy.md` for the
+absorbed group list and `docs/survey_6_1_ack.md` / `docs/survey_6_6_ack.md` for
+the provenance of the old exclusion list.
 
 Batch 6 adds two 6.2-origin pieces that only exist in the android15-6.6
 line (`zram recompression`, `ZSMALLOC_CHAIN_SIZE` zspage sizing), the 6.1

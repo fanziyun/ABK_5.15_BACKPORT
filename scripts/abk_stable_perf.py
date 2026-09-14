@@ -17,8 +17,10 @@ preserved; the ACK 6.1 psi_group pointer/parent rework is deliberately NOT
 ported (it changes struct cgroup layout).
 
 Every group degrades to a reported status when its anchor shape is absent.
-KMI slots claimed by other graft modules (sched_entity 1-4, request_queue 1)
-are never touched by this child.
+From Batch 15 this child is the owner of the sched_entity 1-4 slots (the
+absorbed EEVDF family) and of request_queue slot 1 (blk_mq_async_depth), so
+these are now claimed here rather than avoided -- see the Batch 15 modules and
+"Suite absorption" in docs/porting_policy.md.
 
 Coexistence: standalone by default; if storage-rollback or other feature-
 graft modules are injected in the same build, keep this child between them

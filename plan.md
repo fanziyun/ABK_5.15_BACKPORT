@@ -1181,10 +1181,17 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
   6.2 来源、6.1.y 未收，来源线取 android15-6.6）
 - [ ] PSI 内部全量同步（NR_ONCPU 移除 / TSK_ONCPU 掩码 / 父链）— 与 KMI 卡点纠缠
 
-## 禁区清单（与两个 sibling 模块的硬边界）
+## 禁区清单（与 sibling 模块的硬边界）
 
-- 不 claim `sched_entity` KABI 槽 1–4、`request_queue` 槽 1（ABI 套件已占用）
-- 不改写 ABI 套件硬失败组的函数体：`alloc_pid()`、`pick_file()/__range_close()`、
-  `select_idle_cpu()`、`pick_next_entity()`（除非探测到其 marker 后走跳过分支）
+**Batch 15 起 ABI 套件红线已撤销**（依据见 `docs/porting_policy.md` 的
+"Suite absorption"）：套件的优化特性全部并入本模块，因此下面两条原红线作废。
+
+- 本模块**自己**占用 `sched_entity` KABI 槽 1–4（EEVDF：
+  `deadline`/`min_vruntime`/`vlag`/`slice`）与 `request_queue` 槽 1
+  （`async_depth`）。同一构建**不得**再注入 ABK_ABI_PATCH_SUITE，否则两个
+  模块争同一槽位（KMI 硬冲突）。
+- 原「不改写 ABI 套件硬失败组函数体」的限制作废：`alloc_pid()`、
+  `pick_file()`/`__range_close()`、`select_idle_cpu()`、`pick_next_entity()`
+  现在由本模块自己接管。
 - 不在本模块内回滚/前向改写 `fs/f2fs`、`drivers/scsi/ufs`（F2FS 套件领地）
 - 不引入 .patch 载荷；全部嫁接保持 anchor 脚本形态
