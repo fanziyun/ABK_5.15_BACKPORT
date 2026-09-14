@@ -96,6 +96,9 @@ FETCH_FILES=(
   block/blk-core.c
   block/blk-mq-sched.c
   block/blk-sysfs.c
+  # blk_mq_quiesced_elevator_switch (5.15.209) moves the elevator_switch_mq()
+  # declaration in here, and the file is the group's rename->user chain anchor.
+  block/blk.h
   block/elevator.c
   block/mq-deadline.c
   block/bfq-iosched.c

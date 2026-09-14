@@ -267,18 +267,86 @@ def _dst_group_allowed_stats_apply(ctx):
 
 
 # ---------------------------------------------------------------------------
+# sched: drop excess steal time instead of carrying it forward (5.15.179)
+# ---------------------------------------------------------------------------
+
+# Upstream-shape rewrite (no marker): the 194/216 baselines already carry it and
+# a tree that does ends up byte-identical to this group's output.  Value
+# boundary, stated up front: the whole block sits under
+# CONFIG_PARAVIRT_TIME_ACCOUNTING (present in the GKI defconfig because the same
+# image runs as a KVM/AVF guest) *and* inside
+# static_key_false(paravirt_steal_rq_enabled), which only a hypervisor that
+# advertises steal time ever turns on.  On bare metal the graft is therefore
+# inert by construction; inside a guest it stops the catch-up from freezing
+# clock_task for the whole time the host is suspended (and from charging that
+# steal to whichever task happens to be running next).
+
+
+def _sched_steal_time_drop_apply(ctx):
+    try:
+        text = ctx.read("kernel/sched/core.c")
+    except FileNotFoundError:
+        text = ""
+    if "rq->prev_steal_time_rq = prev_steal;" in text:
+        return "already_present", (
+            "the 5.15.179 excess-steal-time drop is already in "
+            "update_rq_clock_task()")
+    status, _results, detail = apply_steps(ctx, [
+        ("kernel/sched/core.c",
+         "#ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING\n"
+         "\tif (static_key_false((&paravirt_steal_rq_enabled))) {\n"
+         "\t\tsteal = paravirt_steal_clock(cpu_of(rq));\n"
+         "\t\tsteal -= rq->prev_steal_time_rq;\n"
+         "\n"
+         "\t\tif (unlikely(steal > delta))\n"
+         "\t\t\tsteal = delta;\n"
+         "\n"
+         "\t\trq->prev_steal_time_rq += steal;\n"
+         "\t\tdelta -= steal;\n"
+         "\t}\n"
+         "#endif\n",
+         "#ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING\n"
+         "\tif (static_key_false((&paravirt_steal_rq_enabled))) {\n"
+         "\t\tu64 prev_steal;\n"
+         "\n"
+         "\t\tsteal = prev_steal = paravirt_steal_clock(cpu_of(rq));\n"
+         "\t\tsteal -= rq->prev_steal_time_rq;\n"
+         "\n"
+         "\t\tif (unlikely(steal > delta))\n"
+         "\t\t\tsteal = delta;\n"
+         "\n"
+         "\t\trq->prev_steal_time_rq = prev_steal;\n"
+         "\t\tdelta -= steal;\n"
+         "\t}\n"
+         "#endif\n",
+         T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
 # Per-task kstack randomization offset (5.15.210) - KMI-safe via KABI slot 8
 # ---------------------------------------------------------------------------
 
 def _sched_h_kstack_step(text):
     """Pick the KABI slot for kstack_offset based on the tree shape.
 
-    ABK's kernel-specific patch step rewrites task_struct's slots 6/7/8 into
-    the CONFIG_SYSVIPC sysvsem/sysvshm restoration (an #ifdef/#else block).
-    In that shape slots 7/8 only exist inside the dead #else branch, so a
-    first-occurrence RESERVE(8) replacement lands in dead code and the struct
-    silently loses the member.  Use the still-free slot 5 there, and the
-    anchored slots 1..8 run otherwise.
+    Three shapes are known, and every one of them keeps the member inside
+    struct task_struct (see _verify_kstack_member, which re-checks that):
+
+    - the anchored 1..8 RESERVE run (every deprecated/ release baseline) --
+      claim slot 8;
+    - ABK's kernel-specific patch step rewrites task_struct's slots 6/7/8 into
+      the CONFIG_SYSVIPC sysvsem/sysvshm restoration (an #ifdef/#else block).
+      In that shape slots 7/8 only exist inside the dead #else branch, so a
+      first-occurrence RESERVE(8) replacement lands in dead code and the struct
+      silently loses the member -- use the still-free slot 5 there;
+    - the android13-5.15-lts branch from 5.15.211 on: AOSP already claims slot 1
+      for the user_dumpable:1 bitfield, so the free RESERVE run starts at 2 and
+      the 1..8 anchor is gone.  Claim slot 8 there as well, so the smoke grep
+      for ANDROID_KABI_USE(8 holds on every baseline.
     """
     marker = "/* ABK stable_515_backport: per-task kstack randomization offset (5.15.210) mapped onto the KABI reserve slot. */"
     if "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" in text:
@@ -289,6 +357,17 @@ def _sched_h_kstack_step(text):
             "\tANDROID_KABI_USE(5, u32\t\t\tkstack_offset);",
             T,
         )
+    if "ANDROID_KABI_USE(1, struct {" in text and "user_dumpable:1;" in text:
+        # 5.15.211+ lts shape: slot 1 is AOSP, so the anchored run is 2..8.
+        # (The probe cannot fire on the 1..8 baselines: they carry neither the
+        # KABI_USE(1) bitfield nor user_dumpable.)
+        run_old = "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(2, 9))
+        run_new = (
+            "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(2, 8))
+            + "\t" + marker + "\n"
+            + "\tANDROID_KABI_USE(8, u32\t\t\tkstack_offset);\n"
+        )
+        return ("include/linux/sched.h", run_old, run_new, T)
     run_old = "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(1, 9))
     run_new = (
         "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(1, 8))
@@ -529,7 +608,32 @@ def _semaphore_wake_q_apply(ctx):
 # block: abort suspend when wakeup events are pending (5.15.198)
 # ---------------------------------------------------------------------------
 
+# The lts branch (5.15.211+) carries 8fe7de5d1c7f upstream-first, but with the
+# <linux/suspend.h> include wrapped in an AOSP `#ifndef __GENKSYMS__` guard
+# (AOSP keeps the CRCs stable that way), so the plain include-pair anchor never
+# matches there and the group reported blocked_by_shape on a tree that already
+# has the payload.  Probe the payload itself instead -- it is the same four
+# lines either way, and this module's own graft uses the identical text, so the
+# second pass short-circuits here too.
+_BLK_MQ_SUSPEND_PAYLOAD = (
+    "\t\t\tif (pm_wakeup_pending()) {\n"
+    "\t\t\t\tclear_bit(BLK_MQ_S_INACTIVE, &hctx->state);\n"
+    "\t\t\t\tret = -EBUSY;\n"
+    "\t\t\t\tbreak;\n"
+    "\t\t\t}\n"
+)
+
+
 def _blk_mq_suspend_apply(ctx):
+    try:
+        text = ctx.read("block/blk-mq.c")
+    except FileNotFoundError:
+        text = ""
+    if _BLK_MQ_SUSPEND_PAYLOAD in text:
+        return "already_present", (
+            "the 5.15.198 abort-on-pending-wakeup payload is already in "
+            "blk_mq_hctx_notify_offline() (upstream-first on this baseline, or "
+            "this module's own graft on the second pass)")
     steps = [
         ("block/blk-mq.c",
          "#include <linux/sched/signal.h>\n#include <linux/delay.h>",
@@ -568,6 +672,69 @@ def _blk_mq_suspend_apply(ctx):
 # ---------------------------------------------------------------------------
 # android14-6.1 line: lazy preemption via vendor hooks (ACK 969cb3d family)
 # ---------------------------------------------------------------------------
+
+def _blk_mq_quiesced_elevator_apply(ctx):
+    """Reinit-time elevator switch goes through the quiesced entry point.
+
+    Upstream-shape rewrite (no marker): the baseline that already carries
+    8237c01f1696 looks byte-identical to this group's output, which is what
+    the already_present probe below detects.
+    """
+    try:
+        text = ctx.read("block/blk-mq.c")
+    except FileNotFoundError:
+        text = ""
+    if "elevator_switch(q, NULL);" in text:
+        return "already_present", (
+            "the 5.15.209 quiesced elevator switch is already in "
+            "blk_mq_elv_switch_none()/blk_mq_elv_switch_back()")
+    steps = [
+        # rename -> users, all required: a tree holding one half of the pair
+        # (a static definition plus a non-static declaration) does not link.
+        ("block/elevator.c",
+         "int elevator_switch_mq(struct request_queue *q,\n"
+         "\t\t\t      struct elevator_type *new_e)\n"
+         "{\n",
+         "static int elevator_switch_mq(struct request_queue *q,\n"
+         "\t\t\t      struct elevator_type *new_e)\n"
+         "{\n",
+         T),
+        # The one-line form of this replacement is a substring of the
+        # pristine static definition, so replace_once would short-circuit to
+        # already_present (trap 1) -- the comment tail anchors it instead.
+        ("block/elevator.c",
+         " */\n"
+         "static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)\n"
+         "{\n"
+         "\tint err;\n",
+         " */\n"
+         "int elevator_switch(struct request_queue *q, struct elevator_type *new_e)\n"
+         "{\n"
+         "\tint err;\n",
+         T),
+        ("block/blk.h",
+         "int elevator_switch_mq(struct request_queue *q,\n"
+         "\t\t\t      struct elevator_type *new_e);",
+         "int elevator_switch(struct request_queue *q, struct elevator_type *new_e);",
+         T),
+        ("block/blk-mq.c",
+         "\t * After elevator_switch_mq, the previous elevator_queue will be\n",
+         "\t * After elevator_switch, the previous elevator_queue will be\n",
+         T),
+        ("block/blk-mq.c",
+         "\televator_switch_mq(q, NULL);\n",
+         "\televator_switch(q, NULL);\n",
+         T),
+        ("block/blk-mq.c",
+         "\televator_switch_mq(q, t);\n",
+         "\televator_switch(q, t);\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
 
 def _lazy_preempt_hooks_apply(ctx):
     steps = []
@@ -1428,6 +1595,13 @@ PATCH_GROUPS = [
         _dst_group_allowed_stats_apply,
     ),
     PatchGroup(
+        "sched_steal_time_excess_drop",
+        "excess steal time is dropped instead of catching up later (5.15.179)",
+        ["56135262c1f9 (5.15.179)"],
+        ["kernel/sched/core.c"],
+        _sched_steal_time_drop_apply,
+    ),
+    PatchGroup(
         "randomize_kstack_pertask",
         "kstack randomization offset becomes per-task, extending entropy lifetime (5.15.210)",
         ["7e1b6b281aa8 (5.15.210)"],
@@ -1454,6 +1628,13 @@ PATCH_GROUPS = [
         ["8fe7de5d1c7f (5.15.198)"],
         ["block/blk-mq.c"],
         _blk_mq_suspend_apply,
+    ),
+    PatchGroup(
+        "blk_mq_quiesced_elevator_switch",
+        "blk-mq reinitialisation switches elevators through the quiesced entry point (5.15.209)",
+        ["9646443f28f3 (5.15.209)"],
+        ["block/blk-mq.c", "block/blk.h", "block/elevator.c"],
+        _blk_mq_quiesced_elevator_apply,
     ),
     PatchGroup(
         "sched_lazy_preemption_hooks",

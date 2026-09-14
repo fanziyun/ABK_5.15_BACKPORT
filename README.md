@@ -24,7 +24,7 @@ is left byte-identical rather than touched up with a comment.
 | child id | content |
 |---|---|
 | `stable_backport_core` | fd-table allocation conventions (5.15.191, incl. INT_MAX guard) and the 5.15.195 `replace_fd()` errno fix, page_alloc ALLOC_MIN_RESERVE semantics (5.15.171), THP `__GFP_THISNODE` no-reclaim (5.15.202), cpuset insane-config early bail-out (5.15.191), percpu pagelist lock-free reads (5.15.200), cgroup root_list RCU (5.15.168), cgroup destroy-wq split (5.15.194), per-memcg proactive reclaim via `memory.reclaim` (android14-6.1), zram recompression (android15-6.6 / 6.2 series) with a read-only `zstd` secondary compressor, the Batch 12 zram algorithm lock (read-only `zram.abk_comp_algo` / `zram.abk_lock_algo`; both algorithm stores become reported no-ops, so no runtime writer can reassign them — and a refused write would abort Android's `mmd_setup`, writeback included), zsmalloc zspage chain-size sizing (android15-6.6 / 6.2 series), `MADV_COLLAPSE` (android14-6.1), Batch 8 page_alloc fallback-mode reuse and claimability cleanup (android15-6.6 / 6.12), opt-in `RCU_NOCB_CPU_DEFAULT_ALL`, plus the module's defconfig lane that actually enables the recompression symbols |
-| `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
+| `stable_perf_backport` | NOHZ idle-balance series (5.15.174), PSI psi_flags migration (5.15.179), RT scan optimizations (5.15.202/.212), per-task kstack randomization via KABI slot 8 (5.15.210 — the slot probe knows all four `task_struct` shapes, including the lts one where AOSP owns slot 1), excess steal time dropped instead of carried forward (5.15.179, inert on bare metal by construction, live in a KVM/AVF guest), `__release_sock` cond_resched reduction (5.15.197), semaphore wake_q (5.15.180), blk-mq suspend wakeup abort (5.15.198), blk-mq quiesced elevator switch on queue reinit (5.15.209), PSI IRQ pressure tracking, PSI trigger kernfs polling, lazy-preemption + mutex/rwsem wakeup vendor hooks (android14-6.1) |
 | `stable_display_fix` | removal of the 5.15.185 `drm: Add valid clones check` encoder validation (the Concurrent Writeback series) from `drivers/gpu/drm/drm_atomic_helper.c`; the check makes every vendor `msm_drm` atomic commit fail with `-EINVAL` on 5.15.185+ (2025-07 / 2025-09 / 2025-12) and the lts branch, so the panel stays black while touch/fingerprint keep working; on 5.15.167/.178 (which never carried the check) the group reports `already_present` and writes nothing |
 | `stable_backport_core` (Batch 9-1) | `dynamic_readahead_lowmem`: dynamic readahead (OPLUS/Xiaomi `mi_dynamic_readahead`) as a GKI built-in — a `core_initcall` in `mm/readahead.c` registers the `android_vh_ra_tuning_max_page` / `android_vh_tune_mmap_readaround` vendor-hook callbacks so low-memory background (cpuset "background") tasks get halved readahead windows and shrunk mmap read-around, behind `CONFIG_ABK_DYNAMIC_READAHEAD` with a `readahead.dynamic_readahead=0` runtime disable |
 | `stable_backport_core` (Batch 13) | `customize_alloc_gfp_vh` + `gfp_pressure_fastfail`: the `android_vh_customize_alloc_gfp` vendor hook grafted verbatim from android15-6.6 (commit `4466afd69452`; declare in `include/trace/hooks/mm.h`, call between the nodemask restore and `__alloc_pages_slowpath()`, export in `drivers/android/vendor_hooks.c`), plus its ABK consumer: while `si_mem_available()` sits below `abk_gfp_fastfail_pct`% (default 50) of the summed high watermarks, slowpath attempts of order >= `abk_gfp_fastfail_order` (default 9 — the THP class) gain `__GFP_NORETRY|__GFP_NOWARN`, so a fragmented, nearly-full phone fails those requests into their callers' fallback after one direct-reclaim/compaction try instead of stalling the faulting task; knobs at `/sys/module/page_alloc/parameters/`, off with `page_alloc.abk_gfp_fastfail=0` |
@@ -96,16 +96,18 @@ the black-screen fix can carry just
 One injection string covers all three: the engine gates on text anchors, never
 on the sublevel, so a group whose upstream commit the baseline already carries
 reports `already_present` instead of `applied`. On 5.15.178 that is one group
-(the 5.15.174 NOHZ series); on 5.15.194 it is five (fd-table conventions,
-cpuset bail-out, cgroup destroy-wq split, NOHZ series, semaphore wake_q). The
-per-sublevel expectations are in `tests/sublevel_matrix.py` and
-`docs/porting_policy.md`.
+(the 5.15.174 NOHZ series); on 5.15.194 it is six (fd-table conventions,
+cpuset bail-out, cgroup destroy-wq split, NOHZ series, excess steal time,
+semaphore wake_q). The per-sublevel expectations are in
+`tests/sublevel_matrix.py` and `docs/porting_policy.md`.
 
 The baseline-neutral rule also works across the newer android13-5.15-lts
-tree: `tests/sublevel_matrix.py` keeps a `.211` fixture row whose two known
-debts (`randomize_kstack_pertask` KABI-slot drift, `blk_mq_suspend_wakeup_abort`
-shape) are recorded so the local `.211` tree can be audited even though it is
-not a CI combination.
+tree: `tests/sublevel_matrix.py` keeps an `.216` fixture row (re-keyed from the
+`.211` one when the rolling branch moved) with the groups that branch carries
+already. **Since Batch 19 that row has no `KNOWN_DEBT` entry at all** — the two
+`.211` blockers (`randomize_kstack_pertask` KABI-slot drift,
+`blk_mq_suspend_wakeup_abort` shape) were closed rather than recorded, so every
+group of every child is expected to land on all four supported baselines.
 
 The children read `KERNEL_ROOT`, `DEFCONFIG`,
 `CUSTOM_EXTERNAL_MODULE_STAGE` and `ABK_BUILD_*` from the ABK environment.

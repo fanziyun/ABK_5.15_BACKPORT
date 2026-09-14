@@ -478,6 +478,23 @@ def test_kstack_slot_shape_selection():
     step2 = perf._sched_h_kstack_step(sysv)
     check("sysv-patched -> slot 5", "RESERVE(5);" in step2[1] and "USE(5" in step2[2])
     check("slot-5 anchor hits patched tail", step2[1] in sysv)
+    # android13-5.15-lts from 5.15.211 on: AOSP claims slot 1 for the
+    # user_dumpable bitfield, so the 1..8 run no longer exists -- the group has
+    # to find the 2..8 run (that shape reported blocked_by_shape until it did).
+    lts = (
+        "\tANDROID_KABI_USE(1, struct {\n"
+        "\t\t/* Save user-dumpable when mm goes away */\n"
+        "\t\tunsigned\tuser_dumpable:1;\n"
+        "\t\t});\n"
+        "\n"
+        + "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(2, 9))
+    )
+    step3 = perf._sched_h_kstack_step(lts)
+    check("lts slot-1-taken -> the 2..8 run",
+          "RESERVE(2);" in step3[1] and "RESERVE(1);" not in step3[1])
+    check("lts anchor hits the free run", step3[1] in lts)
+    check("lts still claims slot 8",
+          "USE(8" in step3[2] and "USE(1," not in step3[2])
 
 
 def test_defconfig_lane():

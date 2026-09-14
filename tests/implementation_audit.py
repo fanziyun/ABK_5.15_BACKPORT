@@ -394,6 +394,43 @@ REQUIRED_CONTENT = {
         "zcomp_decompress(zstrm, src, size, zstrm->buffer)",
         "zero_user(page, 0, PAGE_SIZE)",
     ],
+    "perf:sched_steal_time_excess_drop": [
+        # The drop is only real if the sampled value is remembered *before* the
+        # delta clamp and stored back unbounded -- the pre-5.15.179 form adds
+        # the clamped steal, which is what re-charges it to the next task.
+        "steal = prev_steal = paravirt_steal_clock(cpu_of(rq));",
+        "rq->prev_steal_time_rq = prev_steal;",
+    ],
+    "perf:randomize_kstack_pertask": [
+        # "Per-task" is the whole point: both macros must read and write
+        # current->kstack_offset instead of the per-CPU variable, and the
+        # fork-time initialiser must exist.  The per-CPU definitions the commit
+        # removes are pinned in REQUIRED_ABSENT below.
+        "u32 offset = current->kstack_offset;",
+        "current->kstack_offset = offset;",
+        "random_kstack_task_init",
+    ],
+    "perf:blk_mq_suspend_wakeup_abort": [
+        # The abort path is only real if the wait loop can see a pending wakeup,
+        # can un-inactivate the hctx again, and can propagate the failure -- the
+        # upstream hunk returns -EBUSY from blk_mq_hctx_notify_offline(), whose
+        # caller is the CPUHP teardown state.
+        "pm_wakeup_pending()",
+        "clear_bit(BLK_MQ_S_INACTIVE, &hctx->state);",
+        "ret = -EBUSY;",
+        "#include <linux/suspend.h>",
+    ],
+    "perf:blk_mq_quiesced_elevator_switch": [
+        # The rename has to land on all three sides at once: the definition,
+        # the declaration and both call sites.  Half of it is a link error
+        # (blk.h declaring a function nobody defines) or, worse, a non-static
+        # elevator_switch_mq() that blk-mq no longer calls while the switch
+        # happens through the unquiesced path the group exists to retire.
+        "static int elevator_switch_mq(struct request_queue *q,",
+        "int elevator_switch(struct request_queue *q, struct elevator_type *new_e);",
+        "elevator_switch(q, NULL);",
+        "elevator_switch(q, t);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -510,6 +547,35 @@ REQUIRED_ABSENT = {
         ["drivers/block/zram/zram_drv.c", ", zstrm->local_copy)"],
         ["drivers/block/zram/zram_drv.c", "zcomp_stream_put(zstrm)"],
         ["drivers/block/zram/zram_drv.c", "memset_page("],
+    ],
+    "perf:sched_steal_time_excess_drop": [
+        # The catch-up accumulator this commit removes.
+        ["kernel/sched/core.c", "rq->prev_steal_time_rq += steal;"],
+    ],
+    "perf:randomize_kstack_pertask": [
+        # The per-CPU offset the commit exists to remove.  Pinned per file on
+        # purpose: init/main.c legitimately keeps its DEFINE_STATIC_KEY_MAYBE_RO()
+        # next to it, so a whole-blob sweep of the group's files would be a
+        # weaker claim than "the per-CPU variable is gone from *this* file".
+        ["include/linux/randomize_kstack.h", "DECLARE_PER_CPU(u32, kstack_offset);"],
+        ["init/main.c", "DEFINE_PER_CPU(u32, kstack_offset);"],
+    ],
+    "perf:blk_mq_suspend_wakeup_abort": [
+        # The pre-5.15.198 wait loop (no escape on a pending wakeup).  The needle
+        # is the whole tryget/put block, i.e. exactly the anchor the group
+        # rewrites, so it cannot false-positive on a lookalike loop elsewhere in
+        # the file.
+        ["block/blk-mq.c",
+         "\tif (percpu_ref_tryget(&hctx->queue->q_usage_counter)) {\n"
+         "\t\twhile (blk_mq_hctx_has_requests(hctx))\n\t\t\tmsleep(5);\n"
+         "\t\tpercpu_ref_put(&hctx->queue->q_usage_counter);\n\t}"],
+    ],
+    "perf:blk_mq_quiesced_elevator_switch": [
+        # The pre-5.15.209 spelling must be gone from both ends that matter:
+        # the call sites in blk-mq.c and the declaration in blk.h.  (elevator.c
+        # keeps the symbol itself, demoted to static.)
+        ["block/blk-mq.c", "elevator_switch_mq"],
+        ["block/blk.h", "elevator_switch_mq"],
     ],
 }
 

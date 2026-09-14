@@ -161,19 +161,30 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 27 applied | 13 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 27 applied | 12 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 24 applied + 3 present | 11 applied + 2 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 35 applied | 20 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 35 applied | 19 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 32 applied + 3 present | 17 applied + 3 present |
+| 216 | `android13-5.15-lts` | rolling | 29 applied + 6 present | 12 applied + 8 present |
 
-A second pass is `already_present` for every group on all three (the untracked
-`android13-5.15-lts` row, keyed to the fetched tree's `SUBLEVEL = 216`, carries
-the two Batch-2-era perf debts — see `KNOWN_DEBT` in `tests/sublevel_matrix.py`).
-Groups the baseline pre-empts:
+The display child is the odd one out: its single revert group reports
+`already_present` on 167/178 (which never carried the 5.15.185 check) and
+`applied` on 194/216.
+
+A second pass is `already_present` for every group on all four, and since
+Batch 19 `KNOWN_DEBT` in `tests/sublevel_matrix.py` is **empty** — no group of
+any child degrades on any supported baseline.  Groups the baseline pre-empts:
 
 - **178** — `sched_nohz_idle_balance_series` (5.15.174).
 - **194** — the 178 set plus `fdtable_alloc_conventions` (5.15.191),
-  `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194)
-  and `semaphore_wake_q` (5.15.180).
+  `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194),
+  `sched_steal_time_excess_drop` (5.15.179) and `semaphore_wake_q` (5.15.180).
+- **216** — the 194 set plus `fdtable_replace_fd_errno` (5.15.195),
+  `pagealloc_thisnode_thp_noreclaim` (5.15.202),
+  `pagealloc_high_fraction_lockfree` (5.15.200),
+  `release_sock_cond_resched` (5.15.197), `sched_rt_optimizations`
+  (5.15.202/.212), `sched_dst_group_allowed_stats` (5.15.212),
+  `blk_mq_suspend_wakeup_abort` (5.15.198) and
+  `blk_mq_quiesced_elevator_switch` (5.15.209).
 
 Batch 14's three zram writeback groups (`zram_wb_teardown`,
 `zram_writeback_bounds`, `zram_wb_limit_align`) apply on **all** of them and add
@@ -192,14 +203,18 @@ adding a matrix entry; it does not mean adding version gating.
 
 The android13-5.15-lts tree (recorded at 5.15.211; the branch has since rolled
 -- the matrix row is keyed to the fetched tree's Makefile `SUBLEVEL`, 216 as of
-the 2026-09 re-fetch, re-proven on that tree) is a fourth fixture only:
-`step_audit.py` audits it against a matrix row whose two known debts are
-recorded (`randomize_kstack_pertask` and `blk_mq_suspend_wakeup_abort`, both
-`blocked_by_shape`). lts is not a CI combination and nothing gates on it. It is
-a rolling branch, so re-check its `PRE_APPLIED` row and re-key it when
-re-fetching the tree —
+the 2026-09 re-fetch, re-proven on that tree) is a fourth fixture with the same
+standing as the three release baselines: every group must land or be genuinely
+pre-applied there too.  The two `.211` blockers it used to carry are closed as
+of Batch 19 rather than recorded as debt — `randomize_kstack_pertask` grew the
+slot-1-taken KABI shape (AOSP owns slot 1 for `user_dumpable`, so the free
+RESERVE run is 2..8) and `blk_mq_suspend_wakeup_abort` now probes the payload
+instead of the `#ifndef __GENKSYMS__`-wrapped include, which is why it moved
+from `KNOWN_DEBT` to `PRE_APPLIED`.  lts is not a CI combination and nothing
+gates on it.  It is a rolling branch, so re-check its `PRE_APPLIED` row and
+re-key it when re-fetching the tree —
 `sched_rt_optimizations` (5.15.202) and `sched_dst_group_allowed_stats` (5.15.212)
-have since landed there and moved from drift to pre-applied.
+landed there earlier and moved from drift to pre-applied.
 
 Note that `fdtable_alloc_conventions` reporting `already_present` on 194 means
 `fs/file.c` carries **no** module marker there — the 5.15.195 `replace_fd()`

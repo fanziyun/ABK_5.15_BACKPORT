@@ -2,6 +2,161 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-20"></a>
+
+## Batch 20(v0.25.0)
+
+起因：本批把 survey 的「Deferred backlog」清账 —— 5.15.167→.218 里剩下的候选只有三条，
+本批**落地两条**、**证伪一条**，至此上游 5.15.y 这条来源线没有未结候选。
+`module.conf` 0.24.0 → **0.25.0**，`GROUP_COUNTS` perf **19 → 20**（Batch 19 已把 18 → 19）。
+
+### 1. 落地：blk_mq_quiesced_elevator_switch（`9646443f28f3`，5.15.209）
+
+上游 `8237c01f1696`（2022）。队列重初始化时 `blk_mq_elv_switch_none()/back()` 走的是
+`elevator_switch_mq()`（只 freeze 队列，**不** quiesce），而 hctx 的 `run_work` 仍可能在跑，
+于是它可能拿到正在拆的 elevator 指针 —— 上游给的现场是 `kyber_has_work()` 空指针 panic，
+调用栈正是 `blk_mq_run_work_fn`。改成 `elevator_switch()`（quiesced 版）后，两者互斥。
+
+实现是**三条链一起改**（改名 → 使用点，全部 `required`，事务性）：
+
+| 文件 | 改动 |
+|---|---|
+| `block/elevator.c` | `int elevator_switch_mq()` → `static int`；`static int elevator_switch()` → `int` |
+| `block/blk.h` | 声明 `elevator_switch_mq()` → `elevator_switch()` |
+| `block/blk-mq.c` | 注释 + 两个调用点 `elevator_switch_mq(q, NULL/t)` → `elevator_switch(q, NULL/t)` |
+
+半改一半是**链接错误**（blk.h 声明了没人定义的函数），更糟的是留下一个已无人调用的非 static
+`elevator_switch_mq()`，所以没有可选步。
+
+- **上游形态改写，无 marker**：`.209` 之后的基线自己就是目标形态，`already_present` 探针落在
+  改写后的调用点上（`elevator_switch(q, NULL);`）。
+- **陷阱 1**：`int elevator_switch(struct request_queue *q, struct elevator_type *new_e)` 是
+  pristine 里 `static int elevator_switch(...)` 的**子串** —— 直接 replace 会短路成
+  `already_present`，编辑永远不落地。改为把上一行注释尾 ` */` 一起锚进 old/new 才生效。
+- survey 原先的延后理由「与 ABI 套件改写的 elevator 路径重叠」**自 Batch 15 起作废**：
+  套件禁止共注入（`AGENTS.md` 红线），而本模块收编的 `blk_mq_async_depth` 占的是
+  `__blk_mq_alloc_request()` / `blk_mq_init_allocated_queue()` / `blk_mq_update_nr_requests()`，
+  与本组无交集。
+
+### 2. 落地：sched_steal_time_excess_drop（`56135262c1f9`，5.15.179）
+
+`update_rq_clock_task()` 在 steal time 超过本次 delta 时会把超出部分**记到未来**追赶
+（`rq->prev_steal_time_rq += steal;`）。读 elapsed 与采样 steal 之间存在窗口，在那里被抢占
+就会造出「steal > delta」——而这份多出来的 steal 会**记到下一个任务头上**。宿主挂起时
+`clock_task` 会一直冻住、正在跑的任务一直跑。上游的处置是**直接丢弃**超出量。
+
+本批落地的文本与上游逐字一致（样例见 `research/upstream-5.15.y/patches/56135262c1f9.patch`）。
+
+**价值边界（写在最前面，别误读为普遍收益）**：整块代码在
+`CONFIG_PARAVIRT_TIME_ACCOUNTING` 之下（GKI defconfig 里**是** `=y`，因为同一份 image 会以
+KVM/AVF guest 身份启动），并且还在 `static_key_false(paravirt_steal_rq_enabled)` 之下 ——
+后者只有**通告 steal time 的 hypervisor** 才会打开。所以：
+
+- 裸机上该 static key 恒为关，本组是**构造性 no-op**（行为逐字节不变）；
+- 作为 guest 运行时它才生效：宿主挂起期间不再冻结 `clock_task`，也不再把这笔 steal 记给下一个任务。
+
+### 3. 证伪：sched_to_ratio_u64（`64d9b734b6fe`，5.15.210）—— 在 arm64 上是 no-op
+
+`to_ratio()` 由 `unsigned long` 改 `u64`、`tg_rt_schedulable()` 的 `total/sum` 由 `unsigned long`
+改 `u64`。commit 自己写明收益场景：**32 位构建**（`unsigned long` 32 位时会截断/回绕）。
+本模块只跑 arm64（GKI 侧只认 `arch/arm64/configs/gki_defconfig`），LP64 下 `unsigned long` 就是
+64 位，三行改动**不改变任何一处的位宽或取值**。为一个不可能发生的截断去改三个文件、并给
+`to_ratio()` 树内唯一的调用链留下与上游不同的类型拼写 —— 与 survey §「churn without value」
+同类，**按政策排除**并记录在此，不再重议。
+
+`newidle_balance` 改名（.196）、iov_iter 初始化器改名（.210）、inode sysctls 文件搬动（.179）
+维持原判：无用户可见价值的 churn。
+
+### 4. 门禁与 fixture 缺口（本批唯一一次「审计全绿但 smoke 红」）
+
+新增组第一次跑 smoke 时：`step_audit` / `implementation_audit` 四档全绿，167/178/194 的 smoke 却
+报 `stable_perf_backport pass1={{'applied': 18, 'blocked_by_shape': 1}}` —— 因为 smoke 有**自己第三份**
+文件清单 `SMOKE_FILES`（与 `tests/fetch_sublevel_tree.sh` 的 `FETCH_FILES`、
+`tests/step_audit.py` 的 `AUDIT_FILES` 并列），新组要的 `block/blk.h` 不在里面。
+216 之所以没红：本组的 `already_present` 探针在触碰 blk.h 之前就短路了 —— 正好演示了
+「探针先于锚点」的价值。三处清单已同步加上 `block/blk.h`，`FETCH_FILES` 的 gap-fill 语义
+（已有文件不重下）使重取只补这一个文件。
+
+本批新增的门禁：
+
+- `tests/stable_5_15_test.py`：新增 lts KABI 形态 fixture（槽 1 被 `user_dumpable` 占用 → 认 2..8 run），
+  并断言该形态仍取槽 8、且不碰槽 1。
+- `tests/implementation_audit.py`：三个新组的 `REQUIRED_CONTENT` / `REQUIRED_ABSENT`
+  （改名三面一致、`elevator_switch_mq` 从 blk-mq.c 与 blk.h 消失、
+  `rq->prev_steal_time_rq += steal;` 消失、per-CPU kstack 变量消失）。
+- `tests/smoke.sh`：两条新断言（`elevator_switch(q, NULL);`、`rq->prev_steal_time_rq = prev_steal;`），
+  两者在四档基线上都成立（本模块写入或基线自带）。
+
+### 5. 四档基线状态（本地审计）
+
+| child | 167 | 178 | 194 | 216 |
+|---|---|---|---|---|
+| stable_backport_core (35) | applied 35 | applied 35 | applied 32 / already 3 | applied 29 / already 6 |
+| stable_perf_backport (20) | applied 20 | applied 19 / already 1 | applied 17 / already 3 | applied 12 / already 8 |
+| stable_display_fix (1) | already 1 | already 1 | applied 1 | applied 1 |
+
+`step_audit` / `implementation_audit` / `smoke.sh`（两遍幂等 + 回滚字节一致）四档全部通过。
+
+<a id="batch-19"></a>
+
+## Batch 19(v0.24.0)
+
+起因：`plan.md` 里 Batch 5 记下的两个「.211（android13-5.15-lts）遗留阻塞」是**唯一还剩的
+降级组**：整个模块只有这两组在滚动 lts 分支上报 `blocked_by_shape`（`tests/sublevel_matrix.py`
+的 `KNOWN_DEBT`）。本批逐个定位**为什么锚点失配**，两组都能落地 —— 一个是真缺一条形态分支，
+另一个是探针写错了对象。`module.conf` 0.23.0 → **0.24.0**，`GROUP_COUNTS` perf **18 → 19**，
+`KNOWN_DEBT` **清空**。
+
+### 1. randomize_kstack_pertask：不是「已自带」，是锚点认不出这个形态
+
+lts 从 `5.15.211` 起，AOSP 把 `task_struct` 的 KABI 槽 1 占成了 `user_dumpable` 位域：
+
+```c
+	ANDROID_KABI_USE(1, struct {
+		/* Save user-dumpable when mm goes away */
+		unsigned	user_dumpable:1;
+		});
+	ANDROID_KABI_RESERVE(2);
+	...
+	ANDROID_KABI_RESERVE(8);
+```
+
+于是 `ANDROID_KABI_RESERVE(1)..(8)` 这条八连锚**在这条分支上根本不存在**（2..8 才是空闲 run），
+而 `_sched_h_kstack_step()` 当时只会两种形态：八连 run → 槽 8、SysVIPC 形态（`USE(6, sysv_sem)`）
+→ 槽 5。两者都不匹配 → `blocked_by_shape` → **per-task kstack 随机化在整条 lts 分支上一直没被登记**
+（这正是 trap 4 的形态：早返回的探针让一整组永远不跑）。
+
+修复：新增第三条形态分支（探针 `ANDROID_KABI_USE(1, struct {` + `user_dumpable:1;`），认 2..8 run，
+仍然占**槽 8**，于是 `tests/smoke.sh` 里那句 `ANDROID_KABI_USE(8` 的断言在四档基线上一致成立。
+`_verify_kstack_member()`（成员必须落在 `struct task_struct` 内）继续把关。
+
+### 2. blk_mq_suspend_wakeup_abort：内容早就在，锚点盯错了那一行
+
+lts 分支**已经带了** `8fe7de5d1c7f`（5.15.198）的全部 payload：`pm_wakeup_pending()` 逃逸、
+`clear_bit(BLK_MQ_S_INACTIVE)`、`ret = -EBUSY`、`return ret`。唯一差别是 AOSP 把
+`#include <linux/suspend.h>` 包在 `#ifndef __GENKSYMS__` 里（他们靠这个保持 CRC 不变），
+而本组的第一个 `required` 步锚的是**未包裹的 include 对** → 整组 `blocked_by_shape`，
+报的却是「锚点缺失」，读起来像缺功能。
+
+修复：改为**探针 payload 本身**（四行 `if (pm_wakeup_pending()) {...}` 文本），命中即
+`already_present` 且一个字节都不写；216 行因此从 `KNOWN_DEBT` 移到 `PRE_APPLIED`。
+该探针同时覆盖第二遍幂等（自己的 graft 也是同一段文本）。
+
+### 3. 结论：`KNOWN_DEBT` 为空
+
+`tests/sublevel_matrix.py` 的 `KNOWN_DEBT` 现在是空表 —— **每个 child 的每个组，在四档受支持
+基线（167/178/194/216）上都必须真的落地或真的是基线自带**，没有任何「已知降级」可以借道。
+`smoke.sh` 的注释同步改写：它过去写着「矩阵记录了 .211 的已知债」，现在这句不再成立。
+
+### 4. 未结项（本批的诚实边界）
+
+- 两组的真判据仍是**编译**：本批改的是 KABI 槽位选择与探针，`kernel/sched/core.c` /
+  `block/blk-mq.c` 的实际文本没有新增 C（kstack 组本就会写 sched.h / randomize_kstack.h /
+  main.c / fork.c），形态分支只有在这条 lts 分支上真正编译过才算证明 —— ABK CI 是本轮
+  唯一的编译门禁。
+- 本地审计用的是 `build/abk-trees/216` 这份**只含 75 个被触碰文件**的参考树（gitiles 抓取），
+  不是完整的 lts 源码树。
+
 <a id="batch-18"></a>
 
 ## Batch 18(v0.23.0)

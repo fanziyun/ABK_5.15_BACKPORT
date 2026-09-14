@@ -95,6 +95,10 @@ SMOKE_FILES=(
   block/blk-core.c
   block/blk-mq-sched.c
   block/blk-sysfs.c
+  # Batch 20: the quiesced elevator switch renames the elevator_switch_mq()
+  # declaration in blk.h; without this file the group degrades to
+  # blocked_by_shape in smoke only (the reference trees do carry it).
+  block/blk.h
   block/elevator.c
   block/mq-deadline.c
   block/bfq-iosched.c
@@ -145,10 +149,11 @@ echo "== assertions =="
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The per-child JSON assertions below are the authoritative degradation gate:
-# they compare the exact status summaries against sublevel_matrix (which
-# records the known .211 debts), so a blanket log grep here would wrongly fail
-# a baseline whose debts are expected blocked_by_shape.  Missing report files
-# are guarded inside the loop itself.
+# they compare the exact status summaries against sublevel_matrix (whose
+# KNOWN_DEBT table is empty since the .211 blockers were closed, so every group
+# of every child must land on every baseline), so a blanket log grep here would
+# wrongly fail a baseline that legitimately reports already_present.  Missing
+# report files are guarded inside the loop itself.
 for child in stable_backport_core stable_perf_backport stable_display_fix; do
   [ -f "$WORK/pass1_reports/$child/${child}_report.json" ] || fail "missing pass1 report for $child"
   [ -f "$KERNEL_ROOT/abk_5_15_backport_reports/$child/${child}_report.json" ] || fail "missing pass2 report for $child"
@@ -211,6 +216,17 @@ grep -q "android_vh_resched_curr_lazy" "$KERNEL_ROOT/common/include/trace/hooks/
   || fail "lazy preemption hook missing"
 grep -q "android_vh_mutex_wakeup_patch" "$KERNEL_ROOT/common/kernel/locking/mutex.c" \
   || fail "mutex wakeup patch hook missing"
+# blk_mq_quiesced_elevator_switch is an upstream-shape rewrite with no marker of
+# its own, so the check is the rewritten call site itself: this module wrote it
+# on 167/178/194 and the baseline already carried it on 216.
+grep -q "elevator_switch(q, NULL);" "$KERNEL_ROOT/common/block/blk-mq.c" \
+  || fail "quiesced elevator switch call site missing"
+# Same shape for sched_steal_time_excess_drop: markerless upstream rewrite, so
+# the rewritten accumulator store is the assertion (grafted on 167/178, already
+# upstream on 194/216).
+grep -q "rq->prev_steal_time_rq = prev_steal;" \
+  "$KERNEL_ROOT/common/kernel/sched/core.c" \
+  || fail "excess steal time drop missing"
 # The smart-freq payload's load-bearing markers.  The group is inert by *default*
 # (the knob ships off), so nothing in the pass-1 status proves the gated form is
 # the one in the tree -- and an older payload mixed into this file would be a

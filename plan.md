@@ -4,6 +4,10 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 20(v0.25.0,已落地)→ 详见 CHANGELOG.md#batch-20 — 上游 5.15.y 剩余候选清账：`blk_mq_quiesced_elevator_switch`（`9646443f28f3`）与 `sched_steal_time_excess_drop`（`56135262c1f9`）落地，`64d9b734b6fe` 按 arm64 no-op 排除 —— 这条来源线至此无未结候选
+
+## Batch 19(v0.24.0,已落地)→ 详见 CHANGELOG.md#batch-19 — 关闭 lts 行的两个降级组（kstack KABI 槽形态分支 + blk-mq suspend 的 already_present 探针），`KNOWN_DEBT` 清空：四档基线上不再有任何「已知降级」
+
 ## Batch 18(v0.23.0,已落地)→ 详见 CHANGELOG.md#batch-18 — zram writeback 的 Enforcing 策略缺口（companion 模块 sepolicy.rule）
 
 ## Batch 17(v0.22.0,已落地)→ 详见 CHANGELOG.md#batch-17 — zram writeback bio batching + compressed writeback
@@ -216,13 +220,12 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 
 ## Batch 5(v0.6.0,已落地)→ 详见 CHANGELOG.md#batch-5 — 多 sublevel 兼容 167/.178/.194
 
-### .211（android13-5.15-lts）遗留阻塞（后续批次）
+### .211（android13-5.15-lts）遗留阻塞 — **Batch 19(v0.24.0) 已全部关闭**
 
-- [ ] `randomize_kstack_pertask` — .211 已占用 `ANDROID_KABI_RESERVE(1)`
-  （`user_dumpable` 位域），8 连 RESERVE 锚点失配，需补该形态的槽位分支
-- [ ] `blk_mq_suspend_wakeup_abort` — .211 已自带
-  `#ifndef __GENKSYMS__ #include <linux/suspend.h> #endif` 与
-  `pm_wakeup_pending()` 逻辑，需补 `already_present` 探针
+- [x] `randomize_kstack_pertask` — 已补「槽 1 被 `user_dumpable` 占用」形态：认 2..8 的
+  RESERVE run，仍占槽 8（原文见 CHANGELOG.md#batch-19 §1）
+- [x] `blk_mq_suspend_wakeup_abort` — 改为探 payload 本身，216 行转入 `PRE_APPLIED`
+  （原文见 CHANGELOG.md#batch-19 §2）；`KNOWN_DEBT` 因此清空
 
 ## Batch 4(v0.5.0,已落地)→ 详见 CHANGELOG.md#batch-4 — android15-6.6 来源线
 
@@ -234,9 +237,13 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 
 - [x] Gorman 深水区：ca8527f25736（AOSP 已自带拆分）→ c1b8856c5a7d → 17dedfd6de69 → 85f58ee33c6c → 4c4e238d3ada → 735457683e23 → `pagealloc_highatomic_reserve_semantics`（12 步，vendor CMA 块与 trace 保留）
 - [x] d99f14f8b142（.212）sched/fair dst-group 统计跳过 → `sched_dst_group_allowed_stats`（AOSP fair.c 锚点无漂移）
-- [~] 9646443f28f3（.209）blk-mq quiesced elevator 切换
-- [ ] 56135262c1f9（.179）steal time 追赶封顶（虚拟化场景才有收益）
-- [ ] 64d9b734b6fe（.210）带宽比值 u64 化
+- [x] 9646443f28f3（.209）blk-mq quiesced elevator 切换 → **Batch 20(v0.25.0) 已落地**
+  （`blk_mq_quiesced_elevator_switch`；原「与 ABI 套件重叠」的延后理由自 Batch 15 起作废）
+- [x] 56135262c1f9（.179）steal time 追赶封顶 → **Batch 20 已落地**
+  （`sched_steal_time_excess_drop`；裸机上 static key 恒关故为构造性 no-op，KVM/AVF guest 内生效）
+- [-] 64d9b734b6fe（.210）带宽比值 u64 化 → **排除**：commit 自己写明收益场景是 32 位构建，
+  本模块只跑 arm64（LP64 下 `unsigned long` 即 64 位），三行改动不改变任何位宽 —— 见
+  CHANGELOG.md#batch-20 §3
 
 ## 排除记录（不再重议）
 

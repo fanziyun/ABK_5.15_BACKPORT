@@ -50,11 +50,13 @@ GROUP_COUNTS = {
     "stable_backport_core": 35,
     # 13 Batch-1..13 groups + the two absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields), the two absorbed
-    # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode)
-    # and the absorbed blk_mq_async_depth.  The EEVDF pair is registered
-    # pick_logic-first so the sched_entity slot claim only happens once the
-    # fair.c logic has really landed.
-    "stable_perf_backport": 18,
+    # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode),
+    # the absorbed blk_mq_async_depth and blk_mq_quiesced_elevator_switch (the
+    # last upstream 5.15.y backlog item, 5.15.209), plus
+    # sched_steal_time_excess_drop (5.15.179, the other one).  The EEVDF pair is
+    # registered pick_logic-first so the sched_entity slot claim only happens
+    # once the fair.c logic has really landed.
+    "stable_perf_backport": 20,
     "stable_display_fix": 1,
 }
 
@@ -81,9 +83,11 @@ PRE_APPLIED = {
             "pagealloc_cpuset_bailout",
             "cgroup_destroy_wq_split",
         },
-        # 5.15.174 NOHZ series and 5.15.180 semaphore wake_q.
+        # 5.15.174 NOHZ series, 5.15.179 excess steal time and 5.15.180
+        # semaphore wake_q.
         "stable_perf_backport": {
             "sched_nohz_idle_balance_series",
+            "sched_steal_time_excess_drop",
             "semaphore_wake_q",
         },
         # The 2025-12 baseline carries the 5.15.185 valid-clones check: the
@@ -96,10 +100,10 @@ PRE_APPLIED = {
     # audited and drift surfaces before the baseline ships.
     # This is a rolling branch, so re-check these two sets -- and re-key this
     # row to the new Makefile SUBLEVEL -- when re-fetching it.
-    # The two remaining perf debts are known blockers from plan.md: the lts
-    # branch already occupies the kstack KABI slot 1 shape, and its blk-mq
-    # suspend path was rewritten upstream-first, so both report
-    # blocked_by_shape until a later batch.
+    # Both .211 blockers from plan.md are closed on this row: the kstack KABI
+    # slot probe learned the slot-1-taken 2..8 RESERVE shape (so the group
+    # really applies here), and the blk-mq suspend path arrived upstream-first
+    # so it is recorded in PRE_APPLIED instead of KNOWN_DEBT.
     "216": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
@@ -111,6 +115,7 @@ PRE_APPLIED = {
         },
         "stable_perf_backport": {
             "sched_nohz_idle_balance_series",
+            "sched_steal_time_excess_drop",
             "release_sock_cond_resched",
             "semaphore_wake_q",
             # The lts branch now carries all three 5.15.202 RT hunks (the
@@ -118,6 +123,16 @@ PRE_APPLIED = {
             # default) and the .212 dst-group stats fix.
             "sched_rt_optimizations",
             "sched_dst_group_allowed_stats",
+            # 5.15.198 blk-mq suspend abort: the branch has the payload but
+            # wraps its <linux/suspend.h> include in an __GENKSYMS__ guard, so
+            # the include-pair anchor cannot match.  The group probes the
+            # payload itself and reports already_present.
+            "blk_mq_suspend_wakeup_abort",
+            # 5.15.209 quiesced elevator switch: same story -- the branch has
+            # the post-commit shape (static elevator_switch_mq() plus the
+            # renamed non-static elevator_switch()), so the group probes for
+            # the renamed call site and writes nothing.
+            "blk_mq_quiesced_elevator_switch",
         },
         # The lts branch carries the valid-clones check; the revert applies.
         "stable_display_fix": set(),
@@ -134,14 +149,13 @@ PRE_APPLIED = {
 # hunk is not editable input to the fix -- and the leak is closed in
 # zram_remove() rather than by deleting zram_reset_device()'s early return, so
 # 5.15.167 is covered like the rest.
-KNOWN_DEBT = {
-    "216": {
-        "stable_perf_backport": {
-            "randomize_kstack_pertask": "blocked_by_shape",
-            "blk_mq_suspend_wakeup_abort": "blocked_by_shape",
-        },
-    },
-}
+# Empty since the 5.15.211+ lts row was closed: randomize_kstack_pertask now
+# really applies there (the KABI slot probe learned the slot-1-taken 2..8
+# RESERVE shape) and blk_mq_suspend_wakeup_abort reports already_present (the
+# branch carries 8fe7de5d1c7f upstream-first behind an __GENKSYMS__ include
+# guard, which the payload probe now recognises).  Every group of every child
+# therefore lands on every supported baseline.
+KNOWN_DEBT = {}
 
 SUPPORTED = tuple(PRE_APPLIED)
 DEFAULT_SUB_LEVEL = "167"

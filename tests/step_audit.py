@@ -142,6 +142,9 @@ AUDIT_FILES = [
     "block/blk-core.c",
     "block/blk-mq-sched.c",
     "block/blk-sysfs.c",
+    # Batch 20: blk_mq_quiesced_elevator_switch moves the elevator_switch_mq()
+    # declaration here (block/blk.h) and renames its definition in elevator.c.
+    "block/blk.h",
     "block/elevator.c",
     "block/mq-deadline.c",
     "block/bfq-iosched.c",
