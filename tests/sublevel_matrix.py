@@ -47,7 +47,10 @@ GROUP_COUNTS = {
     # fdtable_alloc_conventions owns that text, and the suite's helper name is
     # one of this module's suite-detection markers.  What is ported
     # (abk_expand_files_needed() and the open_fds walk) is absent from all four.
-    "stable_backport_core": 35,
+    # The Batch-24 recompression cap (zram_recompress_max_pages) is a
+    # second-pass group: it edits the text zram_recompression and
+    # zram_async_recompress generate, both of which now probe their own payload.
+    "stable_backport_core": 36,
     # 13 Batch-1..13 groups + the two absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields), the two absorbed
     # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode),

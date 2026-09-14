@@ -63,6 +63,7 @@ abk_status_report() {
     abk_show "mem_limit (mm_stat f4)" "$(abk_zram_mem_limit)"
     abk_show "mm_stat" "$(abk_read "$ABK_ZRAM_DIR/mm_stat" | tr -d '\n')"
     abk_show "io_stat" "$(abk_read "$ABK_ZRAM_DIR/io_stat" | tr -d '\n')"
+    abk_show "recomp pass cap" "$(abk_cfg zram.recomp.max_pages 16384) attempted entries (0 = unbounded; needs the kernel max_pages graft)"
     if [ -n "$(abk_zram_secondary)" ]; then
       abk_show "recompression armed" "yes"
     else
@@ -160,6 +161,7 @@ abk_action_pass() {
   abk_zram_reassert || true
   _ap_age="$(abk_cfg zram.recomp.idle_age_sec 3600)"
   _ap_threshold="$(abk_cfg zram.recomp.threshold 0)"
+  _ap_max_pages="$(abk_cfg zram.recomp.max_pages 16384)"
   _ap_mode="$(abk_cfg zram.recomp.mode async)"
   _ap_tool="$MODDIR/bin/zram_recompress_trigger.sh"
 
@@ -169,7 +171,8 @@ abk_action_pass() {
   fi
 
   sh "$_ap_tool" --sys-root "$ABK_SYS_ROOT" --device "$ABK_ZRAM_DEV" \
-    --idle-age "$_ap_age" --mode "$_ap_mode" --threshold "$_ap_threshold"
+    --idle-age "$_ap_age" --mode "$_ap_mode" --threshold "$_ap_threshold" \
+    --max-pages "$_ap_max_pages"
 }
 
 # The lock is a read-only kernel parameter: only the boot cmdline can turn it

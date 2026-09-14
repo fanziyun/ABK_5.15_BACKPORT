@@ -21,12 +21,23 @@
 # --mark-each-pass is given explicitly, because marking and recompressing in
 # the same instant recompresses everything every time.
 #
+# An uncapped pass is an unbounded amount of work: it attempts every idle
+# entry on the device, in index order, and the CPU bill is paid on a phone
+# that is trying to stay quiet.  max_pages (mainline 34efe1c3b688, grafted by
+# this module as Batch 24) bounds the number of *attempts*; the scan restarts
+# at index 0 each pass, so a cap drains a prefix of the cold set per pass and
+# later passes continue to work through the ones the age mark still reports.
+# A kernel without that graft ignores an unknown parameter rather than
+# failing the write, so passing --max-pages to an older kernel is harmless --
+# it just behaves as if the option had not been given.
+#
 # Options:
 #   --device N        zram device index (default 0)
 #   --mark-idle       mark every stored page idle ("all"), then pass once
 #   --idle-age SECS   mark pages untouched for >= SECS seconds idle, then pass
 #   --mode sync|async async (default) uses recompress_async
 #   --threshold N     only recompress entries >= N bytes (default 0 = all)
+#   --max-pages N     attempt at most N entries per pass (default 0 = no cap)
 #   --interval SECS   seconds between passes with --daemon (default 1800)
 #   --daemon          keep sweeping (marks once unless --mark-each-pass)
 #   --mark-each-pass  with --daemon: re-run the mark step every pass
@@ -45,6 +56,7 @@ MARK_IDLE=0
 IDLE_AGE=
 MODE=async
 THRESHOLD=0
+MAX_PAGES=0
 INTERVAL=1800
 DAEMON=0
 MARK_EACH_PASS=0
@@ -54,7 +66,7 @@ STATUS=0
 SYS_ROOT=/sys
 
 usage() {
-  sed -n '2,40p' "$0"
+  sed -n '2,51p' "$0"
   exit 2
 }
 
@@ -82,6 +94,7 @@ while [ $# -gt 0 ]; do
     --idle-age) IDLE_AGE="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
+    --max-pages) MAX_PAGES="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --daemon) DAEMON=1; shift ;;
     --mark-each-pass) MARK_EACH_PASS=1; shift ;;
@@ -96,6 +109,7 @@ done
 
 case "$DEV" in ''|*[!0-9]*) usage_fail "bad --device: $DEV" ;; esac
 case "$THRESHOLD" in ''|*[!0-9]*) usage_fail "bad --threshold: $THRESHOLD" ;; esac
+case "$MAX_PAGES" in ''|*[!0-9]*) usage_fail "bad --max-pages: $MAX_PAGES" ;; esac
 case "$INTERVAL" in ''|*[!0-9]*) usage_fail "bad --interval: $INTERVAL" ;; esac
 case "$MODE" in sync|async) ;; *) usage_fail "bad --mode: $MODE (want sync or async)" ;; esac
 if [ -n "$IDLE_AGE" ]; then
@@ -145,6 +159,13 @@ if [ "$STATUS" = 1 ]; then
   echo "zram$DEV secondary  = ${SECONDARY_ALGO:-none}"
   echo "zram$DEV recomp     = [$ALGO]"
   echo "zram$DEV mm_stat    = $STAT"
+  if [ "$MAX_PAGES" -gt 0 ]; then
+    echo "zram$DEV pass cap   = $MAX_PAGES attempted entries per pass"
+    echo "                 (needs the kernel max_pages graft; an older kernel"
+    echo "                  ignores the parameter and the pass stays unbounded)"
+  else
+    echo "zram$DEV pass cap   = none (a pass attempts every idle entry)"
+  fi
   [ -n "$ALGO" ] || echo "zram$DEV: recompression is NOT armed (no secondary compressor)"
   if [ -n "$PRIMARY_ALGO" ] && [ "$PRIMARY_ALGO" = "$SECONDARY_ALGO" ]; then
     echo "zram$DEV: primary and secondary are both $PRIMARY_ALGO, so a pass"
@@ -199,19 +220,26 @@ mark() {
 }
 
 pass() {
+  local args node cap
+  args="type=idle threshold=$THRESHOLD"
+  [ "$MAX_PAGES" -eq 0 ] || args="$args max_pages=$MAX_PAGES"
+  if [ "$MODE" = async ]; then
+    node="$DIR/recompress_async"
+  else
+    node="$DIR/recompress"
+  fi
+  cap=""
+  [ "$MAX_PAGES" -eq 0 ] || cap=", cap $MAX_PAGES attempts"
+
   if [ "$DRY_RUN" = 1 ]; then
-    echo "[dry-run] echo \"type=idle threshold=$THRESHOLD\" > $DIR/recompress_$MODE"
+    echo "[dry-run] echo \"$args\" > $node"
     return 0
   fi
 
   before="$(compr_size)"
-  if [ "$MODE" = async ]; then
-    echo "type=idle threshold=$THRESHOLD" > "$DIR/recompress_async"
-  else
-    echo "type=idle threshold=$THRESHOLD" > "$DIR/recompress"
-  fi
+  echo "$args" > "$node"
   after="$(compr_size)"
-  echo "zram$DEV: pass done (compr_data_size $before -> $after)"
+  echo "zram$DEV: pass done (compr_data_size $before -> $after$cap)"
 }
 
 # The mark step is a one-shot action: marking and recompressing in the same

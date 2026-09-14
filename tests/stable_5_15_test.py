@@ -973,6 +973,7 @@ def test_batch22_psi_oncpu_state_mask():
               all(ctx.read(rel) == snapshot[rel] for rel in files))
 
 
+
 def test_batch23_zram_writeback_guard():
     """Batch 23: the compressed-writeback block must survive the config being off."""
     print("Batch 23: zram compressed writeback inside CONFIG_ZRAM_WRITEBACK")
@@ -1013,6 +1014,128 @@ def test_batch23_zram_writeback_guard():
                   for gate, _n in ia.CONFIG_GATED_REFERENCES[
                       "drivers/block/zram/zram_drv.c"]))
 
+
+def test_batch24_zram_max_pages():
+    """Batch 24: max_pages bounds a recompression pass on both sysfs nodes."""
+    print("Batch 24: zram_recompress_max_pages (max_pages cap + type guard)")
+    import inspect
+
+    import abk_stable_core as core
+    import batch24_core_zram_max_pages as b24
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_recompress_max_pages"), None)
+    check("zram_recompress_max_pages group registered", group is not None)
+    if group is None:
+        return
+    keys = [g.key for g in core.PATCH_GROUPS]
+    check("registered after zram_recompression (it generates recompress_store)",
+          keys.index("zram_recompress_max_pages") > keys.index("zram_recompression"))
+    check("registered after zram_async_recompress (it generates the async node)",
+          keys.index("zram_recompress_max_pages") > keys.index("zram_async_recompress"))
+
+    # Trap 5: this is the one group in the module that rewrites text two other
+    # groups append.  Both of those must therefore recognise their own payload --
+    # without the probe a second pass appends a second recompress_store().
+    for fn, sym in (("_zram_recompression_apply", "RECOMPRESS_HELPER"),
+                    ("_zram_async_recompress_apply", "RECOMPRESS_ASYNC_STORE")):
+        src = inspect.getsource(getattr(core, fn))
+        check(fn + " short-circuits on its own payload",
+              "b24_zmp." + sym in src and "already_present" in src,
+              [ln for ln in src.split(chr(10)) if sym in ln])
+
+    steps = b24.build_steps()
+    check("six required steps, three per node",
+          len(steps) == 6 and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j in range(i + 1, len(steps)):
+            check("step %d new does not contain step %d new" % (i, j),
+                  steps[j][2] not in new_i)
+
+    sync_body = (
+        b24.RECOMPRESS_HELPER + " struct page *page,\n"
+        "\t\t\t   u32 threshold, u32 prio, u32 prio_max)\n"
+        "{\n\treturn 0;\n}\n\n"
+        "static ssize_t recompress_store(struct device *dev,\n"
+        "\t\t\t\tstruct device_attribute *attr,\n"
+        "\t\t\t\tconst char *buf, size_t len)\n"
+        "{\n"
+        + b24._SYNC_HEAD_OLD +
+        "\n\tif (threshold >= huge_class_size)\n\t\treturn -EINVAL;\n\n"
+        + b24._SYNC_LOOP_OLD +
+        "\n\tif (!zram_allocated(zram, index))\n\t\tgoto next;\n\n"
+        + b24._SYNC_CALL_OLD +
+        "next:\n\t\tzram_slot_unlock(zram, index);\n\t}\n}\n\n"
+    )
+    async_body = (
+        "static ssize_t recompress_async_store(struct device *dev,\n"
+        "\t\t\t\t\t\t\t\t\t\t\tstruct device_attribute *attr,\n"
+        "\t\t\t\t\t\t\t\t\t\t\tconst char *buf, size_t len)\n"
+        "{\n"
+        + b24._ASYNC_HEAD_OLD +
+        "\n\tif (threshold >= huge_class_size)\n\t\treturn -EINVAL;\n\n"
+        + b24._ASYNC_LOOP_OLD +
+        "\n\tif (!zram_allocated(zram, index))\n\t\tgoto abk_async_next;\n\n"
+        "abk_async_next:\n\t\tzram_slot_unlock(zram, index);\n"
+        "\t\tif (!candidate)\n\t\t\tcontinue;\n\n"
+        + b24._ASYNC_ENQUEUE_OLD +
+        "\t\tif (err) {\n\t\t\tret = err;\n\t\t\tbreak;\n\t\t}\n\t}\n}\n"
+    )
+    files = {b24.ZRAM_C: sync_body + async_body}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, files)
+        status, detail = group.apply_fn(ctx)
+        check("all six steps land on the composed shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b24.ZRAM_C)
+
+        check("both nodes declare the counter the way mainline does",
+              text.count(b24.MAX_PAGES_CAP_DECL) == 2,
+              [ln for ln in text.split(chr(10)) if "num_recomp_pages" in ln])
+        check("both nodes parse max_pages with kstrtoull",
+              text.count('if (!strcmp(param, "max_pages")) {') == 2
+              and text.count("ret = kstrtoull(val, 10, &num_recomp_pages);") == 2)
+        check("both nodes carry the provenance marker",
+              text.count(b24.MAX_PAGES_MARKER) == 2)
+        check("both nodes reject an unrecognised type= value",
+              text.count("if (!mode)\n\t\t\t\treturn -EINVAL;") == 2)
+        check("both loops stop on a spent cap",
+              text.count("if (!num_recomp_pages)\n\t\t\tbreak;") == 2)
+        check("the cap is tested before the slot is taken",
+              text.count("if (!num_recomp_pages)\n\t\t\tbreak;\n\n"
+                         "\t\tzram_slot_lock(zram, index);") == 2)
+        check("the decrement counts attempts on both nodes",
+              text.count("num_recomp_pages--;\n\t\terr = zram_recompress(") == 1
+              and text.count("num_recomp_pages--;\n\t\terr = abk_zram_recomp_enqueue(") == 1)
+        # Upstream counts an attempt even when the recompression then fails, so
+        # the decrement must sit after every candidate filter, at the call.
+        check("the attempt is counted after the filters, not at the scan top",
+              text.index("goto next;\n\n\t\tnum_recomp_pages--;") >
+              text.index("\t\tif (!num_recomp_pages)"))
+
+        snapshot = ctx.read(b24.ZRAM_C)
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass is a no-op", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical", ctx.read(b24.ZRAM_C) == snapshot)
+
+        # A tree that never gained the recompression surface degrades; it must
+        # not half-graft the parameter onto one of the two nodes.
+        ctx_bare = make_ctx(tmp + "/bare", {b24.ZRAM_C: "static int x;\n"})
+        status3, detail3 = group.apply_fn(ctx_bare)
+        check("degrades without zram_recompression",
+              status3 == "blocked_by_shape" and "zram_recompression" in detail3,
+              (status3, detail3))
+
+        # Only the sync node present (the async group missing) degrades too.
+        ctx_half = make_ctx(tmp + "/half", {b24.ZRAM_C: sync_body})
+        status4, detail4 = group.apply_fn(ctx_half)
+        check("degrades without the async node",
+              status4 == "blocked_by_shape"
+              and "recompress_async_store" in detail4, (status4, detail4))
 
 def test_sublevel_matrix():
     """The expectation matrix must stay in sync with the registries."""
@@ -2391,6 +2514,14 @@ echo "sync_after=$(cat "$T/block/zram0/recompress")"
 sh "{tool_sh}" --sys-root "$T" --dry-run
 echo "async_after_dryrun=$(cat "$T/block/zram0/recompress_async")"
 
+# --max-pages appends the cap to the same pass string, in mainline order
+# (type, threshold, max_pages).  Without the option the pass string is byte
+# identical to the pre-Batch-24 form, which is what a kernel without the graft
+# needs to keep working.
+: > "$T/block/zram0/recompress_async"
+sh "{tool_sh}" --sys-root "$T" --threshold 64 --max-pages 4096
+echo "capped_async=$(cat "$T/block/zram0/recompress_async")"
+
 sh "{tool_sh}" --sys-root "$T" --status
 
 # A secondary that equals the primary cannot shrink anything: refuse with exit
@@ -2418,6 +2549,9 @@ echo "idle_age=$(cat "$T/block/zram0/idle")"
 set +e
 sh "{tool_sh}" --sys-root "$T" --idle-age 0 >/dev/null 2>&1
 echo "RC_IDLE_AGE_ZERO=$?"
+sh "{tool_sh}" --sys-root "$T" --max-pages abc >/dev/null 2>&1
+echo "RC_MAX_PAGES_BAD=$?"
+sh "{tool_sh}" --sys-root "$T" --status --max-pages 4096 | sed -n 's/^.*pass cap *= */PASS_CAP=/p'
 sh "{tool_sh}" --sys-root "$T" --mark-idle --idle-age 60 >/dev/null 2>&1
 echo "RC_IDLE_AGE_CONFLICT=$?"
 sh "{tool_sh}" --sys-root "$T" --daemon --mark-each-pass >/dev/null 2>&1
@@ -2457,6 +2591,13 @@ rm -rf "$T"
           r.stdout)
     check("--idle-age passes the age to the kernel, not 'all'",
           got.get("idle_age") == "3600", r.stdout)
+    check("--max-pages extends the pass string in mainline parameter order",
+          got.get("capped_async") == "type=idle threshold=64 max_pages=4096",
+          r.stdout)
+    check("a bad --max-pages is a usage error",
+          got.get("RC_MAX_PAGES_BAD") == "2", r.stdout)
+    check("--status reports the cap it will send",
+          got.get("PASS_CAP", "").startswith("4096 attempted entries"), r.stdout)
     check("bad --idle-age and --mark-idle conflicts are usage errors",
           got.get("RC_IDLE_AGE_ZERO") == "2"
           and got.get("RC_IDLE_AGE_CONFLICT") == "2"
@@ -2532,7 +2673,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.28.0", "0.28.0"], _versions)
+          _versions == ["0.29.0", "0.29.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3587,6 +3728,7 @@ def main():
     test_batch21_psi_cgroup_pressure_switch()
     test_batch22_psi_oncpu_state_mask()
     test_batch23_zram_writeback_guard()
+    test_batch24_zram_max_pages()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

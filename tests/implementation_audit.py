@@ -543,6 +543,22 @@ REQUIRED_CONTENT = {
         "elevator_switch(q, NULL);",
         "elevator_switch(q, t);",
     ],
+    "core:zram_recompress_max_pages": [
+        # 34efe1c3b688.  The parameter has to be parsed *into* the counter, the
+        # sweep has to test the counter, and both recompress nodes have to carry
+        # it -- recompress_async advertises the same grammar, so a cap that only
+        # bounds the synchronous pass leaves the companion's default path
+        # uncapped.  2f529e73d720's type guard rides along: without it a
+        # mistyped type= value means "no filter", the opposite of what the cap
+        # is for.
+        'if (!strcmp(param, "max_pages")) {',
+        "ret = kstrtoull(val, 10, &num_recomp_pages);",
+        "u64 num_recomp_pages = ULLONG_MAX;",
+        "if (!num_recomp_pages)",
+        "num_recomp_pages--;",
+        "ABK stable_515_backport: 34efe1c3b688",
+        "if (!mode)",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -709,6 +725,14 @@ REQUIRED_ABSENT = {
         # keeps the symbol itself, demoted to static.)
         ["block/blk-mq.c", "elevator_switch_mq"],
         ["block/blk.h", "elevator_switch_mq"],
+    ],
+    "core:zram_recompress_max_pages": [
+        # The cap counts *attempts*.  A decrement above the candidate filters --
+        # which is what "charge it right after taking the slot" would be -- makes
+        # the sweep stop after max_pages slots were *looked at*, so on a device
+        # whose idle pages are sparse it recompresses far less than asked.
+        ["drivers/block/zram/zram_drv.c",
+         "\t\tnum_recomp_pages--;\n\t\tzram_slot_lock(zram, index);"],
     ],
 }
 
@@ -919,6 +943,24 @@ REQUIRED_IN_FUNCTION = {
           "WRITE_ONCE(abk_gfp_high_wm, sum);",
           "si_mem_available() < (long)limit"],
          ["abk_gfp_high_wm += "]),
+    ],
+    "core:zram_recompress_max_pages": [
+        # Both nodes need all three parts, in this relative order.  Slicing by
+        # function is the only way to see which node got which hunk: the two
+        # grammars are otherwise textually identical, so a cap that landed only
+        # on the synchronous side passes whole-file matching perfectly.
+        ("drivers/block/zram/zram_drv.c", "recompress_store",
+         ["u64 num_recomp_pages = ULLONG_MAX;",
+          'if (!strcmp(param, "max_pages")) {',
+          "if (!num_recomp_pages)\n\t\t\tbreak;\n\n\t\tzram_slot_lock(zram, index);",
+          "num_recomp_pages--;\n\t\terr = zram_recompress(zram, index, page,"],
+         ["abk_zram_recomp_enqueue"]),
+        ("drivers/block/zram/zram_drv.c", "recompress_async_store",
+         ["u64 num_recomp_pages = ULLONG_MAX;",
+          'if (!strcmp(param, "max_pages")) {',
+          "if (!num_recomp_pages)\n\t\t\tbreak;\n\n\t\tzram_slot_lock(zram, index);",
+          "num_recomp_pages--;\n\t\terr = abk_zram_recomp_enqueue("],
+         ["zram_recompress(zram, index, page"]),
     ],
 }
 

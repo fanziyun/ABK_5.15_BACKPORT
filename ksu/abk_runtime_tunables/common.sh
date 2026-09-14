@@ -5,7 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.7.0"
+ABK_VERSION="v0.8.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -219,6 +219,7 @@ zram.recomp.enable
 zram.recomp.idle_age_sec
 zram.recomp.interval_sec
 zram.recomp.threshold
+zram.recomp.max_pages
 zram.recomp.mode
 zram.compact.enable
 zram.compact.min_waste_mb

@@ -119,7 +119,16 @@ time; `tests/step_audit.py` catches them on a pristine tree:
    "already_present"`): `apply_steps` is transactional, so the presence of any
    one of its own payload functions means the whole group is already in.
    Before editing text that another group contributed, add that probe (and
-   register the two groups in dependency order).
+   register the two groups in dependency order).  Batch 24 is the case where
+   the edit is the point rather than an accident: `recompress_store()` is not
+   pristine 5.15 at all -- `zram_recompression` generates it, and
+   `zram_async_recompress` generates its async twin -- so a parameter that
+   belongs in that parser can live nowhere else.  Both producers now probe
+   their own payload (`zram_recompress(` / `recompress_async_store(`) and
+   `zram_recompress_max_pages` is registered after them.  The probes are what
+   makes this safe, and the unit test pins them by source: a deleted probe is
+   invisible on the first pass and only shows up as a duplicated function in
+   the compiler, so pinning the probe is cheaper than explaining the C.
 
 Traps 1–3 are enforced per step by `tests/step_audit.py`: every step of a
 group that must really apply reports `applied` on the pristine tree (never

@@ -4,6 +4,8 @@
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）已归档到 [`CHANGELOG.md`](CHANGELOG.md)，按 Batch 倒序排列；本文件里每个已落地批次只保留一行索引。
 
+## Batch 24(v0.29.0,已落地)→ 详见 CHANGELOG.md#batch-24 — 重压缩每趟上限 `max_pages`（`34efe1c3b688`）+ 拒绝无法识别的 `type=`（`2f529e73d720`），同步与异步两个节点一起；本模块第一个**改写别的组生成文本**的批次，故给 `zram_recompression`/`zram_async_recompress` 各加自身载荷探针（trap 5 解法）；companion v0.8.0 默认 `zram.recomp.max_pages=16384`
+
 ## Batch 23(v0.28.0,已落地)→ 详见 CHANGELOG.md#batch-23 — 修 CI 暴露的真问题：zram compressed-writeback 新增块放进 `CONFIG_ZRAM_WRITEBACK` 门内（配置关掉也能编译），并新增"配置门内符号引用"审计
 
 ## Batch 22(v0.27.0,已落地)→ 详见 CHANGELOG.md#batch-22 — PSI 内部同步收口：`TSK_ONCPU` 改为 state mask 的位（去掉 `NR_ONCPU` 计数与 `identical_state` 启发式），仍不引入 `psi_group::parent`
@@ -135,16 +137,21 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   完整证据、上游溯源与全部裁决见
   [`research/zram_writeback_plan.md`](research/zram_writeback_plan.md)，
   上游哈希复核结果见 `research/zram_wb_audit/verified_commits.tsv`。
-- [x] `zram_recompress_max_pages`（P3）— **溯源完成，未落地**：参数确在
-  mainline `recompress_store()`——`research/upstream-zram/zram_drv_master.c:2580`
-  解析 `max_pages` 到 `num_recomp_pages`（初值 `ULLONG_MAX`），
-  `recompress_slot()` 逐页递减，扫描循环在归零时 `break`；
+- [x] `zram_recompress_max_pages`（P3）— **Batch 24(v0.29.0) 已落地**
+  （组名 `zram_recompress_max_pages`，原文见 CHANGELOG.md#batch-24）。溯源记录保留如下，
+  它是这条为什么必须独立成组的依据：参数确在 mainline `recompress_store()`——
+  `research/upstream-zram/zram_drv_master.c:2580` 解析 `max_pages` 到
+  `num_recomp_pages`（初值 `ULLONG_MAX`），`recompress_slot()` 逐页递减，扫描循环在
+  归零时 `break`（另有一条同函数的 `2f529e73d720` 拒绝无法识别的 `type=`，一并收）；
   `research/upstream-zram/zram_drv_linux-5.15.y.c` 与 android13-5.15 都没有。
   **为什么不当"可选追加步"落地**：该函数在 pristine 5.15 里**根本不存在**
   （实测 `abk515_ref_167/drivers/block/zram/zram_drv.c` 无 `recompress_store`），
-  它是本模块 `zram_recompression` 组自己生成的文本。所以这里的锚点不是
-  pristine 锚点，按 `docs/group_recipe.md` 的 trap 4，它应当是**注册在
-  `zram_recompression` 之后的独立组**，而不是该组的可选步。留作候选。
+  它是本模块 `zram_recompression` 组自己生成的文本。所以锚点不是 pristine 锚点，
+  按 `docs/group_recipe.md` 的 trap 4/5 它必须是**注册在 `zram_recompression` 之后
+  的独立组**，而且那两个生成了被改写文本的前置组（`zram_recompression`、
+  `zram_async_recompress`）要先各自加上自身载荷探针，否则第二遍会再追加一份函数。
+  落地时还多带了一条 companion 旋钮 `zram.recomp.max_pages`（默认 16384 次尝试）——
+  内核侧的上限没人调就等于没有。
 - [x] QPACE / kcompressd 异步压缩：popsicle diff 已抽读完毕（异步骨架 =
   整 bio 提交 + ring + 完成回调，绑定 6.12 形态与 QTI 硬件）→ 选定
   **方案 A**：把同一套"kthread + 队列 + 完成回调"骨架嫁接到本模块已落地的

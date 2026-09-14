@@ -168,6 +168,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `zram.recomp.idle_age_sec` | `3600` | mark only pages untouched this long |
 | `zram.recomp.interval_sec` | `1800` | seconds between sweeps |
 | `zram.recomp.threshold` | `0` | only recompress entries at least this large |
+| `zram.recomp.max_pages` | `16384` | how many entries **one** sweep may attempt (0 = no cap). An uncapped pass walks every idle entry in index order -- tens of seconds of one core on a full device; 16384 attempted entries is 64 MiB of pages. Requires the kernel's `max_pages` parameter (module Batch 24): on a kernel without it the parameter is ignored and the sweep stays unbounded, exactly as before that batch. |
 | `zram.recomp.mode` | `async` | `async` (kernel worker) or `sync` |
 | `zram.compact.enable` | `1` | after each sweep tick, run one gated `compact` pass (rides the sweep clock, so `zram.recomp.enable=0` stops it too) |
 | `zram.compact.min_waste_mb` | `50` | only compact when `mem_used_total − compr_data_size` exceeds this many MiB; 1..1024 |

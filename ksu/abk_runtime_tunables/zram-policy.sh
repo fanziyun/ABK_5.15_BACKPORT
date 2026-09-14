@@ -584,12 +584,19 @@ abk_zram_supervisor_main() {
   _zs_age="$(abk_cfg zram.recomp.idle_age_sec 3600)"
   _zs_interval="$(abk_cfg zram.recomp.interval_sec 1800)"
   _zs_threshold="$(abk_cfg zram.recomp.threshold 0)"
+  # 16384 attempted entries = 64 MiB of pages per sweep at 4 KiB.  A bound is
+  # the point: an uncapped pass walks every idle entry in index order, which
+  # is what made a sweep on a full device cost tens of seconds of one core.
+  # A kernel without the max_pages graft ignores the parameter, so this is
+  # also the pre-Batch-24 behaviour -- no cap is imposed behind our back.
+  _zs_max_pages="$(abk_cfg zram.recomp.max_pages 16384)"
   _zs_mode="$(abk_cfg zram.recomp.mode async)"
   _zs_reassert="$(abk_cfg zram.reassert_interval_sec "$ABK_ZRAM_REASSERT_SECS")"
 
   abk_is_uint "$_zs_age" || _zs_age=3600
   abk_is_uint "$_zs_interval" || _zs_interval=1800
   abk_is_uint "$_zs_threshold" || _zs_threshold=0
+  abk_is_uint "$_zs_max_pages" || _zs_max_pages=16384
   abk_is_uint "$_zs_reassert" || _zs_reassert="$ABK_ZRAM_REASSERT_SECS"
   case "$_zs_mode" in sync|async) ;; *) _zs_mode=async ;; esac
   [ "$_zs_interval" -ge 60 ] || _zs_interval=60
@@ -606,7 +613,7 @@ abk_zram_supervisor_main() {
     return 1
   fi
 
-  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
+  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold cap=${_zs_max_pages} reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
 
   # The tool's own --daemon loop would block this process, and the supervisor
   # has two jobs the tool cannot do: keep the policy in force between passes,
@@ -620,10 +627,11 @@ abk_zram_supervisor_main() {
       _zs_tick=0
       sh "$_zs_tool" --sys-root "$ABK_SYS_ROOT" --device "$ABK_ZRAM_DEV" \
         --idle-age "$_zs_age" --mode "$_zs_mode" \
-        --threshold "$_zs_threshold" >/dev/null 2>&1
+        --threshold "$_zs_threshold" --max-pages "$_zs_max_pages" \
+        >/dev/null 2>&1
       _zs_rc=$?
       case "$_zs_rc" in
-        0) abk_log "recompression sweep done (age=${_zs_age}s mode=$_zs_mode)" ;;
+        0) abk_log "recompression sweep done (age=${_zs_age}s mode=$_zs_mode cap=$_zs_max_pages)" ;;
         3) abk_warn "recompression sweep refused: the secondary equals the primary" ;;
         *) abk_warn "recompression sweep failed (rc=$_zs_rc)" ;;
       esac

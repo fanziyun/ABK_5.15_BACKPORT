@@ -2,6 +2,115 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-24"></a>
+
+## Batch 24(v0.29.0)
+
+结掉 `plan.md` 上唯一一条「溯源完成、未落地」的小项：重压缩扫描的**每趟上限**
+`max_pages`（mainline `34efe1c3b688`，v6.10），顺带把同函数上后来的
+`2f529e73d720`（v7.1，拒绝无法识别的 `type=` 值）一起收进来。
+android13-5.15 两条都没有——它的重压缩面本来就是本模块从 android15-6.6 自己生成的，
+所以这两条在这里也只存在于我们生成的文本里。
+
+### 1. 为什么要这条
+
+companion 每 `zram.recomp.interval_sec`（默认 1800s）跑一趟重压缩。**没有上限的一趟
+会按 index 顺序尝试设备上每一个 idle 条目**——满设备下这是几十秒的单核 CPU，而它跑的
+时机恰恰是手机想安静的时候。上游加 `max_pages` 就是为了这个。
+
+`2f529e73d720` 那条守卫看着像 cosmetic，其实不是：`mode` 的初值是 0，而 0 在这段
+代码里的意思是「不做任何过滤」。所以打错一个字母（`type=huger`）今天的表现不是报错，
+是**把整盘重压一遍**——正好是上限想避免的那件事。两条必须一起落。
+
+### 2. 落地明细
+
+新组 `core:zram_recompress_max_pages`（`scripts/batch24_core_zram_max_pages.py`，
+6 步全 required，注册在 core 末尾）：
+
+| 位置 | 改动 |
+|---|---|
+| `recompress_store()` 声明区 | 加 `u64 num_recomp_pages = ULLONG_MAX;`（上游同款） |
+| 同函数参数循环 | `type` 分支内加 `if (!mode) return -EINVAL;`；分支后加 `max_pages` 解析（`kstrtoull`），带 ABK 标记注释 |
+| 同函数扫描循环 | 循环体首 `if (!num_recomp_pages) break;`（在取 slot 锁**之前**）；调用点前 `num_recomp_pages--;` |
+| `recompress_async_store()` | 同样三处——这个节点是 Batch 10-1 自造的，其 docstring 明说「与 recompress 同一套 type/threshold/algo 语法」，语法就不能只有一半 |
+
+语义逐条对齐上游：**计的是「尝试」不是「成功」**。上游把减量放在
+`recompress_slot()` 里 `zcomp_compress` 之后（哪怕这次压缩失败也扣，「因为我们确实
+花了这份资源」）。5.15 这边 `zram_recompress()` 内部自己按优先级循环，把减量放进去
+要么改签名、要么被 Batch 10-1 的 async worker 一起继承——所以减量落在调用点：
+上面每个候选过滤分支都是 `goto next`，能走到这一行就等于一次尝试，位置等价。
+异步节点这边扣在 `abk_zram_recomp_enqueue()` 之前，一个 job 一次尝试，同一量。
+
+### 3. 本批真正的坑：它改写的是「别的组生成的文本」
+
+`recompress_store()` **不是** pristine 5.15——它是 `zram_recompression` 的载荷。
+`replace_once` 先查 new 块，所以只要本组动了那段文本，那两个上游组第二遍就找不到自己
+的 new、却仍能找到 pristine 的 old，于是**再追加一遍**（`docs/group_recipe.md`
+trap 5，Batch 21 踩过一次；这是本模块**第一个**故意破「没有组改写别的组的块」这条约定的
+批次）。做法就是 Batch 21 的解法，只是这次要给**两个**组加：
+
+| 组 | 新增探针 |
+|---|---|
+| `zram_recompression` | 载荷里有 `static int zram_recompress(struct zram *zram, u32 index,` → 直接 `already_present` |
+| `zram_async_recompress` | 载荷里有 `static ssize_t recompress_async_store(struct device *dev,` → 同上 |
+
+探针用的符号只有该组自己会写（5.15 任何一档都不带 zram 重压缩），所以第一遍永远照写，
+只有第二遍短路。单测把「这两个组必须带自身载荷探针」钉住（`inspect.getsource`），
+删掉探针当场红；本组的注册顺序也钉在两个前置组之后。
+
+### 4. 试错记录：锚点不能靠眼睛抄
+
+第一次跑，本组在 216 上是 `blocked_by_shape`：
+`required anchor missing (...:applied x5; ...:missing_anchor)`——第 6 步没锚上。
+原因：`_ASYNC_ENQUEUE_OLD` 的续行我从 registry 里 Batch 10-1 的写法「看着一样」抄了
+**10 个 tab**，树里实际是 **9 个**（那行续行的缩进是 `_tabs()` 由 4 空格/层换算出来的，
+人眼数不出来）。
+
+教训与 AGENTS.md 里那条老话同型：**锚点必须从「已经打完前面各组的树」里逐字节取**，
+不能从 registry 源码里目测。本轮取法：把 `tmp/b24_216`（当前 registry 全量打完的一棵
+树）里目标片段用 `repr()` 打出来再照抄。顺带补上参考树缺的两只文件
+（`Documentation/admin-guide/cgroup-v2.rst`、`block/blk.h`——`FETCH_FILES` 后来加过
+它们，四档树都是旧的，导致 `step_audit` 直接报「reference tree is missing」）。
+
+### 5. 验证
+
+- 四档全绿（167/178/194/.216）：`py_compile`、`stable_5_15_test.py`（新增
+  `test_batch24_zram_max_pages`：33 项检查，含六个步骤的 trap-2 互斥、两节点语义、
+  第二遍逐字节幂等、缺前置组时降级为 `blocked_by_shape`）、`step_audit`
+  （core 199/200/191/191 步，**第二遍 36 组全部 already_present**，说明那两个新探针
+  生效）、`implementation_audit`（新增 REQUIRED_CONTENT / REQUIRED_ABSENT /
+  REQUIRED_IN_FUNCTION 三条；后者按函数切片钉「上限检查在取锁之前、减量在调用点」——
+  整文件 substring 匹配看不出这两条到底落在哪个节点上）、`smoke.sh`（两遍 + 回滚；
+  167 档 pass1 `{'applied': 36}`，四档 pass2 全 `already_present`）。
+- `GROUP_COUNTS` core 35 → **36**；`module.conf` 0.28.0 → **0.29.0**。
+- companion：`zram.recomp.max_pages=16384`（= 64 MiB 页）进 `tunables.conf` /
+  `abk_known_keys` / supervisor / `action.sh pass` / status 行；
+  `tools/zram_recompress_trigger.sh` 加 `--max-pages N`，**不给这个选项时写出去的
+  pass 字符串与改动前逐字节相同**（老内核行为不变，单测钉住），给了则
+  `type=idle threshold=N max_pages=M`。模块版本 v0.7.0 → **v0.8.0**
+  （versionCode 9 → 10）。四只 companion 脚本 `bash -n` + `sh -n` 全过（mksh 的
+  真机复测留待下次装机；本轮改动不含算术，也没有 awk 单引号串）。
+- 本地四档替代不了的仍是编译：本批引入 C，CI 记录见本节末尾/下一批。
+
+### 6. 已知边界（写清楚，不留惊喜）
+
+- 扫描从 index 0 起，**封顶后尾部拿不到机会**——这是上游同款行为，不是本模块的选择。
+  缓解来自语义本身：一次尝试会清掉该条目的 `ZRAM_IDLE`，而 companion 的标记步骤按
+  「多久没被访问」重新打，所以被尝试过的条目不会立刻重新变成候选，后续趟次自然往后走。
+  要一口气把整盘压完就写 `zram.recomp.max_pages=0`（= 不发这个参数）。
+- 上限是「尝试数」，所以 `type=huge` 这类大条目多的时候一趟的 CPU 差异仍然很大；
+  `zram.recomp.threshold` 才是管那个的旋钮。
+- 老内核收到 `max_pages=...` 会**静默忽略**（未知参数在解析循环里就是不匹配、继续下一
+  个），所以 companion 的默认值对旧内核无害，但也**不会**在旧内核上产生上限。
+  `--status` 与 `tunables.conf` 注释都明说了这一点。
+- 本批之后 plan.md 的「溯源完成未落地」清单为空；剩下的都是需要新审计类型的多批次项目
+  （per-VMA locks 读侧核）、或要新基线才能验的小项。
+
+### 7. CI
+
+见下条运行记录（带 / 不带 `CONFIG_ZRAM_WRITEBACK` 各一次；本批与 writeback 无关，
+但那是 Batch 23 定下的门禁形态）。
+
 <a id="batch-23"></a>
 
 ## Batch 23(v0.28.0)

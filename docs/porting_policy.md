@@ -359,6 +359,16 @@ noting for future batches: it inserts only at block **boundaries** (the pristine
 another group's replacement text breaks that group's second-pass idempotency and
 is what `step_audit.py` catches.
 
+The exception is Batch 24 (`zram_recompress_max_pages`), and it is the rule's safety
+valve rather than a hole in it: its target, `recompress_store()`, is not pristine
+5.15 at all but the payload `zram_recompression` writes, so a parameter belonging to
+that parser can be grafted nowhere else. The two producer groups therefore gained a
+probe on their own payload (`zram_recompress(`, `recompress_async_store(`) and the
+cap group registers after them — see `docs/group_recipe.md` trap 5. Registering
+such a group *without* the probe is the failure mode, and the unit test pins both
+probes precisely because a removed one stays invisible until a second pass duplicates
+a function.
+
 One gap is deliberately **not** closed by the companion: the ROM's own zram
 daemon (`mmd_setup`, Android 16's Rust memory daemon) needs
 `CONFIG_ZRAM_WRITEBACK`, which no userspace can supply. Enabling it is a

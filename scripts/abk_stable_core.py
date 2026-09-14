@@ -1305,6 +1305,18 @@ def _zram_recompression_apply(ctx):
     ``comp_algs[0]``.  ``zs_lookup_class_index()`` (a 6.6 zsmalloc API the
     recompress sizing path needs) is added to zsmalloc.
     """
+    # docs/group_recipe.md trap 5: zram_recompress_max_pages rewrites text this
+    # group appends -- recompress_store() is not pristine 5.15, it is generated
+    # right here -- so per-step idempotency alone would let a second pass append
+    # a second copy.  Probe one of this group's own symbols: no android13-5.15
+    # baseline carries a zram_recompress() helper, so a first pass always
+    # rewrites and only a second pass stops.
+    try:
+        _probe = ctx.read("drivers/block/zram/zram_drv.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _b24_zmp.RECOMPRESS_HELPER in _probe:
+        return "already_present", ("the recompression graft is already in zram_drv.c")
     T = True
     steps = [
         # -- Kconfig -----------------------------------------------------
@@ -3758,6 +3770,17 @@ import batch10_core_zram_async as _b10_zram  # noqa: E402
 
 
 def _zram_async_recompress_apply(ctx):
+    # Trap 5 again: zram_recompress_max_pages edits the body of
+    # recompress_async_store(), which this group appends, so the group has to
+    # stop on its own payload rather than on per-step idempotency.  The probe
+    # is the forward declaration this group writes next to the include it
+    # anchors on, i.e. text no other group produces.
+    try:
+        _probe = ctx.read("drivers/block/zram/zram_drv.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _b24_zmp.RECOMPRESS_ASYNC_STORE in _probe:
+        return "already_present", ("the async recompress engine is already in zram_drv.c")
     status, _results, detail = apply_steps(ctx, _b10_zram.build_steps())
     if status is None:
         return "blocked_by_shape", detail
@@ -4140,6 +4163,30 @@ PATCH_GROUPS = PATCH_GROUPS + _b15_mm.build_groups(PatchGroup)
 import batch17_core_zram_writeback as _b17_zwb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b17_zwb.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 24: bound a recompression pass (max_pages).
+# Steps live in scripts/batch24_core_zram_max_pages.py.
+#
+#   zram_recompress_max_pages  mainline 34efe1c3b688 (v6.10) adds max_pages to
+#                              recompress_store() and 2f529e73d720 (v7.1)
+#                              rejects an unrecognised type=; neither ever
+#                              reached android13-5.15, whose recompression
+#                              surface this module itself generated from
+#                              android15-6.6.  The companion drives a sweep
+#                              every zram.recomp.interval_sec, so without a cap
+#                              one pass is an unbounded amount of CPU.
+#
+# Registered last and deliberately the first group in this module that rewrites
+# another group's replacement block: its target is the generated
+# recompress_store()/recompress_async_store(), not pristine text.  That is only
+# safe because zram_recompression and zram_async_recompress now probe for their
+# own payload (see the trap-5 notes there) -- register anything else in this
+# region in the same dependency order.
+# ============================================================================
+import batch24_core_zram_max_pages as _b24_zmp  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b24_zmp.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()
