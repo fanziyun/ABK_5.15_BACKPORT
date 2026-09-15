@@ -1,6 +1,179 @@
 # CHANGELOG.md — 已落地批次原文归档
 
-本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
+本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链。
+
+<a id="overview-nine"></a>
+
+## 交付日志总览：九项优化（按清单顺序）
+
+本节按功能清单的 1→9 顺序把这些批次重排成一份可读的交付日志：每一项只回答三件事——**做什么**、
+**落在哪个批次/组**、**手上有什么证据**（真机 adb / CI 构建 / 四道审计 / 单测）。逐批次的完整原文
+（政策变更说明、落地明细表、调试/试错记录、审计基线）仍是下面各 Batch 小节，本节只做顺序重排与交叉索引。
+
+| # | 项 | 批次 | 版本 | 一句话 |
+|---|---|---|---|---|
+| 1 | 优化内存分配 | Batch 13 | v0.18.0 | `android_vh_customize_alloc_gfp` 逐字移植 + ABK 消费者（第 4 条） |
+| 2 | 优化线程调度 | Batch 13（调研） | — | 四条基线逐字自带 → **不建组**；调度面见第 5 条 |
+| 3 | 空实现修复 | Batch 16 | v0.21.0 | `offload_all` **接上**，`se->slice` / nohz 死面**删掉** |
+| 4 | 低内存立刻触发碎片回收 | Batch 13 | v0.18.0 | `abk_gfp_fastfail`：order ≥ 9 的尝试加 `NORETRY\|NOWARN` |
+| 5 | 添加 EEVDF | Batch 15 | v0.20.0 | 选择器 14 步 + `sched_entity` 槽 1–4 认领 |
+| 6 | 添加 async_depth | Batch 15 | v0.20.0 | 真正的 `q->async_depth` 策略（9 文件）+ `request_queue` 槽 1 |
+| 7 | back port zram writeback | Batch 14/17/18/23 | v0.19.0 → v0.28.0 | 正确性 → compressed writeback → sepolicy → 编译门 |
+| 8 | 优化 I/O 瓶颈（bio batching） | Batch 17 | v0.22.0 | 上游 v6.19 系列，用 5.15 自己的 `UNDER_WB`/`IDLE` 改写 |
+| 9 | 添加重压缩 | Batch 4/6/10-1/12/24 | v0.5.0 → v0.29.0 | 落地 → 补 config → 修空转 → 锁算法 → 每趟上限 |
+
+### 1. 优化内存分配（`android_vh_customize_alloc_gfp`）
+
+Batch 13（v0.18.0）落地两组，都在 core：
+
+| 组 | 内容 |
+|---|---|
+| `customize_alloc_gfp_vh` | android15-6.6 的 `4466afd69452`（Bug 337192903，OPPO）**3-hunk upstream-shape 逐字移植**：`include/trace/hooks/mm.h` 声明 + `mm/page_alloc.c` 在慢路径入口把即将交给 `__alloc_pages_slowpath()` 的 gfp 按**指针**交给回调改写 + `drivers/android/vendor_hooks.c` 导出。**不加 ABK 标记**，因此未来基线自带该 commit 时自动 `already_present` 且逐字节不动 |
+| `gfp_pressure_fastfail` | 本模块的策略载荷，见第 4 条 |
+
+可行性前提是**实测**出来的，不是推理：ACK 早已把 6.1 的 cpuset 快路径系列收进 android13-5.15，
+所以慢路径入口块与 6.6 逐字相同（变量名就是 `alloc_gfp`），三处锚点在 .167/.178/.194/lts 上各**唯一**。
+KMI 侧只**新增**一个 tracepoint 与一个 vendor hook 声明，不动任何导出结构的布局。
+详见 [Batch 13](#batch-13)。
+
+### 2. 优化线程调度（`android_rvh_wake_up_new_task`）
+
+**这一项的结论是「基线自带，不重复移植」**。`android_rvh_wake_up_new_task`（受限钩子，
+`wake_up_new_task()` 首条语句；`include/trace/hooks/sched.h` 声明 + `kernel/sched/core.c` 调用）
+在四条基线（.167/.178/.194/lts）上**逐字自带**，形状与 6.x 相同 —— 调研全文
+`research/hooks_gfp_vs_wake_up_new_task.md`（Batch 13 的起因之一）。所以：
+
+- 重写它只会与基线自带文本冲突，收益为零 → 记为排除项，不再重议；
+- 本模块**不**在该钩子上挂 payload（FAS `fast_start` / 初始放置属他方领地）。将来若要做，
+  直接 `register_trace_android_rvh_wake_up_new_task`，与 Batch 10-5/10-6 挂
+  `android_vh_scheduler_tick`（**只读**报告 DVFS 归属，不写频率）同族；
+- 本模块真正交付的「线程调度」面是**第 5 条**（EEVDF 选择器族）与同批的
+  `avg_idle_preemption_mode`（退役 `wake_avg_idle` 唤醒侧预测，SIS_PROP 预算改由 `avg_idle` 直接给）、
+  `nohz_field_refinement`（`tick_sched` 状态字段命名化 + 访问器）。
+
+### 3. 修复 `offload_all`、`se->slice` 等地方的空实现
+
+Batch 16（v0.21.0）。方法不是读代码，而是拿**完整 GKI 树**（30,481 个 `.c`）当消费者语料做静态反查，
+再把可达性对齐到 **CI 复刻构建真实产出的 `.config`**。查出四处真空实现，分成「删掉」与「接上」两类：
+
+| 空实现 | 事实 | 处置 |
+|---|---|---|
+| `se->slice`（KMI 级） | `include/linux/sched.h:582` 的槽 4 在全树只出现两次：声明，以及 `kernel/sched/fair.c:746` 的 `se->slice = slice;`；`abk_eevdf_slice()` 写它之后返回的是**局部变量**，0 个读取点 | 槽 4 退回 `ANDROID_KABI_RESERVE(4)`，删掉那次写入，并修正 fair.c 里「四个字段它都读」的错误注释（另三个 `deadline`/`vlag`/`min_vruntime` 逐个查过，都有真实读点，保留） |
+| `offload_all` 恒为 false | `kernel/rcu/tree_nocb.h` 的两处赋值分别落在 `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` 与 `CONFIG_NO_HZ_FULL` 门内，而**两个宏都没开** → Batch 8 的 rcu_nocb 嫁接编译得进去、永远不执行。根因很具体：该组往 `kernel/rcu/Kconfig` 加了 `config RCU_NOCB_CPU_DEFAULT_ALL`（`default n`），**没有任何 tier 启用它** | **接上**：加进 `_MODULE_CONFIGS`，让嫁接真正生效 |
+| nohz 四个谓词 + 两个 `EXPORT_SYMBOL_GPL` | `nohz_cpu_state_test()`/`nohz_cpu_inidle()`/`nohz_cpu_idle_active()`/`nohz_cpu_tick_stopped()` 在完整树里**文件外调用者为 0**，而 `nohz_cpu_state_test()` 的唯一调用者就是另外三个 | 判为**死 KMI 面**：删四个谓词与两个导出；`nohz_cpu_idle_calls()` 降为 file-local `static`（它确实还被两个 debugfs reader 用）。真正在干活的部分保留：`enum nohz_cpu_state` + `abk_tick_nohz_state_flags()` + tick-sched.c 的五个读取点 |
+| Batch 14 在出厂配置下等于调用一个空函数 | Batch 14 的 34 行新增代码全落在 `#ifdef CONFIG_ZRAM_WRITEBACK` 内，而实测 `.config` 是 `# CONFIG_ZRAM_WRITEBACK is not set`（原始 gki_defconfig 只有 `CONFIG_ZRAM=m`） | **保持 ROM tier opt-in，不改默认行为**：设备实测该 ROM 不启用 writeback（`vendor.zram.disable=1`、mmd 从不完成），默认打开只会在别的 ROM 上白送一个吃闪存寿命的能力 |
+
+顺带删掉三处死代码：`scripts/abk_common.py` 的 `replace_once_any()`、companion 的 `abk_checkpoint()`
+与 `abk_zram_dir()`。详见 [Batch 16](#batch-16)。
+
+### 4. 内存耗尽时立刻触发碎片回收（`abk_gfp_fastfail`）
+
+Batch 13（v0.18.0）的第二组，是 ABK 自己的策略载荷（`mm/page_alloc.c` 文件尾，
+`#ifdef CONFIG_ANDROID_VENDOR_HOOKS` 内）：
+
+- **触发**：`__alloc_pages()` 快路径失败、进入慢路径**之前**，`si_mem_available()` < high 水位和的
+  `abk_gfp_fastfail_pct`%（默认 **50**；水位和每秒采样一次，沿用 Batch 9-1 的门形状），
+  且 order ≥ `abk_gfp_fastfail_order`（默认 **9** = 4K-page arm64 的 THP 级）；
+- **动作**：给这次尝试加 `__GFP_NORETRY|__GFP_NOWARN`。5.15 的 NORETRY 语义（实测 `.167` 的
+  `__alloc_pages_slowpath` @5408）= 各允许**一轮**直接回收 + 压缩、**不进** compact/reclaim 重试循环
+  → 请求快速失败，回落到调用方既有 fallback（THP→4K 页、宽容调用方拿 `-ENOMEM`），
+  消除碎片化近满内存下的**毫秒级分配停顿**；
+- **默认档不是 no-op**（评审质疑已实测排除）：`.167` 的 `GFP_TRANSHUGE_LIGHT` 只带 `__GFP_NOWARN`、
+  不带 `__GFP_NORETRY`（`include/linux/gfp.h` @365），默认 defrag=madvise 下 madvised fault 走
+  `LIGHT|__GFP_DIRECT_RECLAIM`、khugepaged defrag 走 `GFP_TRANSHUGE`（`vma_thp_gfp_mask` @688、
+  `khugepaged.c` @837）—— 全是可重试类，正被本门捕获；外加 hugetlb 运行期扩池与驱动 order-9；
+- **旋钮**（全 0644，落在 `/sys/module/page_alloc/parameters/`）：`page_alloc.abk_gfp_fastfail`
+  （总开关，`=0` 关闭）、`abk_gfp_fastfail_pct`（`0` = 移除压力门，恒快速失败）、
+  `abk_gfp_fastfail_order`；
+- **故意不在覆盖范围**：启动期 CMA/hugetlb 池建立（发生在 `late_initcall` 之前，那类分配该重试）。
+
+### 5. 添加 EEVDF 调度器
+
+Batch 15（v0.20.0），perf 两个组，注册顺序**是载荷相关的**：
+
+| 组 | 内容 |
+|---|---|
+| `sched_eevdf_pick_logic` | 扫描式 EEVDF 选择器，14 步落在 `kernel/sched/fair.c` |
+| `sched_eevdf_core_fields` | **KABI 槽认领**：`ANDROID_KABI_USE(1..4)` → `deadline` / `min_vruntime` / `vlag` / `slice` |
+
+`sched_eevdf_pick_logic` 必须排在 `sched_eevdf_core_fields` **之前** —— 后者是**反漂移闸门**：
+只有 fair.c 真的落地（探本模块 marker + 三个调用点）才认领槽位，否则槽位保持 `RESERVE`。
+`sizeof(struct sched_entity)` 在 `CONFIG_WERROR=y` 下**实测未变（512 B）**。
+
+Batch 15 同时收编了 ABK_ABI_PATCH_SUITE 的 EEVDF 面（从此两个模块**互斥**：双占同一 KMI 槽是硬冲突），
+并在收编过程中修掉套件自身四个「编译通过但行为错」的缺陷。
+**与第 3 条呼应**：Batch 16 复查后发现 `slice`（槽 4）只写不读，于是把槽 4 退回 `RESERVE` ——
+KMI 面不为「看起来完整」付费。详见 [Batch 15](#batch-15)。
+
+### 6. 添加 async_depth
+
+Batch 15（v0.20.0）perf 组 `blk_mq_async_depth`：真正的 `q->async_depth` 队列深度策略，**9 个文件**，
+KMI 侧认领 `request_queue` 槽 1（这与第 5 条的 `sched_entity` 槽一起，正是「本模块必须代替
+ABK_ABI_PATCH_SUITE 注入」的原因）。
+
+收编时修掉的两个套件缺陷都落在 I/O 路径上：
+
+- **bfq/kyber 的 `async_depth` 量纲错**：`q->async_depth` 是**请求数**，而套件把它写进
+  `kqd->async_depth` / `bfqd->word_depths[][]` —— 那是**每 word 的 bit 上限**，
+  两处限流实际上是**死代码**；
+- 一处**无条件采样** `rq->idle_stamp`：在从未跑过 `newidle_balance()` 的 CPU 上读到的是
+  「开机以来的纳秒」。
+
+### 7. back port zram writeback
+
+四个批次叠出来的，每一层都有证据：
+
+| 批次 | 落地 |
+|---|---|
+| Batch 14（v0.19.0） | **正确性**（该分支 2022 年冻结了这块代码，`linux-5.15.y` 到 SUBLEVEL 220 也没有这些修复）：`zram_wb_teardown`（上游 `74363ec674cb`，让「在 `disksize` 之前就挂过 backing device」的设备也能正常拆除，带 `zram_meta_free()` 的空表护栏）+ `zram_writeback_bounds`（`894913e2d35c`：`writeback_store()` 的扫描上界与 `page_index=` 范围检查改在 `init_lock` **内**取，racing reset 换小 `disksize` 后不能走过新表；并带 `cond_resched()` `424d0e5828ad`）+ `zram_wb_limit_align`（`rounddown(val, PAGE_SIZE / 4096)`，16 KiB 页构建不会 underflow 把闪存磨损上限悄悄关掉） |
+| Batch 17（v0.22.0） | **compressed writeback**：写侧进组、读侧 dispatcher、`compressed_writeback` 属性（采用改名后的**最终 ABI 名**），`v7.0` 的尾字节清零修复**内建**；两条 `Cc: stable`（`bf62f69574b1` 的 `wb_ctl` UAF、`3e8d8eb8d7f5` 的「已保留未提交」blk_idx 泄漏）从第一行新代码起就不存在 |
+| Batch 18（v0.23.0） | companion 的 `sepolicy.rule`：Enforcing 下 loop worker 读写后备文件需要策略 |
+| Batch 23（v0.28.0） | **编译门**：新增块整体包进 `#ifdef CONFIG_ZRAM_WRITEBACK`，两处调用点用 `#ifdef/#else/#endif` 回落到 pristine 原句（配置关掉时该区域回到 pristine 形态）；并新增「配置门内符号引用」审计（`tests/implementation_audit.py` 的 `CONFIG_GATED_REFERENCES`），把 CI 那次 `no member named 'bdev' in 'struct zram'` 变成可机械复现的检查（双向验过：修复后 0 条，故意铲掉门立刻报 24 条） |
+
+**真机取舍**（Batch 17，vermeer 的 zram1，不碰在用的 zram0）：compressed writeback 写侧省、读侧花，
+读回时**系统级** CPU 高约 48%，按量级**盈亏平衡点约在读回率 25–30%** ⇒ 模块**默认 0** 是正确取舍，
+不强行打开；`writeback_limit=100` 块在 batch 1/32/256 下都**恰好写 100 页**（提交前扣费不超发）；
+同时**证伪**了「后备设备少写 4K 页」（bio 恒为 `PAGE_SIZE`）。详见 [Batch 14](#batch-14) /
+[Batch 17](#batch-17) / [Batch 23](#batch-23)。
+
+### 8. 优化 I/O 瓶颈（zram bio batching）
+
+Batch 17（v0.22.0）core 组，上游系列一 v6「zram: introduce writeback bio batching」
+（2025-11-22，6 patch，v6.19）：`f405066a1f0d` 机制 + `e828cccb72ed` `writeback_batch_size`（默认 32）。
+
+**5.15 等价改写，不是 cherry-pick**：上游靠 pp-slot 机制（`zram_pp_ctl`/`zram_pp_slot`，
+v6.13）驱动分批，而 5.15 **0 命中** → in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE`
+表达：前者让 `recompress_store()` / `abk_zram_recomp_work()` 在 slot lock 下跳过飞行中的槽，
+后者（`zram_free_page()` 入口清 IDLE、`idle_store()` 拒绝给 UNDER_WB 标 IDLE）就是
+「这个槽还是我读到的那一个」的可靠判据。上游的独立 `zram_writeback_slots()` 在 5.15 是
+**内联在** `writeback_store()` 里，保留内联（函数切分是 pp-slot 两阶段选择才需要的）。
+
+**真机数据**（同一次 vermeer 实测，每例校验写回前后读回 md5）：
+
+| batch | 结果 |
+|---|---|
+| 1 → 32 | **墙钟 17×、上下文切换 12×、写回任务 CPU 6.5×**（90.7→14.0 jiffy = 363→56 ms） |
+| 32 → 256 | 再压上下文切换，但**不压墙钟** —— 瓶颈已转到 loop/闪存，所以默认值是 32 而不是越大越好 |
+
+### 9. 添加重压缩
+
+| 批次 | 落地 |
+|---|---|
+| Batch 4（v0.5.0） | core 组 `zram_recompression`（android15-6.6 / 6.2 系列）：`ZRAM_MULTI_COMP` + `ZRAM_TRACK_ENTRY_ACTIME`、`comps[]`/`comp_algs[]`/`num_active_comps`（保留 `ZRAM_FLAG_SHIFT=24`）、`zram_read_from_zspool` / `zram_recompress` / `recompress_store` + sysfs、`mark_idle` 龄期标记、多 comp 初始化，zsmalloc 新增 `zs_lookup_class_index()` |
+| Batch 6（v0.7.0） | `config_enablement` 默认打开 `ZRAM_TRACK_ENTRY_ACTIME` / `ZRAM_MULTI_COMP` —— 让 Batch 4 **不再是「代码在、开关没有」** |
+| Batch 10-1（v0.12.0） | 真机复勘发现**重压缩空转**（`[zram_recompd]` 线程确实被创建、没有一页被重压缩）→ core 组 `zram_async_recompress`：`recompress_store()` 只按现参排程，专用 kthread 逐项执行，`reset` 前 flush（排程/执行的互斥按 `init_lock` 锁死），作业持自身 scratch page |
+| Batch 12（v0.15.0） | `zram_algo_lock`：`recomp_algorithm` 与 `comp_algorithm` 一起进锁 —— **接受写入但保留锁定值**，故意**不返回 `-EPERM`**（Android 16 的 `mmd_setup` 在算法写失败时会放弃整条 zram bring-up，含 writeback） |
+| Batch 24（v0.29.0） | 重压缩扫描的**每趟上限** `max_pages`（`34efe1c3b688`，v6.10）+ 拒绝无法识别的 `type=`（`2f529e73d720`，v7.1：`mode` 初值 0 的含义是「不做过滤」，打错一个字母今天会把**整盘重压一遍**），同步与异步两个节点一起 |
+
+运行时由 companion 驱动：`zram.recomp.enable=1`、每 `zram.recomp.interval_sec=1800` 跑一趟
+（`idle_age_sec=3600` 标冷、`mode=async`、`max_pages=16384`），并且**每趟之后**跑一次受门控的
+zsmalloc `compact`（两个开销门都判定设备已碎片化才写节点）。详见 [Batch 4](#batch-4) /
+[Batch 10-1](#batch-10-1) / [Batch 12](#batch-12) / [Batch 24](#batch-24)。
+
+---
+
+本节不含新落的批次：九项都是上面已归档内容的**顺序重排**，唯一一次「按清单补写」是把散在各 Batch
+小节里的证据（真机 adb 输出、CI 构建号、审计门禁名）提到与功能项同一层，便于按清单核对。
 
 <a id="batch-26"></a>
 
