@@ -204,15 +204,16 @@ REQUIRED_CONTENT = {
     ],
     "perf:sched_eevdf_core_fields": [
         # The KABI claim itself -- this is the group that takes ownership of the
-        # sched_entity slots the retired red line used to forbid.  Three scalars,
+        # sched_entity slots the retired red line used to forbid.  Four scalars,
         # so each ANDROID_KABI_USE's size/alignment static assert holds and
         # sizeof(struct sched_entity) is unchanged.  Batch 16 released slot 4
-        # (see REQUIRED_ABSENT): the suite claimed it as ``u64 slice`` and a
-        # full-tree consumer sweep found the field written and never read.
+        # (see REQUIRED_ABSENT for the packing that must not come back); Batch 28
+        # re-claimed it for real as ``u64 slice``, which update_deadline(), the
+        # EEVDF yield and PREEMPT_SHORT all read.
         "ANDROID_KABI_USE(1, u64 deadline);",
         "ANDROID_KABI_USE(2, u64 min_vruntime);",
         "ANDROID_KABI_USE(3, s64 vlag);",
-        "ANDROID_KABI_RESERVE(4);",
+        "ANDROID_KABI_USE(4, u64 slice);",
     ],
     "perf:sched_eevdf_pick_logic": [
         "abk_pick_eevdf",
@@ -223,14 +224,53 @@ REQUIRED_CONTENT = {
         "abk_eevdf_store_rel_deadline",
         "abk_eevdf_scale_rel_deadline",
         "ABK_EEVDF_REL_DEADLINE_BIT",
+        # The Batch 28 accumulators.  Without them avg_vruntime() falls back to
+        # walking the tree, which is the quadratic cost the rebuild removed.
+        "abk_entity_key",
+        "abk_avg_vruntime_add",
+        "abk_avg_vruntime_sub",
+        "abk_avg_vruntime_update",
+        # The policy rules Batch 28 added on top of the Batch 15 payload.
+        "sched_feat(RUN_TO_PARITY)",
+        "abk_eevdf_preempt_short",
+        "abk_eevdf_lag_limit",
         # Definitions alone would pass even if nothing called them: these are the
-        # three call sites that make the selector live.  They are also what
-        # sched_eevdf_core_fields' anti-drift gate probes before it will claim
-        # the sched_entity KABI slots.
+        # call sites that make the runtime state live.  They are also what
+        # sched_eevdf_core_fields' and sched_eevdf_modern_fields' anti-drift
+        # gates probe before they will claim the KABI slots / add the cfs_rq
+        # fields.
+        "abk_avg_vruntime_add(cfs_rq, se);",
+        "abk_eevdf_refresh_deadline(cfs_rq, curr);",
         "return abk_pick_eevdf(cfs_rq, curr);",
-        "abk_eevdf_refresh_deadline(cfs_rq, se);",
         "abk_eevdf_place_entity(cfs_rq, se, initial);",
-        "scan-based EEVDF runtime-state graft",
+        "cfs_rq->abk_pick_deadline = se->deadline;",
+        "EEVDF runtime-state graft (Batch 28 shape)",
+        # Batch 28 repair: upstream nulls an ineligible curr before its
+        # run-to-parity test.  Without it run-to-parity also hands the CPU to
+        # an ineligible current, which hides the skip buddy that
+        # yield_task_fair() sets, so sched_yield() ends up weaker than stock CFS.
+        "!abk_eevdf_eligible(curr, avruntime)",
+        # ...and the guards that preserve a userspace-provided request size.
+        "if (!se->slice)",
+        # The !EEVDF halves.  See REQUIRED_PAIRING for why they are required.
+        "if (sched_feat(EEVDF))",
+        "if (!sched_feat(EEVDF) && wakeup_preempt_entity(se, pse) == 1)",
+    ],
+    "perf:sched_eevdf_modern_fields": [
+        # The cfs_rq side of the rebuild: the two accumulators that make
+        # avg_vruntime() O(1) and the run-to-parity stash, plus the two policy
+        # switches.  struct cfs_rq is not an exported type, so these three
+        # fields cost no KMI.
+        "s64\t\t\tavg_vruntime;",
+        "u64\t\t\tavg_load;",
+        "u64\t\t\tabk_pick_deadline;",
+        # Batch 28 repair: without a producer, se->slice can only ever hold the
+        # global default, and abk_eevdf_preempt_short() is a tautology.
+        "p->se.slice = min_t(u64, max_t(u64, attr->sched_runtime,",
+        "p->se.slice = 0;",
+        "SCHED_FEAT(EEVDF, true)",
+        "SCHED_FEAT(RUN_TO_PARITY, true)",
+        "SCHED_FEAT(PREEMPT_SHORT, true)",
     ],
     "perf:nohz_field_refinement": [
         "enum nohz_cpu_state",
@@ -636,16 +676,25 @@ REQUIRED_ABSENT = {
         # two fields share one 8-byte slot and the KABI size assert is wrong.
         ["include/linux/sched.h", "ANDROID_KABI_USE(3, struct {"],
         ["include/linux/sched.h", "ANDROID_KABI_USE(4, struct {"],
-        # Batch 16 released slot 4.  It was claimed as ``u64 slice`` and the
-        # only occurrence of the field anywhere in the tree was the single
-        # store in abk_eevdf_slice() -- dead frozen-ABI space.  It must not
-        # come back as a claim.
-        ["include/linux/sched.h", "ANDROID_KABI_USE(4, u64 slice);"],
+        # Batch 16 released slot 4 because the suite's ``u64 slice`` was written
+        # once and read nowhere; Batch 28 re-claimed it because the rebuilt
+        # payload really does read it.  The *released* form must not come back --
+        # the needle carries the ``vlag`` line so it pins the sched_entity tail
+        # and not the identical reserve runs in sched_rt_entity / task_struct.
+        ["include/linux/sched.h",
+         "ANDROID_KABI_USE(3, s64 vlag);\n\tANDROID_KABI_RESERVE(4);"],
     ],
     "perf:sched_eevdf_pick_logic": [
-        # The consumer end of the released field: the helper wrote it and read
-        # its own local instead.
+        # The Batch 15 consumer end of the old dead field: the helper wrote
+        # se->slice and read its own local instead.  The rebuilt slice has real
+        # readers (abk_eevdf_slice() feeds vslice, the deadline, the lag limit
+        # and PREEMPT_SHORT), so the discarded-local form must not return.
         ["kernel/sched/fair.c", "se->slice = slice;"],
+        # The Batch 15 selector refreshed deadlines while selecting, and walked
+        # the tree to do it.  Both are what the rebuild removed.
+        ["kernel/sched/fair.c", "abk_eevdf_refresh_deadline(cfs_rq, se);"],
+        ["kernel/sched/fair.c", "abk_eevdf_max_slice"],
+        ["kernel/sched/fair.c", "abk_eevdf_total_weight"],
     ],
     "perf:nohz_field_refinement": [
         # Batch 16 removed the suite's exported accessor pair and its four
@@ -742,6 +791,40 @@ REQUIRED_ABSENT = {
 # body and assert on that slice, so a hunk landing in the neighbouring function
 # fails the audit.  Keyed as "child:group" -> list of
 # (rel, function_name, must_contain, must_not_contain).
+# Cross-file invariants: a switch is only a switch if BOTH branches exist, and
+# a comparison is only a comparison if the thing it compares can differ.
+#
+# This table exists because nothing else in this file could see the failure it
+# catches.  Batch 28 first shipped `SCHED_FEAT(PREEMPT_SHORT, true)` wired to a
+# tautology: se->slice had two writers (both the same global constant) and a
+# reader whose zero-fallback was that same constant, so
+# `abk_eevdf_slice(pse) >= abk_eevdf_slice(se)` was X >= X and the guard always
+# rejected.  Every check passed -- the symbol existed in System.map, the feature
+# was enabled, the field was read on a hot path.  Presence is not liveness, and
+# a switch that cannot change anything is worse than an absent one because it
+# reads as a control.
+#
+# Rows are (condition_rel, condition_needle, consequence_rel, consequence_needle,
+# why).  The check fails when the condition is present and the consequence is
+# not, in a group that reported applied/partial.
+REQUIRED_PAIRING = {
+    "perf:sched_eevdf_modern_fields": [
+        ("kernel/sched/features.h", "SCHED_FEAT(PREEMPT_SHORT, true)",
+         "kernel/sched/core.c", "attr->sched_runtime",
+         "PREEMPT_SHORT compares two request sizes; with no producer of a "
+         "non-default se->slice the comparison is a tautology"),
+        ("kernel/sched/features.h", "SCHED_FEAT(EEVDF, true)",
+         "kernel/sched/fair.c", "if (!sched_feat(EEVDF) && wakeup_preempt_entity",
+         "an EEVDF switch with no !EEVDF wakeup path is a switch with one "
+         "branch, so turning it off changes nothing"),
+        ("kernel/sched/features.h", "SCHED_FEAT(EEVDF, true)",
+         "kernel/sched/fair.c",
+         "if (sched_feat(EEVDF))\n\t\treturn abk_pick_eevdf(cfs_rq, curr);",
+         "same: the selector needs its legacy half too"),
+    ],
+}
+
+
 REQUIRED_IN_FUNCTION = {
     "perf:psi_oncpu_state_mask": [
         # The flag must be handled where the mask is built, and it must never
@@ -1084,6 +1167,16 @@ def run_tree(source):
                             if needle in body:
                                 problems.append(f"{child}/{group.key}: {fn_name} "
                                                 f"has forbidden text: {needle!r}")
+
+                # Cross-file pairing invariants
+                if key in REQUIRED_PAIRING and status in ("applied", "partial"):
+                    for crel, cneedle, drel, dneedle, why in REQUIRED_PAIRING[key]:
+                        if not (ctx.path(crel).exists() and ctx.path(drel).exists()):
+                            continue
+                        if cneedle in ctx.read(crel) and dneedle not in ctx.read(drel):
+                            problems.append(
+                                f"{child}/{group.key}: {cneedle!r} in {crel} has no "
+                                f"counterpart {dneedle!r} in {drel} -- {why}")
 
                 if status in ("applied", "partial") and \
                         not any(MARKER in ctx.read(f) for f in changed):

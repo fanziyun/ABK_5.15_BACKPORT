@@ -2796,7 +2796,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.30.1", "0.30.1"], _versions)
+          _versions == ["0.31.1", "0.31.1"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads

@@ -417,15 +417,28 @@ then
   grep -q "ANDROID_KABI_USE(3, s64 vlag);" \
     "$KERNEL_ROOT/common/include/linux/sched.h" \
     || fail "EEVDF did not claim sched_entity slot 3"
-  # Batch 16 released slot 4: the suite's u64 slice was written once and read
-  # nowhere, so it goes back to a reserve instead of staying dead KABI space.
-  if grep -q "ANDROID_KABI_USE(4, u64 slice);" \
-       "$KERNEL_ROOT/common/include/linux/sched.h"; then
-    fail "EEVDF still claims the write-only sched_entity slot 4"
-  fi
-  grep -q "ANDROID_KABI_RESERVE(4);" \
+  # Batch 16 released slot 4 because the suite's u64 slice was written once and
+  # read nowhere.  Batch 28 re-claimed it, because the rebuilt payload really
+  # does read se->slice (update_deadline, the yield forfeit, PREEMPT_SHORT).
+  grep -q "ANDROID_KABI_USE(4, u64 slice);" \
     "$KERNEL_ROOT/common/include/linux/sched.h" \
-    || fail "sched_entity slot 4 was not released back to ANDROID_KABI_RESERVE"
+    || fail "EEVDF did not re-claim sched_entity slot 4 as u64 slice"
+  grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
+    "$KERNEL_ROOT/common/kernel/sched/fair.c" \
+    || fail "EEVDF selector is not wired into pick_next_entity"
+  # The Batch 28 rebuild: accumulators in, quadratic scans out.
+  grep -q "abk_avg_vruntime_add(cfs_rq, se);" \
+    "$KERNEL_ROOT/common/kernel/sched/fair.c" \
+    || fail "EEVDF tree insert does not maintain the cfs_rq accumulators"
+  grep -q "abk_eevdf_refresh_deadline(cfs_rq, curr);" \
+    "$KERNEL_ROOT/common/kernel/sched/fair.c" \
+    || fail "update_curr() does not own the EEVDF deadline refresh"
+  grep -q "s64			avg_vruntime;" \
+    "$KERNEL_ROOT/common/kernel/sched/sched.h" \
+    || fail "struct cfs_rq has no EEVDF accumulator"
+  grep -q "SCHED_FEAT(RUN_TO_PARITY, true)" \
+    "$KERNEL_ROOT/common/kernel/sched/features.h" \
+    || fail "RUN_TO_PARITY is not declared"
   grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
     "$KERNEL_ROOT/common/kernel/sched/fair.c" \
     || fail "EEVDF selector is not wired into pick_next_entity"

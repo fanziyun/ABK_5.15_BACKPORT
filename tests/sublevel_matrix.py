@@ -51,20 +51,22 @@ GROUP_COUNTS = {
     # second-pass group: it edits the text zram_recompression and
     # zram_async_recompress generate, both of which now probe their own payload.
     "stable_backport_core": 36,
-    # 13 Batch-1..13 groups + the two absorbed EEVDF groups
-    # (sched_eevdf_pick_logic, sched_eevdf_core_fields), the two absorbed
+    # 13 Batch-1..13 groups + the three absorbed EEVDF groups
+    # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
+    # sched_eevdf_modern_fields), the two absorbed
     # scheduler refinements (nohz_field_refinement, avg_idle_preemption_mode),
     # the absorbed blk_mq_async_depth and blk_mq_quiesced_elevator_switch (the
     # last upstream 5.15.y backlog item, 5.15.209), plus
     # sched_steal_time_excess_drop (5.15.179, the other one), plus the Batch-21
     # psi_cgroup_pressure_switch (android14-6.1 cgroup.pressure) and
     # psi_oncpu_state_mask (android14-6.1: TSK_ONCPU becomes a state-mask bit).
-    # The EEVDF pair is registered pick_logic-first so the sched_entity slot
-    # claim only happens once the fair.c logic has really landed; the three PSI
+    # The EEVDF trio is registered pick_logic-first so the sched_entity slot
+    # claim and the cfs_rq accumulators only happen once the fair.c logic has
+    # really landed; the three PSI
     # groups are registered in dependency order -- psi_irq_tracking first (the
     # switch patches the walk it appends), psi_cgroup_pressure_switch next (the
     # ONCPU group edits its disabled branch).
-    "stable_perf_backport": 22,
+    "stable_perf_backport": 23,
     "stable_display_fix": 1,
 }
 

@@ -16,7 +16,7 @@
 | 2 | 优化线程调度 | Batch 13（调研） | — | 四条基线逐字自带 → **不建组**；调度面见第 5 条 |
 | 3 | 空实现修复 | Batch 16 | v0.21.0 | `offload_all` **接上**，`se->slice` / nohz 死面**删掉** |
 | 4 | 低内存立刻触发碎片回收 | Batch 13 | v0.18.0 | `abk_gfp_fastfail`：order ≥ 9 的尝试加 `NORETRY\|NOWARN` |
-| 5 | 添加 EEVDF | Batch 15 | v0.20.0 | 选择器 14 步 + `sched_entity` 槽 1–4 认领 |
+| 5 | 添加 EEVDF | Batch 15 → **Batch 28** | v0.20.0 → **v0.31.0** | Batch 15 选择器 14 步 + `sched_entity` 槽 1–4 认领；**Batch 28 按 `docs/survey_eevdf_gap.md` 的差异审计重建**：O(1) 累加器 + `RUN_TO_PARITY` + EEVDF 唤醒抢占 + `PREEMPT_SHORT` + EEVDF yield |
 | 6 | 添加 async_depth | Batch 15 | v0.20.0 | 真正的 `q->async_depth` 策略（9 文件）+ `request_queue` 槽 1 |
 | 7 | back port zram writeback | Batch 14/17/18/23 | v0.19.0 → v0.28.0 | 正确性 → compressed writeback → sepolicy → 编译门 |
 | 8 | 优化 I/O 瓶颈（bio batching） | Batch 17 | v0.22.0 | 上游 v6.19 系列，用 5.15 自己的 `UNDER_WB`/`IDLE` 改写 |
@@ -496,6 +496,368 @@ companion `abk_zram_writeback_sweep`（source 模块脚本后单独调用）：
 改法：`writeback` 那一写不再走 `abk_write`，直接写并保留 rc；分类逻辑不变 —— 仍是
 `rc≠0` **且** `bd_stat` 未动才算真失败，所以"哨兵规则缺失"和"生物 IO 错误"仍然报得出来。
 
+
+<a id="batch-28"></a>
+
+## Batch 28(v0.31.0)
+
+起因是一次 **EEVDF 现代版本差异审计**：不再问「EEVDF 有没有」，而问「5.15 上这套 EEVDF
+比 Linux 6.6 → 7.3 还缺什么」。审计原文 845 行，落在
+[`docs/survey_eevdf_gap.md`](docs/survey_eevdf_gap.md)，逐候选给出 commit / 上游版本 /
+5.15 是否已有等价物 / 缺失位置 / 依赖 / 可独立回移性 / 难度 / 对 8 Gen 2 与 Android
+的收益。本批落地其 **S 与 A 两级**。
+
+### 1. 审计的主要发现：Batch 15 收编的那套不是上游 EEVDF 的数据结构
+
+Batch 15 的 graft 是**扫描式重建**，它自己就写明了：选择器保留旧 rb-tree 排序、靠扫描
+重新推导 EEVDF 量，因为 5.15 没有 augmented cfs_rq。后果具体到代价：
+
+- `abk_pick_eevdf()` 对**每一个节点**调用 `abk_eevdf_refresh_deadline()`；
+- 而该函数每次要走 `avg_vruntime()`（**全树扫描**）与 `abk_eevdf_max_slice()`
+  （**又一次全树扫描**，且每个节点再算一次 `sched_slice()`，后者还要走 cgroup 层级）。
+
+⇒ 一次 `pick_next_entity()` 约 **O(n²)–O(n³)**，而它**每次上下文切换和每个 tick**
+都会跑（`check_preempt_tick()` 也调它）；更糟的是它在**选择过程中改写**
+`se->deadline` / `se->vlag` / `se->vruntime` —— 只是「问一下该跑谁」就扰动了调度器状态。
+
+上游对此的解法是 6.6 的 `af4cf40470c2`（`cfs_rq::avg_vruntime` 累加器）加 6.8 的
+`2227a957e1d5` + `ee4373dc902c`（按 deadline 排序的增强树 + O(1) 左侧快速路径）。
+
+### 2. 落地明细（perf 22 → 23 组，registry 改的是既有文件）
+
+三个组，都在 `scripts/batch15_perf_eevdf.py` —— **改既有文件而不是新建**，因为新建文件
+再改它插入的 helper 块会踩 `docs/group_recipe.md` 的 trap 5（后置组改写前置组新增文本）。
+
+| 组 | 文件 | 内容 |
+|---|---|---|
+| `sched_eevdf_pick_logic` | `kernel/sched/fair.c` | 21 步：累加器 + 重建的 helper 集 + `update_curr`/`update_min_vruntime`/`__enqueue_entity`/`__dequeue_entity`/`pick_next_entity`/`reweight_entity`/`enqueue_entity`/`dequeue_entity`/`place_entity`/`check_preempt_tick`/`set_next_entity`/`check_preempt_wakeup`/`yield_task_fair` 的改写 |
+| `sched_eevdf_core_fields` | `include/linux/sched.h` | 四个 `ANDROID_KABI_USE` 槽（机制不变，槽 4 重新认领） |
+| `sched_eevdf_modern_fields` | `kernel/sched/sched.h`、`kernel/sched/features.h` | 三个 `cfs_rq` 字段 + 两个开关 |
+
+审计条目 → 落地的上游 commit：
+
+| 审计等级 | commit | 落成什么 |
+|---|---|---|
+| S1 | `63304558ba5d`(v6.6) | `sched_feat(RUN_TO_PARITY)` + `abk_pick_eevdf()` 里的提前返回 + `set_next_entity()` 取的 `cfs_rq::abk_pick_deadline` 快照 |
+| S2 | `147f3efaa241`(v6.6) 的 `check_preempt_wakeup()` hunk | 用 `abk_pick_eevdf(cfs_rq, se) == pse` 取代 `wakeup_gran()` 阶梯 |
+| S3（部分） | `af4cf40470c2`(v6.6) + `ee4373dc902c`(v6.8) | `abk_avg_vruntime_*` 累加器、O(1) 的 `avg_vruntime()`、把 deadline 刷新搬进 `update_curr()`、只读的 O(n) 选择器 |
+| A2 | `147f3efaa241` 的 yield hunk + `79104becf42b`(v6.17) | `yield_task_fair()` 的放弃 vruntime |
+| A3 | `85e511df3cec`(v6.12) | `sched_feat(PREEMPT_SHORT)` + `abk_eevdf_preempt_short()` |
+| A4 | `c40dd90ac045`(v6.12) | `abk_eevdf_place_entity()` 的 `initial` 分支按 `avg_vruntime()` 放置 |
+
+**槽 4 的翻案**：Batch 16 把 `sched_entity` 槽 4 退回 `RESERVE`，理由是套件的 `u64 slice`
+只写不读。Batch 28 把它**重新认领**，因为重建后的载荷真的读 `se->slice`（deadline 刷新、
+yield 放弃、PREEMPT_SHORT 三处）。这一并**用尽**了 `sched_entity` 的保留槽游程 ——
+上游 6.12+ 的 `min_slice` / `max_slice` / `vprot` / `sched_delayed` 四个字段没有槽可放，
+这就是 delayed dequeue、slice protection、`min_slice` 传播被记为「超出边界」而不是
+「暂未尝试」的**具体原因**。
+
+### 3. 明确没做的（都写了理由，不再重议）
+
+- `2227a957e1d5` + `b01db23d5923`(v6.8/v6.6) **按 deadline 排序的增强 rbtree**：改的是
+  全树排序键，`__pick_first_entity()` 的语义对所有调用者（`update_min_vruntime()`、
+  `check_preempt_tick()`）都变，还要补 5.15 没有的 `rb_add_augmented_cached()`。
+  本批已消掉二次项，剩下的 O(n) → O(log n) 是**下一批**，也是审计里唯一「难度：高」的条目。
+- `e8f331bcc270`(v6.6) **lag 化跨 rq 放置**：要 `enqueue_entity` + `dequeue_entity` +
+  `detach_task_cfs_rq` + `attach_task_cfs_rq` + `task_fork_fair` 一起改，改一半会毁
+  `vruntime`。
+- `152e11f6df29`(v6.12) **delayed dequeue**：要 `se->sched_delayed`、`cfs_rq->nr_delayed`
+  与 `dequeue_task()` 核心改写，且上游带着约 20 条后续修正。
+- `d4ac164bde7a`(v6.12)：**不适用** —— 它修的是 `update_curr()` 侧的 preempt-short 路径，
+  而本次把规则放在 `check_preempt_wakeup()` 里，那里不看 `rq->nr_running`。
+
+### 4. 验证
+
+| 层级 | 检查 | 结果 |
+|---|---|---|
+| 语法 | `python3 -m py_compile scripts/*.py tests/*.py` | 通过 |
+| 单测 | `python3 tests/stable_5_15_test.py` | 全过 |
+| 结构 | `tests/step_audit.py` × 5.15.167/.178/.194/.216 | 四棵树全过（perf 子模块 182/182/180/171 步，第二遍逐字节一致） |
+| 内容 | `tests/implementation_audit.py` × 四棵树 | 全过 |
+| 端到端 | `bash tests/smoke.sh` × .194/.216 | 通过，回滚逐字节一致 |
+| 编译 | `rebuild.sh --reseed`（android13-5.15.216-lts，`CONFIG_WERROR=y`） | 无诊断；`kernel/sched/core.o` 与 `kernel/sched/fair.o` 均干净编译 |
+
+`System.map` 里 `abk_pick_eevdf` / `abk_eevdf_preempt_short` 是真实符号，其余 helper
+（`abk_avg_vruntime_add` / `abk_eevdf_refresh_deadline` / `abk_entity_key` …）被内联掉，
+这是预期结果（都是 `static`/`static inline` 的薄函数）。
+
+### 5. 真机：vermeer（红米 K70，SD 8 Gen 2）
+
+`boot_a` 是**纯内核**分区（192 MiB，`magiskboot unpack` 报 `RAMDISK_SZ [0]`），所以流程是
+「解当前 boot_a → 换进新 `Image` → repack → dd 回 boot_a」，不碰 ramdisk。刷前先
+`dd` 出原 `boot_a` 存两处（设备 `/data/local/tmp/boot_a.orig` 与 PC `tmp/b27/`，
+sha256 `1197110979…`）。
+
+最终刷入的是 **`581bc3df…`** 那一次构建的 `Image`（即与仓库审计状态逐字对应的那一次），
+回读 `cmp` 通过后才重启。判据链：
+
+1. **回读逐字节一致** —— 刷写脚本只在 `cmp` 通过后才允许重启（`--reboot` 才重启），
+   不匹配就 `exit 1` 不重启；
+2. **运行中的内核确实是新的** —— `/proc/kallsyms` 里同时有 `abk_pick_eevdf` 与
+   `abk_eevdf_preempt_short`（后者 Batch 15 没有），所以这个判据**有分辨力**；
+   `uname -r` 与 `/proc/version` 两侧完全相同（localversion 与固定
+   `KBUILD_BUILD_TIMESTAMP` 都不随这批变），**不能**用作判据；
+3. **没有引入新告警** —— 见 §6；
+4. **KMI 没破** —— KernelSU root 正常（`u:r:ksu:s0`），companion v0.10.0 模块在位，
+   zram 正常；
+5. **压得住** —— 8 个 CPU hog 跑 20 秒，`soft lockup` / `hung task` / `RCU stall` /
+   `BUG: scheduling while` 全 0；重启后复测：`dmesg | grep kernel/sched` 的 WARN/BUG 数为
+   **0**，stall 类计数为 **0**，`sys.boot_completed=1`。
+
+### 6. 那些 `mm/page_alloc.c` 告警是**旧的**（做了 A/B）
+
+刷完首次启动看到 `WARNING: CPU`，其中两条在 `mm/page_alloc.c`（`:4091 rmqueue`、
+`:5865 __alloc_pages`）。**没有靠推断，而是回刷原 `boot_a` 实测了一次**：老内核上**同样的
+5 条、同样的位置、同样的条数**，连 `drivers/base/core.c:1318` 与两条
+`kernel/irq/manage.c:791` 都对得上。所以**这批一条新告警都没有**，最终镜像上复测仍是这 5 条
+（外加见下的 PMIC 抖动）。
+
+两条 mm 告警的性质（读代码即可定性，与调度器无关）：`:4091` 是
+`WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1))`，`:5865` 是
+`order >= MAX_ORDER` 且没带 `__GFP_NOWARN` —— 两者的触发条件都来自**调用方自己传的
+gfp 标志**，而调用方是开机 `modprobe` 的一批厂商模块。调度器改不了别人传的 gfp 标志。
+
+本次 A/B 附带**验证了回滚路径**：`dd` 原镜像回 `boot_a` → 重启 → 运行的是老内核
+（`kallsyms` 只剩 `abk_pick_eevdf`）→ 再 `dd` 新镜像回去 → 重启 → 两个符号都在。
+即 `tmp/b27/boot_a.orig.img` 是一条可用的退路。
+
+另外：`drivers/spmi/spmi-pmic-arb.c:311 pmic_arb_wait_for_done` 超时告警**每次开机会随机出现
+0～4 条**（老内核上也出现过），属于开机 PMIC 时序抖动，不是版本差异。
+
+### 7. 「刷进去的到底是哪一个内核」：本机构建**不是逐字节可复现的**（实测）
+
+这条是本批附带测出来的、对**整个仓库的对齐方法论**都有影响的事实。
+
+本批一共构建了三次：`build27`（Batch 27 注释）、`build28`、`build28b`（与 build28
+输入**完全相同**）。三个 `Image` 的 sha256 分别是 `78e0824d…`、`581bc3df…`、`eaae25aa…`。
+
+- **build28 vs build28b（输入完全相同）：只有 1,110 字节不同**，且全部落在 40.7 MB 镜像的
+  ~31 MB 与 ~38 MB 两处 —— 也就是 **BTF / 调试元数据**区。**代码段逐字节相同。**
+- **build27 vs build28（只差 8 行注释）：8,554,807 字节不同**（约 20%）。
+
+结论两条，都是测出来的：
+
+1. **代码是可复现的，元数据不是。** 给定同样的源码，两次构建的函数布局与机器码一致，
+   差异只在 BTF/debug 区（pahole 生成 BTF 的顺序不受控），所以**不能拿 `Image` 的
+   sha256 当「同一个内核」的判据**。
+2. **改一行注释会移动约 20% 的镜像。** ThinLTO 的分区由模块内容哈希决定，注释变了就换一整套
+   分区，函数摆放随之重排。所以「本地构建和 CI 的 `Image` 成员一致」这件事**在
+   ThinLTO + BTF 下本来就不该被期待** —— 用 `verify-parity.py` 对两个同源构建做成员比对时，
+   `Image` 会报 DIFFERENT，而这不是分歧。真正的同源判据只能是（a）代码段对比，
+   或（b）如上 `/proc/kallsyms` 这类带分辨力的功能判据。
+
+> 本批**没有**回头去改 `SILENT-DIVERGENCES.md` / `verify-parity.py`；这条先记在这里，
+> 因为它是本批实测出来的，而不是推断的。
+
+### 8. 未做（本批的边界，如实写）
+
+- **没有做性能 A/B**：`RUN_TO_PARITY` 上游给的 −31% 上下文切换是 `perf bench sched messaging`
+  在 x86 上的数，**不是这台手机上的数**。本批只证明「装上了、跑得稳、没引入新告警」，
+  **不主张提速**。要主张提速得先设计两臂测量（对照臂＝`tmp/b27/boot_a.orig.img`，
+  且必须按 Batch 27 的教训保证亮屏已解锁）。
+- **`RUN_TO_PARITY` / `PREEMPT_SHORT` 无法在设备上直接读**：它们是 `sched_feat`，
+  走 `/sys/kernel/debug/sched/features`，而这台设备的 `CONFIG_SCHED_DEBUG` 关着
+  （该目录不存在）。可验证的是编译期：两个 `SCHED_FEAT` 的 `enabled=true` 在
+  `SCHED_DEBUG=n` 时会被展开成编译期常量 `1UL<<bit`，因此行为是「默认开」。
+
+`module.conf` 0.30.1 → **0.31.0**，`GROUP_COUNTS` perf **22 → 23**。
+
+
+
+### 9. 存活审计：这批有 4 处空实现，全部是本批次引入的
+
+Batch 28 落地后做了一次**逐特性存活审计**（44 个 agent：13 个特性 × 初次判定 + 2 名独立复核，
+外加配置门、上游 `custom_slice`、模块级空实现普查、回归四路横切）。结论是：**有 4 处"编译通过、
+报告 applied、但在设备上不产生任何行为"的东西**，其中一处是真缺陷。
+
+| # | 什么 | 为什么是空的 |
+|---|---|---|
+| 1 | `PREEMPT_SHORT` / `abk_eevdf_preempt_short()` | `se->slice` 只有两个写入点，都写 `sysctl_sched_min_granularity`；读取点的零回退也是同一个全局量 ⇒ `abk_eevdf_slice(pse) >= abk_eevdf_slice(se)` 是 **X ≥ X**，函数恒返回 false。`SCHED_FEAT(PREEMPT_SHORT, true)` 是**静态分支为真、toggle 它什么也不变**的开关，而 KABI 槽 4 花在一个常量上 |
+| 2 | `wakeup_preempt_entity` / `wakeup_gran` / `__pick_next_entity` | 零调用者，ThinLTO 直接删掉（`nm` 与镜像 BTF 表里都没有）。我写的注释 **"kept for out-of-tree users" 是假的** —— 它们是 `static`、无 `EXPORT_SYMBOL`，树外模块引用不到 |
+| 3 | **缺了上游的 `curr = NULL if !eligible` 前置门** | 不是我加的行，是我**没加**的行。后果：RUN_TO_PARITY 的触发状态严格宽于上游；而且它**早于 skip 判定**就 `return curr`，于是 `yield_task_fair()` 设的 skip buddy 被遮住 —— `sched_yield()` 退化成"跑完当前 slice"，**比原版 CFS 还弱**，而 A2 声称修好了它 |
+| 4 | `sched_vslice()` 的 START_DEBIT 计算被 `initial` 分支覆盖 | 属于"被取代的死计算"，非行为缺陷 |
+
+第 2、3 条合起来还使 **EEVDF 版 yield 的放弃逻辑在常见路径上不生效**：`yield_task_fair()` 先调
+`update_curr()`，当前实体的 vruntime 已经推高到平均值之上，`abk_eevdf_eligible()` 恒为假。
+
+### 10. 修复（补全而非删除）
+
+按"以补全代替删除"处理三处：
+
+1. **补回前置门**。`abk_pick_eevdf()` 在做 RUN_TO_PARITY 判定**之前**加上上游那两行：
+   `if (curr && (!curr->on_rq || !abk_eevdf_eligible(curr, avruntime))) curr = NULL;`
+   这同时收窄了 RUN_TO_PARITY、放出了 skip buddy、并让 yield 的放弃逻辑可达。
+
+2. **补上 `se->slice` 的生产者**。上游靠 `sched_setattr(sched_runtime)` →
+   `__setparam_fair()` → `se->custom_slice = 1; se->slice = r`。本批补的就是这一环，落在
+   `kernel/sched/core.c` 的 `__setscheduler_params()` 里那个本来就存在的
+   `else if (fair_policy(policy))` 分支上（上游正是把这一行换成 `__setparam_fair(p, attr)` 的）。
+   两个写入点改成 `if (!se->slice)` 守卫，于是用户态给的请求**能穿过**默认值填充。
+   - **零编码**：上游用 `unsigned char custom_slice` 一位独立的标记，而 5.15 的
+     `sched_entity` 保留槽已用尽，所以用 `se->slice == 0` 表示"无自定义请求"。
+     可观测行为与上游一致（上游 `!custom_slice` 的分支同样是写 `sysctl_sched_base_slice`）。
+   - **钳位是上游的**：100us .. 100ms。没有它，`sched_setattr` 就是一条来自非特权用户态的
+     无界 slice 请求 —— 这一点在下面"未做"里再提。
+   - 体量：core.c 一处分支 + fair.c 两处守卫。
+
+3. **把三个死符号的调用者恢复回来**。不删它们，而是恢复 **EEVDF 系列自己带过的
+   `SCHED_FEAT(EEVDF)` 开关**（`147f3efaa241` 加入、`5e963f2bd465` "Commit to EEVDF" 删除），
+   把 CFS 选择阶梯与 CFS 唤醒粒度阶梯放回 `!EEVDF` 那一半：`pick_next_entity()`、
+   `check_preempt_wakeup()`、`check_preempt_tick()` 三处各一个分支。于是
+   `__pick_next_entity` / `wakeup_preempt_entity` / `wakeup_gran` 重新有调用者，
+   `__maybe_unused` 与其上那句假注释一并去掉。
+   - 这是**上游自己的中途形态**，不是我发明的回退路径。
+   - 它同时给了一个**运行期回到 CFS 选择的开关**——在刚刚发生过真机异常之后，这个价值不低于可读性。
+   - 边界要写清楚：它不是"关掉 EEVDF"。`place_entity()` 仍做 EEVDF 放置，所以它是
+     **选择/抢占面的回退**，不是整族回滚。
+
+### 11. 让审计能抓住这类东西（否则下次还会漏）
+
+审计本身指出，这个仓库的存活判据是**字符串匹配**——正是它放过了 Batch 8 的死 RCU graft 和
+Batch 16 的只写字段，这次也放过了一个恒假函数。补了两处：
+
+- **`tests/implementation_audit.py` 新增 `REQUIRED_PAIRING`（跨文件不变量）**：
+  "开关只有两半都在才是开关；比较只有两侧能不同才是比较"。具体两条：
+  `SCHED_FEAT(PREEMPT_SHORT, true)` 必须伴随 `core.c` 里的 `attr->sched_runtime`；
+  `SCHED_FEAT(EEVDF, true)` 必须伴随两个 `!sched_feat(EEVDF)` 分支。
+- **`tests/config_gate_audit.py` 补上 `SCHED_FEAT` 覆盖**（审计的 G7）：它此前只解析
+  `#if/#ifdef` 里的 `CONFIG_*`，对 `SCHED_FEAT` 结构性地看不见。现在默认关的开关必须进
+  `DARK_GATES` 并给出理由，默认开的开关必须**在模块新增的行上真的被 `sched_feat()` 读到**。
+
+**分辨力验证（这条是关键）**：拿修复前的模块跑扩展后的 `implementation_audit.py`，它必须报红 ——
+实测确实报红，且诊断正确：
+
+```
+AUDIT FAIL: perf/sched_eevdf_modern_fields:
+  'SCHED_FEAT(PREEMPT_SHORT, true)' in kernel/sched/features.h has no counterpart
+  'attr->sched_runtime' in kernel/sched/core.c -- PREEMPT_SHORT compares two
+  request sizes; with no producer of a non-default se->slice the comparison is
+  a tautology
+```
+
+对着修复后的模块则全绿。**"如果它没修好，这个测试会不会报红"的答案是会。**
+
+同时要如实说明边界：`config_gate_audit` 新加的"开关必须有读者"这一条，**对本次这个缺陷没有
+分辨力** —— 修复前的 `abk_eevdf_preempt_short()` 里也有 `sched_feat(PREEMPT_SHORT)`，
+读者是存在的。抓住恒假的是 `REQUIRED_PAIRING`，不是它。它面向的是下一类缺陷（开关加了没人读）。
+
+### 12. 修复后的验证
+
+| 层级 | 检查 | 结果 |
+|---|---|---|
+| 语法 | `py_compile` | 通过 |
+| 单测 | `stable_5_15_test.py` | 全过 |
+| 结构 | `step_audit.py` × 四棵树 | 全过（perf 177 步；`__pick_next_entity`/`wakeup_preempt_entity`/`wakeup_gran` 三处 `__maybe_unused` 步骤因 `old == new` 撤掉，属 trap 1，已在锚点处注明） |
+| 内容 | `implementation_audit.py` × 四棵树（含新不变量） | 全过 |
+| 端到端 | `smoke.sh` × .194/.216 | 通过，回滚逐字节一致 |
+| 配置门 | `config_gate_audit.py`（含新 `SCHED_FEAT` 覆盖） | 通过：3 个新增开关全部默认开且有读者，0 个默认关 |
+| 编译 | `rebuild.sh --reseed`（`.216-lts`，`CONFIG_WERROR=y`） | `kernel/sched/core.o` 与 `kernel/sched/fair.o` **零诊断** |
+| 符号 | `System.map` | `abk_pick_eevdf` + `abk_eevdf_preempt_short` 在；**`wakeup_preempt_entity` 从"被 ThinLTO 删除"变成真实符号**；`wakeup_gran`/`__pick_next_entity` 被内联 |
+| KMI（审计 G5 部分关闭） | 导出符号计数 | `core.c` 66→66、`fair.c` 14→14，**未新增任何 `EXPORT_SYMBOL`**（生产者的体是内联进 `__setscheduler_params()` 的，不是新符号） |
+
+产物：`Image` sha256 `e559237b0e8a7f4a8cf7c5d81297bae60102f84e3845fecdb20873367735551c`。
+
+### 13. 修复后仍然未做的（不能因为改完就当没有）
+
+- **没有上机**。修复后的镜像只过了编译与四道静态审计，**一次都没刷进手机**。上一版（缺陷版）
+  在设备上跑过一次并触发了 workqueue lockup 事故，事故的成因仍未定论（见 §14）。
+- **没有跑正式的 `abidiff`/GKI KMI 工具**。上面只有"未新增导出符号 + 四个 KABI 槽的
+  `sizeof` 静态断言编译通过"这两条证据，比原来那句"KernelSU 还能 root 所以 KMI 没破"强，
+  但**不等于**跑过 ABI 检查。
+- **`sched_setattr(sched_runtime)` 现在对普通任务开放**。这是上游语义，钳位也是上游的
+  （100us..100ms），但它确实是一条新的、非特权可达的调度策略面。Android 自己是否用它、
+  以及要不要在 SELinux 侧收紧，都不是本批次能定的。
+- **性能仍未测量**。上一轮的 A/B 因事故中断，一个有效采样都没有。而且我在审计里写的
+  "旧选择器 O(n²)–O(n³)" **是夸大的**：旧代码对尚未用尽 slice 的实体是提前 return 的，
+  常见代价是**每个节点一次 `sched_slice()`**，真实量级 **O(n)**，O(n²) 只在大量实体同时过期
+  时出现。审计文档里那条结论已按此更正，**实际收益比原文写的小**。
+
+### 14. 真机事故（未定论，如实留档）
+
+2026-09-16 的一次 A/B 测量把设备搞挂了：我把 **200 个 CPU-bound 任务用 `taskset` 钉在同一个
+核（cpu3）**，用来放大调度器信号。后果见 dmesg：
+
+```
+BUG: workqueue lockup - pool cpus=3 node=0 flags=0x0 nice=0 stuck for 53s!
+pwq 6: cpus=3 ... active=67/256
+pending: psi_avgs_work ×67, kfree_rcu_monitor, lru_add_drain_per_cpu, vmstat_update
+```
+
+那个核的 kworker 池被饿死，看门狗如实报锁死，随后 Android 框架侧 watchdog 判定 system_server
+无响应并重启它，最后整机自动重启。内核**没有 panic、没有 Oops、没有 hung task、没有 RCU stall**。
+
+**直接原因是负载设计**：200 个同优先级任务钉死一核，在任何调度器上都是自我 DoS。
+但有一点**用"公平分享"解释不通**：拿 1/201 的 CPU 也不该 53 秒毫无进展。当时内存已紧
+（14951/15196 MB，swap 在用），所以可能卡在 direct reclaim 而非 CPU。**无法排除 Batch 28
+的贡献** —— 事故发生时跑的是缺陷版（缺前置门 ⇒ RUN_TO_PARITY 触发面偏宽），而**旧内核在
+同一负载下的对照一次都没测过**。
+
+事故后的处置：立刻停负载、抓全量 dmesg（13541 行）、清掉设备上所有压测脚本；
+`/data/local/tmp/boot_a.orig`（刷 Batch 28 之前的原厂内核，sha256 `1197110979…`）保留。
+**没有再做任何钉核压测**，包括"用旧内核跑一遍对照"——那正是把手机搞挂的东西。
+
+
+### 15. 修复版真机验证（2026-09-16，vermeer）
+
+镜像 `Image` sha256 `e559237b0e8a7f4a8cf7c5d81297bae60102f84e3845fecdb20873367735551c`，
+刷入 `boot_a` 前先 `dd` 备份了两份退路：`/data/local/tmp/boot_a.orig`（Batch 28 之前的原厂内核）
+与 `/data/local/tmp/boot_a.b28`（缺陷版 Batch 28）。repack 后的回读 `cmp` 逐字节一致才重启。
+
+| 判据 | 结果 |
+|---|---|
+| `boot_completed` | 1，重启后 70 s 内恢复 adb |
+| **`/proc/kallsyms` 符号数** | **3**（`abk_pick_eevdf` / `abk_eevdf_preempt_short` / **`wakeup_preempt_entity`**）；缺陷版是 **2** —— `wakeup_preempt_entity` 在缺陷版里被 ThinLTO 删掉了，现在它是真实符号。这是"修复真的落地了"的**有分辨力**判据（`uname -r` 与 `/proc/version` 两侧永远相同，不能用） |
+| workqueue lockup / soft lockup / hung task / RCU stall | 0 / 0 / 0 / 0 |
+| `kernel/sched` 相关 WARN | 0 |
+| `WARNING: CPU` 总数 | 4 条开机已知旧告警（`device_links_driver_bound`、`enable_irq`、`rmqueue`、`__alloc_pages`），随后只余 2 条 `enable_irq` |
+| KernelSU root / companion | 正常（`u:r:ksu:s0`）/ `v0.10.0` 在位 ⇒ `sched_entity` 槽 4 的认领**没有破坏 KMI** |
+| 温和负载（8 个**不钉核**的 hog，8 核各一） | ctxt ≈ 9,805/s，无 stall、无 lockup，负载退出后回落 |
+
+### 16. 更正：那两个开关在设备上**是可观测的**（我之前说错了两次）
+
+前文（§5、§8）我说 `/sys/kernel/debug/sched/features` 不存在，并先把原因归给
+"`CONFIG_SCHED_DEBUG` 关着"，后来改成"ROM 把 debugfs 藏了"。**两条都不对，正确的是**：
+
+- `CONFIG_SCHED_DEBUG=y`、`CONFIG_JUMP_LABEL=y`（已从构建出的 `.config` 核实）；
+- `/sys/kernel/debug/` 确实是空的，但那是挂载点的问题，不是配置；
+  **另挂一个 debugfs 实例就能看到全部内容**：
+
+```sh
+mkdir -p /mnt/dbg && mount -t debugfs none /mnt/dbg
+grep -E "EEVDF|RUN_TO_PARITY|PREEMPT_SHORT" /mnt/dbg/sched/features
+# → ... ALT_PERIOD BASE_SLICE EEVDF RUN_TO_PARITY PREEMPT_SHORT
+```
+
+这把 §8 里"无法在设备上直接读这两个开关"的结论**推翻**了。三个新开关都真实存在。
+
+### 17. 顺手做掉的一项验证：恢复的那半真的能跑
+
+既然 `EEVDF` 可读写，就做了这件事——**翻转它并让系统在 `!EEVDF` 下承压**，用来验证
+§10 第 3 条恢复的 CFS 阶梯在真机上是否可用：
+
+```
+state now      : EEVDF
+state after off: NO_EEVDF      ← 写入 NO_EEVDF 生效
+（8 个不钉核 hog 压 25 s：lockup 0、stall 0、WARNING:CPU 1）
+state after on : EEVDF
+```
+
+**结论两条**：①`SCHED_FEAT(EEVDF)` 是一个**真的能改变行为的开关**，不是
+`PREEMPT_SHORT` 那种静态分支恒真的摆设；②恢复进 `!EEVDF` 那一半的 CFS 选择与唤醒阶梯
+**在真机上跑得起来**，没有 panic、没有 stall。这是本次修复里唯一能在设备上直接证伪一项的验证。
+
+### 18. 修复版的边界（真机跑过之后仍然没有的）
+
+- **`PREEMPT_SHORT` 的生产者仍未在设备上被行使。** 它现在编译通过、从 `sched_setattr` 可达、
+  钳位与上游一致，但**没有任何 shell 工具能带 `sched_runtime` 调 `sched_setattr`**
+  （toybox 只有 `taskset`/`nice`，没有 `chrt`/`sched`），设备上也没有编译器可以现编一个。
+  所以"生产者存在"是**编译期与静态证据**，不是实测。这是修复后唯一还没被真机覆盖的一环。
+- **仍然没有正式 `abidiff`**。证据是"未新增 `EXPORT_SYMBOL`（`core.c` 66→66、`fair.c` 14→14）
+  ＋ 四个 KABI 槽的 `sizeof` 静态断言编译通过 ＋ KernelSU 与 vendor 模块照常加载"。
+- **仍然没有性能数据**，且审计里"旧选择器 O(n²)–O(n³)"的写法是夸大的（真实常见代价 O(n)，
+  见 §13）。
+- **`sched_setattr(sched_runtime)` 现在对普通任务开放**（上游语义、上游钳位 100us..100ms），
+  是否要在 SELinux 侧收紧不由本批次决定。
 
 <a id="batch-26"></a>
 

@@ -67,6 +67,14 @@ GATE_RE = re.compile(
 )
 IS_ENABLED_RE = re.compile(r"IS_ENABLED\(\s*(CONFIG_[A-Za-z0-9_]+)\s*\)")
 
+# SCHED_FEAT is a gate too.  `features.h` is expanded into either a sysctl
+# bitmask or a set of static keys, and the second argument is the default, so
+# the line itself says whether the gate is on.  See scan_sched_feats().
+SCHED_FEAT_RE = re.compile(
+    r"^\s*SCHED_FEAT\(\s*([A-Za-z0-9_]+)\s*,\s*(true|false)\s*\)"
+)
+SCHED_FEAT_USE_RE = re.compile(r"sched_feat\(\s*([A-Za-z0-9_]+)\s*\)")
+
 # Dark gates this audit accepts.  Every entry needs a reason, because an
 # unrecorded dark gate is exactly the Batch 8 RCU bug.  Keep it small.
 DARK_GATES = {
@@ -207,14 +215,75 @@ def scan(common: Path) -> tuple[list, list, int]:
     return class_a, class_b, len(snapshots)
 
 
+def scan_sched_feats(common: Path) -> tuple[list, list]:
+    """Module-added SCHED_FEAT lines, split by their default.
+
+    Returns (enabled, disabled); each hit is (rel, line, name, default).
+
+    A `true` entry that nothing reads is the Batch 28 failure: the switch is
+    on, the symbol exists, and toggling it changes nothing because no
+    module-added line consults it.
+    """
+    enabled, disabled = [], []
+    for snapshot in sorted(common.rglob("*.abk-orig")):
+        target = Path(str(snapshot)[:-len(".abk-orig")])
+        if not target.is_file():
+            continue
+        original = snapshot.read_text(errors="replace").splitlines()
+        patched = target.read_text(errors="replace").splitlines()
+        added = added_lines(original, patched)
+        if not added:
+            continue
+        rel = str(target.relative_to(common))
+        for i, line in enumerate(patched):
+            lineno = i + 1
+            if lineno not in added:
+                continue
+            m = SCHED_FEAT_RE.match(line)
+            if not m:
+                continue
+            name, default = m.group(1), m.group(2)
+            (enabled if default == "true" else disabled).append(
+                (rel, lineno, name, default))
+    return enabled, disabled
+
+
+def _sched_feat_has_reader(common: Path, name: str, defined_in: str,
+                           defined_at: int) -> bool:
+    """Is there a sched_feat(<name>) on a module-added line, in any file?"""
+    for snapshot in sorted(common.rglob("*.abk-orig")):
+        target = Path(str(snapshot)[:-len(".abk-orig")])
+        if not target.is_file():
+            continue
+        original = snapshot.read_text(errors="replace").splitlines()
+        patched = target.read_text(errors="replace").splitlines()
+        added = added_lines(original, patched)
+        if not added:
+            continue
+        rel = str(target.relative_to(common))
+        for i, line in enumerate(patched):
+            lineno = i + 1
+            if rel == defined_in and lineno == defined_at:
+                continue          # the definition itself does not count
+            if lineno not in added:
+                continue
+            for use in SCHED_FEAT_USE_RE.finditer(line):
+                if use.group(1) == name:
+                    return True
+    return False
+
+
 def run(common: Path, config: Path) -> list[str]:
     on, _off, known = config_state(config)
     class_a, class_b, snapshots = scan(common)
+    feats_on, feats_off = scan_sched_feats(common)
     print(f"tree       : {common}")
     print(f"config     : {config}")
     print(f"abk-orig   : {snapshots} snapshot(s)")
     print(f"class A    : {len(class_a)} added gate line(s)")
-    print(f"class B    : {len(class_b)} upstream gate(s) containing added code\n")
+    print(f"class B    : {len(class_b)} upstream gate(s) containing added code")
+    print(f"sched_feat : {len(feats_on)} added switch(es) default-on, "
+          f"{len(feats_off)} default-off\n")
 
     problems, dark = [], []
     for label, hits in (("A", class_a), ("B", class_b)):
@@ -240,6 +309,27 @@ def run(common: Path, config: Path) -> list[str]:
                     f"compiles, and neither a tier nor DARK_GATES accounts for "
                     f"it"
                 )
+
+    # SCHED_FEAT gates.  A default-off switch is dark by construction and
+    # needs a reason; a default-on one needs a reader, because "enabled" is not
+    # "effective" -- that is exactly how Batch 28 shipped a switch that could
+    # not change anything.
+    for rel, line, name, _default in feats_off:
+        if name in DARK_GATES:
+            dark.append(("SF", rel, line, name))
+            continue
+        problems.append(
+            f"[SF] {rel}:{line}: SCHED_FEAT({name}, false) is an ABK-added "
+            f"switch that is off by construction and no DARK_GATES entry "
+            f"records why"
+        )
+    for rel, line, name, _default in feats_on:
+        if not _sched_feat_has_reader(common, name, rel, line):
+            problems.append(
+                f"[SF] {rel}:{line}: SCHED_FEAT({name}, true) is on, but no "
+                f"module-added line calls sched_feat({name}) -- a switch with "
+                f"no reader controls nothing (Batch 28 shipped exactly this)"
+            )
 
     if dark:
         print("Deliberately dark (recorded, not failures):")

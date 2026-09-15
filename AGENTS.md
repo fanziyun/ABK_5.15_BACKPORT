@@ -174,12 +174,16 @@ required strings.
   `psi_group::enabled` member would move every member after it). This module uses
   `task_struct` slot 8; if ABK's
   kernel-specific patch has reused slots 6/7/8 (SysVIPC), move to slot 5. From
-  Batch 15 this module **owns** `sched_entity` slots 1–3 (the absorbed EEVDF
+  Batch 15 this module **owns** `sched_entity` slots 1–4 (the absorbed EEVDF
   family) and `request_queue` slot 1 (the absorbed `blk_mq_async_depth`): the
   old "never claim these — ABI-suite territory" rule is retired, so they are
   claimed here. Batch 16 released `sched_entity` slot 4, which the suite claimed
-  as `u64 slice`: nothing in the tree ever read that field, so it is
-  `ANDROID_KABI_RESERVE(4)` again rather than dead frozen-ABI space.
+  as `u64 slice`, because nothing in the tree then read that field. **Batch 28
+  re-claimed it** (`ANDROID_KABI_USE(4, u64 slice)`) once the rebuilt EEVDF
+  payload gave `se->slice` real readers — the deadline refresh, the yield
+  forfeit and `PREEMPT_SHORT`. That exhausts the `sched_entity` reserve run:
+  the 6.12+ EEVDF fields (`min_slice`, `max_slice`, `vprot`, `sched_delayed`)
+  have no slot and are deliberately not ported (`docs/survey_eevdf_gap.md`).
 - **Scope**: features/optimizations/refactors only. Security-only fixes (they
   arrive with newer sublevels) are excluded.
 - **Family gate**: a non-`android13-5.15` lineage produces `report_only` for every

@@ -27,16 +27,23 @@ anchor step and proves uniqueness against four pristine trees.
 
 ## 2. What the suite claimed (KABI)
 
-Exactly two structs, five slots claimed by the suite; four are still claimed here
-(Batch 16 released the `sched_entity` slot-4 row):
+Exactly two structs, five slots claimed by the suite; all five are claimed here
+again (Batch 16 released the `sched_entity` slot-4 row for one release, Batch 28
+took it back once the rebuilt payload gave `se->slice` real readers):
 
 | struct | slot | field | file |
 |---|---|---|---|
 | `struct sched_entity` | 1 | `u64 deadline` | `include/linux/sched.h` |
 | `struct sched_entity` | 2 | `u64 min_vruntime` | `include/linux/sched.h` |
 | `struct sched_entity` | 3 | `s64 vlag` | `include/linux/sched.h` |
-| ~~`struct sched_entity`~~ | ~~4~~ | ~~`u64 slice`~~ | released by Batch 16: written once at `abk_eevdf_slice()`, read nowhere |
+| `struct sched_entity` | 4 | `u64 slice` | `include/linux/sched.h` — released by Batch 16 (written once, read nowhere), re-claimed by Batch 28 |
 | `struct request_queue` | 1 | `unsigned int async_depth` | `include/linux/blkdev.h` |
+
+This exhausts the `sched_entity` reserve run.  Upstream's 6.12+ EEVDF needs four
+more fields (`min_slice`, `max_slice`, `vprot`, `sched_delayed`); none of them
+fits, which is why delayed dequeue, slice protection and `min_slice` propagation
+are recorded as out of scope rather than merely unattempted —
+`docs/survey_eevdf_gap.md` §4.
 
 Slots 2-4 of `request_queue` stay `ANDROID_KABI_RESERVE`.  The suite also
 recognises an older broken packing (`USE(3, struct{u64 min_slice; u64 max_slice;})`)

@@ -2425,11 +2425,19 @@ PATCH_GROUPS = PATCH_GROUPS + [
 #   batch15_perf_eevdf
 #       THIS is where this module takes ownership of the sched_entity KABI
 #       slots 1-4 (deadline / min_vruntime / vlag / slice) -- the slots the
-#       retired red line used to forbid.  Its two groups are registered in a
-#       deliberate order, pick_logic BEFORE core_fields, so the slot claim only
-#       happens once the fair.c logic has really landed: on anchor drift the
-#       slots stay ANDROID_KABI_RESERVE instead of being claimed for code that
-#       is not in the tree.
+#       retired red line used to forbid.  Its three groups are registered in a
+#       deliberate order, pick_logic BEFORE core_fields and modern_fields, so
+#       the slot claim and the cfs_rq accumulators only happen once the fair.c
+#       logic has really landed: on anchor drift the slots stay
+#       ANDROID_KABI_RESERVE instead of being claimed for code that is not in
+#       the tree.
+#
+#       Batch 28 rebuilt that payload onto the upstream data structure and
+#       policy (docs/survey_eevdf_gap.md): the cfs_rq virtual-time accumulators
+#       make avg_vruntime() O(1), update_curr() owns the deadline refresh so the
+#       selector is O(n) and read-only, and RUN_TO_PARITY / PREEMPT_SHORT /
+#       EEVDF wakeup preemption / EEVDF yield / new-task placement are in.
+#       The modern_fields group adds the cfs_rq fields and the two switches.
 #
 # Ordering: both modules are appended after every pre-existing perf group, so
 # their fair.c / core.c anchors see the earlier groups' output.  A build that
