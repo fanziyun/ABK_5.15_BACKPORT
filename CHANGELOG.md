@@ -1,6 +1,6 @@
 # CHANGELOG.md — 已落地批次原文归档
 
-本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链。
+本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项续写这条清单，收的是「前九项在真机上能不能用」所依赖的 per-cgroup PSI 可用性链路。
 
 <a id="overview-nine"></a>
 
@@ -170,10 +170,58 @@ v6.13）驱动分批，而 5.15 **0 命中** → in-flight 窗口用 5.15 自己
 zsmalloc `compact`（两个开销门都判定设备已碎片化才写节点）。详见 [Batch 4](#batch-4) /
 [Batch 10-1](#batch-10-1) / [Batch 12](#batch-12) / [Batch 24](#batch-24)。
 
+### 10. 每 cgroup 的压力记账开关真正可用（Batch 21/25/26）
+
+这一项是清单之外、但**前九项在真机上能不能用**取决于它的一条：第 5 条描述的 per-cgroup PSI
+记账（Batch 21 的 `cgroup.pressure` 开关）在这台设备上**从落地那天起就不可达** —— 节点数 0。
+
+| 批次 | 落地 |
+|---|---|
+| Batch 21（v0.26.0） | android14-6.1 的 `cgroup.pressure` **KMI 中性**实现：状态塞进 cgroup **自己的 `flags` 位**，`struct psi_group` / `struct cgroup` **一字节不动**（6.1 的 `psi_group::enabled` 成员会移动它之后的所有成员）；语义与上游逐条对齐 |
+| Batch 25（companion v0.9.0） | 设备侧策略 `tools/abk_psi_policy.sh`（`keep`/`auto`/`aggressive`，**只写 0 不写 1**，根组无条件先跳，带前缀保护名单）+ `--selftest` 假树 |
+| Batch 26（v0.30.0） | **可用性开关**：AOSP lts 的 `gki_defconfig` 自带 `CONFIG_CMDLINE="… cgroup_disable=pressure"`，它同时关掉 per-cgroup 记账（`psi_cgroups_enabled` 静态分支）与**全部** `CFTYPE_PRESSURE` 文件。新增第 4 档 `ABK_515_DEFCONFIG_PSI=1`（默认关）在 config lane 里去掉该 token |
+
+**第一条结论是负面的，也要写下来**：`auto`（只关「没有任务的组」）经点名验证是**零收益 no-op**
+—— 452 个组里 314 个有任务、读者只有全局 PSI 的 `lmkd`/`system_server`/`mimd`，
+所以真正的对照只有 `keep` vs `aggressive`。**被证伪的便宜修法**：把 `cgroup.pressure` 条目的
+`CFTYPE_PRESSURE` 标志去掉，token 在时节点也会出现，但那是**装饰性**的 ——
+`psi_cgroups_enabled` 静态分支仍关着，写 0 与不写没有任何区别。
+
+**真机结果**（vermeer / 5.15.216，带 `ABK_515_DEFCONFIG_ROM=1 ABK_515_DEFCONFIG_PSI=1` 重编刷入）：
+
+| 检查 | 结果 |
+|---|---|
+| `/proc/cmdline` 里的 `cgroup_disable` | **0** 处（token 真的没了） |
+| `find /sys/fs/cgroup -name cgroup.pressure` | **355~369**（随 app 组创建/销毁浮动） |
+| 根组 `cgroup.pressure` | 1（`psi_system` 未被碰）；全局 `/proc/pressure/*` 照常 |
+| 临时组写 0 / 1 / 2 | rc = 0 / 0 / **1**(EINVAL)，值 0/1 正确；**无需额外 sepolicy**（`refused=0`，dmesg 无 pressure 相关 avc） |
+| 开机自动策略 | `per-cgroup PSI supervisor up: mode=aggressive … nodes=355 disabled=106 refused=0` |
+
+**A/B 的结论是「不可复现」**，两次都没能把它做成一个可测收益：
+
+| 工装 | 规模 | 差（off 省） | 判定 |
+|---|---|---|---|
+| 旧（`printf` 循环） | 6000 fork × 3 轮 | **−330,741**（负） | 符号不定 |
+| 旧 | 15000 fork × 3 轮 | +2,987,831 | 同上 |
+| 旧 | 15000 fork × 5 轮 | +1,625,494（1.9%） | 同上 |
+| 修正后（`echo` 内建） | 20000 fork × 9 轮 | **+1,585,682**（+0.68% = 6 permille） | ×34.7% ≈ **0.24%** |
+
+按 `docs/psi_field_protocol.md` §5 的判定规则 ⇒ **出厂默认仍 `keep`**（设备侧只在展示那一趟手工用过
+`aggressive`，关掉是单向的）。三次设备实测连带修掉**四个只在这台机器上才现形的 companion 缺陷**：
+bench 的 32 位溢出把负收益印成 `49 permille`；psi supervisor 的 pid 文件写的是字面 `$`（于是
+`abk_spawn` 误报「没起来」，而它其实在跑）；**唤醒风暴的 `printf` 不是 mksh 内建**（`type printf` →
+alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 两次，量的是进程创建而不是
+这个开关跳过的那个事件）；策略 walk 把「走到一半消失的组」记成 `refused`（一条退出记录就能让
+首趟规则停掉整个 boot 的策略）。另加一道**臂完整性门**：`aggressive` 下 supervisor 每
+`psi.cgroup.interval_sec` 会连 bench 的两个臂一起关掉，跨 tick 的一轮会把两个已关的臂拿来比
+→ 现在每轮开跑前重读两臂节点，不符即**中止**。详见 [Batch 21](#batch-21) / [Batch 25](#batch-25) /
+[Batch 26](#batch-26)。
+
 ---
 
-本节不含新落的批次：九项都是上面已归档内容的**顺序重排**，唯一一次「按清单补写」是把散在各 Batch
-小节里的证据（真机 adb 输出、CI 构建号、审计门禁名）提到与功能项同一层，便于按清单核对。
+本节十项都是上面已归档内容的**顺序重排与续写**：1–9 按功能清单重排，第 10 项把「前九项在真机上
+能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
+实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
 <a id="batch-26"></a>
 
