@@ -162,6 +162,9 @@ suite-preference cross-check.
 
 - **Config lane.** The children always received `--defconfig` but never used
   it. `GraftContext.enable_configs()` now rewrites the three possible shapes
+  (Batch 26 added `defconfig_drop_cmdline_token()` next to it, for the one
+  string-valued symbol a lane cannot express as `CONFIG_x=y`: the per-cgroup PSI
+  tier drops `cgroup_disable=pressure` from `CONFIG_CMDLINE`)
   of a symbol (target value, `# CONFIG_x is not set`, another value, or
   absent), snapshots through `.abk-orig`, and refuses to write a defconfig
   outside `KERNEL_ROOT` (`report_only` with the reason). `config_enablement`

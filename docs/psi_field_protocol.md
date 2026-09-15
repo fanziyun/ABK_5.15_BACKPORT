@@ -7,6 +7,13 @@ measurement that decides whether it ships enabled.
 Device: vermeer, android13-5.15-lts 5.15.216, ABK v0.29.0 (Batch 24), KernelSU root.
 Everything below was taken on that device unless stated otherwise.
 
+**Batch 26 correction**: the kernel everything below was taken on put
+`cgroup_disable=pressure` in its command line, so `cgroup.pressure` did not exist
+on it (measured: 0 nodes) and the accounting the switch is meant to turn off was
+already off device-wide.  See §2 -- the pointing run reproduced below therefore
+describes a kernel *without* that token, which is what
+`ABK_515_DEFCONFIG_PSI=1` builds.
+
 ## 1. The switch, and where it comes from
 
 `cgroup.pressure` is **this module's own graft**, not something the baseline carries:
@@ -36,6 +43,20 @@ Before switching anything off, the question is who reads these numbers. Measured
   `mimd`, and every one of them had **`/proc/pressure/memory`** -- the global file,
   served by `psi_system` through the root group, which this switch does not touch.
 * **No process had any per-cgroup PSI file open.**
+
+> **Corrected by Batch 26.**  None of the four bullets above is reproducible on
+> a kernel built from this repository's template: the AOSP `android13-5.15-lts`
+> `gki_defconfig` ships `CONFIG_CMDLINE="... cgroup_disable=pressure"` with
+> `CONFIG_CMDLINE_EXTEND=y`, `cgroup_psi_enabled()` is therefore false for the
+> whole boot, `psi_init()` disables the `psi_cgroups_enabled` static branch (the
+> per-cgroup accounting itself) and `cgroup_addrm_files()` never creates a
+> `CFTYPE_PRESSURE` file -- `cgroup.pressure` included.  Measured on the flashed
+> kernel: `find /sys/fs/cgroup -name cgroup.pressure | wc -l` = **0**, and
+> `cpu.pressure` / `memory.pressure` / `io.pressure` are gone too.  The numbers
+> below were measured on a kernel without that token; to make them hold on the
+> target device the kernel has to be built with `ABK_515_DEFCONFIG_PSI=1`
+> (Batch 26), which drops the token -- and with it re-enables the accounting, or
+> the switch would have nothing to switch off.
 
 Reproduce it (the second command is the one that matters):
 
@@ -70,7 +91,21 @@ path prefix so `protect_memcg` covers every group this ROM names that way.
 That asymmetry is why the shipped default is `keep`: the mode with an upside is also
 the mode with a risk, and the difference between them is a number, not an argument.
 
-## 4. The measurement (two boots)
+## 4. The measurement
+
+**Batch 26 update.**  The shipped bench now takes the A/B *inside one boot*:
+two sibling groups under `--cgroot`, the identical storm run in each with the
+rounds alternating, and the bill read back from each group's own `cpu.stat`
+(`--mode ab`).  That removes the between-boot drift the two-boot loop below was
+built to live with, and it refuses to print a comparison when the kernel has no
+`cgroup.pressure`, when a group is not being billed at that depth, or when the
+arms did not land on `on=1 off=0`.  `--mode single` bills one storm in one group
+and works on any kernel, which is how the instrument itself is checked.
+
+The two-boot loop below still is the protocol of record when the thing being
+measured is the *policy pass* rather than the switch: it is what the supervisor
+does at boot, and its cost is part of the comparison.
+
 
 Re-enabling a group is supported on this graft (`psi_cgroup_restart()` rebuilds each
 CPU's state mask from the counts it kept) and explicitly *not* restore safe in

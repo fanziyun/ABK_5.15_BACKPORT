@@ -251,13 +251,17 @@ them (the kernel tree to graft is always under `KERNEL_ROOT`, with `common/` bel
   `OS_PATCH_LEVEL`, … (`ABK_BUILD_SUB_LEVEL`, `ABK_BUILD_ANDROID_VERSION`,
   `ABK_BUILD_KERNEL_VERSION` drive the family/sublevel detection in
   `stable_backport.sh`). `ABK_FEATURE_*` are the build's feature toggles.
-- `ABK_515_ALLOW_UNSUPPORTED`, `ABK_515_DEFCONFIG_ALIGN` and
-  `ABK_515_DEFCONFIG_ROM` are **module-specific overrides set by the user**, not
-  by ABK. `ABK_515_KSU_MODULE=0` skips the runtime-companion bundle;
-  `ABK_515_DEFCONFIG_ALIGN=1` adds the 6.6-GKI config deltas and
-  `ABK_515_DEFCONFIG_ROM=1` the ROM-integration tier (currently
-  `CONFIG_ZRAM_WRITEBACK=y`, off by default). The tiers are additive and each is
-  named in the config-lane detail string.
+- `ABK_515_ALLOW_UNSUPPORTED`, `ABK_515_DEFCONFIG_ALIGN`,
+  `ABK_515_DEFCONFIG_ROM` and `ABK_515_DEFCONFIG_PSI` are **module-specific
+  overrides set by the user**, not by ABK. `ABK_515_KSU_MODULE=0` skips the
+  runtime-companion bundle; `ABK_515_DEFCONFIG_ALIGN=1` adds the 6.6-GKI config
+  deltas, `ABK_515_DEFCONFIG_ROM=1` the ROM-integration tier (currently
+  `CONFIG_ZRAM_WRITEBACK=y`, off by default) and `ABK_515_DEFCONFIG_PSI=1` the
+  per-cgroup PSI tier, which drops `cgroup_disable=pressure` from
+  `CONFIG_CMDLINE` (the baseline token hides every `CFTYPE_PRESSURE` file and
+  disables per-cgroup accounting device-wide, so the Batch 21 switch and the
+  companion's PSI policy are otherwise unreachable — off by default). The tiers
+  are additive and each is named in the config-lane detail string.
 
 Injection goes into `custom_external_modules`, `|`-separated; the grammar:
 - plain module: `module:repo;stage` (legacy `repo;stage`);

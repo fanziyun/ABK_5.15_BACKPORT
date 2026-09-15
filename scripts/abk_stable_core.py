@@ -2332,9 +2332,31 @@ _INTRODUCED_KCONFIG = {
 }
 
 
+# Per-cgroup PSI accounting tier (ABK_515_DEFCONFIG_PSI=1), off by default.
+#
+# The AOSP android13-5.15-lts gki_defconfig ships
+# ``CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off
+# kvm-arm.mode=protected cgroup_disable=pressure"`` with
+# CONFIG_CMDLINE_EXTEND=y, so the token is in every boot of every build from
+# this tree.  It makes ``cgroup_psi_enabled()`` false, which does two things:
+# ``psi_init()`` disables the ``psi_cgroups_enabled`` static branch (the
+# per-cgroup accounting itself), and every ``CFTYPE_PRESSURE`` file is skipped
+# at creation -- ``io.pressure``, ``memory.pressure``, ``cpu.pressure`` and
+# **this module's ``cgroup.pressure``**.
+#
+# Batch 21's switch and the runtime companion's per-cgroup PSI policy both need
+# that one file to exist, and the accounting they are meant to switch off has to
+# be running for the switch to mean anything.  So the tier drops the token.  It
+# is off by default because the trade is device-wide: with the token gone every
+# one of the ~450 groups derives and times its own states until the companion's
+# policy pass turns it off group by group, which is what the token did for free.
+_PSI_CMDLINE_TOKEN = "cgroup_disable=pressure"
+
+
 def _config_enablement_apply(ctx):
     align = os.environ.get("ABK_515_DEFCONFIG_ALIGN", "").strip() == "1"
     rom = os.environ.get("ABK_515_DEFCONFIG_ROM", "").strip() == "1"
+    psi = os.environ.get("ABK_515_DEFCONFIG_PSI", "").strip() == "1"
     configs = list(_MODULE_CONFIGS)
     tiers = ["module-owned symbols only"]
     if align:
@@ -2343,7 +2365,17 @@ def _config_enablement_apply(ctx):
     if rom:
         configs += _ROM_CONFIGS
         tiers.append("ROM integration")
+    if psi:
+        tiers.append("per-cgroup PSI accounting")
     status, detail = ctx.enable_configs(configs)
+    if psi:
+        psi_status, psi_detail = ctx.defconfig_drop_cmdline_token(
+            _PSI_CMDLINE_TOKEN)
+        if psi_status == "blocked_by_missing_anchor":
+            status = psi_status
+        elif psi_status == "applied":
+            status = "applied"
+        detail = f"{detail}; {psi_detail}"
     return status, f"{detail} [{', '.join(tiers)}]"
 
 

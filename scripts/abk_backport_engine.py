@@ -129,6 +129,51 @@ class GraftContext:
         return ("applied",
                 f"{appended} appended, {rewritten} rewritten in {rel}")
 
+    def defconfig_drop_cmdline_token(self, token):
+        """Drop one token from ``CONFIG_CMDLINE`` in the build defconfig.
+
+        ``enable_configs()`` speaks ``CONFIG_x=y``; ``CONFIG_CMDLINE`` is a
+        string, so a lane that has to change the kernel command line needs its
+        own line-level edit.  Exactly one line is rewritten (its quoting and the
+        order of the surviving tokens are kept), and the edit is idempotent the
+        same way the rest of the lane is: a second pass finds no token and
+        reports ``already_present`` without touching the file.
+
+        A defconfig with no ``CONFIG_CMDLINE`` line is
+        ``blocked_by_missing_anchor`` rather than a silent success: a tree that
+        does not carry the line at all is not the tree this lane was written
+        against, and inventing one would change the boot command line of a kernel
+        nobody asked to change.
+        """
+        rel = self.defconfig_rel()
+        if rel is None:
+            reason = ("no defconfig passed" if self.defconfig is None
+                      else "defconfig outside KERNEL_ROOT")
+            return "report_only", reason
+
+        text = self.read(rel)
+        joiner = "\r\n" if "\r\n" in text else "\n"
+        head, tail = 'CONFIG_CMDLINE="', '"'
+        seen = dropped = False
+        lines = []
+        for line in text.split(joiner):
+            if line.startswith(head) and line.endswith(tail):
+                seen = True
+                tokens = line[len(head):-len(tail)].split()
+                if token in tokens:
+                    tokens = [t for t in tokens if t != token]
+                    line = head + " ".join(tokens) + tail
+                    dropped = True
+            lines.append(line)
+        if not seen:
+            return ("blocked_by_missing_anchor",
+                    f"no CONFIG_CMDLINE line in {rel}")
+        if not dropped:
+            return ("already_present",
+                    f"{token} already absent from CONFIG_CMDLINE in {rel}")
+        self.write(rel, joiner.join(lines))
+        return "applied", f"dropped {token} from CONFIG_CMDLINE in {rel}"
+
     # -- compatibility shape probes --------------------------------------
     def suite_touched(self, rel):
         """True when ABK_ABI_PATCH_SUITE markers appear in ``rel``."""

@@ -2082,13 +2082,15 @@ def test_batch13_wake_up_new_task_excluded():
 
 
 def test_config_tiers():
-    print("config tiers: module-owned vs GKI align vs ROM integration")
+    print("config tiers: module-owned vs GKI align vs ROM integration vs PSI")
     import abk_stable_core as core
     import os
 
-    def enabled(env_name):
-        saved = {k: os.environ.get(k) for k in
-                 ("ABK_515_DEFCONFIG_ALIGN", "ABK_515_DEFCONFIG_ROM")}
+    ENV_NAMES = ("ABK_515_DEFCONFIG_ALIGN", "ABK_515_DEFCONFIG_ROM",
+                 "ABK_515_DEFCONFIG_PSI")
+
+    def enabled(env_name, psi_status="applied", psi_detail="probe-drop"):
+        saved = {k: os.environ.get(k) for k in ENV_NAMES}
         for key in saved:
             os.environ.pop(key, None)
         if env_name:
@@ -2103,6 +2105,10 @@ def test_config_tiers():
                 caught["configs"] = list(configs)
                 return "applied", "probe"
 
+            def defconfig_drop_cmdline_token(self, token):
+                caught["cmdline"] = token
+                return psi_status, psi_detail
+
         try:
             status, detail = core._config_enablement_apply(Probe())
         finally:
@@ -2111,11 +2117,13 @@ def test_config_tiers():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        return status, detail, dict(caught.get("configs", []))
+        return (status, detail, dict(caught.get("configs", [])),
+                caught.get("cmdline"))
 
-    _s, _d, plain = enabled(None)
-    _s, _d, align = enabled("ABK_515_DEFCONFIG_ALIGN")
-    status, detail, rom = enabled("ABK_515_DEFCONFIG_ROM")
+    _s, _d, plain, plain_cmd = enabled(None)
+    _s, _d, align, align_cmd = enabled("ABK_515_DEFCONFIG_ALIGN")
+    status, detail, rom, rom_cmd = enabled("ABK_515_DEFCONFIG_ROM")
+    psi_status, psi_detail, psi, psi_cmd = enabled("ABK_515_DEFCONFIG_PSI")
 
     check("module-owned tier enables the module's own symbols",
           dict(plain).get("ZRAM_MULTI_COMP") == "y"
@@ -2128,6 +2136,121 @@ def test_config_tiers():
           and "LRU_GEN_ENABLED" not in dict(rom), sorted(dict(rom)))
     check("ROM tier is reported in the detail string",
           status == "applied" and "ROM integration" in detail, (status, detail))
+    # The PSI tier is the only one that touches the kernel command line, and it
+    # exists because the AOSP lts gki_defconfig hides every pressure file (and
+    # switches per-cgroup accounting off) with one token:
+    # cgroup_disable=pressure.  Without dropping it, Batch 21's cgroup.pressure
+    # is never created and the companion's PSI policy has nothing to walk.
+    check("only the PSI tier edits CONFIG_CMDLINE",
+          plain_cmd is None and align_cmd is None and rom_cmd is None
+          and psi_cmd == core._PSI_CMDLINE_TOKEN,
+          (plain_cmd, align_cmd, rom_cmd, psi_cmd))
+    check("the dropped token is the baseline's cgroup_disable=pressure",
+          core._PSI_CMDLINE_TOKEN == "cgroup_disable=pressure",
+          core._PSI_CMDLINE_TOKEN)
+    check("the PSI tier is reported in the detail string",
+          psi_status == "applied" and "per-cgroup PSI accounting" in psi_detail,
+          (psi_status, psi_detail))
+    check("the PSI tier keeps the module symbols and pulls in no other tier",
+          psi.get("ZRAM_MULTI_COMP") == "y" and "ZRAM_WRITEBACK" not in psi
+          and "LRU_GEN_ENABLED" not in psi, sorted(psi))
+    blocked_status, blocked_detail, _c, _t = enabled(
+        "ABK_515_DEFCONFIG_PSI", psi_status="blocked_by_missing_anchor",
+        psi_detail="no CONFIG_CMDLINE line in arch/arm64/configs/gki_defconfig")
+    check("a tree with no CONFIG_CMDLINE blocks the lane instead of passing it",
+          blocked_status == "blocked_by_missing_anchor"
+          and "no CONFIG_CMDLINE line" in blocked_detail,
+          (blocked_status, blocked_detail))
+    already_status, _d2, _c2, _t2 = enabled(
+        "ABK_515_DEFCONFIG_PSI", psi_status="already_present",
+        psi_detail="cgroup_disable=pressure already absent")
+    check("an already-dropped token does not fail the lane",
+          already_status == "applied", already_status)
+
+
+def test_psi_cmdline_tier():
+    """The PSI tier's one edit, on a real defconfig file.
+
+    Batch 21's cgroup.pressure and the companion's per-cgroup PSI policy are
+    both unreachable on any build from a tree whose gki_defconfig ships
+    cgroup_disable=pressure -- which android13-5.15-lts does.  The token makes
+    cgroup_psi_enabled() false, so psi_init() disables the psi_cgroups_enabled
+    static branch and cgroup_addrm_files() never creates a CFTYPE_PRESSURE
+    file: no accounting to switch off, and no switch.  This test pins the edit
+    that removes it, the fact that it survives a second pass byte-identically,
+    and that it refuses to touch a tree it was not written against.
+    """
+    print("PSI tier: CONFIG_CMDLINE token drop (Batch 26)")
+    import abk_stable_core as core
+    from pathlib import Path
+    import tempfile
+
+    token = core._PSI_CMDLINE_TOKEN
+    base = ("stack_depot_disable=on kasan.stacktrace=off "
+            "kvm-arm.mode=protected ")
+
+    def fixture(tmp, preamble, eol="\n"):
+        root = Path(tmp) / "common"
+        cfgdir = root / "arch/arm64/configs"
+        cfgdir.mkdir(parents=True)
+        defconfig = cfgdir / "gki_defconfig"
+        defconfig.write_bytes(preamble.encode("utf-8"))
+        ctx = GraftContext(str(root), "216", "android13-5.15",
+                           defconfig=str(defconfig))
+        return ctx, defconfig
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx, defconfig = fixture(tmp,
+            "# base\n"
+            'CONFIG_CMDLINE="' + base + token + '"\n'
+            "CONFIG_CMDLINE_EXTEND=y\n")
+        status, detail = ctx.defconfig_drop_cmdline_token(token)
+        text = defconfig.read_text()
+        check("the token is gone",
+              status == "applied" and token not in text, (status, text))
+        check("the surviving tokens keep their order and quoting",
+              'CONFIG_CMDLINE="' + base.rstrip() + '"\n' in text, text)
+        check("CONFIG_CMDLINE_EXTEND is untouched",
+              "CONFIG_CMDLINE_EXTEND=y" in text, text)
+        check("the pristine defconfig is snapshotted for rollback",
+              (defconfig.parent / "gki_defconfig.abk-orig").read_text().count(token) == 1)
+        after_first = text
+        status2, _detail2 = ctx.defconfig_drop_cmdline_token(token)
+        check("second pass reports already_present",
+              status2 == "already_present", status2)
+        check("second pass writes nothing",
+              defconfig.read_text() == after_first, defconfig.read_text())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx, defconfig = fixture(tmp,
+            "# base\r\n"
+            'CONFIG_CMDLINE="' + base + token + '"\r\n'
+            "CONFIG_CMDLINE_EXTEND=y\r\n")
+        status, _detail = ctx.defconfig_drop_cmdline_token(token)
+        raw = defconfig.read_bytes().decode("utf-8")
+        check("a CRLF defconfig keeps CRLF",
+              status == "applied" and token not in raw and "\r\n" in raw,
+              repr(raw))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx, _defconfig = fixture(tmp, "CONFIG_PSI=y\n")
+        status, detail = ctx.defconfig_drop_cmdline_token(token)
+        check("no CONFIG_CMDLINE line is blocked_by_missing_anchor, not a pass",
+              status == "blocked_by_missing_anchor" and ctx.pending_writes() == [],
+              (status, detail))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "common"
+        root.mkdir()
+        outside = Path(tmp) / "gki_defconfig"
+        outside.write_text('CONFIG_CMDLINE="' + token + '"\n')
+        ctx = GraftContext(str(root), "216", "android13-5.15",
+                           defconfig=str(outside))
+        status, detail = ctx.defconfig_drop_cmdline_token(token)
+        check("a defconfig outside KERNEL_ROOT is refused",
+              status == "report_only" and "outside" in detail, (status, detail))
+        check("the refused defconfig is not written",
+              token in outside.read_text())
 
 
 def test_introduced_kconfig_tiers():
@@ -2673,7 +2796,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.29.0", "0.29.0"], _versions)
+          _versions == ["0.30.0", "0.30.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -2991,14 +3114,41 @@ def test_runtime_tunables_module():
                   "Batch 21" in _psi_tool
                   and "inherited upstream" not in _psi_tool)
             _psi_bench = archive.read("bin/abk_psi_bench.sh").decode("utf-8")
-            check("the bench reads /proc/stat through a real awk regex, not a caret",
-                  "/^cpu  /" in _psi_bench
-                  and "awk '^cpu" not in _psi_bench)
-            check("the bench refuses an unreadable /proc/stat instead of reporting zero",
-                  "refusing to print a zero" in _psi_bench)
-            check("the bench labels each round by the state measured from the tree",
-                  "state=$(abk_state_probe)" in _psi_bench
-                  and "nodes=" in _psi_bench and "off=" in _psi_bench)
+            # Whether a string is absent depends on comment vs code here: two of
+            # the strings below are named in the tool header precisely because
+            # they are the old bugs, so the absence checks run against a
+            # comment-stripped view (the same split the DVFS pins use above).
+            _psi_bench_code = "\n".join(l for l in _psi_bench.splitlines()
+                                         if not l.lstrip().startswith("#"))
+            # The first version of this tool billed itself out of /proc/stat and was
+            # rewritten after the first device run, because two things about it were wrong
+            # in ways every local gate had passed: machine-wide busy jiffies are about 45%
+            # background load on this phone, so the saving this switch can produce is a
+            # rounding error on that number; and its wake storm was a second fork storm
+            # wearing a wake storm label, because toybox sleep forks.  The pins below are
+            # about the second version, and they pin the same three shapes the first one
+            # ate: a reading that came back silently empty, a label the tree does not
+            # support, and a run that generated no work exiting 0.
+            check("the bench reads cpu.stat by key, not by summing /proc/stat",
+              "awk -v k=" in _psi_bench_code and "$1 == k" in _psi_bench_code
+                  and "/^cpu  /" not in _psi_bench_code
+                  and "/proc/stat" not in _psi_bench_code)
+            check("the bench refuses an unreadable cpu.stat instead of billing zero",
+              "aborting instead of billing zero" in _psi_bench)
+            check("the bench refuses a group that is not being billed",
+              "not being billed at depth" in _psi_bench and "instrument live" in _psi_bench)
+            check("the bench verifies both arms by reading the pressure nodes back",
+              "arms did not land on on=1 off=0" in _psi_bench and "echo 0 > " in _psi_bench)
+            check("the bench says so when the kernel has no switch to A/B",
+              "this kernel has no per-cgroup PSI switch" in _psi_bench)
+            check("a missing storm binary fails the bench instead of passing it",
+              "cannot generate a storm" in _psi_bench
+                  and "exit 1" in _psi_bench.split("cannot generate a storm", 1)[1][:40])
+            check("the wake storm is a blocking wake, not a fork storm in disguise",
+              "mkfifo" in _psi_bench_code and "sleep 0" not in _psi_bench_code)
+            check("the bench reports the groups it left behind",
+              "groups left =" in _psi_bench)
+            check("the bench has a help path", "-h|--help) abk_usage" in _psi_bench)
             check("embedded FAS check tool is byte-identical to tools/",
                   archive.read("bin/abk_fas_check.sh")
                   == (repo / "tools" / "abk_fas_check.sh").read_bytes())
@@ -3786,6 +3936,7 @@ def main():
     test_batch13_gfp_pressure_fastfail()
     test_batch13_wake_up_new_task_excluded()
     test_config_tiers()
+    test_psi_cmdline_tier()
     test_introduced_kconfig_tiers()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()

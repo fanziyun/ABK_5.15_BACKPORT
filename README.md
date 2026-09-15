@@ -57,7 +57,13 @@ own symbols by default and, with `ABK_515_DEFCONFIG_ALIGN=1`, also the
 android15-6.6 GKI config deltas whose 5.15 code already exists
 (`LRU_GEN_ENABLED`, BBR, `BLK_WBT`, cgroup IO throttling, delay accounting);
 `ABK_515_DEFCONFIG_ROM=1` adds the ROM-integration tier
-(`CONFIG_ZRAM_WRITEBACK=y`, off by default — see the runtime-companion section).
+(`CONFIG_ZRAM_WRITEBACK=y`, off by default — see the runtime-companion section),
+and `ABK_515_DEFCONFIG_PSI=1` adds the per-cgroup PSI tier: the baseline tree
+puts `cgroup_disable=pressure` in `CONFIG_CMDLINE`, which switches per-cgroup
+accounting off device-wide *and* hides every `CFTYPE_PRESSURE` file — including
+Batch 21's `cgroup.pressure` — so the tier drops that one token to make the
+switch, and the companion's PSI policy, reachable (off by default: with the
+token gone every group pays until the policy pass turns it off again).
 Unsupported lineage is now a real gate too: outside android13-5.15 every group
 reports `report_only` and nothing is written unless `ABK_515_ALLOW_UNSUPPORTED=1`
 is set.

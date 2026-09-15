@@ -2,6 +2,79 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。
 
+<a id="batch-26"></a>
+
+## Batch 26(v0.30.0)
+
+起因是真机复现：**Batch 21/25 的功能在这台设备上不可达**。
+
+### 1. 症状
+
+在 vermeer（本地构建 5.15.216，KernelSU root）上：
+
+    su -c 'find /sys/fs/cgroup -name cgroup.pressure | wc -l'   # 0
+
+不只是 `cgroup.pressure`：`cpu.pressure` / `memory.pressure` / `io.pressure` 一个都没有；
+而 `/proc/pressure/*`（含本模块 Batch 3 的 `irq`）全在。于是 Batch 25 的两只工具给出的都是
+正确但无用的答案：`abk_psi_policy.sh --status` → `no cgroup.pressure … nothing done`，
+`abk_psi_bench.sh --mode ab` → `this kernel has no per-cgroup PSI switch`。
+
+### 2. 根因不在 graft，在基线 defconfig 的一个启动参数
+
+AOSP `android13-5.15-lts` 的 `arch/arm64/configs/gki_defconfig` 自带：
+
+    CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=protected cgroup_disable=pressure"
+    CONFIG_CMDLINE_EXTEND=y
+
+（本仓库 `research/config_audit/vermeer-5.15.216-ci.config:522` 是同一条值 ⇒ CI 构建也一样；
+本模块自己的 `gki_defconfig.abk-orig` 快照里也有它 ⇒ 不是本模块加的。）后果两条，都在内核里：
+
+- `psi_init()`：`if (!cgroup_psi_enabled()) static_branch_disable(&psi_cgroups_enabled);`
+  ——**per-cgroup 记账整个关掉**；
+- `cgroup_addrm_files()` / `cgroup_init_cftypes()`：`CFTYPE_PRESSURE` 的文件在创建阶段被跳过，
+  Batch 21 的 `cgroup.pressure` 也在其中。
+
+所以 `docs/psi_field_protocol.md` §2 那份「452 个组带 cgroup.pressure」的点名，只可能量自
+**没有这个 token 的内核**；在本模板的任何构建上复现命令都返回 0。该文档已按此加注。
+
+### 3. 被证伪的「便宜修法」
+
+把 `cgroup.pressure` 条目的 `CFTYPE_PRESSURE` 标志去掉，节点在 token 存在时也会出现——但那是
+**装饰性**的：`psi_cgroups_enabled` 静态分支仍关着，`psi_group_change()` 对非 root 组根本不推导状态，
+写 0 与不写没有任何区别。**要先让记账跑起来，开关才有东西可关。**
+
+### 4. 落地明细
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/abk_backport_engine.py` | 新增 `GraftContext.defconfig_drop_cmdline_token(token)`：按行改写 `CONFIG_CMDLINE="…"`，保留引号与其余 token 顺序；缺该行 → `blocked_by_missing_anchor`（不发明一行）；第二遍 → `already_present` 且逐字节不动；`KERNEL_ROOT` 之外 → `report_only` |
+| `scripts/abk_stable_core.py` | 第 4 档 `ABK_515_DEFCONFIG_PSI=1`（默认关）：config lane 里去掉 `_PSI_CMDLINE_TOKEN = "cgroup_disable=pressure"`，档名进 detail 字符串 |
+| `tests/stable_5_15_test.py` | `test_config_tiers` 扩到四档（只有 PSI 档碰 `CONFIG_CMDLINE`、档名进 detail、blocked 时组状态跟着变）；新增 `test_psi_cmdline_tier`：真文件上钉 token 落地 / 幂等 / CRLF / 缺行 / 越界 5 种形态 |
+| `module.conf` | 0.29.0 → **0.30.0**（`GROUP_COUNTS` 不变：本批无新组） |
+| `ksu/abk_runtime_tunables/module.prop` | companion v0.9.0 → **v0.9.1**（versionCode 11 → 12）：真机首跑暴露的 bench 缺陷已重写——不再读机器级 `/proc/stat` 忙 jiffies（那上面 45% 是别人的负载），改为读自己叶组的 `cpu.stat`；A/B 改成**一次引导内的两个兄弟组**（同量风暴、交替轮次），并且没有 `cgroup.pressure`、或该组没被记账时**拒绝出数**而不是报两个 0 |
+| docs | 本文件、`plan.md`、`README.md`、`AGENTS.md`、`docs/porting_policy.md`、`docs/psi_field_protocol.md` |
+
+设计判断：**默认关**。token 去掉后那 ~450 个组会各自推导/计时自己的状态，直到 companion 的
+`psi.cgroup=aggressive` 把它们逐个关掉——这正是 token 免费做到的事。所以这一档是「把
+Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFCONFIG_ROM=1` 一样由用户显式打开。
+
+### 5. 验证
+
+- `python3 -m py_compile scripts/*.py tests/*.py` 通过；
+- `python3 tests/stable_5_15_test.py` → **all checks passed**（新增 16 条断言，见上表；bench v2 的 8 条断言一并过）；
+- 设备侧：五只脚本（含新增两只）在 vermeer 的 mksh 下 `sh -n` 全过；`abk_psi_policy.sh --selftest` PASS；`abk_psi_bench.sh --mode single` 报 `instrument live` 并正常计费（`groups left = 0`）；
+- registry 未动 ⇒ `step_audit` / `implementation_audit` / `smoke.sh` 的期望状态不变：
+  默认档位下 config lane 的输出与改动前逐字节相同。
+
+### 6. 待办（真机）
+
+- [ ] 带 `ABK_515_DEFCONFIG_PSI=1` 重编 + 刷 boot，确认
+      `find /sys/fs/cgroup -name cgroup.pressure | wc -l` ≈ 452；
+- [ ] 模块 root 写 `cgroup.pressure` 是否需要额外 sepolicy（Batch 25 遗留的唯一未证前提）；
+- [ ] `keep` vs `aggressive` 两态 A/B，按 `docs/psi_field_protocol.md` §5 判定规则回写
+      `tunables.conf` 默认值；
+- [ ] §2 的点名重做一遍，这次带上构建档位做溯源。
+
 <a id="batch-25"></a>
 
 ## Batch 25(companion v0.9.0，已落地；两态 A/B 待真机)
