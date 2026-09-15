@@ -569,6 +569,103 @@ abk_zram_compact_if_fragmented() {
   return 0
 }
 
+# --- zram writeback sweep (opt-in, zram.writeback.trigger) ---------------
+# The kernel moves a writeback page only when userspace asks: mark the page
+# idle through the `idle` node, then write the `writeback` node.  Nothing on
+# this device does that -- the ROM's extm/mmd never starts (vendor.zram.disable
+# =1, init.svc.mmd_setup=stopped) and this module only *attaches* the backing
+# device -- so `zram.writeback=auto` on its own leaves bd_stat at 0 0 0.  This
+# is the missing trigger.  It is off by default because a sweep spends flash.
+#
+# Mode.  `huge` is the cheap one and the one to prefer: an incompressible page
+# costs a whole page of RAM, so moving it frees 1:1 against the flash it
+# spends.  `idle` moves compressed pages too, freeing only about a third of
+# the flash it burns at a 3:1 profile -- that mode is for a device genuinely
+# against its mem_limit, where RAM is worth more than the write.  Both modes
+# start at index 0; `page_index=` is deliberately NOT used here, because on a
+# kernel without this batch's fix it does not mean "one page" -- it sweeps to
+# the end of the device, and page_index=N with N>=1 walks past zram->table and
+# panics (see zram_writeback_bounds in scripts/batch14_core_zram_writeback.py).
+#
+# Budget.  bd_wb_limit is a decrementing counter, not a per-pass ceiling: it
+# only ever falls, so a budget that is not re-armed is spent once and every
+# later pass returns -EIO.  Re-arming it here is what makes
+# zram.writeback.budget_mb a per-pass budget.
+abk_zram_writeback_sweep() {
+  _wb_trigger="$(abk_cfg zram.writeback.trigger off)"
+  case "$_wb_trigger" in
+    off) return 0 ;;
+    huge|idle) ;;
+    *) abk_warn "zram.writeback.trigger: '$_wb_trigger' is not off/huge/idle; writeback left alone"
+       return 0 ;;
+  esac
+
+  abk_zram_writeback_capable || return 0
+  _wb_bdev="$(abk_read "$ABK_ZRAM_DIR/backing_dev" | tr -d ' \n')"
+  [ -n "$_wb_bdev" ] || return 0
+
+  _wb_val="$(abk_cfg zram.writeback.budget_mb 256)"
+  if ! _wb_mb="$(abk_clamp_uint "$_wb_val" 1 65536)"; then
+    abk_warn "zram.writeback.budget_mb: '$_wb_val' is not a number in 1..65536, using 256"
+    _wb_mb=256
+  fi
+  # MiB -> 4 KiB blocks, the unit bd_wb_limit is counted in.
+  _wb_blocks=$(( _wb_mb * 256 ))
+
+  # Never budget more than the backing device can hold: running it out of
+  # space mid-sweep returns -ENOSPC after the flash has already been spent.
+  _wb_sectors="$(abk_read "$ABK_SYS_ROOT/block/${_wb_bdev##*/}/size" | tr -d ' \n')"
+  if abk_is_uint "$_wb_sectors" && [ "$_wb_sectors" -gt 0 ]; then
+    _wb_cap=$(( _wb_sectors / 8 ))   # 512-byte sectors -> 4 KiB blocks
+    [ "$_wb_blocks" -le "$_wb_cap" ] || _wb_blocks="$_wb_cap"
+  fi
+
+  # idle has to be marked first, and only by age: "all" would move every page
+  # on the device in one pass.  The node takes the age in seconds on a kernel
+  # with actime tracking; if it refuses, skip the pass rather than falling
+  # back to "all".
+  if [ "$_wb_trigger" = idle ]; then
+    _wb_val="$(abk_cfg zram.writeback.idle_age_sec 7200)"
+    if ! _wb_age="$(abk_clamp_uint "$_wb_val" 60 2592000)"; then
+      abk_warn "zram.writeback.idle_age_sec: '$_wb_val' is not a number in 60..2592000, using 7200"
+      _wb_age=7200
+    fi
+    if ! abk_write "$ABK_ZRAM_DIR/idle" "$_wb_age"; then
+      abk_warn "writeback idle sweep skipped: the idle node refused an age of ${_wb_age}s"
+      return 0
+    fi
+  fi
+
+  abk_write "$ABK_ZRAM_DIR/writeback_limit" "$_wb_blocks" || return 0
+  abk_write "$ABK_ZRAM_DIR/writeback_limit_enable" 1 || return 0
+
+  _wb_before="$(abk_read "$ABK_ZRAM_DIR/bd_stat" | tr -s ' ')"
+  # Deliberately not abk_write().  A sweep that fills its budget leaves the
+  # loop with -EIO after every page it moved has already landed, so the generic
+  # helper printed a "write failed" WARN on every budget-limited pass -- and a
+  # budget-limited pass is the normal outcome, not an error.  Measured on
+  # vermeer / 5.15.216 (2026-09-15): budget=262144 blocks moved exactly 262144
+  # pages and returned rc=1.  The rc is still the only thing that separates a
+  # spent budget from a real bio error, so it is kept and classified below.
+  if [ ! -e "$ABK_ZRAM_DIR/writeback" ]; then
+    abk_warn "writeback sweep skipped: $ABK_ZRAM_DIR/writeback is missing"
+    return 0
+  fi
+  echo "$_wb_trigger" > "$ABK_ZRAM_DIR/writeback" 2>/dev/null
+  _wb_rc=$?
+  _wb_after="$(abk_read "$ABK_ZRAM_DIR/bd_stat" | tr -s ' ')"
+
+  # A budget that runs out breaks the sweep with -EIO, the same code a real bio
+  # error returns; bd_stat is the only thing that tells the two apart, which is
+  # also why it is logged on the success path.
+  if [ "$_wb_rc" -ne 0 ] && [ "$_wb_before" = "$_wb_after" ]; then
+    abk_warn "writeback sweep moved nothing (rc=$_wb_rc, bd_stat $_wb_after): under Enforcing this is the -EIO of a missing sepolicy rule for the backing file's type, or a budget that was already spent"
+  else
+    abk_log "writeback sweep mode=$_wb_trigger budget=${_wb_blocks} blocks: bd_stat $_wb_before -> $_wb_after (rc=$_wb_rc)"
+  fi
+  return 0
+}
+
 # --- recompression supervisor -------------------------------------------
 # Two jobs on two different clocks: the policy is re-checked every
 # zram.reassert_interval_sec (a writer that switches the compressors behind the
@@ -608,6 +705,15 @@ abk_zram_supervisor_main() {
   _zs_per_sweep=$(( _zs_interval / _zs_reassert ))
   [ "$_zs_per_sweep" -ge 1 ] || _zs_per_sweep=1
 
+  # Writeback rides the same clock but on its own, much longer cadence: it
+  # spends flash, so its unit of time is hours, not the half hour a
+  # recompression sweep gets.
+  _zs_wb_interval="$(abk_cfg zram.writeback.interval_sec 86400)"
+  abk_is_uint "$_zs_wb_interval" || _zs_wb_interval=86400
+  [ "$_zs_wb_interval" -ge 60 ] || _zs_wb_interval=60
+  _zs_per_wb=$(( _zs_wb_interval / _zs_reassert ))
+  [ "$_zs_per_wb" -ge 1 ] || _zs_per_wb=1
+
   if [ ! -f "$_zs_tool" ]; then
     abk_warn "$_zs_tool is missing; recompression sweeps disabled"
     return 1
@@ -615,12 +721,26 @@ abk_zram_supervisor_main() {
 
   abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold cap=${_zs_max_pages} reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
 
+  # Say so when writeback is armed, and stay quiet when it is not: the default
+  # is off, and a line every boot for a feature nobody turned on is noise.
+  _zs_wb_mode="$(abk_cfg zram.writeback.trigger off)"
+  if [ "$_zs_wb_mode" != "off" ]; then
+    abk_log "writeback sweeps armed: mode=$_zs_wb_mode interval=${_zs_wb_interval}s budget=$(abk_cfg zram.writeback.budget_mb 256)MiB"
+  fi
+
   # The tool's own --daemon loop would block this process, and the supervisor
   # has two jobs the tool cannot do: keep the policy in force between passes,
   # and stay alive -- with a log line -- when a pass fails.
   _zs_tick=0
+  _zs_wb_tick=0
   while :; do
     abk_zram_reassert || true
+
+    _zs_wb_tick=$(( _zs_wb_tick + 1 ))
+    if [ "$_zs_wb_tick" -ge "$_zs_per_wb" ]; then
+      _zs_wb_tick=0
+      abk_zram_writeback_sweep || true
+    fi
 
     _zs_tick=$(( _zs_tick + 1 ))
     if [ "$_zs_tick" -ge "$_zs_per_sweep" ]; then

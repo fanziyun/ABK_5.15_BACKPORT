@@ -5,7 +5,10 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.9.3"
+# Has to track module.prop, which carries v0.11.0: Batch 27 chose that over the
+# v0.10.0 this batch had declared, to avoid the collision.  So neither side of
+# the merge is right -- the banner is what the module manager shows.
+ABK_VERSION="v0.11.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -230,6 +233,10 @@ zram.compact.min_waste_mb
 zram.compact.waste_pct
 zram.writeback
 zram.writeback.size_mb
+zram.writeback.trigger
+zram.writeback.budget_mb
+zram.writeback.interval_sec
+zram.writeback.idle_age_sec
 zram.reassert_interval_sec
 vm.swappiness
 vm.page_cluster
@@ -770,7 +777,7 @@ abk_psi_supervisor_main() {
     sleep "$_ps_interval"
   done
 }
-# --- the one SELinux rule this module needs -------------------------------
+# --- the SELinux rules this module needs ----------------------------------
 # The zram writeback data path is kernel-side: the loop worker, a kernel thread
 # in u:r:kernel:s0, is what reads and writes the backing file.  Android's policy
 # has no rule for that direction, so every page returns -EIO and writeback moves

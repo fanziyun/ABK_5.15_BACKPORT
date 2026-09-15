@@ -1,0 +1,75 @@
+launch_bench: mode=warm iters=8 settle=2s gap=3s invert-pct=5
+launch_bench: kernel=5.15.216-android13-8-g5bfe2b8c1439 uptime=5203s MemAvailable_kB=4622440
+POLICY name cpus cpuinfo_min arch cpuinfo_max ceiling cap_view
+POLICY policy0 0 1 2 307200 280 2016000 1555200 216
+POLICY policy3 3 4 5 6 499200 855 2803200 1920000 585
+POLICY policy7 7 595200 1024 3187200 2092800 672
+BIGCLUSTER pol=policy7 arch=1024 cpus=7
+LAUNCH app=com.netease.cloudmusic iter=1 state=COLD total=2980 wait=2999 swapin=9 readin=44572 io_stall_us=33101 polls=10 cap_inv=0 mt_polls=20 mt_big=3 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=2 state=COLD total=2896 wait=3025 swapin=7 readin=1000 io_stall_us=22762 polls=11 cap_inv=0 mt_polls=23 mt_big=4 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=3 state=COLD total=3009 wait=3116 swapin=6 readin=544 io_stall_us=28858 polls=12 cap_inv=0 mt_polls=22 mt_big=4 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=4 state=COLD total=2684 wait=2801 swapin=318 readin=3916 io_stall_us=18790 polls=11 cap_inv=0 mt_polls=21 mt_big=1 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=5 state=UNKNOWN total=NA wait=3032 swapin=339 readin=1936 io_stall_us=20493 polls=9 cap_inv=0 mt_polls=20 mt_big=3 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=6 state=UNKNOWN total=NA wait=3038 swapin=642 readin=3504 io_stall_us=24032 polls=11 cap_inv=0 mt_polls=18 mt_big=1 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=7 state=COLD total=2834 wait=2984 swapin=5 readin=20 io_stall_us=26355 polls=10 cap_inv=0 mt_polls=19 mt_big=2 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.netease.cloudmusic iter=8 state=COLD total=2860 wait=2886 swapin=3 readin=6384 io_stall_us=22933 polls=11 cap_inv=0 mt_polls=19 mt_big=3 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=1 state=UNKNOWN total=NA wait=1893 swapin=0 readin=12 io_stall_us=3911 polls=11 cap_inv=0 mt_polls=18 mt_big=13 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=2 state=UNKNOWN total=NA wait=1869 swapin=5 readin=20 io_stall_us=1015 polls=11 cap_inv=0 mt_polls=18 mt_big=13 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=3 state=UNKNOWN total=NA wait=2035 swapin=7 readin=636 io_stall_us=7439 polls=11 cap_inv=0 mt_polls=19 mt_big=12 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=4 state=UNKNOWN total=NA wait=2459 swapin=7 readin=684 io_stall_us=7553 polls=10 cap_inv=0 mt_polls=18 mt_big=9 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=5 state=UNKNOWN total=NA wait=1955 swapin=20 readin=88 io_stall_us=2119 polls=11 cap_inv=0 mt_polls=18 mt_big=12 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=6 state=UNKNOWN total=NA wait=1888 swapin=9 readin=296 io_stall_us=4838 polls=11 cap_inv=0 mt_polls=18 mt_big=11 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=7 state=UNKNOWN total=NA wait=1931 swapin=5 readin=44 io_stall_us=3704 polls=10 cap_inv=0 mt_polls=19 mt_big=13 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.tencent.mm iter=8 state=UNKNOWN total=NA wait=2160 swapin=3 readin=28 io_stall_us=8898 polls=10 cap_inv=0 mt_polls=16 mt_big=11 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=1 state=UNKNOWN total=NA wait=3038 swapin=9 readin=31756 io_stall_us=28517 polls=13 cap_inv=0 mt_polls=18 mt_big=1 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=2 state=UNKNOWN total=NA wait=3038 swapin=1 readin=40 io_stall_us=15625 polls=18 cap_inv=1 mt_polls=23 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=3 state=COLD total=2564 wait=2676 swapin=4 readin=32028 io_stall_us=14485 polls=15 cap_inv=0 mt_polls=27 mt_big=3 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=4 state=UNKNOWN total=NA wait=3030 swapin=0 readin=164 io_stall_us=16120 polls=17 cap_inv=1 mt_polls=31 mt_big=0 cset= 0 1 2 3 4 5 6 7 cset_big=1/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=5 state=COLD total=2911 wait=2927 swapin=1 readin=136 io_stall_us=9234 polls=17 cap_inv=0 mt_polls=31 mt_big=0 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=6 state=UNKNOWN total=NA wait=3036 swapin=0 readin=0 io_stall_us=9336 polls=19 cap_inv=0 mt_polls=32 mt_big=3 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=7 state=COLD total=2851 wait=2966 swapin=15 readin=536 io_stall_us=10331 polls=17 cap_inv=0 mt_polls=30 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.taobao.idlefish iter=8 state=COLD total=3098 wait=3104 swapin=5 readin=20 io_stall_us=14091 polls=16 cap_inv=1 mt_polls=29 mt_big=0 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=1 state=UNKNOWN total=NA wait=3034 swapin=59 readin=191816 io_stall_us=46962 polls=8 cap_inv=0 mt_polls=16 mt_big=2 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=2 state=UNKNOWN total=NA wait=3028 swapin=56 readin=10884 io_stall_us=19437 polls=13 cap_inv=0 mt_polls=24 mt_big=6 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=3 state=UNKNOWN total=NA wait=3034 swapin=12 readin=60 io_stall_us=15751 polls=15 cap_inv=0 mt_polls=28 mt_big=6 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=4 state=UNKNOWN total=NA wait=3028 swapin=4 readin=60 io_stall_us=9274 polls=18 cap_inv=0 mt_polls=31 mt_big=5 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=5 state=UNKNOWN total=NA wait=3033 swapin=0 readin=0 io_stall_us=10032 polls=17 cap_inv=1 mt_polls=30 mt_big=3 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=6 state=UNKNOWN total=NA wait=3037 swapin=1 readin=436 io_stall_us=6398 polls=17 cap_inv=0 mt_polls=32 mt_big=7 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=7 state=UNKNOWN total=NA wait=3043 swapin=1 readin=12 io_stall_us=8688 polls=17 cap_inv=1 mt_polls=31 mt_big=6 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.coolapk.market iter=8 state=UNKNOWN total=NA wait=3030 swapin=1 readin=192 io_stall_us=14955 polls=16 cap_inv=0 mt_polls=30 mt_big=7 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=1 state=COLD total=1247 wait=1254 swapin=6 readin=6724 io_stall_us=32043 polls=4 cap_inv=0 mt_polls=8 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=2 state=COLD total=653 wait=655 swapin=4 readin=16 io_stall_us=2287 polls=5 cap_inv=0 mt_polls=7 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=3 state=COLD total=671 wait=675 swapin=8 readin=32 io_stall_us=1335 polls=5 cap_inv=0 mt_polls=6 mt_big=1 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=4 state=COLD total=966 wait=969 swapin=13 readin=52 io_stall_us=5005 polls=4 cap_inv=0 mt_polls=7 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=5 state=COLD total=655 wait=657 swapin=5 readin=68 io_stall_us=1507 polls=5 cap_inv=0 mt_polls=6 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=6 state=COLD total=649 wait=651 swapin=10 readin=40 io_stall_us=1834 polls=5 cap_inv=0 mt_polls=7 mt_big=1 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=7 state=COLD total=1552 wait=1554 swapin=9 readin=4064 io_stall_us=12282 polls=5 cap_inv=0 mt_polls=8 mt_big=0 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+LAUNCH app=com.android.settings iter=8 state=COLD total=684 wait=688 swapin=1 readin=4 io_stall_us=1550 polls=5 cap_inv=0 mt_polls=7 mt_big=1 cset= 0 1 2 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+SAVED /data/local/tmp/lb_warm.tsv (40 launches, mode=warm)
+
+app                              n  first_ms    med_ms    min_ms    max_ms readin_pages
+com.tencent.mm                   0        NA        NA        NA        NA         226
+                               (8 of 8 launches gave no TotalTime and are excluded)
+com.coolapk.market               0        NA        NA        NA        NA       25432
+                               (8 of 8 launches gave no TotalTime and are excluded)
+com.android.settings             8      1247       677       649      1552        1375
+com.netease.cloudmusic           6      2980      2878      2684      3009        7734
+                               (2 of 8 launches gave no TotalTime and are excluded)
+com.taobao.idlefish              4      2564      2881      2564      3098        8085
+                               (4 of 8 launches gave no TotalTime and are excluded)
+
+WINDOW polls=461 cap_inv=5 (1.1%)  mt_polls=805 mt_on_big=167 (20.7%)
+BIGCLUSTER policy7 (arch 1024) carried 167/805 main-thread samples (20%)
+
+CPUSET: in 32 of 40 measured launches the biggest cluster (policy7, cpus
+        7) was not in the launching app's cpuset at all, so it was not a
+        candidate for any reason a ceiling can fix.
+
+VERDICT: no placement problem was measured in this arm (1% cap inversion, 167/805
+         main-thread samples on the biggest core). This arm read a median of 8570 pages
+         and stalled 13597 us in PSI io, but pgpgin is machine-wide and one arm cannot say
+         whether those reads were on the critical path -- a launch that causes traffic is not
+         a launch that waited for it.
+         Size the storage's share by running both arms, which is the only thing that answers it:
+           abk_launch_bench.sh --mode warm --save /data/local/tmp/lb_warm.tsv
+           abk_launch_bench.sh --mode drop --compare /data/local/tmp/lb_warm.tsv

@@ -1,0 +1,12 @@
+launch_bench: mode=drop iters=8 settle=2s gap=3s invert-pct=5
+launch_bench: kernel=5.15.216-android13-8-g5bfe2b8c1439 uptime=5817s MemAvailable_kB=4528396
+POLICY name cpus cpuinfo_min arch cpuinfo_max ceiling cap_view
+POLICY policy0 0 1 2 307200 280 2016000 1555200 216
+POLICY policy3 3 4 5 6 499200 855 2803200 1920000 585
+POLICY policy7 7 595200 1024 3187200 2092800 672
+BIGCLUSTER pol=policy7 arch=1024 cpus=7
+LAUNCH app=com.netease.cloudmusic iter=1 state=UNKNOWN total=NA wait=3029 swapin=29 readin=545724 io_stall_us=105730 polls=13 cap_inv=1 mt_polls=24 mt_big=5 cset= 0 1 2 3 4 5 6 cset_big=0/1 big_peak=2956800 big_cpuinfo=3187200 big_capview=672-949 ceilings=2
+FAIL: the device fell to 'Dozing' after 1 launch(es); the rest of this
+      arm would describe a screen-off phone (foreground cpuset, no LaunchState),
+      so the run stops here.  Keep the screen awake and re-run, or pass
+      --allow-screen-off to measure that state on purpose.

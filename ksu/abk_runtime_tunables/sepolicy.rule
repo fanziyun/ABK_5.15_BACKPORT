@@ -19,4 +19,21 @@
 # opened the file in the root domain, and only I/O on the already-open file
 # happens in the kernel domain.  A measured 32 MiB writeback-and-read-back
 # cycle produces no surviving AVC with this rule and nothing else.
+#
+# The rule has to name the file TYPE of the backing store actually in use, and
+# there is more than one in play on this device.  The module's own backing file
+# lives under /data/per_boot/zram/ and carries zram_data_file; the ROM's memory
+# extension (Xiaomi extm) backs its own loop device with
+# /data/extm/extm_file, which carries extm_data_file instead.  A preserved ROM
+# attachment is the case the module prefers (it never trades the ROM's device
+# away), so that type has to be allowed too -- without it the rule above matches
+# nothing on a device whose backing store is the ROM's, and every page still
+# returns -EIO with bd_stat pinned at 0 0 0.  Measured on vermeer / 5.15.216
+# 2026-09-15: /data/extm/extm_file is u:object_r:extm_data_file:s0 while
+# /data/per_boot/zram is u:object_r:zram_data_file:s0.
+#
+# Adding a type that the ROM does not define is harmless: this ksud reports
+# success for an unresolvable symbol anyway, so a stray allow() statement costs
+# nothing on a ROM that has no extm.
 allow kernel zram_data_file file { read write }
+allow kernel extm_data_file file { read write }

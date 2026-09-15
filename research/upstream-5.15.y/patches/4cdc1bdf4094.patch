@@ -1,0 +1,13 @@
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 7ec7559acc8e5..ae9a7fb98e34c 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2771,7 +2771,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 			}
+ 		}
+ 
+-		cond_resched();
++		cond_resched_tasks_rcu_qs();
+ 
+ 		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
+ 			continue;

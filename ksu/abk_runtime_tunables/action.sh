@@ -6,6 +6,10 @@
 #   action.sh takeover   rewrite zram now (algorithms, cap, swap, writeback),
 #                        then print the status
 #   action.sh unlock     print how the kernel-side lock is undone (boot cmdline)
+#   action.sh launch [warm|drop] [iters]
+#                        cold-launch instrument: force-stop and am start -W each
+#                        app, and say whether the launch window was bound by the
+#                        placer, by the cpuset, or by storage
 set -u
 
 MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -199,6 +203,23 @@ abk_action_pass() {
     --max-pages "$_ap_max_pages"
 }
 
+# The cold-launch instrument lives in tools/ and is shipped verbatim, so this is
+# only a wrapper: the verdict rule and the screen guard belong to the tool, and
+# duplicating either here is how the two copies start disagreeing.  `--iters` is
+# passed straight through because a single launch cannot say anything about a
+# median, and the arm chooses itself -- warm is what a user feels, drop is the
+# storage's share of it.
+abk_action_launch() {
+  _al_tool="$MODDIR/bin/abk_launch_bench.sh"
+  if [ ! -f "$_al_tool" ]; then
+    echo "launch bench missing: $_al_tool" >&2
+    return 1
+  fi
+  _al_mode="${2:-warm}"
+  _al_iters="${3:-8}"
+  sh "$_al_tool" --mode "$_al_mode" --iters "$_al_iters"
+}
+
 # The lock is a read-only kernel parameter: only the boot cmdline can turn it
 # off, which is the point (nothing running on the device can).
 abk_action_unlock() {
@@ -224,8 +245,11 @@ case "${1:-status}" in
   unlock)
     abk_action_unlock
     ;;
+  launch)
+    abk_action_launch "$@"
+    ;;
   *)
-    echo "usage: action.sh [status|pass|takeover|unlock]" >&2
+    echo "usage: action.sh [status|pass|takeover|unlock|launch [warm|drop] [iters]]" >&2
     exit 2
     ;;
 esac

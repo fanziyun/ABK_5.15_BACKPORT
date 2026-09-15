@@ -349,6 +349,154 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="v0-30-1"></a>
+
+## v0.30.1（zram writeback 崩溃修复）+ companion v0.10.0
+
+### 1. 起因：驱动 `writeback` 节点把内核打挂
+
+2026-09-15 在 vermeer（5.15.216，batch17 构建）上，向
+`/sys/block/zram0/writeback` 写入 `page_index=0` 之后又写 `page_index=1`，内核 panic 并重启
+（黑屏，uptime 15748s）。pstore 是空的、mtdoops 的 `oops` 分区也没记这一条（环里最新是当天
+00:46），backtrace 从 **rawdump minidump** 的 `md_kmsg` 里取出：
+
+    Unable to handle kernel paging request at virtual address ffffffc05e6e5008
+      ESR = 0x96000007   EC = 0x25: DABT (current EL)   FSC = 0x07: level 3 translation fault
+    lr : writeback_store+0x36c/0x9a4
+    Call trace:  zram_slot_lock+0x38/0xf0  <-  writeback_store+0x36c/0x9a4
+    Kernel panic - not syncing: Oops: Fatal exception
+
+### 2. 根因：Batch 14 的 `zram_writeback_bounds` 覆盖了 PAGE 模式的边界
+
+`894913e2d35c` 这个 step 把 `nr_pages` 的推导挪到 mode 解析**之后**，而且是无条件的：
+
+    else {                                  /* page_index=<N> 分支 */
+        ...
+        nr_pages = 1;                       /* 本意：只写一页 */
+    }
+    down_read(&zram->init_lock);
+    ...
+    nr_pages = zram->disksize >> PAGE_SHIFT;   /* ← 把上面的 1 覆盖掉 */
+    if (index >= nr_pages) { ret = -EINVAL; goto release_init_lock; }
+
+而 sweep 循环把 `nr_pages` 当**次数**用，不是 `index` 的上界：
+
+    for (; nr_pages != 0; index++, nr_pages--) { ... zram_slot_lock(zram, index); ... }
+
+于是 `page_index=N` 从 N 起跑 `nr_pages` 次，index 最大到 **N + nr_pages − 1**：
+
+| 命令 | index 最大值 | 结果 |
+|---|---|---|
+| `page_index=0` | 4194303（最后一个合法槽） | 不炸，但静默扫全盘：`bd_stat` → `1261978 66144 1312914`（约 5 GiB 写入后备设备） |
+| `page_index=1` | **4194304（越界一个）** | panic |
+
+`CONFIG_ZRAM_TRACK_ENTRY_ACTIME=y` 下 `struct zram_table_entry` 是 24 字节，
+`&zram->table[4194304].flags` = base + 4194304×24 + 8 = base + 100663304，正好越过 kvcalloc
+出来的 100663296 字节 → 三级页表翻译失败。寄存器 `x1 = 0x400000 = 4194304`（`index`）与
+fault 地址尾数 `008`（`.flags` 偏移）都对得上。
+
+上界检查拦不住，因为它只校验**起始** index。上游 5.15 安全纯粹因为 `nr_pages = 1` 活了下来
+—— 那正是 `page_index` 模式存在的意义。
+
+### 3. 修复
+
+`_B_POSTLOCK_NEW` 在范围检查之后恢复 PAGE 模式的单次边界：
+
+    if (mode == PAGE_WRITEBACK)
+        nr_pages = 1;
+
+边界仍在读锁下推导（原 step 的意图不变），`idle`/`huge` 两种模式从 index 0 起跑，本来就在
+范围内。
+
+### 4. 同一批的 companion v0.10.0
+
+- **writeback 触发器**：内核只在用户态要求时才搬页（先标 `idle`，再写 `writeback`），而这台
+  ROM 上没有任何东西要求（`vendor.zram.disable=1`、`init.svc.mmd_setup=stopped`），所以
+  `zram.writeback=auto` 只挂设备、`bd_stat` 恒为 `0 0 0`。新增 `zram.writeback.trigger`
+  （`off` 默认 / `huge` / `idle`）、`budget_mb`（每趟预算，写前重置，并按后备设备大小夹取）、
+  `interval_sec`（默认一天）、`idle_age_sec`。**故意不使用 `page_index=`**，因为上面那个缺陷
+  会让它扫全盘、且在 N≥1 时 panic。
+- **第二条 SELinux 规则**：`allow kernel extm_data_file file { read write }`。原规则只覆盖
+  `zram_data_file`，而本机真正在用的后备文件是 `/data/extm/extm_file`，标签是
+  `extm_data_file` —— 只带第一条规则的构建在这台机器上匹配不到任何文件，每页仍然 -EIO。
+
+### 5. 离线验证
+
+- `tests/step_audit.py` 在 `abk515_ref_167` 与 `abk515_ref_194` 上全绿（59 groups、二次幂等）。
+- `tests/stable_5_15_test.py` 新增 5 条断言覆盖 writeback 触发器的 off/huge/idle/夹取/拒绝
+  未知模式，并更新 sepolicy 规则形状（两条，仍逐条最小权限）。
+
+### 6. 真机验证（2026-09-15，刷入修复后的内核）
+
+**判别测试本身要先立住。** 修复后 `uname -r` 仍是 `5.15.216-android13-8-g5bfe2b8c1439`
+—— 与修复**前**逐字相同（模板 commit 没变），所以版本串证明不了刷进去的是哪份构建，只能靠
+行为判别。
+
+`page_index=0` 正好是这个判别器：无补丁时它从 index 0 扫完全部 4194304 个槽位，有补丁时只
+走一次迭代；而索引 0 在**两种**情况下都不越界（它恰好停在最后一个合法槽），所以这个测试既
+有分辨力又不会把机器打挂。用一个内部对照把计时里混着的进程启动开销减掉 —— 越界的
+`page_index=4194304` 会走完解析和加锁、在范围检查处返回 `-EINVAL`，**不进循环**：
+
+| zram 状态 | 对照（越界，不进循环） | 测试（索引 0，进循环） |
+|---|---|---|
+| 近乎空（1 页） | 30 次写入 24 ms | 30 次写入 17 ms |
+| 10 万 huge 页 | — | 7 ms，`bd_writes` 不变 |
+
+测试**不比对照慢** ⇒ 循环没有跑 4194304 次；若无补丁，30 次就是 1.26 亿次迭代，必然秒级。
+带数据那一条更直接：zram 里有 102,231 个 huge 页时执行 `page_index=0`，`bd_stat` `1 0 1` →
+`1 0 1`，**一页没动**；无补丁时这里会把十万个合格页全部写回、`huge_pages` 归零。
+
+`huge` 全量扫描（一次调用）—— 每个计数器逐项自洽：
+
+| 计数 | 前 | 后 | 校验 |
+|---|---|---|---|
+| `huge_pages` | 207,973 | 0 | 全部搬走 |
+| `bd_writes` | 1 | 207,974 | +207,973 个 bio |
+| `bd_count` | 1 | 207,974 | 后备设备上的活块 |
+| `compr_data_size` | 870 MB | 18.6 MB | zsmalloc 对象释放 |
+| `writeback_limit` | 2,752,511 | 2,544,538 | 差值 **207,973**，与块数逐块对上 |
+| `pages_stored` | 896 MB | 896 MB | 不变：页仍算"存在 zram"，只是数据在后备设备上 |
+
+1.84 s 搬完 832 MB（约 452 MB/s）。`pages_stored` 不减不是账目错误 —— `zram_free_page`
+只在 `ZRAM_WB` 分支走 `goto out` 才减，写回后的槽被标 `ZRAM_WB` 且元素换成块号，页从
+shmem 视角看仍然"被换出"。
+
+companion `abk_zram_writeback_sweep`（source 模块脚本后单独调用）：
+
+- `trigger=huge, budget_mb=4096` → rc=0，`bd_writes` +347,524。
+- `trigger=idle, budget_mb=1024, idle_age_sec=60` → `idle` 节点接受了 60 s 年龄，`bd_writes`
+  +**262,144**，正好等于预算 262,144 块 ⇒ 这是预算限制而非内容限制，说明写前重置
+  `writeback_limit` 那一步生效了。
+- 日志落在 `state/abk_runtime_tunables.log`。
+
+**读回正确性用正反对照**（两个随机文件写进 tmpfs，再用零页压力挤进 zram；零页在 zram 里是
+`ZRAM_SAME`，`huge` 扫描会跳过，所以被搬动的只可能是目标文件）：
+
+- 负对照：读只存在于 zram 的 f1 → `bd_reads` 增量 **0**（普通 zram 读不碰后备设备）。
+- 正对照：写回后读 f2（256 MB）→ `bd_reads` 增量 **49,645**，整个文件 md5 与 ext4 上的参照
+  **逐字节一致**；同期 `bd_count` 60,447 → 11,027，即页换回时块被释放。
+
+删除写回过的页会释放后备块：清掉 5.6 GB 测试负载后 `bd_count` 555,690 → 8,245，`bd_writes`
+累计值不变。
+
+全程无 panic、无 BUG/Oops，`dmesg` 干净。
+
+### 7. companion 修复：预算用满时的一条假 WARN
+
+真机日志暴露出来的（离线断言覆盖不到，因为 `abk_write` 是通用 helper）：
+
+    21:53:23 WARN write failed: /sys/block/zram0/writeback <- idle
+    21:53:23 INFO writeback sweep mode=idle budget=262144 blocks: bd_stat 9050 … -> 271194 … (rc=1)
+
+那趟扫描明明搬了 262,144 页（1 GiB），却先打出一条"写入失败"。原因是预算耗尽时
+`writeback_store` 以 `-EIO` 跳出循环（活已经干完），sysfs 写入因此返回错误，而 `abk_write`
+把这个返回值当失败报了出来。**只要扫描把预算用满就会触发，而预算用满恰恰是常态**（默认
+256 MiB 预算下基本都是），所以模块日志每趟都会出现这条误导性警告。
+
+改法：`writeback` 那一写不再走 `abk_write`，直接写并保留 rc；分类逻辑不变 —— 仍是
+`rc≠0` **且** `bd_stat` 未动才算真失败，所以"哨兵规则缺失"和"生物 IO 错误"仍然报得出来。
+
+
 <a id="batch-26"></a>
 
 ## Batch 26(v0.30.0)

@@ -2796,7 +2796,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.30.0", "0.30.0"], _versions)
+          _versions == ["0.30.1", "0.30.1"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -2808,21 +2808,35 @@ def test_runtime_tunables_module():
     # this rule was submitted.  KernelSU can add the rule from a module, which
     # is the only route that needs neither a ROM rebuild nor a relaxed boot
     # policy.  What is pinned here is *narrowness* as much as presence: a
-    # widened rule is a policy change shipped by a kernel flash, so the file is
-    # exactly one least-privilege allow, and no module code gets to relax
-    # SELinux to reach the same end.
+    # widened rule is a policy change shipped by a kernel flash, so every
+    # statement below is a least-privilege allow, and no module code gets to
+    # relax SELinux to reach the same end.
+    #
+    # There are two, and the second is not optional: the rule has to name the
+    # file TYPE of the backing store actually in use, and the type differs with
+    # who attached the device.  The module's own backing file lives under
+    # /data/per_boot/zram/ (zram_data_file); the ROM's memory extension backs
+    # its own loop device with /data/extm/extm_file (extm_data_file), which is
+    # the case the module prefers, because it preserves a ROM attachment rather
+    # than trading it away.  Measured on vermeer / 5.15.216 2026-09-15:
+    # /data/extm/extm_file is u:object_r:extm_data_file:s0 while
+    # /data/per_boot/zram is u:object_r:zram_data_file:s0 -- so with only the
+    # first rule the file matches nothing on that device and every page still
+    # returns -EIO.  A third type must fail this check and be argued for.
     rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
     rule_statements = [line.strip() for line in rule.splitlines()
                        if line.strip() and not line.lstrip().startswith("#")]
-    check("the SELinux rule file carries exactly one statement",
-          rule_statements == ["allow kernel zram_data_file file { read write }"],
+    check("the SELinux rule file carries exactly the two least-privilege allows",
+          rule_statements == ["allow kernel zram_data_file file { read write }",
+                              "allow kernel extm_data_file file { read write }"],
           rule_statements)
     for forbidden in ("setenforce", "permissive", "neverallow", "dontaudit",
                       "auditallow", "type_transition", "allowx"):
         check(f"the SELinux rule never uses {forbidden!r}",
               forbidden not in rule)
     check("the SELinux rule names the kernel domain, not a permissive shell",
-          rule_statements and rule_statements[0].startswith("allow kernel "))
+          rule_statements
+          and all(s.startswith("allow kernel ") for s in rule_statements))
 
     post_fs_data = (module_dir / "post-fs-data.sh").read_text(encoding="utf-8")
     common_source = (module_dir / "common.sh").read_text(encoding="utf-8")
@@ -3095,13 +3109,17 @@ def test_runtime_tunables_module():
             check("embedded reclaim tool is byte-identical to tools/",
                   archive.read("bin/cached_freeze_reclaim.sh")
                   == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
-            check("embed.conf contributes exactly the five device tools",
+            check("embed.conf contributes exactly the six device tools",
                   sorted(name for name in names if name.startswith("bin/"))
                   == ["bin/abk_fas_check.sh",
+                      "bin/abk_launch_bench.sh",
                       "bin/abk_psi_bench.sh",
                       "bin/abk_psi_policy.sh",
                       "bin/cached_freeze_reclaim.sh",
                       "bin/zram_recompress_trigger.sh"])
+            check("embedded launch bench is byte-identical to tools/",
+                  archive.read("bin/abk_launch_bench.sh")
+                  == (repo / "tools" / "abk_launch_bench.sh").read_bytes())
             check("embedded PSI policy tool is byte-identical to tools/",
                   archive.read("bin/abk_psi_policy.sh")
                   == (repo / "tools" / "abk_psi_policy.sh").read_bytes())
@@ -3509,6 +3527,50 @@ abk_zram_compact_if_fragmented > "$T/out10d" 2>&1
 echo "compact_nonode_rc=$?"
 echo "compact_nonode_warn=$(grep -c 'node missing' "$T/out10d" 2>/dev/null)"
 
+# 11. the writeback sweep: the trigger the kernel does not have on its own.
+#     `off` must not touch the node at all, `huge`/`idle` must re-arm the
+#     budget before writing, and the budget is clamped by the backing device so
+#     a pass cannot run it out of space.
+reset_fixture
+printf '/dev/block/loop9\n' > "$T/sys/block/zram0/backing_dev"
+: > "$T/sys/block/zram0/writeback"
+: > "$T/sys/block/zram0/idle"
+printf '0\n' > "$T/sys/block/zram0/writeback_limit"
+printf '0\n' > "$T/sys/block/zram0/writeback_limit_enable"
+printf '0 0 0\n' > "$T/sys/block/zram0/bd_stat"
+mkdir -p "$T/sys/block/loop9"
+printf '2097152\n' > "$T/sys/block/loop9/size"   # 1 GiB = 262144 4 KiB blocks
+
+printf 'zram.writeback.trigger=off\n' > "$T/tunables.conf"
+abk_zram_writeback_sweep >/dev/null 2>&1
+echo "wb_off_lines=$(grep -c . < "$T/sys/block/zram0/writeback")"
+echo "wb_off_limit=$(cat "$T/sys/block/zram0/writeback_limit")"
+
+printf 'zram.writeback.trigger=huge\nzram.writeback.budget_mb=64\n' > "$T/tunables.conf"
+abk_zram_writeback_sweep >/dev/null 2>&1
+echo "wb_huge=$(cat "$T/sys/block/zram0/writeback")"
+echo "wb_huge_limit=$(cat "$T/sys/block/zram0/writeback_limit")"
+echo "wb_huge_enable=$(cat "$T/sys/block/zram0/writeback_limit_enable")"
+
+printf 'zram.writeback.trigger=huge\nzram.writeback.budget_mb=65536\n' > "$T/tunables.conf"
+abk_zram_writeback_sweep >/dev/null 2>&1
+echo "wb_clamp_limit=$(cat "$T/sys/block/zram0/writeback_limit")"
+
+: > "$T/sys/block/zram0/idle"
+: > "$T/sys/block/zram0/writeback"
+printf 'zram.writeback.trigger=idle\nzram.writeback.idle_age_sec=1800\n' > "$T/tunables.conf"
+abk_zram_writeback_sweep >/dev/null 2>&1
+echo "wb_idle_mark=$(cat "$T/sys/block/zram0/idle")"
+echo "wb_idle_node=$(cat "$T/sys/block/zram0/writeback")"
+
+# ... and an unknown mode is refused rather than guessed at
+: > "$T/sys/block/zram0/writeback"
+printf 'zram.writeback.trigger=everything\n' > "$T/tunables.conf"
+abk_zram_writeback_sweep >> "$T/out11" 2>&1
+echo "wb_bad_lines=$(grep -c . < "$T/sys/block/zram0/writeback")"
+echo "wb_bad_warn=$(grep -c 'is not off/huge/idle' "$T/out11" 2>/dev/null)"
+printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
+
 rm -rf "$T"
 '''
     r = run_shell(harness.replace("__MD__", module_sh))
@@ -3592,6 +3654,29 @@ rm -rf "$T"
           got.get("supervisor_gate_line") == "compact=1>50MB+15%", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
+
+    # 11: the writeback sweep.  The kernel only moves a page when userspace
+    # asks, so this is the whole trigger -- and it is the one place the module
+    # writes the writeback node, which is why `off` is checked as hard as the
+    # two live modes.
+    check("the writeback sweep leaves the node alone while trigger=off",
+          got.get("wb_off_lines") == "0" and got.get("wb_off_limit") == "0",
+          (got.get("wb_off_lines"), got.get("wb_off_limit")))
+    check("trigger=huge writes the node and re-arms the budget per pass",
+          got.get("wb_huge") == "huge"
+          and got.get("wb_huge_limit") == "16384"
+          and got.get("wb_huge_enable") == "1",
+          (got.get("wb_huge"), got.get("wb_huge_limit"),
+           got.get("wb_huge_enable")))
+    check("an oversized budget is clamped to the backing device",
+          got.get("wb_clamp_limit") == "262144", got.get("wb_clamp_limit"))
+    check("trigger=idle marks by age and never falls back to 'all'",
+          got.get("wb_idle_mark") == "1800"
+          and got.get("wb_idle_node") == "idle",
+          (got.get("wb_idle_mark"), got.get("wb_idle_node")))
+    check("an unknown writeback mode is refused, not guessed at",
+          got.get("wb_bad_lines") == "0" and got.get("wb_bad_warn") == "1",
+          (got.get("wb_bad_lines"), got.get("wb_bad_warn")))
 
     check("an unset key falls back to the built-in default",
           got.get("cfg_default") == "3600", r.stdout)
@@ -3957,6 +4042,143 @@ def test_batch17_zram_writeback():
               body == "static int zram_bvec_read(void);\n", repr(body))
 
 
+def test_batch27_launch_bench():
+    """The cold-launch instrument refuses to answer a question it did not ask.
+
+    Batch 27's premise is that a launch has three candidate owners and only
+    measurement taken *during* the launch window separates them, so the tool's
+    value is entirely in what it refuses: a median it did not take, a placement
+    ratio out of too few samples, a run against a dozing phone.  Those refusals
+    are what these checks pin -- the device run itself is in
+    research/launch/vermeer_launch_20260915/.
+    """
+    print("Batch 27 cold-launch instrument")
+    repo = Path(__file__).resolve().parent.parent
+    tool = repo / "tools" / "abk_launch_bench.sh"
+    check("launch bench exists", tool.is_file(), tool)
+    text = tool.read_text(encoding="utf-8")
+    # The header's own promise, and the trap that produced the first wrong answer.
+    check("the tool documents the screen guard",
+          "dozing" in text and "top-app (cpus 0-7)" in text)
+    check("the tool names its batch of origin",
+          "Batch 27" in text)
+    # The user-side stack is not a kernel feature and the tool must not imply it
+    # is.  Naming it is allowed -- the storage verdict names it precisely to say
+    # it is not running -- but only in a sentence that calls it userspace, and no
+    # invented CONFIG_ name may appear at all.
+    check("the tool does not claim launch_boost is a kernel feature",
+          "CONFIG_LAUNCH_BOOST" not in text
+          and ("xiaomi.launch_boost" not in text
+               or ("userspace" in text and "is not running" in text)))
+    # 32-bit shell arithmetic: 855 * 2803200 wraps on this ROM, so the product has
+    # to reach awk.  Same rule abk_fas_check.sh landed with.
+    check("cap_view goes through awk, not shell arithmetic",
+          "a * f / m" in text and "int(carch[p] * clr[k] / cinfo[p])" in text)
+    check("the refusal to report a zero it did not measure is present",
+          "0 ms would be a lie" in text)
+    # "The launch did not run on the super core" has two different owners and the
+    # tool must not name one when it only measured the other: a measured ceiling
+    # inversion is the ceiling holder's problem, while an available-but-unused
+    # super core is an outcome with no cause measured in that run.
+    check("the two placement verdicts are distinct",
+          "VERDICT: ceiling bound." in text
+          and "VERDICT: placement bound, cause not measured." in text)
+    # The storage verdict may only be printed when the other arm is available.
+    # Measured on device: dropping the page cache made every launch read 5 to 340
+    # times more pages for 11% to 29% more wall clock, so "this arm read N pages"
+    # is traffic and not a cause -- a single arm must not be allowed to call it.
+    check("the storage verdict needs the other arm",
+          "abk_storage_share" in text and "--compare" in text
+          and "one arm cannot say" in text)
+    # The device state is re-read before every launch, not only at startup: four
+    # runs produced complete, plausible tables from a phone that was asleep or
+    # sitting on its lock screen, and the visible symptoms were "the launches that
+    # failed are the ones that were warm" and "the super core is not in the app's
+    # cpuset".  Both are the same precondition, so both are checked.
+    check("the device guard is re-checked per launch, not only at startup",
+          "abk_device_block" in text and "after $_done_launches launch(es)" in text)
+    check("the lock screen is part of the guard, not just the screen",
+          "mDreamingLockscreen" in text and "lock screen is up" in text
+          and "mShowingLockscreen" in text and "stayed false" in text)
+    # A launch that never reports a LaunchState did not happen; a median over the
+    # survivors is not a sample of anything.
+    check("a run that stops producing LaunchStates aborts",
+          "produced no LaunchState" in text)
+    check("the cpuset range form is expanded, not compared as one token",
+          "abk_expand_cpus" in text)
+    # The processor-field strip.  The first version matched up to the first '(',
+    # which never matches on a line whose comm is itself parenthesised; the
+    # substitution then did nothing and $37 read cnswap, so forty launches
+    # reported a perfectly shaped "0/714 samples on the super core".  A fixture
+    # case in the tool's own selftest now covers it; this pins the form.  The
+    # absence half runs against a comment-stripped view, because the header names
+    # the old expression on purpose (the same split the PSI bench pins use).
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    check("the processor strip goes to the last paren, not the first",
+          "sub(/^.*\\) /" in code and "sub(/^[^(]*\\) /" not in code)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        print("  (no bash on this host: launch bench runs skipped)")
+        return
+    use_wsl = os.name == "nt"
+    shell = ["wsl", "bash"] if use_wsl else [bash]
+
+    def shell_path(path):
+        s = str(path).replace("\\", "/")
+        if use_wsl and len(s) > 2 and s[1] == ":":
+            return "/mnt/" + s[0].lower() + s[2:]
+        return s
+
+    tool_sh = shell_path(tool)
+
+    def run_tool(args):
+        return subprocess.run(shell + [tool_sh] + args,
+                              capture_output=True, text=True,
+                              env=dict(os.environ, TMPDIR="/tmp"))
+
+    r = subprocess.run(shell + ["-n", tool_sh], capture_output=True, text=True)
+    check("launch bench passes bash -n", r.returncode == 0, r.stderr)
+
+    r = run_tool(["--selftest"])
+    check("launch bench selftest passes", r.returncode == 0, r.stdout + r.stderr)
+    check("selftest reports every case it ran", "selftest PASS" in r.stdout)
+    # The fixture cases that back the verdict, by name, so a case silently
+    # dropped from the selftest is a failure here too.
+    for case in ("a capped super core counts as an inversion",
+                 "a ceiling that moves is reported as ceilings=3",
+                 "a pid that never appeared yields 0 polls",
+                 "cpulist 0-7 contains cpu7 and 0-6 does not",
+                 "the processor field survives a paren-wrapped and a spaced comm",
+                 "the two-arm storage share is 33% here"):
+        check(f"selftest covers: {case}", case in r.stdout)
+
+    # A malformed --apps entry is refused before anything is launched.
+    r = run_tool(["--apps", "not-a-component", "--selftest"])
+    check("a malformed --apps entry is refused with usage", r.returncode == 2,
+          r.stdout + r.stderr)
+    check("the refusal names the offending entry",
+          "not-a-component" in (r.stdout + r.stderr))
+    # ... and a well-formed one is accepted, including the pkg/component form
+    # that repeats the package name (a slash count of one is not the rule).
+    r = run_tool(["--apps", "com.example.app/com.example.app/.MainActivity",
+                  "--selftest"])
+    check("a pkg/pkg.Activity entry is accepted", r.returncode == 0,
+          r.stdout + r.stderr)
+
+    # --help must not truncate as options are added (the abk_fas_check.sh lesson).
+    r = run_tool(["--help"])
+    check("--help prints the usage block", "Usage:" in r.stdout)
+    for opt in ("--mode", "--apps", "--iters", "--invert-pct", "--allow-screen-off",
+                "--selftest", "--sys-root", "--save", "--compare"):
+        check(f"--help documents {opt}", opt in r.stdout)
+    # The help body is a sed range that ends at a marker in the header.  A code
+    # symbol leaking into it means the range ran past its end -- the failure
+    # abk_fas_check.sh fixed by adding the marker in the first place.
+    check("--help stops at its own end marker",
+          "end of help" in r.stdout and "abk_launch_selftest" not in r.stdout)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -4003,6 +4225,7 @@ def main():
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()
+    test_batch27_launch_bench()
 
     print()
     if FAILURES:

@@ -4,14 +4,18 @@ The runtime companion of the [ABK 5.15 LTS backport](../..). The kernel grafts
 in that repository ship mechanisms; this module drives them, because a mechanism
 nothing triggers changes nothing.
 
-Three jobs, in order of importance:
+Four jobs, in order of importance:
 
 1. **Keep the zram algorithm policy in force** on every boot (hardcoded, not
    configurable -- see below).
-2. **Add the one kernel-domain SELinux rule the zram writeback path needs.**
-   Without it a writeback is denied at the first page and moves nothing while
+2. **Add the kernel-domain SELinux rules the zram writeback path needs.**
+   Without them a writeback is denied at the first page and moves nothing while
    reporting success (see "SELinux" below).
-3. **Drive the recompression sweeps** through the kernel's async worker, follow
+3. **Drive the writeback sweep** when it is asked for. The kernel only moves a
+   page when userspace tells it to, and nothing else on this ROM does, so
+   attaching a backing device is not enough on its own. `zram.writeback.trigger`
+   is the switch; it is off by default because a sweep spends flash.
+4. **Drive the recompression sweeps** through the kernel's async worker, follow
    each sweep with a gated zsmalloc compaction pass (see Configuration), and
    report (or optionally tune) the other runtime knobs the grafts expose:
    MGLRU, THP, `vm.swappiness`, the schedutil smart-freq policy, dynamic
@@ -106,7 +110,7 @@ Posture:
   `CONFIG_ZRAM_WRITEBACK=y`) -- and once it is on, the SELinux rule below
   decides whether a writeback moves anything at all.
 
-## SELinux: the one kernel-domain rule writeback needs
+## SELinux: the kernel-domain rules writeback needs
 
 The zram writeback data path is kernel-side. Whoever attaches the loop device,
 the reads and writes of the backing file happen in the **loop worker**, a kernel
@@ -120,7 +124,7 @@ kernel, SELinux Enforcing, rule submitted at run time):
 
 | observation | number |
 |---|---|
-| the ROM's own backing store (`loop49` over `/data/per_boot/zram`), pages written since boot | `bd_stat = 0 0 0` |
+| the module's own backing store (`/data/per_boot/zram`), pages written since boot | `bd_stat = 0 0 0` |
 | a manual 16 MiB writeback budget, no rule | 0 of 4096 pages written |
 | the same budget, rule submitted | exactly 4096 pages (`bd_stat = 4096 0 4096`) |
 | a 32 MiB writeback plus full read-back, rule submitted | `rc=0`, no surviving AVC, md5 identical before/after |
@@ -134,11 +138,30 @@ the same rule twice is not an error on this `ksud`), and where no manager can
 add it the module logs the failure and carries on -- it never relaxes the
 policy to get its way.
 
-The rule is deliberately one least-privilege `allow`:
+Each rule is deliberately one least-privilege `allow`, and there are two of
+them because the rule has to name the file *type* of the backing store actually
+in use -- which depends on who attached it:
 
 ```
 allow kernel zram_data_file file { read write }
+allow kernel extm_data_file file { read write }
 ```
+
+The module's own backing file lives under `/data/per_boot/zram/` and carries
+`zram_data_file`. The ROM's memory extension (Xiaomi `extm`) backs *its* loop
+device with `/data/extm/extm_file`, which carries `extm_data_file` -- and a
+preserved ROM attachment is the case the module prefers, since it restores what
+it finds rather than trading it away. Measured on the same device on 2026-09-15:
+
+```
+u:object_r:extm_data_file:s0  /data/extm/extm_file
+u:object_r:zram_data_file:s0  /data/per_boot/zram
+```
+
+so a build carrying only the first rule matches nothing on that device and
+every page still returns `-EIO` with `bd_stat` pinned at `0 0 0`. Naming a type
+the ROM does not define is harmless: this `ksud` reports success for an
+unresolvable symbol anyway.
 
 `read` and `write` are all the loop worker needs, because the kernel never
 resolves the path itself: `losetup` opened the file from the root domain, and
@@ -175,6 +198,10 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `zram.compact.waste_pct` | `15` | ... and the overhead exceeds this percentage of the compressed size (both gates must agree); 1..500 |
 | `zram.writeback` | `auto` | `auto` attaches a backing file when the kernel supports writeback and nobody owns it; `off` only preserves an existing one |
 | `zram.writeback.size_mb` | `1024` | backing file size, sparse, 64..8192 |
+| `zram.writeback.trigger` | `off` | the sweep the kernel does not run by itself: `off` touches nothing, `huge` moves incompressible pages only (frees 1:1 against the flash it spends -- the cheap mode), `idle` also moves cold compressed pages (about a third of the flash back, so only for a device against its `mem_limit`) |
+| `zram.writeback.budget_mb` | `256` | flash a sweep may spend, in MiB, re-armed before every pass and clamped down to the backing device's size so a pass cannot run it out of space; 1..65536 |
+| `zram.writeback.interval_sec` | `86400` | seconds between sweeps -- daily by default, which is the shape the ROM's own extm used (`persist.miui.extm.daily_flush_count` is a *daily* budget) |
+| `zram.writeback.idle_age_sec` | `7200` | `trigger=idle` only: mark a page idle only if nothing touched it for this long. Never `all`, which would move every page on the device in one pass; 60..2592000 |
 | `zram.reassert_interval_sec` | `60` | how often the supervisor re-checks the policy; on an unlocked kernel this is how long a runtime algorithm switch survives (5..3600) |
 | `vm.swappiness` | *(empty)* | 0..300 |
 | `vm.page_cluster` | *(empty)* | 0..8 |
@@ -319,6 +346,31 @@ mislabel a whole run. The protocol, and what decides the shipped default, is
   `--apply --mode auto|aggressive` runs one pass by hand, and `--selftest`
   checks the decision table against a fixture tree with no device at all.
 * `bin/abk_psi_bench.sh --rounds 3` runs the A/B measurement described above.
+* `bin/abk_launch_bench.sh` (or `action.sh launch [warm|drop] [iters]`) measures
+  cold launch: it force-stops each app, runs `am start -W`, and reports the
+  `TotalTime` median next to what the launch window actually looked like --
+  per-cluster `cap_view` and ceiling movement, the share of main-thread samples
+  that landed on the biggest cluster, the cpuset the app was in and whether that
+  cpuset even lists the super core, and the pages the launch read off storage.
+  It ends in one of four verdicts: **cpuset bound** (the super core is not in the
+  app's cpuset at all), **ceiling bound** (a measured cap inversion -- the case
+  Batch 10-6 costed at 16% on this ROM), **placement bound, cause not measured**
+  (the super core was available and the launch still did not run there), and
+  **"neither rule fired"** with the two-arm recipe.
+  The storage's share is deliberately *not* claimed from one arm: `pgpgin` is a
+  machine-wide counter, and measured here, dropping the page cache made every
+  launch read 5 to 340 times more pages for only 11% to 29% more wall clock --
+  so a launch that causes reads is not a launch that waited for them. Run
+  `--mode warm --save FILE` then `--mode drop --compare FILE`, and the tool
+  reports the per-app delta and only calls storage a lever above 15%.
+  `--selftest` exercises the decision logic on a fixture with no device. It
+  **refuses to measure a phone that is asleep or on its lock screen** and
+  re-checks both before every launch: with the screen off, or the keyguard up, a
+  launched app never becomes the top app, so it stays in the foreground cpuset
+  and every launch then reads "cpuset bound" -- true of that state, false of the
+  phone in a hand -- while `am start -W` quietly stops reporting a `LaunchState`
+  at all. Wake and unlock it, or pass `--allow-screen-off` to say you mean that
+  state.
 * Progress goes to **`state/abk_runtime_tunables.log`** (capped at 64 KiB) and,
   best-effort, to logcat under the tag `ABK-Tunables` -- logcat was measured to
   be unreliable on the target ROM (empty for the `shell` user and for a
@@ -360,15 +412,21 @@ remove.
   `uid_*` at all, so a per-UID sweep finds nothing here: select the groups to
   sweep with `cfr.group` (or run the tool by hand with `--group NAME --list`
   first).
-* Exactly **one** SELinux rule is shipped (`sepolicy.rule`, submitted at
-  post-fs-data): `allow kernel zram_data_file file { read write }`, for the
-  kernel-domain writeback path described above. Every sysfs/proc node the module
-  writes was verified writable from KernelSU's root context with no `avc:
-  denied`, so no other rule is needed -- and none is added.
+* Exactly **two** SELinux rules are shipped (`sepolicy.rule`, submitted at
+  post-fs-data): `allow kernel zram_data_file file { read write }` and
+  `allow kernel extm_data_file file { read write }` -- one per backing-file
+  type, for the kernel-domain writeback path described above. Every sysfs/proc
+  node the module writes was verified writable from KernelSU's root context with
+  no `avc: denied`, so no other rule is needed -- and none is added.
 * Nothing outside `/sys`, `/proc`, `/dev`, `/data/per_boot/zram` (the writeback
   backing file, and only when the kernel supports writeback and
   `zram.writeback` is not `off`) and the module's own directory is written. No
   system/vendor file is replaced.
+* The one node the module writes whose effect lands outside `/sys` is
+  `zram0/writeback`, and only under `zram.writeback.trigger`. It writes into
+  the backing device that is already attached -- the ROM's own extm file
+  included, when that is the device the ROM attached. With the shipped
+  `trigger=off` the module never writes that node.
 * `ABK_SYS_ROOT`, `ABK_MEMCG_ROOT`, `ABK_PROC_SWAPS`, `ABK_MEMINFO`,
   `ABK_SWAPON`, `ABK_SWAPOFF`, `ABK_MKSWAP`, `ABK_LOSETUP`, `ABK_DD`,
   `ABK_ZRAM_NODE`, `ABK_ZRAM_WB_DIR`, `ABK_ZRAM_WB_FILE`, `ABK_STATE_DIR`,
