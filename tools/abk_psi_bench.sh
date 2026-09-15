@@ -26,6 +26,14 @@
 # both groups are removed on the way out, so the one-way nature of a disable
 # costs nothing here: that constraint only bites on groups you intend to keep.
 #
+# What can invalidate a run
+# The arms are not protected from the companion's own periodic policy pass: with
+# psi.cgroup=aggressive the supervisor disables every unprotected group it finds
+# every psi.cgroup.interval_sec (five minutes by default), and a run that crosses
+# a tick would compare two disabled arms and call the difference a saving.  So
+# every round re-reads both arm nodes and aborts if either moved -- and the
+# operator has to stop the supervisor for the duration, or measure on a keep boot.
+#
 # What it refuses to do
 # Print a comparison built on an instrument that is not reading.  Before the
 # first real round the tool runs a warm-up storm and requires system_usec to
@@ -62,7 +70,9 @@ ABK_DEPTH=2
 ABK_BIN="${ABK_BENCH_BIN:-true}"
 
 abk_usage() {
-  sed -n 's/^# //p' "$0" | sed -n '1,60p'
+  # Everything above the first line of code, markers stripped.  A fixed line
+  # range here silently truncated the usage section when the header grew.
+  awk '/^[^#]/ { exit } /^#/ { sub(/^# ?/, ""); print }' "$0"
   return 0
 }
 
@@ -116,9 +126,30 @@ abk_storm_fork() {
 
 # A synchronous ping-pong: the parent parks on a read, the child parks on a
 # read, and each iteration is exactly two blocking transitions with no work
-# attached -- the event the switch skips.  No fork happens in the loop (printf
-# and read are builtins, and both fifos stay open on held fds), so a difference
-# between arms is attributable to wakeups and not to exec.
+# attached -- the event the switch skips.  Both fifos stay open on held fds and
+# every command in the loop is a shell builtin (echo, read, test), so no process
+# is created per iteration and a difference between arms is attributable to
+# wakeups rather than to exec.
+#
+# That last clause is the whole storm, and it has now been wrong twice:
+#   * 'sleep 0' in a loop -- toybox sleep forks, so that was a fork storm
+#     wearing a wake storm label.
+#   * "printf 'x\n' >&3" -- on the target ROM (/system/bin/sh, Android mksh)
+#     that is NOT a builtin: 'type printf' answers 'printf is a tracked alias
+#     for /system/bin/printf', and measured on device 500 calls cost 6.3 s of
+#     wall time, which is the same 12.6 ms a fork+exec of /system/bin/true
+#     costs.  The storm was measuring two process creations per round trip,
+#     billed about 30 ms of CPU each, and a default run (--wakes 50000,
+#     storm=both, rounds=3) needed hours per A/B while measuring the wrong
+#     event.  echo is a builtin on the same ROM (500 calls: 0.01 s) and is what
+#     the loop uses now.  The pin that was meant to catch this checked for
+#     'sleep 0' and for mkfifo; every local gate stayed green while the storm
+#     churned processes, and only the device could see it.
+#   * one fifo and no newline in the payload: the reader never saw a line, so it
+#     woke once at close instead of ABK_WAKES times, and the round was billed
+#     25 s of system_usec for work this loop did not do.
+# Those are why --storm can be split: a storm you cannot bill is a storm you
+# cannot claim a saving from.
 #
 # Two earlier shapes of this were wrong in opposite directions:
 #   * "sleep 0" in a loop -- toybox sleep forks, so that was a fork storm
@@ -141,13 +172,15 @@ abk_storm_wake() {
   fi
   # Child order matters: it blocks opening _wa for read until the parent opens
   # the write end below, so starting it first cannot deadlock.
-  ( while read -r _x; do printf 'y\n'; done < "$_wa" > "$_wb" ) &
+  # echo, not printf: see the note above -- printf forks an external binary on
+  # the target ROM, which turns this storm into a fork storm in disguise.
+  ( while read -r _x; do echo y; done < "$_wa" > "$_wb" ) &
   _w=$!
   exec 3>"$_wa"
   exec 4<"$_wb"
   _i=0
   while [ "$_i" -lt "$ABK_WAKES" ]; do
-    printf 'x\n' >&3
+    echo x >&3
     read -r _y <&4
     _i=$((_i + 1))
   done
@@ -291,6 +324,33 @@ while [ "$_r" -le "$ABK_ROUNDS" ]; do
   fi
   for _g in $_order; do
     sleep 3   # let the previous arm's teardown settle before billing the next
+
+    # Integrity, before the round is billed: is the arm still armed?  The
+    # companion's periodic policy pass disables every unprotected group it finds
+    # (service.sh --supervise-psi, every psi.cgroup.interval_sec, five minutes by
+    # default) and this tool's arms are not protected, so a run that crosses a
+    # tick would silently compare two disabled arms and report the difference as
+    # a saving.  Two reads per arm; the cost is nothing next to a storm.
+    case "$_g" in
+      *abk_psi_bench_on*) _want_v=1 ;;
+      *abk_psi_bench_off*) _want_v=0 ;;
+      *) _want_v= ;;
+    esac
+    if [ -n "$_want_v" ]; then
+      _pn=$(abk_pnode "$_g") || _pn=""
+      _pv=$(cat "$_pn" 2>/dev/null)
+      if [ "$_pv" != "$_want_v" ]; then
+        echo "psi_bench: arm state changed mid-run: $_g cgroup.pressure=$_pv want=$_want_v" >&2
+        echo "psi_bench:   something outside this tool wrote that node.  Most likely the runtime" >&2
+        echo "psi_bench:   companion's periodic psi.cgroup pass (service.sh --supervise-psi," >&2
+        echo "psi_bench:   psi.cgroup.interval_sec).  Stop it for the run or take the A/B on a keep boot." >&2
+        ( echo $$ > "$ABK_CGROOT/cgroup.procs" ) 2>/dev/null
+        abk_rmgroupee "$ARM_ON_G"; abk_rmgroupee "$ARM_OFF_G"
+        [ "$ABK_MODE" = single ] && abk_rmgroupee "$G"
+        exit 1
+      fi
+    fi
+
     _s0=$(abk_stat_field "$_g/cpu.stat" system_usec)
     _u0=$(abk_stat_field "$_g/cpu.stat" user_usec)
     _t0=$(abk_now)

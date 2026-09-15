@@ -3128,6 +3128,19 @@ def test_runtime_tunables_module():
             check("the PSI tool names Batch 21 as the node origin, not upstream",
                   "Batch 21" in _psi_tool
                   and "inherited upstream" not in _psi_tool)
+            # A live phone deletes cgroups underneath the walk.  Booking that as
+            # "refused" made the supervisor's first-pass rule (nothing off,
+            # nothing disabled, something refused => this kernel will not let me
+            # write) fire on a single exited app and stop the policy for the rest
+            # of the boot.  The two counters are separate on purpose and the
+            # fixture has a node that disappears to prove it.
+            check("the PSI walk books a group that went away mid-walk as vanished",
+                  "ABK_n_vanished" in _psi_tool
+                  and "vanished=$ABK_n_vanished" in _psi_tool
+                  and _psi_walk.count("ABK_n_vanished=$((") >= 2
+                  and "gone/cgroup.pressure" in _psi_tool)
+            check("the PSI selftest asserts the vanished counter",
+                  "vanished=1" in _psi_tool)
             _psi_bench = archive.read("bin/abk_psi_bench.sh").decode("utf-8")
             # Whether a string is absent depends on comment vs code here: two of
             # the strings below are named in the tool header precisely because
@@ -3159,10 +3172,24 @@ def test_runtime_tunables_module():
             check("a missing storm binary fails the bench instead of passing it",
               "cannot generate a storm" in _psi_bench
                   and "exit 1" in _psi_bench.split("cannot generate a storm", 1)[1][:40])
+            # The loop must create no process at all.  "sleep 0" was the first
+            # shape of that bug; the second was "printf", which on the target
+            # ROM is a tracked alias to /system/bin/printf -- 500 calls measured
+            # 6.3 s on device, i.e. two fork+execs per round trip.  echo is a
+            # builtin there (500 calls: 0.01 s).
             check("the wake storm is a blocking wake, not a fork storm in disguise",
-              "mkfifo" in _psi_bench_code and "sleep 0" not in _psi_bench_code)
+              "mkfifo" in _psi_bench_code and "sleep 0" not in _psi_bench_code
+                  and "printf" not in _psi_bench_code
+                  and "echo x >&3" in _psi_bench_code
+                  and "echo y; done <" in _psi_bench_code)
             check("the bench reports the groups it left behind",
               "groups left =" in _psi_bench)
+            # The companion's own periodic pass disables every unprotected group,
+            # the bench's arms included, so a run crossing a tick would compare
+            # two disabled arms and call the difference a saving.
+            check("the bench re-checks both arms every round and aborts if one moved",
+                  "arm state changed mid-run" in _psi_bench
+                  and "want=$_want_v" in _psi_bench)
             check("the bench has a help path", "-h|--help) abk_usage" in _psi_bench)
             # Measured on the target device: _diff * 10000 overflows mksh's 32-bit
             # arithmetic and printed 49 permille for a negative saving.  Divide first.

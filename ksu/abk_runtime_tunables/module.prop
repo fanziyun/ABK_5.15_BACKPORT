@@ -1,6 +1,6 @@
 id=abk_runtime_tunables
 name=ABK 5.15 Runtime Tunables
-version=v0.9.2
-versionCode=13
+version=v0.9.3
+versionCode=14
 author=FanZiyun
 description=Drives the ABK 5.15 kernel grafts that are otherwise inert on device: keeps the zram algorithm policy in force at every boot (primary lz4kd, secondary zstd, locked in the kernel by Batch 11 and re-asserted here on older kernels), preserves or establishes the zram writeback backing device instead of trading it away, adds the one kernel-domain SELinux rule that path needs under Enforcing (Batch 18), runs age-based recompression sweeps through the async worker, capped per pass by zram.recomp.max_pages (Batch 24 grafts the max_pages parameter; an older kernel ignores it and the sweep stays unbounded), follows each sweep with one gated zsmalloc compaction pass, records who owns CPU frequency at boot (a vendor FAS/WALT governor must keep it, since Batch 10-5 ships the smart-freq floor off), and reports or tunes the remaining runtime knobs (MGLRU, THP, swappiness, abk_sf, dynamic readahead, cgroup-v1 proactive reclaim, and per-cgroup pressure (PSI) accounting switched off for the hundreds of groups nobody reads through the Batch 21 cgroup.pressure node, which makes it a policy pass plus a two-boot measurement rather than a new graft).

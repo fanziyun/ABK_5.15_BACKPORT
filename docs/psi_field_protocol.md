@@ -93,6 +93,32 @@ the mode with a risk, and the difference between them is a number, not an argume
 
 ## 4. The measurement
 
+**Storm cost, measured on vermeer / 5.15.216 (2026-09-15).**  A fork storm bills
+about 1.3 ms of `system_usec` per fork (2000 forks: 2.6 s system, 1 s wall).  A wake
+storm is meant to be almost free -- two blocking transitions per round trip and
+nothing else -- and it now is: 2000 wakes bill 0.30 s of `system_usec`, ~0.15 ms per
+round trip.  It was not until this run.  The loop used `printf`, and on this ROM
+`/system/bin/sh` is Android mksh where `printf` is a **tracked alias for
+`/system/bin/printf`** -- an external binary, not a builtin.  Measured: 500 calls cost
+6.3 s of wall time, the same 12.6 ms a `fork+exec` of `/system/bin/true` costs, so
+each nominal "wake" created two processes and billed ~30 ms of CPU.  A default run
+(`--storm both --forks 20000 --wakes 50000 --rounds 3`) therefore needed hours per
+A/B while measuring process creation rather than the event the switch skips.  `echo`
+is a builtin on the same ROM (500 calls: 0.01 s) and is what the loop uses now.
+Consequence for older numbers: the three runs quoted in `CHANGELOG.md#batch-26` §5.1
+were taken with the `printf` loop, so about seven eighths of the process creations in
+them came from the wake half of the storm, and no A/B taken before companion v0.9.3
+contains a wake measurement.
+
+**What can invalidate a run.**  The arms are ordinary groups; the companion's own
+periodic policy pass (`service.sh --supervise-psi`, every `psi.cgroup.interval_sec`,
+five minutes by default) disables every unprotected group it finds, arms included.
+A run that crosses a tick would compare two disabled arms and report the difference
+as a saving, so the bench re-reads both arm nodes before every round and aborts on a
+mismatch (v0.9.3).  Stop the supervisor for the duration --
+`pkill -9 -f 'service.sh --supervise-psi'`, then `sh service.sh --supervise-psi` via
+`setsid` to bring it back, or reboot -- or measure on a `keep` boot.
+
 **Batch 26 update.**  The shipped bench now takes the A/B *inside one boot*:
 two sibling groups under `--cgroot`, the identical storm run in each with the
 rounds alternating, and the bill read back from each group's own `cpu.stat`

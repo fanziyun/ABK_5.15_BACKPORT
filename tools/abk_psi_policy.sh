@@ -46,6 +46,16 @@
 # the protect list is even consulted.  Then: any group under a protect prefix
 # (system by default; that is where the vendor monitors live).
 #
+# REFUSED IS NOT "GONE"
+# The walk reports refused= and vanished= separately, and the split is load
+# bearing.  A live phone deletes cgroups underneath the walk continuously (an
+# app's last task exits) and the kernel answers those with ENOENT; both were
+# counted as refused before, and on a first pass where nothing had been disabled
+# yet that is precisely the shape the supervisor reads as "this module cannot
+# write" and stops on for good -- so one exited app could take the policy down
+# until the next boot.  In the log, vanished= is churn to ignore; refused= is the
+# one that means SELinux or a read-only mount.
+#
 # NO RE-ENABLE, EVEN THOUGH THIS KERNEL COULD
 # Batch 21 kept the state in the cgroup's own flags word and frees nothing, so
 # its write path can restart accounting (psi_cgroup_restart() rebuilds each
@@ -107,6 +117,7 @@ abk_psi_walk() {
   ABK_n_populated=0
   ABK_n_root=0
   ABK_n_refused=0
+  ABK_n_vanished=0
   ABK_failed=
 
   for _node in $(find "$ABK_CGROOT" -name cgroup.pressure 2>/dev/null); do
@@ -126,6 +137,16 @@ abk_psi_walk() {
 
     _state=$(cat "$_node" 2>/dev/null)
     if [ -z "$_state" ]; then
+      if [ ! -e "$_node" ]; then
+        # The group went away between the enumeration and this read: its last
+        # task exited while the walk was running.  That is ordinary churn on a
+        # live phone, not a refusal, and calling it one was not harmless -- the
+        # supervisor's first-pass rule reads "nothing was off, nothing got
+        # disabled, something was refused" as "this kernel will not let me write"
+        # and stops the loop for good, which a single exited app could trigger.
+        ABK_n_vanished=$((ABK_n_vanished + 1))
+        continue
+      fi
       # Unreadable is not "off": count it and move on rather than write blind.
       ABK_n_refused=$((ABK_n_refused + 1))
       [ -n "$ABK_failed" ] || ABK_failed="$_node"
@@ -160,6 +181,10 @@ abk_psi_walk() {
     # lets "Permission denied" escape to the caller.
     if ( echo 0 > "$_node" ) 2>/dev/null; then
       ABK_n_disabled=$((ABK_n_disabled + 1))
+    elif [ ! -e "$_node" ]; then
+      # Same churn case on the write side: the last task left between the read
+      # above and this write, and the kernel answered ENOENT.
+      ABK_n_vanished=$((ABK_n_vanished + 1))
     else
       # A refusal is SELinux or a read-only mount, never a missing feature.
       ABK_n_refused=$((ABK_n_refused + 1))
@@ -167,7 +192,7 @@ abk_psi_walk() {
     fi
   done
 
-  echo "psi: mode=$ABK_MODE action=$ABK_ACTION nodes=$ABK_n_total already_off=$ABK_n_off disabled=$ABK_n_disabled protected=$ABK_n_protect root=$ABK_n_root populated_skipped=$ABK_n_populated refused=$ABK_n_refused failed_first=$ABK_failed"
+  echo "psi: mode=$ABK_MODE action=$ABK_ACTION nodes=$ABK_n_total already_off=$ABK_n_off disabled=$ABK_n_disabled protected=$ABK_n_protect root=$ABK_n_root populated_skipped=$ABK_n_populated refused=$ABK_n_refused vanished=$ABK_n_vanished failed_first=$ABK_failed"
   if [ "$ABK_n_refused" -gt 0 ]; then
     echo "psi: $ABK_n_refused node(s) could not be read or written; proof: dmesg | grep -i avc | grep cgroup"
   fi
@@ -194,6 +219,11 @@ abk_psi_selftest() {
   done
   echo 1234 > "$_st_root/apps/pid_1234/cgroup.procs"
   echo 0 > "$_st_root/protect_memcg_001/cgroup.pressure"
+  # A node that is a dangling symlink stands in for the group that exits while
+  # the walk is running: find still lists it, cat fails with ENOENT, and the walk
+  # has to book that as vanished, not as a refusal.
+  mkdir -p "$_st_root/gone"
+  ln -s "$_st_root/no_such_group/cgroup.pressure" "$_st_root/gone/cgroup.pressure"
   # The protected fixture dir is named sysdir, not system: this exercises
 # prefix matching, and a literal /system path in shipped module code trips the
 # repository packaging gate on read-only partitions.  The real default value is
@@ -210,12 +240,15 @@ abk_psi_selftest() {
   # default of `system`.
   ABK_PROTECT="sysdir"
   _rc=0
+  # The refused fixture and the vanished fixture have to land in different
+  # counters: the first means SELinux stopped us, the second means the phone
+  # moved on under the walk.  They are asserted together in _want below.
 
   # Status must never write, whatever the mode says.
   _out=$(ABK_MODE=aggressive ABK_ACTION=status abk_psi_walk | head -n 1)
-  _want="psi: mode=aggressive action=status nodes=8 already_off=1 disabled=0 protected=3 root=1 populated_skipped=0 refused=1 failed_first=$ABK_CGROOT/no_perm/cgroup.pressure"
+  _want="psi: mode=aggressive action=status nodes=9 already_off=1 disabled=0 protected=3 root=1 populated_skipped=0 refused=1 vanished=1 failed_first=$ABK_CGROOT/no_perm/cgroup.pressure"
   if [ "$_out" = "$_want" ]; then
-    echo "psi selftest ok: status walk is read-only (8 nodes, 3 protected incl. the prefix sibling, root kept, 1 off, 1 refused)"
+    echo "psi selftest ok: status walk is read-only (9 nodes, 3 protected incl. the prefix sibling, root kept, 1 off, 1 refused, 1 vanished)"
   else
     echo "psi selftest FAIL: status line differs"
     echo "  got:  $_out"
