@@ -1,6 +1,6 @@
 # CHANGELOG.md — 已落地批次原文归档
 
-本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项续写这条清单，收的是「前九项在真机上能不能用」所依赖的 per-cgroup PSI 可用性链路。
+本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
 <a id="overview-nine"></a>
 
@@ -170,7 +170,133 @@ v6.13）驱动分批，而 5.15 **0 命中** → in-flight 窗口用 5.15 自己
 zsmalloc `compact`（两个开销门都判定设备已碎片化才写节点）。详见 [Batch 4](#batch-4) /
 [Batch 10-1](#batch-10-1) / [Batch 12](#batch-12) / [Batch 24](#batch-24)。
 
-### 10. 每 cgroup 的压力记账开关真正可用（Batch 21/25/26）
+### 10. 本轮新增的四个提交（`8a73e95` → HEAD，v0.30.0 / companion v0.9.3）
+
+前九项是**既有批次**的清单式重排（来源：上游 5.15.y LTS 与 android14-6.1 / android15-6.6 ACK 的
+结构性移植）。这一节记的是**本轮真正往下写的那四个提交** —— 它们一个内核特性都没加，加的是
+「前九项在这台设备上能不能用」和「前九项的数据可不可信」。
+
+起点 `8a73e95`（Batch 19/20：`blk_mq_quiesced_elevator_switch` `9646443f28f3`、
+`sched_steal_time_excess_drop` `56135262c1f9`、`64d9b734b6fe` 按 arm64 no-op 排除，
+`KNOWN_DEBT` 清零）—— 之后按顺序：
+
+| # | 提交 | 版本 | 一句话 |
+|---|---|---|---|
+| 1 | `ec96603` feat(companion): Batch 25 | companion v0.9.0 | per-cgroup PSI 的**设备侧策略**（此前 graft 落地后从没被按过一次） |
+| 2 | `94166af` feat(core): Batch 26 | 模块 v0.30.0 | 第 4 档 `ABK_515_DEFCONFIG_PSI=1`：去掉基线 cmdline 的 `cgroup_disable=pressure`，让开关**可达** |
+| 3 | `d395844` fix(companion) | companion v0.9.2 | 真机首跑暴露的两处：supervisor 的 pid 文件、bench 的 32 位溢出 |
+| 4 | `5246867` fix(companion) | companion v0.9.3 | 同一批工具再暴露的两处：唤醒风暴的 `printf`、策略 walk 的 `refused` 误判 |
+
+#### 10.1 `ec96603` — 调度器/内存面之外的这一条：per-cgroup PSI 策略（companion v0.9.0）
+
+**不是 graft，是 companion**：节点已经在树里（Batch 21 嫁接的 `cgroup.pressure`），缺的是**谁去按它**。
+
+**先点名，再改任何东西**（vermeer / 5.15.216 / v0.29.0，记录在 `docs/psi_field_protocol.md`）：
+
+- 452 个组带该节点，其中 **314 个有任务**；
+- 设备上唯一读压力的三个进程 —— `lmkd`、`system_server`、`mimd` —— 打开的都是**全局**
+  `/proc/pressure/memory`（根组提供），per-cgroup 记账**不服务**它们；没有任何进程持有 per-cgroup PSI 文件；
+- 这次点名**当场否掉了第一版方案**：`auto`（只关空组）是**零收益 no-op** —— 空组里根本不会跑到被省掉的那段代码。
+  唯一能碰到真实工作的模式是 `aggressive`，而它也是唯一可能拒绝 vendor daemon 明天要 arm 的 poll trigger 的模式。
+
+落地：
+
+- `tools/abk_psi_policy.sh`（新，随 companion 进 `bin/`）：**一趟 walk**。根组**无条件先跳**（写它等于动
+  `psi_system`，也就是低内存杀进程的信号），且排在 protect 名单**之前**；已经关掉的组跳过 ——
+  这正是周期巡视不必为内核侧同步付几百次代价的原因。**只写 0**：Batch 21 里状态是一位 flag、记账能重启，
+  但上游会释放 per-cpu window 并明说「重开不等于安全恢复」，而这个 companion 跑在**它自己没编译过的内核**上；
+- `--selftest`：假树断言整张判定表（根组 / 受保护子树 / 前缀兄弟 / 有任务 / 空 / 已关 / 不可写）
+  以及「第二遍不写任何东西」。这是**这道策略与真机之间唯一的挡板**；
+- 配置：`psi.cgroup`（`keep`|`auto`|`aggressive`）、`.protect`（字面前缀；内置 `system`，
+  本 ROM 另发 `system,protect_memcg`）、`.interval_sec`。`keep` **什么都不 spawn**；walk 带阻塞写，
+  所以永不放在 `post-fs-data`；稳态巡视不进 logcat；**首趟若每一笔写都被拒**，supervisor 直接退出，
+  而不是每 300 s 再走 452 个节点去重复吃 EACCES。
+
+写这一批时抓到的四处（每处都补了门禁）：默认 protect 名单里含 app 组（Android 上 per-app 组才是大头，
+那会吃掉大部分收益，被 selftest 抓到）；`echo 0 > node 2>/dev/null` 会把 `Permission denied` **泄漏到
+logcat**（失败的是重定向、不是 echo —— 活树上漏了 28 行，改成子 shell 里写）；bench 用
+`awk '^cpu  {'`（少了正则斜杠）读 `/proc/stat`，gawk 语法错被 `2>/dev/null` 吞掉，**失败与读到 0 长得一模一样**；
+打包门禁抓到 shipped 代码里的 `/system/bin/true` 与夹具路径。
+
+验证：`py_compile`、`bash -n` + `sh -n`（含 dash）、策略 selftest PASS（7 条断言）、
+`stable_5_15_test.py` all checks passed（**+22 条断言**，含一条钉住我一开始写错的来源判断：
+这个节点是本模块 Batch 21 的 graft，**不是**上游自带）、167/178/194/216 四档
+`step_audit`/`implementation_audit`/`smoke` 全绿。**registry / sublevel_matrix / module.conf 一行未动**
+（companion 批次只 bump `module.prop`，先例 `a50df6e`）。
+
+#### 10.2 `94166af` — 内核侧：让 Batch 21/25 在真机上可达（v0.30.0）
+
+Batch 21 的 `cgroup.pressure`、Batch 25 的策略，**在任何 android13-5.15-lts 树上都不可达**。
+真机实测（vermeer / 5.15.216 / root）：`find /sys/fs/cgroup -name cgroup.pressure` → **0**，
+`cpu.pressure` / `memory.pressure` / `io.pressure` 也一个没有，而 `/proc/pressure/*` 完好。
+
+**根因不在 graft，在基线的启动参数**：模板 `gki_defconfig` 自带
+
+    CONFIG_CMDLINE="... kvm-arm.mode=protected cgroup_disable=pressure"
+    CONFIG_CMDLINE_EXTEND=y
+
+于是整趟 boot 里 `cgroup_psi_enabled()` 都是 false。后果两条，都在内核里：`psi_init()` 关掉
+`psi_cgroups_enabled` 静态分支（**per-cgroup 记账本身**），`cgroup_addrm_files()` 在创建阶段跳过
+**每一个** `CFTYPE_PRESSURE` 文件（`cgroup.pressure` 在内）。`docs/psi_field_protocol.md` 里那份点名
+因此描述的是一个**没有这个 token 的内核**。
+
+修法：引擎侧新增 `GraftContext.defconfig_drop_cmdline_token(token)` + 显式档
+`ABK_515_DEFCONFIG_PSI=1`（默认关），只去掉这一个 token。**被否决的便宜修法**：把
+`cgroup.pressure` 条目的 `CFTYPE_PRESSURE` 标志去掉让节点「可见」—— 那是装饰性的，
+静态分支仍关着，开关没东西可关。默认关的理由也写在档里：token 一走，那 ~450 个组会各自付账，
+直到 companion 的策略趟把它们逐个关掉 —— 而那正是 token 免费做到的事。
+
+同批带上 companion 的 **bench 重写（v0.9.1）**：不再读机器级忙 jiffies（那上面 45% 是别人的负载），
+改读**自己叶组的 `cpu.stat`**；A/B 改成**一次引导内的两个兄弟组**；没有开关、或该组没被记账时
+**拒绝出数**而不是印两个 0。
+
+验证：`py_compile`；`stable_5_15_test.py` all checks passed（**+16 条断言**）；
+`.216` 上 step/implementation/smoke 全绿（registry 未动）；档位在**真构建树**上生效，
+模块 stage 重跑日志：`config_enablement: "5 symbol(s) already set …; dropped cgroup_disable=pressure from CONFIG_CMDLINE"`。
+
+#### 10.3 `d395844` — 真机首跑暴露的两处（companion v0.9.2）
+
+都在 Batch 25 的工具**第一次上真机**时现形（Batch 26 内核，`cgroup.pressure` 355~369 个节点）：
+
+1. **supervisor 的 pid 文件**：`common.sh` 写的是 `abk_pid_write psi "\$"` —— 一个**字面的美元符**，
+   不是 pid。于是 `abk_spawn` 轮询十秒后记下 `psi supervisor did not start`，而 supervisor
+   **其实正在跑**；任何按 pid 文件做的状态检查全是瞎的。zram 与 cfr 本来就写的 `"\$\$"`，
+   单测现在钉的是**整个类**而不是那一行；
+2. **bench 的 32 位溢出**：`_diff * 10000 / _on_tot` 在手机上（mksh，32 位）溢出 —— 第一次真机跑把
+   **负**收益（−330,741 usec）印成 `saving_permille=49`。改成先除后乘。
+
+两处都修完后的实测：模块 root **能写**该节点（0/1 → rc 0，2 → `EINVAL`）且**不需要额外 sepolicy**；
+开机 supervisor 自己把策略跑完（`nodes=355 disabled=106 refused=0`）；同一引导内的 A/B
+**不可复现**（三趟 −1.7% / +6.0% / +1.9%）⇒ **出厂默认仍 `keep`**。
+
+#### 10.4 `5246867` — 同一批工具再暴露的两处（companion v0.9.3）
+
+3. **唤醒风暴的 `printf` 在目标 ROM 上不是 shell 内建**。`/system/bin/sh` 是 Android mksh，
+   `type printf` 回答 `printf is a tracked alias for /system/bin/printf` —— 每次调用一次 `fork+exec`。
+   设备实测 500 次调用 **6.3 s 墙钟**（12.6 ms/次，与 `fork+exec /system/bin/true` 同价），
+   也就是每次名义「唤醒」创建两个进程、约记 30 ms CPU：默认一趟
+   （`--storm both --forks 20000 --wakes 50000 --rounds 3`）要按小时计，而它量的是**进程创建**，
+   不是这个开关真正跳过的那个事件。改用 `echo`（同一 ROM 500 次 0.01 s）。单测原来只钉 `sleep 0`
+   （第一版是 `sleep 0` 在循环里，toybox sleep 会 fork），现在钉「wake 风暴代码里不得出现 `printf`」
+   + `echo x >&3` + `echo y; done <`；`--help` 也从固定行范围改成「第一个非注释行之前」（头部一长就会被截断）；
+4. **策略 walk 把「走到一半消失的组」记成 `refused`**。真机上任何一个正在退出的 app 都会制造一次，
+   而首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不让我写」——
+   于是一条退出记录就能在开机第一趟把策略**停掉整个 boot**。改为独立计数器 `vanished`
+   （`gone/cgroup.pressure` 单独归类），`--selftest` 断言 `vanished=1`。
+
+另加一道**臂完整性门**：`aggressive` 下 supervisor 每 `psi.cgroup.interval_sec`（默认 300 s）
+关掉所有未保护组 —— **包括 bench 的两个臂**，跨 tick 的一轮会把两个已经关掉的臂拿来比、
+并把差当成收益。现在每轮开跑前重读两臂 `cgroup.pressure`，与期望值不符即**中止**并打印原因
+（要么停 supervisor，要么改在 `keep` boot 上测）。修正后的 **9 轮 fork 风暴**复测：
+`on=233,200,435` / `off=231,614,753` ⇒ **+1,585,682（+0.68% = 6 permille）**，
+乘设备上 root 组之外的状态变化占比 34.7% ≈ **0.24%** ⇒ 判定不变。
+
+---
+
+本节十项都是上面已归档内容的**顺序重排与续写**：1–9 按功能清单重排，第 10 项记本轮
+`8a73e95` → HEAD 的四个提交（Batch 25 companion / Batch 26 core / companion v0.9.2 / v0.9.3）。
+证据全部取自本仓库既有的实测记录（真机 adb 输出、CI 构建号、审计门禁名），四个提交都**没有**新增
+PatchGroup、没有新增内核特性，也没有改写任何历史结论。
 
 这一项是清单之外、但**前九项在真机上能不能用**取决于它的一条：第 5 条描述的 per-cgroup PSI
 记账（Batch 21 的 `cgroup.pressure` 开关）在这台设备上**从落地那天起就不可达** —— 节点数 0。
