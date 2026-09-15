@@ -3046,6 +3046,21 @@ def test_runtime_tunables_module():
     check("the companion README records the two-boot rule and the third supervisor",
           "two boots" in readme_source
           and "three supervisors" in readme_source)
+    # Measured on the target device (2026-09-15): the psi supervisor wrote a
+    # literal "$" into its pid file -- `abk_pid_write psi "$"` is a quoted dollar
+    # sign, not the pid -- so abk_spawn polled for ten seconds and logged "psi
+    # supervisor did not start" while the supervisor was in fact running, and
+    # every pid-file-based check of it was blind.  zram and cfr already passed
+    # "$$"; the psi one was a typo.  Pin the whole class, not the one line.
+    _pid_writes = []
+    for _sh in sorted(module_dir.glob("*.sh")):
+        _pid_writes += re.findall(r'abk_pid_write\s+(\S+)\s+"([^"]*)"',
+                                  _sh.read_text(encoding="utf-8"))
+    check("every supervisor writes its real pid into its pid file",
+          bool(_pid_writes) and all(arg == "$$" for _n, arg in _pid_writes),
+          _pid_writes)
+    check("the psi supervisor is one of them",
+          any(name == "psi" for name, _arg in _pid_writes), _pid_writes)
 
     # --- packaging: the module zip and the AK3 ride-along ---
     sys.path.insert(0, str(repo / "scripts"))
@@ -3149,6 +3164,11 @@ def test_runtime_tunables_module():
             check("the bench reports the groups it left behind",
               "groups left =" in _psi_bench)
             check("the bench has a help path", "-h|--help) abk_usage" in _psi_bench)
+            # Measured on the target device: _diff * 10000 overflows mksh's 32-bit
+            # arithmetic and printed 49 permille for a negative saving.  Divide first.
+            check("the bench cannot overflow its 32-bit arithmetic",
+                  "_diff / (_on_tot / 1000)" in _psi_bench_code
+                  and "* 10000 / _on_tot" not in _psi_bench_code)
             check("embedded FAS check tool is byte-identical to tools/",
                   archive.read("bin/abk_fas_check.sh")
                   == (repo / "tools" / "abk_fas_check.sh").read_bytes())

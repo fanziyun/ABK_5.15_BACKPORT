@@ -66,14 +66,49 @@ Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFC
 - registry 未动 ⇒ `step_audit` / `implementation_audit` / `smoke.sh` 的期望状态不变：
   默认档位下 config lane 的输出与改动前逐字节相同。
 
-### 6. 待办（真机）
+### 5.1 真机验证（vermeer / 5.15.216，本批实测）
 
-- [ ] 带 `ABK_515_DEFCONFIG_PSI=1` 重编 + 刷 boot，确认
-      `find /sys/fs/cgroup -name cgroup.pressure | wc -l` ≈ 452；
-- [ ] 模块 root 写 `cgroup.pressure` 是否需要额外 sepolicy（Batch 25 遗留的唯一未证前提）；
-- [ ] `keep` vs `aggressive` 两态 A/B，按 `docs/psi_field_protocol.md` §5 判定规则回写
-      `tunables.conf` 默认值；
-- [ ] §2 的点名重做一遍，这次带上构建档位做溯源。
+带 `ABK_515_DEFCONFIG_ROM=1 ABK_515_DEFCONFIG_PSI=1` 重编、magiskboot 重打包 boot_a 刷入（新
+的 `Image` 为 5bd74221…：内置 cmdline 里 `cgroup_disable=pressure` 出现 **0** 次）。
+
+| 检查 | 结果 |
+|---|---|
+| `/proc/cmdline` 里的 `cgroup_disable` | 0 处（token 真的没了） |
+| `find /sys/fs/cgroup -name cgroup.pressure` | **355~369**（数目随 app 组的创建/销毁浮动） |
+| `cpu.pressure` 节点数 | 与 `cgroup.pressure` 同步（369 → 369） |
+| 根组 `cgroup.pressure` | 1（`psi_system` 未被碰） |
+| 全局 `/proc/pressure/*` | cpu/io/irq/memory 全在且照常更新 |
+| 临时组写 0 / 1 / 2 | rc=0 / 0 / **1**(EINVAL)，值 0/1 正确；**无需额外 sepolicy**（dmesg 无 pressure 相关 avc） |
+| `--apply --mode aggressive`（手工一趟） | `nodes=369 disabled=122 protected=246 root=1 refused=0`，4.8s；随后 `--status` 报 `already_off=122` |
+| 开机自动策略（supervisor） | 日志 `per-cgroup PSI supervisor up: mode=aggressive …` → `psi: … nodes=355 disabled=106 refused=0`；`action.sh` 显示 `per-cgroup PSI policy running (pid N)` |
+
+两态 A/B（同一引导内，`abk_psi_bench.sh --mode ab`：两个兄弟组、交替轮次、读自己组的 `cpu.stat`）：
+
+| 风暴规模 | on 组 system_usec | off 组 system_usec | 差（off 省） |
+|---|---|---|---|
+| 6000 fork × 3 轮 | 19,914,848 | 20,245,589 | **−330,741**（负） |
+| 15000 fork × 3 轮 | 49,428,610 | 46,440,779 | **+2,987,831** |
+| 15000 fork × 5 轮 | 82,830,578 | 81,205,084 | **+1,625,494**（1.9%） |
+
+按 `docs/psi_field_protocol.md` §5 的判定规则（「几次百分比以内 = 没有可测收益」）：三次里有
+一次为负、两次落在 +1.9%~+6.0%，**不可复现**；乘上设备上 root 组之外的状态变化占比（34.7%）后是 ~0.7% 量级
+⇒ **出厂默认仍 `keep`**。设备侧本轮留在 `aggressive`（展示用；改回是 `tunables.conf` 一行 + 重启）。
+
+### 5.2 真机暴露的两个 companion 缺陷（本批一并修，companion v0.9.2）
+
+1. **bench 的 32 位溢出**：`_pmt=$(( _diff * 10000 / _on_tot ))` 在手机上（mksh，32 位）溢出，把
+   −330,741 的**负**收益印成 `saving_permille=49`。改为先除后乘（`_diff / (_on_tot / 1000)`），并加单测。
+2. **psi supervisor 的 pid 文件**：`abk_pid_write psi "$"` 写进去的是一个字面的 `$`（真展开成 pid 的是
+   `"$$"`），于是 `abk_spawn` 轮询 10 秒后误报 `psi supervisor did not start`——而 supervisor
+   其实在跑；任何按 pid 文件做的状态检查都是瞎的。修成 `"$$"`，并把「每个 supervisor 都写 `$$`」
+   钉成断言（zram/cfr 本来就对，psi 是唯一一个写错的）。
+
+### 6. 收尾
+
+- [x] 带 `ABK_515_DEFCONFIG_PSI=1` 重编 + 刷 boot：`cgroup.pressure` 节点 355~369 个；
+- [x] 模块 root 写 `cgroup.pressure` 不需要额外 sepolicy（`refused=0`，dmesg 无 avc）；
+- [x] `keep` vs `aggressive` 的 A/B 已做（§5.1）→ 判定：不可复现，默认 `keep`；
+- [ ] §2 的点名（452/314）需要在**带该档构建**的内核上重做一遍，才能替代文档里那份无法溯源的数字。
 
 <a id="batch-25"></a>
 

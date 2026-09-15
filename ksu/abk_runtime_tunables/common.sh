@@ -5,7 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-ABK_VERSION="v0.9.0"
+ABK_VERSION="v0.9.2"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -741,7 +741,7 @@ abk_psi_node_count() {
 }
 
 abk_psi_supervisor_main() {
-  abk_pid_write psi "$"
+  abk_pid_write psi "$$"
   _ps_interval="$(abk_psi_interval)"
   abk_log "per-cgroup PSI supervisor up: mode=$(abk_psi_mode) protect=$(abk_psi_protect) interval=${_ps_interval}s"
   _ps_first=1

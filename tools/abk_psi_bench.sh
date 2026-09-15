@@ -324,9 +324,14 @@ abk_rmgroupee "$ARM_ON_G"; abk_rmgroupee "$ARM_OFF_G"
 echo "psi_bench: cleanup: groups left = $(find "$ABK_CGROOT" -maxdepth 1 -name 'abk_psi_bench_*' 2>/dev/null | wc -l)"
 if [ "$ABK_MODE" = ab ] && [ "$_n" -gt 1 ]; then
   _diff=$((_on_tot - _off_tot))
-  # integer permille of the saving against the on arm
+  # Integer per-mille of the saving against the on arm.  Divide first: a full
+  # run makes _diff * 10000 overflow the device shell's 32-bit arithmetic, and
+  # that is not hypothetical -- the first version of this line printed 49
+  # permille for a *negative* saving on the target device (2026-09-15,
+  # 19914848 - 20245589).  Truncating the divisor keeps every intermediate
+  # inside 32 bits; the reported figure stays integer per-mille.
   _pmt=0
-  [ "$_on_tot" -gt 0 ] && _pmt=$(( _diff * 10000 / _on_tot ))
+  [ "$_on_tot" -gt 1000 ] && _pmt=$(( _diff / (_on_tot / 1000) ))
   echo "psi_bench: RESULT on_system_usec_total=$_on_tot off_system_usec_total=$_off_tot saving_usec=$_diff saving_permille=$_pmt"
   echo "psi_bench: how to read this: permille is the share of the storm's kernel time that per-cgroup"
   echo "psi_bench:   PSI accounting costs at depth $ABK_DEPTH.  Multiply by the share of real state"
