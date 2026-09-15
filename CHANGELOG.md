@@ -265,7 +265,19 @@ Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFC
 
 按 `docs/psi_field_protocol.md` §5 的判定规则（「几次百分比以内 = 没有可测收益」）：三次里有
 一次为负、两次落在 +1.9%~+6.0%，**不可复现**；乘上设备上 root 组之外的状态变化占比（34.7%）后是 ~0.7% 量级
-⇒ **出厂默认仍 `keep`**。设备侧本轮留在 `aggressive`（展示用；改回是 `tunables.conf` 一行 + 重启）。
+⇒ **出厂默认仍 `keep`**。设备侧只在展示那一趟手工用过 `aggressive`（关掉是**单向**的：九轮复测时 `--status` 仍见 `already_off=152`），当前 boot 的 `psi.cgroup` 已回到 `keep`，supervisor 不写任何节点。
+
+上表三次用的是**旧工装**：它们测的都是 fork 风暴（fork 风暴本来就 fork，所以那部分是有效的），
+但工装的唤醒面在目标 ROM 上把 12.6 ms 的 `fork+exec` 当成了一次「唤醒」—— 见 §5.3 第 1 条。
+工装修正后用 **9 轮 fork 风暴**（`--forks 20000`，两臂交替，每轮开跑前重读两臂节点）复测：
+
+| 风暴规模 | on 组 system_usec 合计 | off 组 system_usec 合计 | 差（off 省） |
+|---|---|---|---|
+| 20000 fork × 9 轮 | 233,200,435 | 231,614,753 | **+1,585,682**（+0.68% = 6 permille） |
+
+逐轮两臂互有高低（on：24.2 / 21.7 / 26.0 / 26.3 / 24.2 / 25.7 / 28.1 / 28.8 / 28.3 s；
+off：28.0 / 21.4 / 23.5 / 25.4 / 21.0 / 25.0 / 29.7 / 28.5 / 29.2 s 的 system_usec），合起来
++0.68% × root 组之外的状态变化占比 34.7% ≈ **0.24%** ⇒ **结论不变：不可复现、出厂默认仍 `keep`**。
 
 ### 5.2 真机暴露的两个 companion 缺陷（本批一并修，companion v0.9.2）
 
@@ -276,11 +288,36 @@ Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFC
    其实在跑；任何按 pid 文件做的状态检查都是瞎的。修成 `"$$"`，并把「每个 supervisor 都写 `$$`」
    钉成断言（zram/cfr 本来就对，psi 是唯一一个写错的）。
 
+### 5.3 工装修正后又暴露的两个缺陷（companion v0.9.3）
+
+A/B 的**符号**第一次是不确定的（§5.1 上表：一次负、两次正），按 `docs/psi_field_protocol.md` 的
+判定规则这已经是「没有可测收益」；但工装本身还有两个只在设备上才现形的问题，不修掉就没有资格下结论：
+
+1. **唤醒风暴的 `printf` 在目标 ROM 上不是 shell 内建。** `/system/bin/sh` 是 Android mksh，
+   `type printf` 的回答是 `printf is a tracked alias for /system/bin/printf` —— 每次调用都是一次
+   `fork+exec`。设备实测 500 次调用 **6.3 s 墙钟**（12.6 ms/次，与 `fork+exec /system/bin/true` 同价），
+   也就是每次名义「唤醒」创建两个进程、约记 30 ms CPU：默认一趟
+   （`--storm both --forks 20000 --wakes 50000 --rounds 3`）需要按小时计，而它量的是进程创建，
+   不是这个开关真正跳过的那个事件。改用 `echo`（同一 ROM 上 500 次 0.01 s）；
+   单测原来只钉 `sleep 0`（第一版是 `sleep 0` 在循环里，toybox sleep 会 fork），
+   现在钉「wake 风暴代码里不得出现 `printf`」+ `echo x >&3` + `echo y; done <`。
+   工装还顺手把 `--help` 从固定行范围改成「第一个非注释行之前」——头部一长，用法段就被截断。
+2. **策略 walk 把「走到一半消失的组」记成 `refused`。** 真机上任何一个正在退出的 app 都会制造一次，
+   而 supervisor 的首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不让我写」，
+   于是一条退出记录就能在开机第一趟把策略**停掉整个 boot**。改为独立计数器 `vanished`
+   （`gone/cgroup.pressure` 单独归类），`--selftest` 断言 `vanished=1`。
+
+另加一道**臂完整性门**（同一批）：`psi.cgroup=aggressive` 时 supervisor 每
+`psi.cgroup.interval_sec`（默认 300 s）关掉所有未保护组 —— **包括 bench 的两个臂**，跨 tick 的一轮
+会把两个已经关掉的臂拿来比、并把差当成收益。现在每轮开跑前重读两个臂的 `cgroup.pressure`，
+与期望值不符就**中止**并打印原因（操作者要么停掉 supervisor，要么改在 `keep` boot 上测）。
+本轮 9 轮实测跑在 `psi.cgroup=keep` 下（supervisor 不写任何节点），这道门一次都没触发。
+
 ### 6. 收尾
 
 - [x] 带 `ABK_515_DEFCONFIG_PSI=1` 重编 + 刷 boot：`cgroup.pressure` 节点 355~369 个；
 - [x] 模块 root 写 `cgroup.pressure` 不需要额外 sepolicy（`refused=0`，dmesg 无 avc）；
-- [x] `keep` vs `aggressive` 的 A/B 已做（§5.1）→ 判定：不可复现，默认 `keep`；
+- [x] `keep` vs `aggressive` 的 A/B 已做（§5.1）→ 判定：不可复现，默认 `keep`；工装修正后（§5.3）9 轮复测仍是 +0.68% 量级，结论不变；
 - [ ] §2 的点名（452/314）需要在**带该档构建**的内核上重做一遍，才能替代文档里那份无法溯源的数字。
 
 <a id="batch-25"></a>
