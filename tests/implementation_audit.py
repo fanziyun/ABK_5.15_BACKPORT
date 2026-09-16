@@ -647,7 +647,7 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
-    # --- Batch 34: the memory-reclaim chain --------------------------------
+    # --- Batch 37: the memory-reclaim chain --------------------------------
     # Six groups rewriting one path, so each entry is pinned against the blob
     # *as it stands when that group runs* (implementation_audit applies them in
     # registry order): 0388536ac291's cap is visible here even though the third
@@ -727,6 +727,76 @@ REQUIRED_CONTENT = {
         "mem_cgroup_uncharge_list(&pages_to_free);",
         "free_unref_page_list(&pages_to_free);",
         "/* A drained add batch may have freed this slot already. */",
+    ],
+    # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
+    # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
+    # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
+    # pinned, because a port that keeps only the first would take the lock once
+    # per pagevec but still walk the tree once per entry -- which is the half of
+    # the upstream fix that the soft-lockup report is actually about.
+    "core:truncate_shadow_batch": [
+        "clear_shadow_entries",
+        "xa_has_values",
+        "ABK stable_515_backport: 61c663e020d2",
+    ],
+    "core:truncate_shadow_batch_sweep": [
+        "static void clear_shadow_entries(struct address_space *mapping,\n"
+        "\t\t\t\t unsigned long start, unsigned long max)",
+        "xas_for_each(&xas, page, max)",
+        "clear_shadow_entries(mapping, indices[0], indices[nr-1]);",
+        "int nr = pagevec_count(&pvec);",
+        "ABK stable_515_backport: d3db2c042591",
+    ],
+    # The MADV_DONTNEED pair.  reclaim_pt_is_enabled() is the gate, and the
+    # emptiness decision under the pmd lock plus the pte_free_tlb() release are
+    # what make the page table actually go back: a port that only cleared the
+    # pmd would leak the page table instead of freeing it, and every structural
+    # audit would still pass.
+    "core:madvise_pt_reclaim": [
+        "bool reclaim_pt;",
+        "reclaim_pt_is_enabled",
+        "try_to_free_pte",
+        "pmd_clear(pmd);",
+        "pte_free_tlb(tlb, token, addr);",
+        "mm_dec_nr_ptes(tlb->mm);",
+        "\t\t.reclaim_pt = true,",
+        "ABK stable_515_backport: 6375e95f381e",
+    ],
+    "core:madvise_batch_tlb_flush": [
+        "madvise_batch_tlb_flush",
+        "void zap_page_range_single_batched(struct mmu_gather *tlb,",
+        # The gather has to be taken by the caller and handed *down*: the
+        # per-VMA call itself must no longer be the one that gathers.
+        "\t\ttlb_gather_mmu(&tlb, mm);",
+        "\tif (tlbp)\n\t\ttlb_finish_mmu(&tlb);",
+        "zap_page_range_single_batched(tlb, vma, start, end - start, &details);",
+        "ABK stable_515_backport: 43c4cfde7e37",
+    ],
+    "core:arm64_lse_percpu_load_atomics": [
+        # 535fdfc5a228.  The whole graft is two verbatim upstream hunks in one
+        # header: the LSE branch gains a [tmp] destination (store form -> load
+        # form) and the three non-return instantiations flip stadd/stclr/stset
+        # -> ldadd/ldclr/ldset.  The lore link rides in the same hunk and is
+        # the trail this deliberately markerless (upstream-shape) rewrite
+        # leaves behind, so it is pinned too.  The RET_OP ldadd is upstream
+        # context and must survive untouched between the flipped ops.
+        '#op_lse "\\t%" #w "[val], %" #w "[tmp], %[ptr]\\n"',
+        "PERCPU_OP(add, add, ldadd)",
+        "PERCPU_OP(andnot, bic, ldclr)",
+        "PERCPU_OP(or, orr, ldset)",
+        "PERCPU_RET_OP(add, add, ldadd)\n",
+        "e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop",
+    ],
+"core:fuse_prefault_out_of_write_path": [
+        # The pair, in the 5.15 *page* form.  Upstream's hunk is written
+        # against the 6.x folio form (__filemap_get_folio /
+        # copy_folio_from_iter_atomic), which anchors nowhere on any baseline,
+        # so the port had to be written in this spelling -- pinned because a
+        # rewrite that reads faithfully but calls the wrong helper is the one
+        # way this could land and do nothing.  Ordering and both halves are in
+        # REQUIRED_IN_FUNCTION below.
+        "while not holding the page lock:",
+        "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
     ],
 }
 
@@ -918,6 +988,18 @@ REQUIRED_ABSENT = {
         # reclaim.  It must be gone, not merely bypassed.
         "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
         "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
+    ],
+    "core:arm64_lse_percpu_load_atomics": [
+        # The store forms must be gone, not merely bypassed: a tree that kept
+        # one of them compiles and quietly behaves like the baseline on that
+        # one op.  The bare store-form instruction string lives only in
+        # __PERCPU_OP_CASE (the RET_OP case is `[ret]`, the LL/SC branches are
+        # op_llsc), so its absence proves the macro really flipped; the three
+        # instantiations are pinned per line so a half-flip cannot pass.
+        '#op_lse "\\t%" #w "[val], %[ptr]\\n"',
+        "PERCPU_OP(add, add, stadd)",
+        "PERCPU_OP(andnot, bic, stclr)",
+        "PERCPU_OP(or, orr, stset)",
     ],    "core:zram_wb_slot_preserve": [
         # The shape the fix removes.  The whole point is that the *absence* is
         # load-bearing: a tree that kept the save/restore dance would still pass
@@ -929,6 +1011,43 @@ REQUIRED_ABSENT = {
         ["drivers/block/zram/zram_drv.c",
          "\t\tsize = zram_get_obj_size(zram, index);"],
         ["drivers/block/zram/zram_drv.c", "\t\tif (huge)"],
+    ],
+    # Batch 35: the per-entry shadow machinery has to be *gone*, not merely
+    # bypassed.  Both invalidate paths used to call the wrappers that are
+    # deleted here, and a port that deleted the wrappers without moving their
+    # callers would not compile -- but one that kept the wrappers and added a
+    # second clear path would keep taking the lock per entry, which is the
+    # defect.  Scoped to mm/truncate.c: nothing else may define those names.
+    "core:truncate_shadow_batch": [
+        ["mm/truncate.c",
+         "static int invalidate_exceptional_entry(struct address_space *mapping,"],
+        ["mm/truncate.c",
+         "static int invalidate_exceptional_entry2(struct address_space *mapping,"],
+        ["mm/truncate.c", "\tclear_shadow_entry(mapping, index, entry);"],
+        ["mm/truncate.c", "count += invalidate_exceptional_entry(mapping,"],
+    ],
+    "core:truncate_shadow_batch_sweep": [
+        # The pagevec-shaped helper must not survive the pair: leaving it behind
+        # would mean the per-entry __clear_shadow_entry() loop is still the one
+        # the invalidate paths run.
+        ["mm/truncate.c", "clear_shadow_entries(mapping, &pvec, indices);"],
+        ["mm/truncate.c", "\t\t\t__clear_shadow_entry(mapping, indices[i], page);"],
+    ],
+    "core:madvise_pt_reclaim": [
+        # MADV_DONTNEED must not still go through the multi-VMA zap with no
+        # details: that is the shape where the reclaim mark never reaches
+        # zap_pte_range() and the whole change is a no-op.
+        ["mm/madvise.c", "\tzap_page_range(vma, start, end - start);"],
+    ],
+"core:fuse_prefault_out_of_write_path": [
+        # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
+        # marker-free, or a future baseline carrying the commit could not be
+        # recognised -- the module's own marker would sit *inside* the block the
+        # already_present short-circuit compares against, so that tree would
+        # report blocked_by_missing_anchor instead of already_present.  Same
+        # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
+        # is this module's only group there.
+        ["fs/fuse/file.c", "ABK stable_515_backport:"],
     ],
 }
 
@@ -1249,7 +1368,7 @@ REQUIRED_IN_FUNCTION = {
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
     ],
-    # --- Batch 34: the memory-reclaim chain, function-scoped ---------------
+    # --- Batch 37: the memory-reclaim chain, function-scoped ---------------
     # The three groups below all rewrite memory_reclaim(), so which group got
     # which hunk is only visible by slicing the handler: whole-file matching
     # would pass just as happily on a tree where the cap never arrived but the
@@ -1336,6 +1455,90 @@ REQUIRED_IN_FUNCTION = {
         ("mm/swap.c", "release_pages",
          ["if (!page)\n\t\t\tcontinue;"],
          []),
+    ],
+    # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
+    # change rather than a rewrite is *where* each half sits: the decision in
+    # zap_pte_range()'s tail (not in zap_pmd_range(), where a THP collapse could
+    # have replaced the pmd), the emptiness test before pmd_clear() (the reverse
+    # order frees a page table a skipped entry still points into), and the
+    # gather owned by the caller (a per-VMA gather is what the commit removes).
+    "core:madvise_pt_reclaim": [
+        ("mm/memory.c", "zap_pte_range",
+         ["unsigned long start = addr;",
+          "if (reclaim_pt_is_enabled(start, end, details))",
+          "try_to_free_pte(mm, pmd, start, tlb);"],
+         ["pmd_clear(pmd);"]),
+        ("mm/memory.c", "try_to_free_pte",
+         ["start_pte = pte_offset_map(pmd, addr);",
+          "if (!pte_none(*pte)) {",
+          "pmd_clear(pmd);",
+          "free_pte_page(tlb, pmd, pmdval, addr);"],
+         ["pte_free_tlb"]),
+        # The barrier this tree needs and upstream's helper has no counterpart
+        # for (CONFIG_SPECULATIVE_PAGE_FAULT): without it a reader that holds
+        # the ptl of the page table we are about to free races the free.
+        ("mm/memory.c", "free_pte_page",
+         ["#ifdef CONFIG_SPECULATIVE_PAGE_FAULT",
+          "smp_call_function(wait_for_smp_sync, NULL, 1);",
+          "pte_free_tlb(tlb, token, addr);",
+          "mm_dec_nr_ptes(tlb->mm);"],
+         []),
+    ],
+    "core:madvise_batch_tlb_flush": [
+        ("mm/madvise.c", "do_madvise",
+         ["if (madvise_batch_tlb_flush(behavior)) {",
+          "tlb_gather_mmu(&tlb, mm);",
+          "madvise_walk_vmas(mm, start, end, behavior, tlbp,",
+          "if (tlbp)\n\t\ttlb_finish_mmu(&tlb);"],
+         []),
+        # Batching means exactly that the per-VMA helper no longer gathers.
+        ("mm/madvise.c", "madvise_dontneed_single_vma",
+         ["zap_page_range_single_batched(tlb, vma, start, end - start, &details);"],
+         ["tlb_gather_mmu"]),
+    ],
+    # The pair has to reach both invalidate paths, and the loop bound has to be
+    # the batch size the call site indexes with -- a port that changed only the
+    # helper would pass a whole-file substring check on either half.
+    "core:truncate_shadow_batch_sweep": [
+        ("mm/truncate.c", "__invalidate_mapping_pages",
+         ["int nr = pagevec_count(&pvec);",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
+        ("mm/truncate.c", "invalidate_inode_pages2_range",
+         ["int nr = pagevec_count(&pvec);",
+          "xa_has_values = true;",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
+    ],
+"core:fuse_prefault_out_of_write_path": [
+        # faa794dd2e17.  The group's whole claim is that the prefault *moved*,
+        # and a whole-file substring check cannot express that: the new call
+        # site alone is satisfied by a tree that kept the loop-head one too
+        # (which faults twice), and the absence of the old one alone is
+        # satisfied by a tree that deleted the prefault outright (which loses
+        # forward progress).  Both halves are pinned inside the one function, so
+        # neither a deletion nor a duplicate passes -- and the must_not_have
+        # needle carries the ` again:` label so it cannot match the retry path's
+        # own `err = -EFAULT;`.
+        ("fs/fuse/file.c", "fuse_fill_write_pages",
+         ["\t\tif (!tmp) {\n"
+          "\t\t\tunlock_page(page);\n"
+          "\t\t\tput_page(page);\n"
+          "\n"
+          "\t\t\t/*\n"
+          "\t\t\t * Ensure forward progress by faulting in\n"
+          "\t\t\t * while not holding the page lock:\n"
+          "\t\t\t */\n"
+          "\t\t\tif (fault_in_iov_iter_readable(ii, bytes)) {\n"
+          "\t\t\t\terr = -EFAULT;\n"
+          "\t\t\t\tbreak;\n"
+          "\t\t\t}\n"
+          "\n"
+          "\t\t\tgoto again;",
+          "\t\terr = -ENOMEM;\n"
+          "\t\tpage = grab_cache_page_write_begin(mapping, index, 0);"],
+         [" again:\n"
+          "\t\terr = -EFAULT;\n"]),
     ],
 }
 

@@ -110,7 +110,16 @@ SMOKE_FILES=(
   kernel/sched/idle.c
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
   arch/arm64/include/asm/pgtable.h
-  # Batch 34: the lru_add drain filter is the module's first mm/swap.c group.
+  # Batch 35: the page-cache shadow sweeps (mm/truncate.c) and the
+  # struct zap_details the MADV_DONTNEED page-table reclaim marks (mm.h).
+  mm/truncate.c
+  include/linux/mm.h
+  # Batch 34: the non-return per-CPU atomics become load LSE atomics
+  # (mainline 535fdfc5a228) -- the whole group is this header.
+  arch/arm64/include/asm/percpu.h
+  # Batch 35: the FUSE write-path prefault (faa794dd2e17).
+  fs/fuse/file.c
+  # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
   mm/swap.c
 )
 
@@ -290,6 +299,24 @@ grep -q "__free_zspage_lockless(struct zs_pool \*pool," "$KERNEL_ROOT/common/mm/
 if grep -q "[^_]free_zspage(pool, class, zspage);" "$KERNEL_ROOT/common/mm/zsmalloc.c"; then
   fail "zs_free() kept the class->lock-held free_zspage() call"
 fi
+# arm64_lse_percpu_load_atomics (535fdfc5a228): a markerless upstream-shape
+# rewrite, so the load-form instruction and the flipped instantiations are the
+# assertions -- and the store forms must be gone entirely, since a half-flip
+# compiles and quietly keeps one far-executing op.
+PERCPU_H="$KERNEL_ROOT/common/arch/arm64/include/asm/percpu.h"
+grep -qF '#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"' "$PERCPU_H" \
+  || fail "LSE per-CPU macro did not gain the load-form [tmp] destination"
+grep -q "PERCPU_OP(add, add, ldadd)" "$PERCPU_H" \
+  || fail "PERCPU_OP(add) was not flipped to ldadd"
+grep -q "PERCPU_OP(andnot, bic, ldclr)" "$PERCPU_H" \
+  || fail "PERCPU_OP(andnot) was not flipped to ldclr"
+grep -q "PERCPU_OP(or, orr, ldset)" "$PERCPU_H" \
+  || fail "PERCPU_OP(or) was not flipped to ldset"
+grep -q "PERCPU_RET_OP(add, add, ldadd)" "$PERCPU_H" \
+  || fail "PERCPU_RET_OP(add) lost its original ldadd"
+if grep -qE "PERCPU_OP\((add, add, stadd|andnot, bic, stclr|or, orr, stset)\)" "$PERCPU_H"; then
+  fail "a store-form PERCPU_OP instantiation survived the LSE load flip"
+fi
 grep -q "config RCU_NOCB_CPU_DEFAULT_ALL" \
   "$KERNEL_ROOT/common/kernel/rcu/Kconfig" \
   || fail "RCU default-all Kconfig option missing"
@@ -415,7 +442,7 @@ grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 memory.reclaim entry missing"
 
-# Batch 34: the memory-reclaim chain.  Three of its six groups rewrite the
+# Batch 37: the memory-reclaim chain.  Three of its six groups rewrite the
 # memory_reclaim() handler this module generates and the rest of the chain
 # hangs off those, so what has to hold is the *end state*.  Group statuses
 # cannot show it: each superseded group stops on a probe of its successor, so a
@@ -453,6 +480,24 @@ grep -q "A drained add batch may have freed this slot already." \
 grep -q "Swappiness value to reclaim with" \
   "$KERNEL_ROOT/common/Documentation/admin-guide/cgroup-v2.rst" \
   || fail "the memory.reclaim swappiness= key is undocumented"
+
+# Batch 35: the write source buffer is prefaulted where the copy made no
+# progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves
+# are load-bearing and neither is visible in a pass-1 status: without the first
+# the common path keeps its extra userspace touch (the whole point of the
+# commit), and without the second the loop loses its forward-progress guarantee
+# while still reading as a faithful port.  No ABK marker by design -- this is an
+# upstream-shape rewrite -- so the call site itself is the assertion.
+grep -q "while not holding the page lock:" "$KERNEL_ROOT/common/fs/fuse/file.c" \
+  || fail "fuse write prefault did not move into the no-progress retry path"
+if ! "$python_bin" - "$KERNEL_ROOT/common/fs/fuse/file.c" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+sys.exit(1 if " again:\n\t\terr = -EFAULT;\n" in text else 0)
+PY
+then
+  fail "fuse_fill_write_pages() still prefaults its source buffer on every retry"
+fi
 
 # Batch 13: the customize_alloc_gfp hook (declare/call/export) must be in the
 # tree and the ABK fast-fail policy must really register on it.  The hook
@@ -562,6 +607,42 @@ else
   echo "  fs/file.c marker not expected on 5.15.$SUB_LEVEL (baseline already upstream)"
 fi
 
+# Batch 35: the page-cache shadow sweeps and the MADV_DONTNEED page-table pair.
+# None of the four commits has a Cc: stable and no baseline carries its
+# substrate (no page_cache_ra_order(), no folio_batched filemap_map_pages(),
+# per-entry clear_shadow_entry()), so all four apply everywhere and the
+# assertions are unconditional.  Each pair is pinned on the *end state* of both
+# commits, not just the first: a run that landed 61c663e020d2 but not
+# d3db2c042591 would still take the i_pages lock once per pagevec while walking
+# the tree once per entry, which is the half the soft-lockup report is about.
+grep -qF "clear_shadow_entries(mapping, indices[0], indices[nr-1]);" \
+  "$KERNEL_ROOT/common/mm/truncate.c" \
+  || fail "shadow-entry sweep (d3db2c042591) missing in mm/truncate.c"
+# The needle carries the definition, not the bare name: the replacement blocks
+# *document* the deleted wrappers by name in a comment, so a bare symbol needle
+# would match that comment and fail the assertion it exists to protect.
+if grep -q "static int invalidate_exceptional_entry" \
+     "$KERNEL_ROOT/common/mm/truncate.c"; then
+  fail "per-entry shadow helpers survived in mm/truncate.c"
+fi
+grep -q "reclaim_pt_is_enabled" "$KERNEL_ROOT/common/mm/memory.c" \
+  || fail "MADV_DONTNEED page-table reclaim gate missing in mm/memory.c"
+grep -q "try_to_free_pte" "$KERNEL_ROOT/common/mm/memory.c" \
+  || fail "page-table emptiness re-check missing in mm/memory.c"
+grep -q "bool reclaim_pt;" "$KERNEL_ROOT/common/include/linux/mm.h" \
+  || fail "zap_details.reclaim_pt does not exist"
+grep -q "madvise_batch_tlb_flush" "$KERNEL_ROOT/common/mm/madvise.c" \
+  || fail "MADV_DONTNEED tlb batching missing in mm/madvise.c"
+grep -qF "zap_page_range_single_batched(tlb, vma, start, end - start, &details);" \
+  "$KERNEL_ROOT/common/mm/madvise.c" \
+  || fail "MADV_DONTNEED still gathers its own tlb per VMA"
+# The per-VMA helper must not gather for itself any more: that is the whole
+# difference between a batched flush and the 5.15 shape.
+if awk '/^static long madvise_dontneed_single_vma\(/,/^}/' \
+     "$KERNEL_ROOT/common/mm/madvise.c" | grep -q "tlb_gather_mmu"; then
+  fail "madvise_dontneed_single_vma() still owns its mmu_gather"
+fi
+
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
@@ -585,11 +666,23 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
         "$KERNEL_ROOT/common/mm/filemap.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/filemap.c"
 fi
-# Batch 34's lru_add filter is the module's first mm/swap.c write.
+# Batch 37's lru_add filter is the module's first mm/swap.c write.
 if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/mm/swap.c" \
         "$KERNEL_ROOT/common/mm/swap.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/swap.c"
+fi
+# Batch 35 is the first group to write mm/truncate.c and the first to touch
+# include/linux/mm.h; both have to come back byte-identical too.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/truncate.c" \
+        "$KERNEL_ROOT/common/mm/truncate.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/truncate.c"
+fi
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/include/linux/mm.h" \
+        "$KERNEL_ROOT/common/include/linux/mm.h" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for include/linux/mm.h"
 fi
 
 echo "SMOKE OK"

@@ -1,4 +1,4 @@
-"""Batch 34: the memory-reclaim path -- proactive reclaim's batch fidelity,
+"""Batch 37: the memory-reclaim path -- proactive reclaim's batch fidelity,
 its swappiness argument, the suspend abort, and the lru_add drain.
 
 Six upstream commits, all on the ``memory.reclaim`` line.  Five are the ones

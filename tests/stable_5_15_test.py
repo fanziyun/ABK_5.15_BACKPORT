@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.36.0", "0.36.0"], _versions)
+          _versions == ["0.39.0", "0.39.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4758,7 +4758,7 @@ def test_batch33_zsmalloc_free_out_of_lock():
               ctx_bare.read(b33.ZSMALLOC_C) == "static int x;\n")
 
 
-def _batch34_memory_reclaim_fixture(b34):
+def _batch37_memory_reclaim_fixture(b37):
     """A synthetic ``memory_reclaim()`` in the shape memcg_memory_reclaim makes.
 
     Assembled out of the batch module's own pre-image constants, so the fixture
@@ -4766,20 +4766,20 @@ def _batch34_memory_reclaim_fixture(b34):
     `_*_OLD` blocks are exactly what the group before each one leaves behind).
     """
     return (
-        b34._TOKENS_OLD
+        b37._TOKENS_OLD
         + "\t\t\t      size_t nbytes, loff_t off)\n"
         "{\n"
-        + b34._PARSER_OLD
+        + b37._PARSER_OLD
         + "\n"
-        + b34._BATCH_DECL_OLD
-        + b34._SIGNAL_OLD
+        + b37._BATCH_DECL_OLD
+        + b37._SIGNAL_OLD
         + "\t\t * hope of introducing more evictable pages for\n"
         "\t\t * try_to_free_mem_cgroup_pages().\n"
         "\t\t */\n"
         "\t\tif (!nr_retries)\n"
         "\t\t\tlru_add_drain_all();\n"
         "\n"
-        + b34._CALL_OLD
+        + b37._CALL_OLD
         + "\n"
         "\t\tif (!reclaimed && !nr_retries--)\n"
         "\t\t\treturn -EAGAIN;\n"
@@ -4792,11 +4792,11 @@ def _batch34_memory_reclaim_fixture(b34):
     )
 
 
-def test_batch34_reclaim_paths():
-    """Batch 34: the memory.reclaim chain plus the lru_add drain filter."""
-    print("Batch 34: proactive reclaim's batch, swappiness= and suspend abort")
+def test_batch37_reclaim_paths():
+    """Batch 37: the memory.reclaim chain plus the lru_add drain filter."""
+    print("Batch 37: proactive reclaim's batch, swappiness= and suspend abort")
     import abk_stable_core as core
-    import batch34_core_reclaim_paths as b34
+    import batch37_core_reclaim_paths as b37
 
     keys = ["proactive_reclaim_batch_fidelity",
             "proactive_reclaim_decaying_batches",
@@ -4805,7 +4805,7 @@ def test_batch34_reclaim_paths():
             "proactive_reclaim_suspend_abort",
             "lru_add_drain_dead_folios"]
     groups = {g.key: g for g in core.PATCH_GROUPS if g.key in keys}
-    check("all six Batch 34 groups are registered", set(groups) == set(keys),
+    check("all six Batch 37 groups are registered", set(groups) == set(keys),
           sorted(groups))
     if set(groups) != set(keys):
         return
@@ -4822,11 +4822,11 @@ def test_batch34_reclaim_paths():
     # Trap 2 across the whole chain: no step may build its replacement out of a
     # later step's replacement, which replace_once would short-circuit.
     chain_steps = [dict(zip(["rel", "old", "new", "req"], s))
-                   for s in b34.build_steps_batch_fidelity()]
+                   for s in b37.build_steps_batch_fidelity()]
     chain_steps += [dict(zip(["rel", "old", "new", "req"], s))
-                    for s in b34.build_steps_decaying_batches()]
+                    for s in b37.build_steps_decaying_batches()]
     chain_steps += [dict(zip(["rel", "old", "new", "req"], s))
-                    for s in b34.build_steps_swappiness_arg()]
+                    for s in b37.build_steps_swappiness_arg()]
     for i, a in enumerate(chain_steps):
         for j, b in enumerate(chain_steps):
             if i >= j or a["rel"] != b["rel"]:
@@ -4838,7 +4838,7 @@ def test_batch34_reclaim_paths():
     # Trap 5, first link: the memcg group must stop on its own handler.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"mm/memcontrol.c":
-                             b34.MEMORY_RECLAIM_MARKER + "\n"
+                             b37.MEMORY_RECLAIM_MARKER + "\n"
                              "static ssize_t memory_reclaim(struct kernfs_open_file *of,"
                              " char *buf,\n"})
         status, _detail = core._memcg_reclaim_apply(ctx)
@@ -4848,7 +4848,7 @@ def test_batch34_reclaim_paths():
 
     # ...and the two superseded groups in the middle of the chain.
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {"mm/memcontrol.c": b34.DECAYING_BATCH_DECL})
+        ctx = make_ctx(tmp, {"mm/memcontrol.c": b37.DECAYING_BATCH_DECL})
         status, _d = groups["proactive_reclaim_batch_fidelity"].apply_fn(ctx)
         check("the fixed cap does not reappear once the batch decays",
               status == "already_present" and ctx.pending_writes() == [], status)
@@ -4857,24 +4857,24 @@ def test_batch34_reclaim_paths():
               status2 == "already_present" and ctx.pending_writes() == [], status2)
 
     # End to end over a synthetic handler: the four groups in chain order.
-    fixture = _batch34_memory_reclaim_fixture(b34)
+    fixture = _batch37_memory_reclaim_fixture(b37)
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "mm/memcontrol.c": (
                 fixture
-                + b34._INCLUDE_OLD
-                + b34._SWAPPINESS_WRITE_OLD
-                + b34._CALL_RECLAIM_HIGH_OLD + b34._CALL_TRY_CHARGE_OLD
-                + b34._CALL_RESIZE_MAX_OLD + b34._CALL_FORCE_EMPTY_OLD
-                + b34._CALL_HIGH_WRITE_OLD + b34._CALL_MAX_WRITE_OLD),
+                + b37._INCLUDE_OLD
+                + b37._SWAPPINESS_WRITE_OLD
+                + b37._CALL_RECLAIM_HIGH_OLD + b37._CALL_TRY_CHARGE_OLD
+                + b37._CALL_RESIZE_MAX_OLD + b37._CALL_FORCE_EMPTY_OLD
+                + b37._CALL_HIGH_WRITE_OLD + b37._CALL_MAX_WRITE_OLD),
             "mm/vmscan.c": (
-                b34._SC_FIELD_OLD + b34._SC_HELPER_OLD + b34._SC_HELPER_NO_MEMCG_OLD
-                + b34._GET_SCAN_COUNT_OLD + b34._SWAPPINESS_LITERAL_FP_OLD
-                + b34._GET_SWAPPINESS_OLD
-                + b34._TTFMCP_OLD + "};\n}\n"
-                + b34._SHOULD_ABORT_OLD),
-            "include/linux/swap.h": b34._DEFINES_OLD + b34._PROTO_OLD,
-            "Documentation/admin-guide/cgroup-v2.rst": b34._DOC_OLD,
+                b37._SC_FIELD_OLD + b37._SC_HELPER_OLD + b37._SC_HELPER_NO_MEMCG_OLD
+                + b37._GET_SCAN_COUNT_OLD + b37._SWAPPINESS_LITERAL_FP_OLD
+                + b37._GET_SWAPPINESS_OLD
+                + b37._TTFMCP_OLD + "};\n}\n"
+                + b37._SHOULD_ABORT_OLD),
+            "include/linux/swap.h": b37._DEFINES_OLD + b37._PROTO_OLD,
+            "Documentation/admin-guide/cgroup-v2.rst": b37._DOC_OLD,
         })
         for key in keys[:5]:
             status, detail = groups[key].apply_fn(ctx)
@@ -4883,15 +4883,15 @@ def test_batch34_reclaim_paths():
         mc = ctx.read("mm/memcontrol.c")
         vm = ctx.read("mm/vmscan.c")
         check("the batch decays rather than capping",
-              b34.DECAYING_BATCH_DECL in mc and b34.SWAP_CLUSTER_BATCH not in mc)
+              b37.DECAYING_BATCH_DECL in mc and b37.SWAP_CLUSTER_BATCH not in mc)
         check("the swappiness key is parsed and reaches the reclaim call",
-              b34.SWAPPINESS_ARG in mc and '"swappiness=%d"' in mc)
+              b37.SWAPPINESS_ARG in mc and '"swappiness=%d"' in mc)
         check("the freezer's signal is not converted to -EINTR",
-              b34.SUSPEND_ABORT_ERRNO in mc
+              b37.SUSPEND_ABORT_ERRNO in mc
               and "return -EINTR;" not in mc.split("memory_reclaim")[-1])
         check("the scan balance and the MGLRU abort both learned about it",
               "sc_swappiness(sc, memcg)" in vm
-              and b34.SUSPEND_ABORT_GUARD in vm)
+              and b37.SUSPEND_ABORT_GUARD in vm)
         check("the manual documents the nested key",
               "Swappiness value to reclaim with"
               in ctx.read("Documentation/admin-guide/cgroup-v2.rst"))
@@ -4905,12 +4905,12 @@ def test_batch34_reclaim_paths():
 
     # The lru_add filter, in 5.15's pagevec shape.
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {"mm/swap.c": b34._LRU_ADD_OLD + b34._RELEASE_OLD})
+        ctx = make_ctx(tmp, {"mm/swap.c": b37._LRU_ADD_OLD + b37._RELEASE_OLD})
         status, detail = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
         check("the dead-page filter applies", status == "applied", (status, detail))
         swap = ctx.read("mm/swap.c")
         check("a page on its last reference is taken out of the add batch",
-              b34.DEAD_PAGE_FILTER in swap
+              b37.DEAD_PAGE_FILTER in swap
               and "free_unref_page_list(&pages_to_free);" in swap)
         # The two flags the page no longer clears through __pagevec_lru_add_fn().
         check("the flags the LRU add would have cleared are cleared here",
@@ -4939,6 +4939,218 @@ def test_batch34_reclaim_paths():
               status == "blocked_by_shape", status)
         check("the degraded tree is not written",
               ctx.read("mm/swap.c") == "static int x;\n")
+
+
+def test_batch35_pagecache_pt():
+    """Batch 35: shadow-entry sweeps + the MADV_DONTNEED page-table pair."""
+    print("Batch 35: shadow-entry sweeps + MADV_DONTNEED page tables")
+    import abk_stable_core as core
+    import batch35_core_pagecache_pt as b34
+
+    keys = [g.key for g in core.PATCH_GROUPS]
+    groups = {g.key: g for g in core.PATCH_GROUPS}
+    for key in ("truncate_shadow_batch", "truncate_shadow_batch_sweep",
+                "madvise_pt_reclaim", "madvise_batch_tlb_flush"):
+        check(f"{key} group registered", key in groups)
+
+    # Each pair has to be registered in dependency order: the second group of
+    # the pair rewrites text the first one wrote, and both first groups probe
+    # their own payload so the second pass stops there (trap 5).
+    check("the sweep group follows the batch group",
+          keys.index("truncate_shadow_batch")
+          < keys.index("truncate_shadow_batch_sweep"))
+    check("the tlb group follows the reclaim group",
+          keys.index("madvise_pt_reclaim")
+          < keys.index("madvise_batch_tlb_flush"))
+    check("the reclaim group does not own mm/truncate.c",
+          "mm/truncate.c" not in groups["madvise_pt_reclaim"].files)
+    check("the tlb group owns the three files it rewrites",
+          groups["madvise_batch_tlb_flush"].files
+          == ["mm/internal.h", "mm/memory.c", "mm/madvise.c"],
+          groups["madvise_batch_tlb_flush"].files)
+
+    # Trap 2 inside each group: no step may build its replacement out of a
+    # later step's (the batch clear and the call-site rewrites are four
+    # near-identical blocks, so this is exactly where it would happen).
+    for key, builder in (
+            ("truncate_shadow_batch", b34.build_shadow_batch_steps),
+            ("truncate_shadow_batch_sweep", b34.build_shadow_sweep_steps),
+            ("madvise_pt_reclaim", b34.build_pt_reclaim_steps),
+            ("madvise_batch_tlb_flush", b34.build_tlb_batch_steps)):
+        steps = builder()
+        check(f"{key}: every step is required",
+              all(req for _rel, _old, _new, req in steps),
+              [(rel, req) for rel, _o, _n, req in steps])
+        for i, (_rel, _old, new_i, _req) in enumerate(steps):
+            for j in range(i + 1, len(steps)):
+                check("%s: step %d new does not contain step %d new"
+                      % (key, i, j), steps[j][2] not in new_i)
+
+    # Trap 1: the two group-4 call-site rewrites share one replacement text
+    # (`clear_shadow_entries(mapping, indices[0], indices[nr-1]);`), which
+    # replace_once would short-circuit on after the first one landed.  They are
+    # distinguished by carrying the surrounding lines, so the two blocks must
+    # differ textually.
+    check("the two sweep call-site steps are textually distinct",
+          b34._SWEEP_BIP_CALL_NEW != b34._SWEEP_IIP_CALL_NEW)
+    check("the two sweep loop steps are textually distinct",
+          b34._SWEEP_BIP_LOOP_NEW != b34._SWEEP_IIP_LOOP_NEW)
+    # ... and the same for the two clear steps of the first group.
+    check("the two batch clear steps are textually distinct",
+          b34._BIP_CLEAR_NEW != b34._IIP_CLEAR_NEW)
+    # The one-line signature steps: the new form of zap_page_range_single() is
+    # a substring of the pristine `static void ...` line, so the block has to
+    # carry the doc comment above it or replace_once reports already_present.
+    check("the zap_page_range_single step is anchored above the signature",
+          b34._ZPS_OLD.startswith(" * The range must fit into one VMA."),
+          b34._ZPS_OLD[:40])
+    check("... and its replacement is not a substring of the pristine line",
+          b34._ZPS_NEW not in b34._ZPS_OLD)
+
+    # The trap-5 probes, asserted by behaviour rather than by source: a deleted
+    # probe is invisible on the first pass (the pair still applies) and only the
+    # second pass fails -- for the truncate pair with a blocked_by_shape, for the
+    # others with a duplicated definition reaching the compiler.
+    class _ProbeCtx:
+        def __init__(self, texts):
+            self._texts = texts
+
+        def read(self, rel):
+            return self._texts[rel]
+
+    probe_cases = (
+        (b34._shadow_batch_probe, b34.TRUNCATE,
+         b34._BATCH_FN_OLD, b34._SWEEP_FN_NEW),
+        (b34._shadow_sweep_probe, b34.TRUNCATE,
+         b34._SWEEP_FN_OLD, b34._SWEEP_FN_NEW),
+        (b34._pt_reclaim_probe, b34.MM_H, b34._ZD_OLD, b34._ZD_NEW),
+        (b34._tlb_batch_probe, b34.MADVISE, "static int x;\n",
+         b34.MADVISE_TLB_GATHER),
+    )
+    for probe, rel, before, after in probe_cases:
+        check(f"{probe.__name__}: false before its payload lands",
+              probe(_ProbeCtx({rel: before})) is False)
+        check(f"{probe.__name__}: true once its payload is in the tree",
+              probe(_ProbeCtx({rel: after})) is True)
+    # Both groups of a pair have to probe *their own* payload: a shared probe
+    # would make the first group skip on text the second one writes.
+    check("the truncate pair uses two different probes",
+          b34._shadow_batch_probe.__name__ != b34._shadow_sweep_probe.__name__)
+    check("the batch probe stops on the pagevec form, not the sweep form",
+          b34._shadow_batch_probe(_ProbeCtx({b34.TRUNCATE: b34._SWEEP_FN_NEW}))
+          is True)
+
+    # End-to-end on a synthetic tree: the first group's pagevec helper is
+    # entirely replaced by the second group's sweep, so the *end state* of the
+    # pair is what both groups are asserted against.
+    truncate_fixture = (
+        "static inline void __clear_shadow_entry(struct address_space *mapping,\n"
+        "\t\t\t\tpgoff_t index, void *entry)\n{\n"
+        "\tXA_STATE(xas, &mapping->i_pages, index);\n"
+        "\n"
+        "\txas_set_update(&xas, workingset_update_node);\n"
+        "\tif (xas_load(&xas) != entry)\n"
+        "\t\treturn;\n"
+        "\txas_store(&xas, NULL);\n}\n"
+        "\n"
+        + b34._BATCH_FN_OLD + "\n"
+        + b34._WRAPPERS_OLD + "\n"
+        "static unsigned long __invalidate_mapping_pages(struct address_space *mapping,\n"
+        "\t\tpgoff_t start, pgoff_t end, unsigned long *nr_pagevec)\n{\n"
+        "\tpgoff_t indices[PAGEVEC_SIZE];\n"
+        "\tstruct pagevec pvec;\n"
+        "\tpgoff_t index = start;\n"
+        "\tunsigned long ret;\n"
+        + b34._BIP_DECL_OLD
+        + "\n\tpagevec_init(&pvec);\n"
+        "\twhile (find_lock_entries(mapping, index, end, &pvec, indices)) {\n"
+        "\t\tfor (i = 0; i < pagevec_count(&pvec); i++) {\n"
+        "\t\t\tstruct page *page = pvec.pages[i];\n"
+        "\t\t\tindex = indices[i];\n"
+        + b34._BIP_ENTRY_OLD
+        + "\t\t\tcount += ret;\n"
+        "\t\t}\n"
+        "\t\tpagevec_remove_exceptionals(&pvec);\n"
+        "\t\tpagevec_release(&pvec);\n"
+        "\t}\n"
+        "\treturn count;\n}\n"
+        "\n"
+        "int invalidate_inode_pages2_range(struct address_space *mapping,\n"
+        "\t\t\t\t  pgoff_t start, pgoff_t end)\n{\n"
+        "\tpgoff_t indices[PAGEVEC_SIZE];\n"
+        "\tstruct pagevec pvec;\n"
+        "\tpgoff_t index;\n"
+        "\tint i;\n"
+        "\tint ret = 0;\n"
+        + b34._IIP_DECL_OLD
+        + "\n\tpagevec_init(&pvec);\n"
+        "\tindex = start;\n"
+        "\twhile (find_get_entries(mapping, index, end, &pvec, indices)) {\n"
+        "\t\tfor (i = 0; i < pagevec_count(&pvec); i++) {\n"
+        "\t\t\tstruct page *page = pvec.pages[i];\n"
+        "\t\t\tindex = indices[i];\n"
+        + b34._IIP_ENTRY_OLD
+        + "\t\t\tunlock_page(page);\n"
+        "\t\t}\n"
+        "\t\tpagevec_remove_exceptionals(&pvec);\n"
+        "\t\tpagevec_release(&pvec);\n"
+        "\t}\n"
+        "\treturn ret;\n}\n"
+        # The truncate path keeps its own __clear_shadow_entry() caller, which
+        # is why 5.15 must not delete the helper the sweep group stops using.
+        "static void truncate_exceptional_pvec_entries(struct address_space *mapping,\n"
+        "\t\t\t\tstruct pagevec *pvec, pgoff_t *indices)\n{\n"
+        "\t__clear_shadow_entry(mapping, index, page);\n}\n"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b34.TRUNCATE: truncate_fixture})
+        group = groups["truncate_shadow_batch"]
+        status, detail = group.apply_fn(ctx)
+        check("the batch group applies", status == "applied", (status, detail))
+        text = ctx.read(b34.TRUNCATE)
+        check("the pagevec helper really lands first",
+              "clear_shadow_entries(struct address_space *mapping,\n"
+              "\t\t\t\t struct pagevec *pvec, pgoff_t *indices)" in text)
+        check("the per-entry wrapper definitions are gone",
+              "static int invalidate_exceptional_entry" not in text)
+        # The needle carries the call shape: the replacement blocks *document*
+        # __clear_shadow_entry() by name in a comment, so a bare symbol count
+        # would match the comment (the same trap smoke.sh records).
+        check("the truncate path's own caller survives",
+              "truncate_exceptional_pvec_entries" in text
+              and text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
+
+        sweep = groups["truncate_shadow_batch_sweep"]
+        status2, detail2 = sweep.apply_fn(ctx)
+        check("the sweep group applies on top of it",
+              status2 == "applied", (status2, detail2))
+        text = ctx.read(b34.TRUNCATE)
+        check("the pagevec form is gone from the end state",
+              "&pvec, indices);" not in text)
+        check("the sweep walks the index span once",
+              "xas_for_each(&xas, page, max)" in text)
+        check("both call sites carry the batch span",
+              text.count("clear_shadow_entries(mapping, indices[0], indices[nr-1]);")
+              == 2)
+        check("both loops index by the batch size",
+              text.count("int nr = pagevec_count(&pvec);") == 2)
+        check("__clear_shadow_entry() keeps its truncate caller",
+              text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
+
+        # Second pass: the earlier group has to stop on its own payload rather
+        # than re-derive anchors the sweep group consumed (trap 5).
+        for name, fn in (("batch", group), ("sweep", sweep)):
+            status3, detail3 = fn.apply_fn(ctx)
+            check(f"second pass: the {name} group is already_present",
+                  status3 == "already_present", (status3, detail3))
+
+        # A tree that lacks the anchors degrades instead of half-patching.
+        bare = make_ctx(tmp + "/bare35", {b34.TRUNCATE: "static int x;\n"})
+        status4, _detail4 = group.apply_fn(bare)
+        check("degrades on an unknown shape", status4 == "blocked_by_shape")
+        check("the degraded tree is not written",
+              bare.read(b34.TRUNCATE) == "static int x;\n")
 
 
 def main():
@@ -4992,7 +5204,8 @@ def main():
     test_batch30_readahead_mmap_miss_race()
     test_batch31_arm64_pte_mkwrite_clean()
     test_batch33_zsmalloc_free_out_of_lock()
-    test_batch34_reclaim_paths()
+    test_batch37_reclaim_paths()
+    test_batch35_pagecache_pt()
 
     print()
     if FAILURES:

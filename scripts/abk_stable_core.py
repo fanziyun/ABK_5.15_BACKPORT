@@ -1041,7 +1041,7 @@ def _cgroup_wq_split_apply(ctx):
 
 def _memcg_reclaim_apply(ctx):
     # docs/group_recipe.md trap 5, and a chain rather than a single later
-    # edit: Batch 34 rewrites the memory_reclaim() handler this group
+    # edit: Batch 37 rewrites the memory_reclaim() handler this group
     # generates -- its call site three times over (the SWAP_CLUSTER_MAX cap,
     # the decaying batch, the swappiness= argument) and its failure path
     # (-ERESTARTSYS) -- so on a second pass the handler's `new` block no
@@ -1053,7 +1053,7 @@ def _memcg_reclaim_apply(ctx):
         _probe = ctx.read("mm/memcontrol.c")
     except FileNotFoundError:
         _probe = ""
-    if _b34_rp.MEMORY_RECLAIM_MARKER in _probe:
+    if _b37_rp.MEMORY_RECLAIM_MARKER in _probe:
         return "already_present", (
             "memory.reclaim is already in memcontrol.c")
     steps = [
@@ -1346,9 +1346,9 @@ def _memcg_reclaim_apply(ctx):
 
 
 # ---------------------------------------------------------------------------
-# reclaim-path chain (Batch 34): the memory.reclaim batch fidelity, the
+# reclaim-path chain (Batch 37): the memory.reclaim batch fidelity, the
 # swappiness= argument, the suspend abort and the lru_add drain.
-# Steps live in scripts/batch34_core_reclaim_paths.py.  Registered on its own
+# Steps live in scripts/batch37_core_reclaim_paths.py.  Registered on its own
 # below (after memcg_memory_reclaim / cached_freeze_reclaim / memcg_v1_reclaim,
 # whose generated text it edits) for the trap-5 reason spelled out there.
 # ---------------------------------------------------------------------------
@@ -4427,10 +4427,62 @@ import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 
+import batch35_core_pagecache_pt as _b35_pcpt  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b35_pcpt.build_groups(PatchGroup)
 # ============================================================================
-# Batch 34: the memory-reclaim path -- proactive reclaim's batch fidelity, its
+# Batch 34: the non-return per-CPU atomics become load LSE atomics.
+# Steps live in scripts/batch34_core_arm64_lse_percpu.py.
+#
+#   arm64_lse_percpu_load_atomics
+#                              mainline 535fdfc5a228 (v6.18, arm64-fixes).
+#                              The LSE branch of __PERCPU_OP_CASE() grows a
+#                              [tmp] destination and the three PERCPU_OP()
+#                              instantiations flip from stadd/stclr/stset to
+#                              ldadd/ldclr/ldset, so the instructions execute
+#                              "near" (L1) instead of "far".  No other group
+#                              writes arch/arm64/include/asm/percpu.h, so
+#                              there is nothing to order against.  The
+#                              upstream-measured BPF-fentry regression and why
+#                              it does not apply to a 5.15 arm64 build, plus
+#                              the no-speedup-claim rule, are in the child's
+#                              module docstring and CHANGELOG.md (Batch 34).
+# ============================================================================
+import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 35: the FUSE write path stops prefaulting its source buffer on every
+# retry.  Steps live in scripts/batch35_core_fuse_erofs.py.
+#
+#   fuse_prefault_out_of_write_path
+#                              mainline faa794dd2e17 (v6.16).  One file, and
+#                              the module's first group in fs/fuse/ -- the
+#                              file carries no other group's text, so there is
+#                              nothing to order against.
+#
+# The erofs half of this batch does not land: fb176750266a + 6422cde1b0d5
+# stand on the 5.15 -> 6.12 erofs evolution (erofs_buf/erofs_bread, the
+# parallel erofs_fileio_aops, fs/erofs/fileio.c), none of which exists on any
+# tracked baseline -- see the group module's docstring and the plan.md
+# exclusion record.  770c8d55c428 (lib/iov_iter) is inapplicable: 5.15 has no
+# page_folio()/folio_test_slab() in that file.  FUSE passthrough stays
+# unported by decision (android13-5.15 ships its own on _IOW(229,126)).
+#
+# Renumbered from 34 when this branch merged main: the arm64 LSE group landed
+# there first with the same number and the same version.  Its file keeps the
+# batch34_ prefix because it was registered under that number on main; this
+# one is batch35_.
+# ============================================================================
+import batch35_core_fuse_erofs as _b35_fuse  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b35_fuse.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 37: the memory-reclaim path -- proactive reclaim's batch fidelity, its
 # swappiness= argument, the suspend abort, and the lru_add drain.
-# Steps live in scripts/batch34_core_reclaim_paths.py.
+# Steps live in scripts/batch37_core_reclaim_paths.py.
 #
 #   proactive_reclaim_batch_fidelity  mainline 0388536ac291 (v6.6)
 #   proactive_reclaim_decaying_batches
@@ -4450,10 +4502,14 @@ PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 # that outlives its successor, which is what keeps the second pass a no-op --
 # docs/group_recipe.md trap 5, the Batch 21/24 remedy.  Keep any further group
 # that edits this chain in the same order.
+#
+# Renumbered from 34 when this branch merged main: main had already released
+# its own Batch 34 (arm64_lse_percpu_load_atomics), 35 and 36, so the
+# reclaim-path chain takes the next free number and the next version.
 # ============================================================================
-import batch34_core_reclaim_paths as _b34_rp  # noqa: E402
+import batch37_core_reclaim_paths as _b37_rp  # noqa: E402
 
-PATCH_GROUPS = PATCH_GROUPS + _b34_rp.build_groups(PatchGroup)
+PATCH_GROUPS = PATCH_GROUPS + _b37_rp.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()
