@@ -8,7 +8,11 @@ name: ABK kernel compile gate
 # 是安全的 —— 后续任何往本文件加 actions/checkout 的改动都必须被否决。
 #
 # 一次性前置（见 docs/pr_compile_gate.md）：
-#   secret ABK_CI_TOKEN          fine-grained PAT，仅 fanziyun/ABK，Actions: read/write
+#   secret ABK_CI_TOKEN          fine-grained PAT：Repository access 只选 fanziyun/ABK，
+#                                Repository permissions 只给 Actions: Read and write。
+#                                别给 Contents / Pull requests / Workflows / Administration ——
+#                                本工作流**不需要**它们：读 run 与日志是 Actions，读模块描述符
+#                                走本仓库的 github.token，读 ABK 侧工作流源码走匿名 CDN。
 #   var    ABK_CI_EXTRA_MODULES  与出厂构建同形的其它模块描述符，换行分隔（留空=只注入本仓库 child）
 #   var    ABK_CI_WORKFLOW_REF   ABK 侧工作流 ref，默认 dev
 #   var    ABK_CI_VERSION_BASE   版本名前缀，默认 -202609202-FanZiyun
@@ -288,14 +292,23 @@ jobs:
             printf '%s\n' "no-token" > conclusion.txt
             exit 1
           fi
+          # token 只看得到仓库就够了（Metadata 读，fine-grained PAT 必带），真正的能力验证在下面。
           gh api "repos/$ABK_REPO" --jq .full_name > /dev/null
           # 钉住 PR 用的是描述符第三字段 ;ref=，只有 fanziyun/ABK#5 之后的 kernel-custom.yml 认识它。
           # 目标 ref 不认识，就会白等 90 分钟、最后报成「编的不是这份代码」，所以先验一遍契约。
-          if ! gh api "repos/$ABK_REPO/contents/.github/workflows/$ABK_WORKFLOW?ref=$ABK_WORKFLOW_REF" \
-                -H 'Accept: application/vnd.github.raw' 2>/dev/null | grep -q 'run-name: ABK-CI'; then
-            echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_WORKFLOW_REF 指到 ci/module-ref-pin，见 docs/pr_compile_gate.md"
-            printf '%s\n' "no-ref-support" > conclusion.txt
-            exit 1
+          # ⚠️ 这一读取**刻意不带 token**，走 raw.githubusercontent 的匿名 CDN：ABK 是公开仓库，
+          # 于是 ABK_CI_TOKEN 只需要 Actions 权限，不需要 Contents —— 少一项权限就少一条被滥用的路。
+          # （不要改回 gh api .../contents：那需要 Contents 读，会把凭据权限面撑大。）
+          wf_src_url="https://raw.githubusercontent.com/$ABK_REPO/refs/heads/$ABK_WORKFLOW_REF/.github/workflows/$ABK_WORKFLOW"
+          if wf_src="$(curl -fsSL --max-time 30 "$wf_src_url" 2>/dev/null)"; then
+            if ! printf '%s\n' "$wf_src" | grep -q 'run-name: ABK-CI'; then
+              echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_WORKFLOW_REF 指到 ci/module-ref-pin，见 docs/pr_compile_gate.md"
+              printf '%s\n' "no-ref-support" > conclusion.txt
+              exit 1
+            fi
+          else
+            # 拿不到源码（网络/CDN 抖动）时不能误判成「不认识 ;ref=」：跳过预检，让 wait 步骤去发现。
+            echo "::warning::拿不到 $wf_src_url，跳过 ;ref= 契约预检（真正的判定交给 wait 步骤）"
           fi
           date -u +%Y-%m-%dT%H:%M:%SZ > dispatched_at.txt
           gh api -X POST "repos/$ABK_REPO/actions/workflows/$ABK_WORKFLOW/dispatches" --input payload.json
