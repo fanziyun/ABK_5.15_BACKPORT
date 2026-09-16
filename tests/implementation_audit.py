@@ -647,6 +647,17 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
+    "core:fuse_prefault_out_of_write_path": [
+        # The pair, in the 5.15 *page* form.  Upstream's hunk is written
+        # against the 6.x folio form (__filemap_get_folio /
+        # copy_folio_from_iter_atomic), which anchors nowhere on any baseline,
+        # so the port had to be written in this spelling -- pinned because a
+        # rewrite that reads faithfully but calls the wrong helper is the one
+        # way this could land and do nothing.  Ordering and both halves are in
+        # REQUIRED_IN_FUNCTION below.
+        "while not holding the page lock:",
+        "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -848,6 +859,16 @@ REQUIRED_ABSENT = {
         ["drivers/block/zram/zram_drv.c",
          "\t\tsize = zram_get_obj_size(zram, index);"],
         ["drivers/block/zram/zram_drv.c", "\t\tif (huge)"],
+    ],
+    "core:fuse_prefault_out_of_write_path": [
+        # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
+        # marker-free, or a future baseline carrying the commit could not be
+        # recognised -- the module's own marker would sit *inside* the block the
+        # already_present short-circuit compares against, so that tree would
+        # report blocked_by_missing_anchor instead of already_present.  Same
+        # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
+        # is this module's only group there.
+        ["fs/fuse/file.c", "ABK stable_515_backport:"],
     ],
 }
 
@@ -1167,6 +1188,36 @@ REQUIRED_IN_FUNCTION = {
           "__free_zspage_lockless(pool, zspage);",
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
+    ],
+    "core:fuse_prefault_out_of_write_path": [
+        # faa794dd2e17.  The group's whole claim is that the prefault *moved*,
+        # and a whole-file substring check cannot express that: the new call
+        # site alone is satisfied by a tree that kept the loop-head one too
+        # (which faults twice), and the absence of the old one alone is
+        # satisfied by a tree that deleted the prefault outright (which loses
+        # forward progress).  Both halves are pinned inside the one function, so
+        # neither a deletion nor a duplicate passes -- and the must_not_have
+        # needle carries the ` again:` label so it cannot match the retry path's
+        # own `err = -EFAULT;`.
+        ("fs/fuse/file.c", "fuse_fill_write_pages",
+         ["\t\tif (!tmp) {\n"
+          "\t\t\tunlock_page(page);\n"
+          "\t\t\tput_page(page);\n"
+          "\n"
+          "\t\t\t/*\n"
+          "\t\t\t * Ensure forward progress by faulting in\n"
+          "\t\t\t * while not holding the page lock:\n"
+          "\t\t\t */\n"
+          "\t\t\tif (fault_in_iov_iter_readable(ii, bytes)) {\n"
+          "\t\t\t\terr = -EFAULT;\n"
+          "\t\t\t\tbreak;\n"
+          "\t\t\t}\n"
+          "\n"
+          "\t\t\tgoto again;",
+          "\t\terr = -ENOMEM;\n"
+          "\t\tpage = grab_cache_page_write_begin(mapping, index, 0);"],
+         [" again:\n"
+          "\t\terr = -EFAULT;\n"]),
     ],
 }
 

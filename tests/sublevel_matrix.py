@@ -66,7 +66,13 @@ GROUP_COUNTS = {
     # any of them, so the mainline series patches 1-2 are inapplicable and only
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
-    "stable_backport_core": 40,
+    #
+    # The Batch-34 FUSE write-path prefault (fuse_prefault_out_of_write_path)
+    # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
+    # with no Cc: stable, so no 5.15 tree carries it, and its two anchors are
+    # byte-identical on all four.  It is also the module's first group in
+    # fs/fuse/, so nothing else writes the file.
+    "stable_backport_core": 41,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

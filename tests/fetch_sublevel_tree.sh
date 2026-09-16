@@ -113,6 +113,9 @@ FETCH_FILES=(
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).  The module's
   # first arch/arm64 C source -- the file is the whole group.
   arch/arm64/include/asm/pgtable.h
+  # Batch 34: the FUSE write-path prefault (faa794dd2e17).  The module's first
+  # group in fs/fuse/ -- the file is the whole group.
+  fs/fuse/file.c
 )
 
 decode() {
