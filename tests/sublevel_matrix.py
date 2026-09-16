@@ -66,7 +66,15 @@ GROUP_COUNTS = {
     # any of them, so the mainline series patches 1-2 are inapplicable and only
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
-    "stable_backport_core": 40,
+    #
+    # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
+    # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
+    # diverged), so the rolling lts row cannot arrive pre-applied either -- and
+    # its percpu.h anchors are byte-identical to the upstream old form on all
+    # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
+    # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
+    # non-LSE fallback path is untouched on cores without FEAT_LSE.
+    "stable_backport_core": 41,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed
