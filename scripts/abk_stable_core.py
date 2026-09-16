@@ -4343,5 +4343,27 @@ import batch32_core_zram_wb_slot_preserve as _b32_zwbsp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b32_zwbsp.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 33: a dead zspage's pages go back to the buddy allocator outside
+# class->lock.
+# Steps live in scripts/batch33_core_zsmalloc_free.py.
+#
+#   zsmalloc_free_zspage_out_of_lock
+#                              mainline 7ef28e8b8142, patch 3 of the v6 series
+#                              "mm/zsmalloc: reduce lock contention in
+#                              zs_free()".  Patches 1-2 of that series delete a
+#                              pool-level rwlock read side, and android13-5.15
+#                              has no pool->lock at all (see the plan.md
+#                              exclusion record), so only patch 3 applies --
+#                              and it is the part this module's own
+#                              zsmalloc_chain_size graft made longer.  No other
+#                              group writes into zs_free(), __free_zspage() or
+#                              free_zspage(), so there is nothing to order
+#                              against.
+# ============================================================================
+import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

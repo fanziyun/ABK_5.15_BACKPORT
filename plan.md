@@ -7,6 +7,8 @@
 
 ## 交付总览（九项优化，按功能清单顺序）→ 详见 CHANGELOG.md#overview-nine — 把九项功能重排成一份交付日志并往下续写第 10 项（`8a73e95` → HEAD 的四个提交）：逐项给出批次、组名与到手证据，不新增任何批次
 
+## Batch 33(v0.35.0,已落地)→ 详见 CHANGELOG.md#batch-33 — zsmalloc `zs_free()` 的 `class->lock` 临界区收窄（mainline `7ef28e8b8142`，系列 "mm/zsmalloc: reduce lock contention in zs_free()" v6 的第 3 个 patch）：空 zspage 的页面归还 buddy 的动作搬到 `class->lock` **之外**，锁内只留 `trylock_zspage()` + `remove_zspage()` + 每类统计（`class->stats.objs[]` 是普通 `unsigned long`、`zs_stat_dec()` 用 `-=` 更新，`zs_can_compact()` 在 `class->lock` 下经 `zs_stat_get()` 读它，那条搬不出去）。**系列前两个 patch 不移植**（`9909b088b1f0` 把 class 索引编码进 obj、`59e88952a827` 据此在 64 位免 `pool->lock`）：它们要去掉的是 `pool->lock` 读侧，而 android13-5.15 的 `mm/zsmalloc.c` **整文件没有 `pool->lock`**（五条基线 grep 均为 0）——见「排除记录」。**未做性能 A/B，不主张提速**
+
 ## Batch 32(v0.34.0,已落地；未做真机验证；构建闸门未跑)→ 详见 CHANGELOG.md#batch-32 — 核对 ACK 6.12 的 `37b72d525502` 是否需要回移：**需要**，它是 mainline `b0377ee80429`（`Fixes: d38fab605c667`）的回移，而那条正是 Batch 17 移植的 compressed writeback ⇒ 本模块的 `zram_writeback_complete()` 是**修复前形状**（先 `zram_free_page()` 再回填 huge/obj_size/priority）。落到两处：① 完成路径改成 open-coded 释放（`huge_pages` 只减一次），② `zram_free_page()` 的 huge 块加 `ZRAM_WB` 守卫；`pages_stored` 两个方向一起去掉 ⇒ 净值仍是 0，与 v0.30.1 真机表的 896 MB → 896 MB 逐字一致。**该缺陷不可由那次测量判别**（多减的一次落在槽被释放时，而那轮只写回）⇒ 不主张设备侧结论。本模块又一例「改写前置组生成文本」的组（同族于 Batch 21/24），按 trap 5 给 `zram_writeback_batching` 补了自身载荷探针；**顺带修正 Batch 17 的一条历史结论**：这条修复 2026-03-19 就合入、Batch 17 是 2026-09-14 落的（本就在审计窗口内），且补丁当时就在 `research/upstream-zram/patches/` 里 —— 当时三路核对各自漏得开它（搜索串少一位、窗口晚于合入点、快照晚于合入点），且没与同目录补丁集对账；core 38 → 39 组
 
 ## Batch 31(v0.33.0,已落地；四档干跑+四道门禁已过)→ 详见 CHANGELOG.md#batch-31 — 6.18 的 `143937ca51cc`（`pte_mkwrite()` 不再无条件清 `PTE_RDONLY`）**不是 6.18 独有**：上游 5.15.y 自己已 backport（`8a2375b0e9b8`，v5.15.196），而 167/178/194 仍是旧形态、216 已带上 ⇒ 目标形态取 **5.15.y 的 `pte_mkwrite()`**（5.15 没有 `pte_mkwrite_novma()`，照抄 mainline 一处锚点也匹配不上），上游形态改写不加 marker（216 逐字节不动、报 `already_present`）。core **37 → 38**（Batch 30 先取走 0.32.0/37）；这是本模块第一个 `arch/arm64` C 落点，fixture 三处（`FETCH_FILES`/`AUDIT_FILES`/`SMOKE_FILES`）已同步
@@ -165,6 +167,18 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 
 ## 排除记录（不再重议）
 
+- [-] `9909b088b1f0` + `59e88952a827`（mainline「mm/zsmalloc: reduce lock contention in zs_free()」
+  v6 的 patch 1/2）：**排除（前提不存在）**。两条的目标是把现代树的 `read_lock(&pool->lock)`
+  读侧去掉——patch 1 把 size_class 索引编码进 obj，patch 2 据此在 64 位下不再取 `pool->lock`。
+  而 android13-5.15 的 `mm/zsmalloc.c` **没有 `pool->lock`**：167/178/194/211/lts 五条基线
+  整文件 grep 均为 **0**，`zs_free()` 走 `pin_tag(handle)` → `obj_to_location()` →
+  `get_zspage_mapping()` → `pool->size_class[class_idx]`。三套锁设计必须分清，否则会把
+  「更早、更细的设计」误读成「已经优化过」：5.15/5.10 = per-zspage `migrate_read_lock()`
+  + pin bit（最细）；6.1/6.6 = 单把 `spin_lock(&pool->lock)` 管整条 free/alloc 路径（最粗）；
+  2026 那棵现代树 = 第三种（`pool->lock` rwlock 读侧 + `class->lock`）。patch 1/2 优化的是
+  **第三种**。硬移植 patch 1 还要动 handle 编码，而 5.15 的 obj bit 0 是 `HANDLE_PIN_BIT`
+  （迁移路径 `trypin_tag()` 取到后才改写 PFN），等于零收益纯风险。Batch 33 只取 patch 3。
+  证据：`research/zsmalloc_lockfree/*.patch` + 本节 §2 的逐符号核对
 - [-] 4edae3ff6d4e mark_victim tracepoint：AOSP 2024-11 树已自带
 - [-] `1119609dce0875`（ACK：「EEVDF scheduling fail → 取 leftmost」）：**已覆盖**。选择器的 `if (!best)` leftmost 回退早在 `scripts/batch15_perf_eevdf.py:1138`（效果等价于它的 hunk 1），hunk 2 依赖 5.15 没有的 `se->sched_delayed`，而它那条 `printk_deferred` 照抄会误报（我们的 skip 判定在扫描**内**）；本次只补上缺的钉子。逐调用点核对与理由见 `docs/survey_eevdf_gap.md` §7.1
 - [-] mm/kfence：5.15.y 无特性提交

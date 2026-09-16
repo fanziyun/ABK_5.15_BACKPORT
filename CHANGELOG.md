@@ -349,6 +349,174 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-33"></a>
+
+## Batch 33(v0.35.0)
+
+mainline「mm/zsmalloc: reduce lock contention in zs_free()」v6 系列（Wenchao Hao / Xueyuan Chen，
+小米；akpm 收，Minchan Kim / Sergey Senozhatsky 在 Cc，Nhat Pham / Barry Song 给了 Reviewed-by）
+共 4 个 patch，本批**只落第 3 个** `7ef28e8b8142`（把空 zspage 的页面归还搬到 `class->lock`
+之外），前两个按「前提不存在」排除。原始 patch 存 `research/zsmalloc_lockfree/`。
+
+### 1. 为什么只有第 3 个 patch 可移植
+
+系列有两个命题：**(a)** 去掉 `zs_free()` 里的 `pool->lock` 读侧（patch 1+2）；**(b)** 把
+`class->lock` 内的 `put_page()` 搬出去（patch 3）。逐条对 5.15 实测：
+
+| | 现代树（系列针对的形态） | android13-5.15（实测） |
+|---|---|---|
+| `zs_free()` 起手 | `read_lock(&pool->lock)` | `pin_tag(handle)` |
+| class 从哪来 | `zspage_class(pool, zspage)`（要 pool->lock 护着） | `get_zspage_mapping()` → `pool->size_class[]`（本来就免锁） |
+| 迁移互斥 | `pool->lock` 读侧 | per-zspage `migrate_read_lock()` |
+| 整文件 `pool->lock` 出现次数 | 有 | **0**（167/178/194/211/lts 全为 0） |
+
+**(a) 在 5.15 上没有对象可去。** patch 1 要做的事（把 class 索引编码进 obj 以便免锁定位
+class）在这棵树上本来就是这样：`zspage->class` 是索引位域，`get_zspage_mapping()` 免锁。
+硬移植 patch 1 反而要动 handle 编码，而 5.15 的 obj **bit 0 是 `HANDLE_PIN_BIT`**
+（`zs_page_migrate()` 必须 `trypin_tag()` 拿到它才改写 PFN）——零收益、真风险。
+
+三套锁设计必须分清，否则会把「更早、更细的设计」误读成「已经优化过」：5.15/5.10 是
+per-zspage `migrate_read_lock()` + pin bit（最细）；6.1/6.6 收成单把
+`spin_lock(&pool->lock)` 管整条 free/alloc 路径（最粗，连 `class->lock` 都没有）；
+2026 的现代树是第三种（`pool->lock` rwlock 读侧 + `class->lock`）。**patch 1/2 优化的是第三种。**
+
+**(b) 则逐字成立：** `zs_free()` → `free_zspage()` → `__free_zspage()` 全程持 `class->lock`，
+而 `__free_zspage()` 在锁内逐页 `put_page()` → buddy → 压力下撞 `zone->lock`；一个 CPU 卡在
+zone->lock 上就握着 `class->lock`，同一 size class 的其它 `zs_free()` 全部排队。
+
+### 2. 落地明细
+
+新组 `core:zsmalloc_free_zspage_out_of_lock`（`scripts/batch30_core_zsmalloc_free.py`，
+3 步全 required，注册在 core 末尾）：
+
+| 位置 | 改动 |
+|---|---|
+| `__free_zspage()` | 拆出 `__free_zspage_lockless(pool, zspage)`（页面归还半段，无锁要求；两个 `VM_BUG_ON` 跟着它走，zs_free 路径因此不丢断言）+ 保留带 `assert_spin_locked()` 的外壳 |
+| `zs_free()` 声明区 | 加 `struct zspage *zspage_to_free = NULL;` |
+| `zs_free()` 尾部 | `trylock_zspage()` + `remove_zspage()` + `zs_stat_dec(OBJ_ALLOCATED)` 留在锁内并记到 `zspage_to_free`；`spin_unlock()` **之后**才 `__free_zspage_lockless()` + `atomic_long_sub(pages_allocated)` |
+
+5.15 形状差异（逐符号核对，不是照抄）：
+
+| 上游写法 | 5.15 对应 |
+|---|---|
+| `remove_zspage(class, zspage)` | `remove_zspage(class, zspage, ZS_EMPTY)` |
+| `class_stat_sub(class, ZS_OBJS_ALLOCATED, …)` | `zs_stat_dec(class, OBJ_ALLOCATED, …)` |
+| `ZS_INUSE_RATIO_0` | `ZS_EMPTY` |
+| `cache_free_zspage(zspage)` | `cache_free_zspage(pool, zspage)` |
+| `atomic_long_sub(pages_allocated)` 移出锁 | 同（本来就是 atomic） |
+
+`zs_stat_dec(OBJ_ALLOCATED)` **必须**留在锁内：`class->stats.objs[]` 是普通 `unsigned long`，
+`zs_stat_dec()` 用 `-=` 更新（不是 atomic），而 `zs_can_compact()` 经 `zs_stat_get()` 就在
+`class->lock` 下读它（`zs_stats_size_show()` 走同一条路）；上游也把它留在锁内（只是从
+`__free_zspage()` 挪进了 `zs_free()`）。5.15 **没有**现代的 `zs_pool_stats_read()`，别按现代
+树的名字去找。
+所有用到的符号（`trylock_zspage` / `kick_deferred_free` / `is_zspage_isolated` /
+`remove_zspage`）在 5.15 上都**不在任何 `#ifdef` 内**（`kick_deferred_free` 在
+`!CONFIG_COMPACTION` 下有空桩），所以新增行不需要再套配置门。
+
+安全性逐条核对：zspage 已从所有 fullness 链表摘除（`remove_zspage()`）、页面已被
+`trylock_zspage()` 锁住、且不是 isolated ⇒ `zs_compact()` / `async_free_zspage()` /
+`zs_page_putback()` 都够不到它，迁移要 `lock_page()` 也拿不到。`isolated` 判定发生在持
+`class->lock` 期间，而 isolate/putback 同样要 `class->lock`，判定到 `remove_zspage()` 之间
+不可能翻转。`free_zspage()` / `__free_zspage()` 的锁内形态原样留给剩下的调用者
+（`__zs_compact()` 与 `async_free_zspage()`）。
+
+顺带一条本模块特有的理由：**这条临界区是本模块自己加长的**。Batch 6 的
+`zsmalloc_chain_size` 把 `ZS_MAX_PAGES_PER_ZSPAGE` 从 5.15 的常量 4 提到
+`CONFIG_ZSMALLOC_CHAIN_SIZE`（默认 8），一个空 zspage 在锁内归还的页面数上限因此从 4 变 8。
+
+### 3. 试错记录（一）：`__free_zspage` 包含 `free_zspage`，负向探针被自己骗过
+
+`smoke.sh` 的负向断言第一次直接红：
+
+```
+FAIL: zs_free() kept the class->lock-held free_zspage() call
+```
+
+而同一棵树里负向目标其实已经没了。原因：`free_zspage()` 自己的调用点
+`__free_zspage(pool, class, zspage);`（**必须**保留）**包含**
+`free_zspage(pool, class, zspage);` 这个子串——`__free_zspage` 的尾部就是这个名字。
+
+锚点唯一性脚本查的是 `old` 块（带缩进与上下文），不会暴露这种「负向探针太松」。修法两处：
+smoke 用 `grep "[^_]free_zspage(pool, class, zspage);"` 把 `__` 挡掉；
+`implementation_audit` 的 `must_not_have` 换成带两个 tab 缩进的整行。
+
+教训与「锚点必须逐字节取」同族，方向相反：**正向锚点要够宽才唯一，负向探针要够窄才有效**，
+两者失效都是静默的——前者报 `already_present`，后者报「假 FAIL」，只有真跑一遍才看得见。
+
+### 3b. 试错记录（二）：`module.conf` 的 row 里放单引号会截断整个 `ABK_MODULE_SET_ITEMS`
+
+给 core 行描述补 Batch 33 那句话时写的是「a dead zspage's pages」，单测立刻两条红：
+
+```
+FAIL  every child row keeps the 12-field module-set shape {'stable_backport_core': 3}
+FAIL  companion ships inside the kernel zip, not via an app download []
+```
+
+`ABK_MODULE_SET_ITEMS` 本身是**单引号**包起来的 shell 串，单测用
+`re.search(r"ABK_MODULE_SET_ITEMS='(.*?)'", conf, re.S)` 取值，因而 `zspage's` 里的那个
+撇号直接把匹配截断在行中间——12 个字段塌成 3 个。和 AGENTS.md 里那条 mksh/awk 单引号
+事故是同一族（那次是 `awk '...'` 里的撇号），只是这次发生在自己的发布契约文件里，
+而且**只有单测看得见**（三只树级审计都不读 module.conf）。
+
+规则：`ABK_MODULE_SET_ITEMS` 的每行描述、以及任何被单引号包起来的配置串，**只能出现
+双引号或不用引号**。
+
+### 4. 验证
+
+- 五条基线逐锚点核对：三条 `old` 在 167/178/194/211/lts 上各**唯一**（各 1 处），三条 `new`
+  各 0 处。做的是手写校验脚本而不是 `research/hunks.py`：`.patch` 的上下文是现代树的
+  `zpdesc` 形态（`obj_to_zpdesc()`/`zspage_read_unlock()`/`zram->class` 索引），与 5.15 差得
+  太远，转换器在这里用不上。
+- **三档全绿（167/178/194）**（数字是 rebase 到并行落地的 Batch 30 `readahead_mmap_miss_race`、
+  Batch 31 `arm64_pte_mkwrite_clean` 与 Batch 32 `zram_wb_slot_preserve` 之后重测的——本批最初
+  叫 30，随后改 31、再改 32，三次都撞上同时段落地的批次，最终让位改为 33）：
+  `py_compile`、`bash -n`（含 mksh 口径的 tools/ksu 脚本）、
+  `stable_5_15_test.py`（新增 `test_batch31_zsmalloc_free_out_of_lock`：17 项检查，含
+  trap-2 互斥、「页面归还跟着 helper 走」（`put_page()` 必须出现在 `assert_spin_locked()`
+  之前）、第二遍逐字节幂等、未知形状降级且不写树）、`step_audit`（core **207 / 208 / 199** 步，
+  三档第二遍全部幂等）、`implementation_audit`（三档本组均 `applied`；新增 REQUIRED_CONTENT +
+  REQUIRED_IN_FUNCTION，后者按函数切片钉「锁内摘链、锁外归还」的顺序与「wrapper 不再碰页面」）、
+  `smoke.sh`（两遍 + 回滚；167/178 core pass1 `{'applied': 40}` → pass2
+  `{'already_present': 40}`，194 pass1 `{'already_present': 3, 'applied': 37}` → pass2
+  `{'already_present': 40}`）。另外三棵参考树要补 `arch/arm64/include/asm/pgtable.h`——
+  Batch 31 把它加进了 `FETCH_FILES`，补 fetch 前的树会直接 `AUDIT FAIL`（AGENTS.md 早就写了）。
+- `GROUP_COUNTS` core 39 → **40**；`module.conf` 0.34.0 → **0.35.0**（单测里钉的那对版本号
+  同步改）；registry 未新增 KMI 槽、config 符号或导出符号。
+
+### 5. 审查（两轴：Standards / Spec）与修订
+
+两个 sub-agent 并行审：Standards（本仓 `AGENTS.md` / `docs/group_recipe.md` /
+`docs/porting_policy.md` + Fowler 气味基线）与 Spec（动手前的约定）。查出并修掉的：
+
+| 轴 | 发现 | 处理 |
+|---|---|---|
+| Spec | **`zs_pool_stats_read()` 是 6.x 的名字，5.15 没有**（`grep` 全文件 0 处）。我拿它当了「每类统计必须留在锁内」的理由 | 换成可核对的事实：`class->stats.objs[]` 是普通 `unsigned long`，`zs_stat_dec()` 用 `-=` 更新，读者是 `zs_can_compact()`（经 `zs_stat_get()`、在 `class->lock` 下）。5 处引用（模块 / 单测 / 审计 / CHANGELOG / plan）全部改写，并在本节显式记下「别按现代树的名字去找」 |
+| Spec | `README.md` 的组数普查没有把本组算进去（core 39、合计 63），而它同一段就断言「必须与 `GROUP_COUNTS` 一致」；顺带发现 Batch 31 的 `arm64_pte_mkwrite_clean` 也没进那一串枚举（那些批次只改了 `GROUP_COUNTS`，没改 README） | 改成 core **40** / perf 23 / 合计 **64**，并把**两个**缺的组都补进枚举（只补自己那半句的话，数字与实际枚举仍然对不上） |
+| Spec | `research/zsmalloc_lockfree/` 未跟踪，而模块 / plan / CHANGELOG 都引它当证据 | 随本批提交 |
+| Standards | 新 helper 自身没带 ABK 标记（标记落在了外壳函数上） | 标记注释移到 `__free_zspage_lockless()` 之前 |
+| Standards | 上游是 `static inline`，我写成了 `static` | 改回 `static inline`（签名换行，与该文件 `free_zspage()` 的续行风格一致）；探针改成不含存储类的签名前缀，去掉这层无谓耦合 |
+| Standards | 「为什么 patch 1/2 不落」的论据在 4 处重复（模块 docstring / registry banner / CHANGELOG / plan），docstring 92 行远超 Batch 24 的 46 行——本仓先例（`e1f7874`「hand the landed-batch prose back to CHANGELOG.md」）是把落批叙事交回 CHANGELOG | docstring 收到 58 行、只留工程事实并指向 CHANGELOG；registry banner 收到 16 行；论据完整版只留在 CHANGELOG 与本条的排除记录 |
+| Standards | 未用 `research/hunks.py` 转换 | 保留人工转换，理由见 §4（`.patch` 上下文是现代树的 `zpdesc` 形态，转换器在这里不适用） |
+
+修订后复跑：五条基线锚点、三档 `step_audit` / `implementation_audit` / `smoke.sh` 全绿
+（数字同 §4）。Standards 轴另指出 `module.conf` 的描述字段没按本批补文案——**已补**，而且补全
+了三处：`ABK_MODULE_DESCRIPTION`、`ABK_MODULE_SET_DESCRIPTION` 各一句，外加
+`ABK_MODULE_SET_ITEMS` 的 core 行那一句。依据是并行落地的 Batch 30 三个字段都补了（最近的先例；
+Batch 26/27/28/29 没补，所以这条约定此前是松的，本次按「最近一次怎么做」对齐）。
+
+### 6. 已知边界
+
+- **不主张提速。** 上游那两个数字（RADXA O6 12 线程并发 `zs_free()` 20%；同系列 RPi4 上
+  4 进程 1.83x）都是合成 microbench，后者测的还是并发 `munmap`。5.15 的 `class->lock` 是
+  **per-size-class**，zram 压缩尺寸分散 ⇒ 争用也分散，能吃到多少要看真机 A/B。本批交付的是
+  「临界区更短」，不是「去掉了一把锁」，且只在压力下才可能显现。
+- 只搬 `zs_free()` 这一条路。`async_free_zspage()` 依旧在 `class->lock` 内
+  `__free_zspage()`，`__zs_compact()` 依旧在锁内 `free_zspage()` —— 上游本批也没动它们
+  （第 4 个 patch 只是把拆分后的三个变体写成文档，故未移植）。
+- 本机 zram 的收益面本来就窄（`plan.md` 记过 writeback 从不触发一类事实），这条改动属于
+  「平时不可观测」的那一类。
+
 <a id="batch-32"></a>
 
 ## Batch 32(v0.34.0)

@@ -633,6 +633,20 @@ REQUIRED_CONTENT = {
         "zs_free(zram->mem_pool, zram_get_handle(zram, index));",
         "if (!zram_test_flag(zram, index, ZRAM_WB))",
     ],
+    "core:zsmalloc_free_zspage_out_of_lock": [
+        # The split helper, its call site outside the lock, and the marker.  A
+        # port that renamed __free_zspage() but kept calling it under
+        # class->lock satisfies every structural audit and changes nothing, so
+        # the call site is what is pinned (see REQUIRED_IN_FUNCTION for the
+        # ordering, which a whole-file substring cannot express).
+        "static inline void __free_zspage_lockless(struct zs_pool *pool,",
+        "zspage_to_free",
+        "ABK stable_515_backport: 7ef28e8b8142",
+        # free_zspage() must keep a caller: zs_free() no longer calls it, so
+        # __zs_compact() is the only one left.  Losing that call silently turns
+        # it into an unused static function.
+        "free_zspage(pool, class, src_zspage);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1127,6 +1141,32 @@ REQUIRED_IN_FUNCTION = {
          ["zram_free_page(zram, index);",
           "atomic64_inc(&zram->stats.pages_stored);",
           "\t\tif (huge)"]),
+    ],
+    "core:zsmalloc_free_zspage_out_of_lock": [
+        # zs_free(): the zspage is parked in zspage_to_free under class->lock
+        # and handed to the lockless helper *after* the unlock.  That ordering
+        # is the whole change, and it is invisible to whole-file matching.
+        # must_not_have is the old tail -- surviving it means the pages are
+        # still returned with class->lock held.
+        ("mm/zsmalloc.c", "zs_free",
+         ["\tstruct zspage *zspage_to_free = NULL;",
+          "if (trylock_zspage(zspage)) {",
+          "remove_zspage(class, zspage, ZS_EMPTY);",
+          "zs_stat_dec(class, OBJ_ALLOCATED,",
+          "spin_unlock(&class->lock);\n\n"
+          "\tif (zspage_to_free) {\n"
+          "\t\t__free_zspage_lockless(pool, zspage_to_free);",
+          "atomic_long_sub(class->pages_per_zspage,"],
+         ["\t\tfree_zspage(pool, class, zspage);"]),
+        # The locked wrapper keeps the assert and the per-class stat -- which
+        # cannot move out with the pages, because class->stats.objs[] is a plain
+        # unsigned long that zs_stat_dec() updates with -= and zs_can_compact()
+        # reads via zs_stat_get() under class->lock.
+        ("mm/zsmalloc.c", "__free_zspage",
+         ["assert_spin_locked(&class->lock);",
+          "__free_zspage_lockless(pool, zspage);",
+          "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
+         ["put_page(page);"]),
     ],
 }
 
