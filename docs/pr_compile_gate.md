@@ -2,7 +2,7 @@
 
 本仓库（`fanziyun/ABK_5.15_BACKPORT`）是 ABK 的外部 `module_set`，改一行 `scripts/*.py`
 就可能让内核编译不过。这个门禁把「**这个 PR 的代码能不能编过**」变成 PR 上的一条状态检查：
-把 PR 的 commit 钉进 ABK 描述符的第三字段，派发 `fanziyun/ABK` 的「Android 内核构建-自定义」
+把 PR 的 commit 钉进 ABK 描述符的第三字段，派发 `ABK_CI_REPO`（默认 `fanziyun/ABK`，**推荐指到自己的一次性 fork**）的「Android 内核构建-自定义」
 （`kernel-custom.yml`），等它跑完，从日志取证，再把结论回写到 PR。
 
 工作流：`.github/workflows/abk-kernel-compile.yml`（`pull_request_target`，**永不 checkout PR 代码**）。
@@ -17,7 +17,7 @@
 | `ABK kernel compile (android13-5.15-lts)` | 工作流最后一步 `Report result to the PR`，`POST /repos/{repo}/statuses/{head_sha}` | **真正的编译结论**，描述是一句人话（见第 8 节），`target_url` 指向 ABK 的 run，点进去是构建日志 |
 
 为什么结论要单独写一条 **commit status** 而不是让 Actions 自动报：真正的编译发生在
-`fanziyun/ABK`，`workflow_dispatch` 的 check 挂在那边的 ref 上，**不会**出现在本仓库的 PR 里，
+`ABK_CI_REPO`，`workflow_dispatch` 的 check 挂在那边的 ref 上，**不会**出现在本仓库的 PR 里，
 只能由本仓库这条 `pull_request_target` 工作流回写。两者都在 PR 的 “Checks” 区域，也都能被
 分支保护 require（名字不同、命名空间不同）。
 
@@ -48,9 +48,10 @@
 7. `Upload debug bundle`：payload、日志、取证、结论等留 14 天（排查用）。
 8. `Report result to the PR`：写 commit status + 更新评论 + 写 Summary；结论红时**同时**让 job 失败，两条检查一致。
 
-> 第 2/5 步依赖 ABK 侧的 `;ref=` 第三字段与 `run-name: ABK-CI ${{ inputs.version }}`，两者都在
-> `fanziyun/ABK` 的 PR #5（分支 `ci/module-ref-pin`）里。合并前必须把 var `ABK_CI_WORKFLOW_REF`
-> 指到 `ci/module-ref-pin`；合并后删掉这个 var（回落默认 `dev`）。指错了第 4 步会立刻红。
+> 第 2/5 步依赖 ABK 侧的 `;ref=` 第三字段与 `run-name: ABK-CI ${{ inputs.version }}`。上游把它放在
+> PR #5（分支 `ci/module-ref-pin`，比 `dev` 只多一个 commit）。所以要么把 var `ABK_CI_WORKFLOW_REF`
+> 指到那个分支（等它合进 `dev` 后删掉这个 var），要么——**推荐**——在你自己的 fork 里把那个分支合进
+> `dev`，然后 `ABK_CI_REPO` 指 fork、`ABK_CI_WORKFLOW_REF` 留空。指错了第 4 步会立刻红。
 
 ## 3. 哪些 PR 不编（跳过规则）
 
@@ -75,9 +76,17 @@
 
 ## 4. 一次性前置（**配齐之前不要合并到 main**）
 
-1. **secret `ABK_CI_TOKEN`** —— fine-grained PAT：**Repository access 只选 `fanziyun/ABK`**，
-   **Repository permissions 只勾 `Actions: Read and write`**，别的一个都不要给。
-   `pull_request_target` 自带的 `GITHUB_TOKEN` 只能写本仓库，派发不了别的仓库的工作流，所以必须要它。
+1. **secret `ABK_CI_TOKEN`** —— fine-grained PAT：**Repository access 只选派发目标**（`ABK_CI_REPO`，
+   **推荐是你自己的一次性 fork**），**Repository permissions 只勾 `Actions: Read and write`**，
+   别的一个都不要给。`pull_request_target` 自带的 `GITHUB_TOKEN` 只能写本仓库，派发不了别的仓库的
+   工作流，所以必须要它。
+
+   > **为什么目标应该是 fork，而不是 `fanziyun/ABK` 本身**：`Actions: write` 在 ABK 这类仓库上**不是**
+   > 小权限。拿到它的人可以派发 `kernel-custom.yml`，把 `custom_external_modules` 换成任意仓库，
+   > 于是构建机执行那个仓库的 `setup.sh`，而构建 token 带 `contents: write`（`kernel-custom.yml` 的
+   > `permissions:` 块）——**等于目标仓库被接管**，连 release 产物都归他。把这张 PAT 关在一个可以随时
+   > 删掉重开的一次性 fork 里，泄露的上限就是那个 fork。同理：小号**不需要**为了这张 PAT 去当
+   > `fanziyun/ABK` 的协作者 —— 协作者要 Write 角色，那是比这张 PAT 更宽、且撤不掉痕迹的东西。
 
    它在这个工作流里只干三件事：**派发** ABK 构建、**读** ABK 的 run/jobs/日志、取消**它自己派发过**的被顶替 run。
 
@@ -89,9 +98,14 @@
    | `Pull requests` | ❌ 不给 | 评论与 status 全部用本仓库 `github.token` 写 |
    | `Workflows` / `Administration` / `Secrets` / `Variables` / `Webhooks` | ❌ 不给 | 本工作流不碰 |
 
-   一句话：**它只能触发/取消 `fanziyun/ABK` 的 Actions 并读它的日志，写不了任何代码，也开不了、审不了、
+   一句话：**它只能触发/取消目标仓库的 Actions 并读它的日志，写不了任何代码，也开不了、审不了、
    合不了 PR**（那是 `Contents` 与 `Pull requests` 权限，都没给）。过期时间挑 30–90 天，到期换新。
-2. **var `ABK_CI_WORKFLOW_REF`** —— 目前填 `ci/module-ref-pin`；ABK PR #5 合并后删掉（不设即默认 `dev`）。
+  但注意上面那段：它「能派发」这一件事，已经足以在目标仓库上执行任意模块代码。
+2. **派发目标 + 它的 ref** —— fork 一个 `fanziyun/ABK`，把上游分支 `ci/module-ref-pin`（= `dev` 只多
+   一个 commit 的 `;ref=` 补丁）合进 fork 的 `dev`；然后 **var `ABK_CI_REPO`** 填这个 fork、
+   **var `ABK_CI_WORKFLOW_REF`** 留空（回落 `dev`）。要跟上游同步就点 fork 的 *Sync fork*，补丁不会被冲掉。
+   不设 `ABK_CI_REPO` 时派发目标是 `fanziyun/ABK`，这时 `ABK_CI_WORKFLOW_REF` 要填 `ci/module-ref-pin`
+   （等 PR #5 合进 `dev` 后删掉）—— 但那样这张 PAT 就是整仓接管能力，见上一条。
 3. **var `ABK_CI_EXTRA_MODULES`**（可选）—— 与出厂构建同形的其它模块描述符，换行分隔，留空＝只注入本仓库 child
    （**留空不等于出厂组合**，见第 9 节）。
 4. **var `ABK_CI_VERSION_BASE` / `ABK_CI_BUILD_TIME`**（可选）—— 版本名前缀（默认 `-202609202-FanZiyun`）与固定构建时间。
@@ -101,22 +115,25 @@
 
 ```bash
 R=fanziyun/ABK_5.15_BACKPORT
-gh secret set ABK_CI_TOKEN --repo $R          # 粘贴 PAT（只授权 fanziyun/ABK，Actions read/write）
-gh variable set ABK_CI_WORKFLOW_REF --repo $R --body ci/module-ref-pin
+ABK=<你的 ABK fork>                            # 派发目标，例如 fan221153-blip/ABK
+gh secret set ABK_CI_TOKEN --repo $R          # 粘贴 PAT（只授权 $ABK，Actions read/write）
+gh variable set ABK_CI_REPO --repo $R --body "$ABK"
+gh variable delete ABK_CI_WORKFLOW_REF --repo $R   # 不设＝默认 dev（fork 的 dev 已含 ;ref= 补丁）
 gh variable set ABK_CI_EXTRA_MODULES --repo $R --body ""   # 可选
 gh label create ci:compile --repo $R --description "fork PR 触发 ABK 编译门禁" --color 0e8a16
 ```
 
-建好 PAT 后自己验一遍「它做不到什么」。公开仓库本来就人人可读，所以真正要守住的是**写**：
+建好 PAT 后自己验一遍「它只能在目标仓库上干这一件事」。公开仓库本来就人人可读，所以真正要守住的是**写**：
 
 ```bash
-P=<新 PAT>
-# 应当成功 —— 这正是门禁唯一需要的能力
-GH_TOKEN=$P gh api "repos/fanziyun/ABK/actions/runs?per_page=1" --jq '.workflow_runs[0].id'
-# 以下都应当被拒（404/403）——写代码、开/合 PR、改仓库设置
-GH_TOKEN=$P gh api -X PUT repos/fanziyun/ABK/contents/abk-ci-probe.txt -f message=probe -f content=eA==
-GH_TOKEN=$P gh pr close 3 --repo fanziyun/ABK
-GH_TOKEN=$P gh api -X PATCH repos/fanziyun/ABK -f description=probe
+P=<新 PAT>; ABK=<派发目标>
+# 应当成功 —— 这正是门禁唯一需要的能力。
+# 探权限用不存在的 ref：422"No ref found"＝有 Actions:write，403＝没有。
+GH_TOKEN=$P gh api -X POST "repos/$ABK/actions/workflows/kernel-custom.yml/dispatches" -f ref=refs/heads/__permission-probe__
+# 应当被拒（403）：写代码、开/合 PR、改仓库设置
+GH_TOKEN=$P gh api -X PUT "repos/$ABK/contents/abk-ci-probe.txt" -f message=probe -f content=eA==
+# 而且它**碰不到 fanziyun/ABK 本体** —— 这条 403 就是 fork 模式的意义
+GH_TOKEN=$P gh api -X POST repos/fanziyun/ABK/actions/workflows/kernel-custom.yml/dispatches -f ref=refs/heads/__permission-probe__
 ```
 
 前置没配齐（或 PAT 到期）时，**只有「真的要编」的 PR 会红**，描述是 `没配置 ABK_CI_TOKEN`；
@@ -153,9 +170,10 @@ require 选 **`ABK kernel compile (android13-5.15-lts)`**（有编译结论的�
 2. PAT 只进需要它的 step：job 级 `GH_TOKEN` 是 `ABK_CI_TOKEN`，而**读 PR 内容**（`module.conf`）和
    **解析日志**的两步把它覆盖成 `github.token`；写 PR 评论/状态的步骤也用 `github.token`。
    往 job 级 env 里塞新东西（或给这两步改回 PAT）之前，先想清楚这一步会不会拿到 PR 控制的输入。
-3. `;ref=refs/pull/<N>/head` 只让 ABK 去 clone PR 的 ref，不改变上面两条。secret 只授 `fanziyun/ABK` 的
-   `Actions` 读写 —— **不要顺手给它 `Contents`**：PAT 能写代码，这个 secret 就从「能派发构建」升级成
-   「能改 fanziyun/ABK 的源码」，而门禁一行都不需要它（第 4 节第 1 条的权限表）。
+3. `;ref=refs/pull/<N>/head` 只让 ABK 去 clone PR 的 ref，不改变上面两条。secret 只授**派发目标**的
+   `Actions` 读写 —— **不要顺手给它 `Contents`**（第 4 节第 1 条的权限表）。目标为什么应该是 fork：
+   `Actions: write` 能派发 `kernel-custom.yml` 并指定任意模块仓库，而那个构建跑在带 `contents: write`
+   的 token 下 —— 也就是说**这张 PAT 泄露 ≈ 目标仓库被接管**；关在一次性 fork 里，损失上限是那个 fork。
 4. **凭据最小化是刻意做出来的，别改回去**：契约预检读的是 ABK 侧工作流的源码，走的是
    `raw.githubusercontent.com` 的**匿名** CDN（公开仓库人人可读），不用 token；
    早先那版用 `gh api .../contents`，那需要 `Contents: read`。同理，读本仓库的 `module.conf` 也只用
@@ -170,14 +188,14 @@ require 选 **`ABK kernel compile (android13-5.15-lts)`**（有编译结论的�
 | status 描述 | 多半是 | 处理 |
 | --- | --- | --- |
 | `没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）` | secret 没配 | 第 4 节第 1 条 |
-| `ABK@<ref> 的 kernel-custom.yml 不认识 ;ref=（…）` | `ABK_CI_WORKFLOW_REF` 指到了不含 `;ref=` 支持的 ref | 指到 `ci/module-ref-pin`，等 ABK PR #5 合并 |
+| `ABK@<ref> 的 kernel-custom.yml 不认识 ;ref=（…）` | `ABK_CI_REPO`/`ABK_CI_WORKFLOW_REF` 指到了不含 `;ref=` 补丁的 ref | 指到上游 `ci/module-ref-pin`，或把该分支合进 fork 的 `dev` 再把两个 var 指过去 |
 | `ABK 构建 failure（失败 job: …）` | 真的编不过；失败 job 名会写出来（同 run 还有 get-manager 等 job） | 看 ABK run 日志 / 评论里的 `error:` 段 |
 | `编的不是这份代码：ABK 日志里的 head_sha 对不上` | 日志里没有本 PR 的 head sha | 看评论取证段与 ABK 日志；多半是 ref 钉错或被顶替 |
 | `ABK 没按钉住的 ref 检出模块（日志里没有对应的 pinned_ref）` | ABK 忽略了第三字段（旧版工作流） | 同第二条 |
 | `编译通过但模块版本对不上，八成编的不是这份代码` | 编的是别的分支的模块 | 同上 |
 | `ABK 构建成功但取证失败，无法证明编的是这份代码` | 日志下载/取证步骤失败 | 看门禁 job 日志与 artifact；这是**故意的红** |
 | `ABK 构建超时未完成` | 构建超过 `WAIT_MINUTES`(90) | 看 ABK run；必要时改工作流里的 `WAIT_MINUTES` 与 `timeout-minutes` |
-| `没在 ABK 里找到对应的 run` | ABK 侧没接单：dispatch 权限、队列、run-name 变了 | 去 `fanziyun/ABK` 的 Actions 看有没有新 run |
+| `没在 ABK 里找到对应的 run` | ABK 侧没接单：dispatch 权限、ref 不存在、队列、run-name 变了 | 去 `ABK_CI_REPO` 的 Actions 看有没有新 run（`ABK_CI_REPO`/`ABK_CI_WORKFLOW_REF` 指错会 403/422） |
 | `取证失败：ABK 日志里没有 head_sha 行，拿不到归属证据` | 日志格式变了或没下全 | 看门禁 job 与 artifact；这是**故意的红** |
 | `编译通过但有没落地的组：<组>` | 编过了，但 graft 没落地（本地审计盯的就是这类） | 看评论里的分组状态段 |
 | `内核编译失败（job: …）` | 内核编译 job 自己失败 | 看 ABK run 日志 |

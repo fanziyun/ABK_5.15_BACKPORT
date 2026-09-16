@@ -1,18 +1,22 @@
 name: ABK kernel compile gate
 
-# 派发 fanziyun/ABK 的「Android 内核构建-自定义」(kernel-custom.yml)，把**本 PR 的 commit**
+# 派发 ABK 的「Android 内核构建-自定义」(kernel-custom.yml)，把**本 PR 的 commit**
 # 钉进 custom_external_modules 的描述符（;ref=refs/pull/<N>/head），再把结果回写到 PR。
+# 目标仓库是 var ABK_CI_REPO（默认 fanziyun/ABK）。**推荐指向自己的一次性 fork** ——
+# 在 ABK 上 Actions 权限约等于仓库写权限（派发时构建机会跑任意模块代码，而它的 token 带
+# contents:write），所以见 docs/pr_compile_gate.md 第 4 节，别把这张 PAT 留在主仓库上。
 #
 # 安全边界：本工作流**永不 checkout PR 代码**，只用 GitHub API；PR 代码只在 ABK 的构建 job
 # 里被执行（那是 ABK 自己的权限模型）。因此这里用 pull_request_target 拿 write token + secrets
 # 是安全的 —— 后续任何往本文件加 actions/checkout 的改动都必须被否决。
 #
 # 一次性前置（见 docs/pr_compile_gate.md）：
-#   secret ABK_CI_TOKEN          fine-grained PAT：Repository access 只选 fanziyun/ABK，
+#   secret ABK_CI_TOKEN          fine-grained PAT：Repository access 只选<ABK_CI_REPO 那个仓库>，
 #                                Repository permissions 只给 Actions: Read and write。
 #                                别给 Contents / Pull requests / Workflows / Administration ——
 #                                本工作流**不需要**它们：读 run 与日志是 Actions，读模块描述符
 #                                走本仓库的 github.token，读 ABK 侧工作流源码走匿名 CDN。
+#   var    ABK_CI_REPO           派发目标仓库，默认 fanziyun/ABK；推荐填自己的一次性 fork
 #   var    ABK_CI_EXTRA_MODULES  与出厂构建同形的其它模块描述符，换行分隔（留空=只注入本仓库 child）
 #   var    ABK_CI_WORKFLOW_REF   ABK 侧工作流 ref，默认 dev
 #   var    ABK_CI_VERSION_BASE   版本名前缀，默认 -202609202-FanZiyun
@@ -51,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
-      ABK_REPO: fanziyun/ABK
+      ABK_REPO: ${{ vars.ABK_CI_REPO || 'fanziyun/ABK' }}
       ABK_WORKFLOW: kernel-custom.yml
       ABK_WORKFLOW_REF: ${{ inputs.abk_ref || vars.ABK_CI_WORKFLOW_REF || 'dev' }}
       ABK_EXTRA_MODULES: ${{ vars.ABK_CI_EXTRA_MODULES }}
@@ -295,7 +299,8 @@ jobs:
           fi
           # token 只看得到仓库就够了（Metadata 读，fine-grained PAT 必带），真正的能力验证在下面。
           gh api "repos/$ABK_REPO" --jq .full_name > /dev/null
-          # 钉住 PR 用的是描述符第三字段 ;ref=，只有 fanziyun/ABK#5 之后的 kernel-custom.yml 认识它。
+          # 钉住 PR 用的是描述符第三字段 ;ref=，只有带这个补丁的 kernel-custom.yml 认识它
+          # （上游分支 ci/module-ref-pin，或 fork 上合过它的 dev）。
           # 目标 ref 不认识，就会白等 90 分钟、最后报成「编的不是这份代码」，所以先验一遍契约。
           # ⚠️ 这一读取**刻意不带 token**，走 raw.githubusercontent 的匿名 CDN：ABK 是公开仓库，
           # 于是 ABK_CI_TOKEN 只需要 Actions 权限，不需要 Contents —— 少一项权限就少一条被滥用的路。
@@ -303,7 +308,7 @@ jobs:
           wf_src_url="https://raw.githubusercontent.com/$ABK_REPO/refs/heads/$ABK_WORKFLOW_REF/.github/workflows/$ABK_WORKFLOW"
           if wf_src="$(curl -fsSL --max-time 30 "$wf_src_url" 2>/dev/null)"; then
             if ! printf '%s\n' "$wf_src" | grep -q 'run-name: ABK-CI'; then
-              echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_WORKFLOW_REF 指到 ci/module-ref-pin，见 docs/pr_compile_gate.md"
+              echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_REPO / ABK_CI_WORKFLOW_REF 指到带补丁的仓库和 ref（上游 ci/module-ref-pin，或 fork 上合过补丁的 dev），见 docs/pr_compile_gate.md"
               printf '%s\n' "no-ref-support" > conclusion.txt
               exit 1
             fi
