@@ -31,6 +31,7 @@ is left byte-identical rather than touched up with a comment.
 | `stable_backport_core` (Batch 14) | zram **writeback correctness** (the branch froze this code in 2022 and never got the later fixes — `linux-5.15.y` at SUBLEVEL 220 does not have them either): `zram_wb_teardown` releases a backing device that was attached before `disksize` (upstream `74363ec674cb`; the upstream form deletes `zram_reset_device()`'s early return, this line calls `reset_bdev()` from `zram_remove()` instead, because `zram_reset_device()` is the anchor of the earlier recompression group), with the `zram_meta_free()` NULL-table guard; `zram_writeback_bounds` derives the `writeback_store()` scan bound and the `page_index=` range check **under** `init_lock` (upstream `894913e2d35c`, Cc: stable) so a racing reset that re-initialises a smaller `disksize` cannot walk past the new table, plus `cond_resched()` in the sweep (`424d0e5828ad`) -- and keeps PAGE mode's single-iteration bound through that derivation, because the loop counts iterations from `index`: without it `page_index=N` swept to the end of the device instead of one page, and `N>=1` walked `zram_slot_lock()` past `zram->table` and panicked the kernel on vermeer (v0.30.1); `zram_wb_limit_align` adds mainline's `rounddown(val, PAGE_SIZE / 4096)` guard so a 16 KiB-page build cannot underflow `bd_wb_limit` and silently switch the flash-wear cap off. Evidence, dependency graph and the explicit not-ported list (6.16 writeback ABI rework, bio batching, compressed writeback, `huge_idle`) are in `research/zram_writeback_plan.md` |
 | `stable_backport_core` + `stable_perf_backport` (Batch 15) | **ABK_ABI_PATCH_SUITE absorption.** The suite-preference rule is retired: this module now carries that suite's optimization inventory itself, and the two are **mutually exclusive** (both claim `sched_entity` 1–4 and `request_queue` 1). Core gains `pid_alloc_hotpath_phase2` (`idr_preload(GFP_KERNEL)` single retry), `fd_alloc_hotpath` (the `abk_expand_files_needed()` precheck — the suite's capacity half is deliberately *not* ported because this child's `fdtable_alloc_conventions` owns that text and the suite's helper name is one of this module's own suite-detection markers), `close_range_hotpath` (bitmap walk in `__range_close()`), `slab_alloc_free_hotpath` and `hugepage_fault_alloc_fastpath`; perf gains `blk_mq_async_depth` (`request_queue` slot 1), the EEVDF family (`sched_entity` slots 1–4, registered `pick_logic`-before-`core_fields` so the slots are claimed only once the `fair.c` logic landed — `sizeof(struct sched_entity)` measured unchanged at 512 B under `CONFIG_WERROR=y`), `nohz_field_refinement` and `avg_idle_preemption_mode`. **Four latent defects in the suite's own implementations were fixed on the way in**: an `alloc_pid()` retry using `continue` in a descending loop (could return a pid whose `numbers[0].nr` was never written), a request count assigned into bfq/kyber's *per-word bit cap* (both throttles were dead code), an unconditional `rq->idle_stamp` sample that reads nanoseconds-since-boot on a CPU that never passed `newidle_balance()`, and a `reweight_entity()` whole-body anchor that matched no sublevel on 5.15.194/.216 and would have silently skipped while reporting success. The `step_audit` monkeypatch hole that had left every `scripts/batchNN_*.py` group (including Batch 14) unaudited was also closed. What could not be absorbed, with evidence, is in `docs/survey_suite_absorption.md` |
 | `stable_backport_core` (Batch 31) | `arm64_pte_mkwrite_clean`: the 5.15.196 arm64 `pte_mkwrite()` dirty guard (mainline `143937ca51cc`, v6.18 — "avoid always making PTE dirty in pte_mkwrite()"; stable `8a2375b0e9b8`). `PAGE_SHARED` on arm64 is *clean by default* (`PTE_RDONLY\|PTE_WRITE`), so clearing `PTE_RDONLY` is exactly what makes a page hardware-dirty (`pte_hw_dirty()`): every caller that made a **clean** pte writable reported an unwritten page dirty, and `try_to_unmap()` turns that into `set_page_dirty()` at reclaim. The fix clears `PTE_RDONLY` only for an already software-dirty PTE. The target form is the **5.15.y** form (`pte_mkwrite()`, not mainline's `pte_mkwrite_novma()`, the name the v6.6 rename `2f0584f3f4bd` introduced, which anchors nowhere here); the live 5.15 call sites are the transient-unmap restorers (`remove_migration_pte()`, `do_numa_page()`, userfaultfd), not the commit message's `do_swap_page()` case, which pairs mkwrite with mkdirty on 5.15. Upstream-shape rewrite, so no ABK marker: on the lts baseline the file stays byte-identical and the group reports `already_present`. This is the module's first `arch/arm64` C group — `arch/arm64/include/asm/pgtable.h` joined the fixture lists |
+| `stable_backport_core` (Batch 37) | the **memory-reclaim path**: six upstream commits on the `memory.reclaim` line, in dependency order. `0388536ac291` (v6.6) caps one reclaim call at `SWAP_CLUSTER_MAX` and `287d5fedb377` (v6.9, `Fixes:` the former) replaces that cap with a decaying batch `(nr_to_reclaim - nr_reclaimed) / 4` -- the pair is inseparable, because the fixed 32-page cap cost more in reclaim start/stop cycles than its accuracy bought (upstream: 13742 vs 67352 pages/sec on a full root-cgroup reclaim). `410abb20acae` adds `MIN_SWAPPINESS`/`MAX_SWAPPINESS` and `68cd9050d871` (v6.11, same series) adds the `swappiness=<val>` nested key to `memory.reclaim`, carrying the value to `get_scan_count()`/`get_swappiness()` through a new `sc_swappiness()` accessor so a proactive reclaimer no longer rewrites the global `vm.swappiness` to steer file-vs-anon balance; the manual documents the key (`cgroup-v2.rst`). `dc37771a43d4` (v7.2, `Fixes: 287d5fedb377`) lets the PM freezer interrupt a proactive reclaim -- the MGLRU inner loop gains the signal check and the handler returns `-ERESTARTSYS`, which restarts the syscall after resume instead of failing the suspend (the Android-measured suspend timeout this module's `cached_freeze_reclaim` line is about). `9669b87065a6` (v7.2) frees a page that is already dead before it reaches the LRU: the `lru_add` batch is filtered on its final reference and `release_pages()` tolerates the vacated slot, in 5.15's `pagevec`/`page` form (upstream's `folio_unqueue_deferred_split()` is deliberately not carried: a deferred-split page is always compound, and a compound page drains the `lru_add` pagevec immediately, so the entries that really linger are order-0 pages for which `page[2].deferred_list` is a neighbouring allocation). Everything in the chain but the last group rewrites `memory_reclaim()` -- text this module itself generates -- so each superseded group stops on a probe of its successor (AGENTS.md trap 5) |
 
 Since Batch 3 the module also grafts selected **android14-6.1 ACK line**
 features (the only 6.1 ACK branch): `memory.reclaim` proactive reclaim,
@@ -241,7 +242,7 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 46 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 52 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
@@ -271,13 +272,24 @@ line (the shadow-entry pair `truncate_shadow_batch` + `truncate_shadow_batch_swe
 which clears a pagevec's shadow entries under one `i_pages` acquisition and then
 in one tree traversal, and the MADV_DONTNEED pair `madvise_pt_reclaim` +
 `madvise_batch_tlb_flush`, which hands an emptied PTE page back and gathers the
-whole request's TLB flushes in one `mmu_gather`), and Batch 36's FUSE
+whole request's TLB flushes in one `mmu_gather`), Batch 36's FUSE
 write-path prefault move (`fuse_prefault_out_of_write_path`:
 `fuse_fill_write_pages()` faults its source buffer in only where the copy made
-no progress -- the module's only group in `fs/fuse/`); the
+no progress -- the module's only group in `fs/fuse/`), and Batch 37's six-group
+memory-reclaim chain (`proactive_reclaim_batch_fidelity` +
+`proactive_reclaim_decaying_batches` -- the batch a `memory.reclaim` write uses
+decays from a quarter of the outstanding request instead of being capped at
+`SWAP_CLUSTER_MAX`, the pair `0388536ac291`/`287d5fedb377` upstream keeps
+together -- `reclaim_swappiness_defines` and
+`proactive_reclaim_swappiness_arg`, which add `swappiness=<val>` to
+`memory.reclaim` and carry it to the scan balance through a new
+`sc_swappiness()` accessor, `proactive_reclaim_suspend_abort`, which lets the PM
+freezer interrupt a proactive reclaim instead of failing the suspend, and
+`lru_add_drain_dead_folios`, which frees a page that is already dead before it
+reaches the LRU -- the module's first `mm/swap.c` group); the
 perf child carries 23, including the five Batch 15 scheduler/block groups and
 the PSI line (`psi_irq_tracking`, `psi_cgroup_pressure_switch`,
-`psi_oncpu_state_mask`); the display child carries 1, for 70 groups in total.
+`psi_oncpu_state_mask`); the display child carries 1, for 76 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 
@@ -314,7 +326,7 @@ markers, then exercises the rollback path. Expected statuses come from
 `tests/sublevel_matrix.py`, keyed by the tree's Makefile `SUBLEVEL` (override
 with `ABK_TEST_SUB_LEVEL`).
 
-To verify a baseline you don't have checked out, fetch just the ~81 files the
+To verify a baseline you don't have checked out, fetch just the ~82 files the
 groups touch:
 
 ```bash

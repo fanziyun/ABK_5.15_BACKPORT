@@ -647,6 +647,87 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
+    # --- Batch 37: the memory-reclaim chain --------------------------------
+    # Six groups rewriting one path, so each entry is pinned against the blob
+    # *as it stands when that group runs* (implementation_audit applies them in
+    # registry order): 0388536ac291's cap is visible here even though the third
+    # group removes it again.
+    "core:proactive_reclaim_batch_fidelity": [
+        # 0388536ac291.  The cap is the whole commit; the group's second-pass
+        # behaviour is what DECAYING_BATCH_DECL's own entry below pins.
+        "min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),",
+    ],
+    "core:proactive_reclaim_decaying_batches": [
+        # 287d5fedb377.  Both halves: the declaration and the argument that
+        # replaced the fixed cap.  A tree with only the declaration still
+        # overreclaims; one with only the argument does not compile.
+        "/* Will converge on zero, but reclaim enforces a minimum */",
+        "unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
+        "batch_size, GFP_KERNEL, reclaim_options);",
+    ],
+    "core:reclaim_swappiness_defines": [
+        # 410abb20acae.  The two constants plus the two literals they take
+        # over on 5.15; the third hunk of that commit (the MGLRU paths) has no
+        # 200 literal here and is deliberately left byte-identical.
+        "#define MIN_SWAPPINESS 0",
+        "#define MAX_SWAPPINESS 200",
+        "\tfp = (MAX_SWAPPINESS - swappiness) * (total_cost + 1);",
+        "\tif (val > MAX_SWAPPINESS)",
+    ],
+    "core:proactive_reclaim_swappiness_arg": [
+        # 68cd9050d871.  The value has to reach the scan balance from the
+        # request, not from the memcg's own setting: the accessor, its two
+        # callers, the field, the prototype, the definition, and the parser
+        # that fills it.  A port that only adds the argument would leave
+        # get_scan_count() reading mem_cgroup_swappiness() and the knob inert.
+        "int *swappiness",
+        "int *proactive_swappiness;",
+        "static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)",
+        "int swappiness = sc_swappiness(sc, memcg);",
+        # The bare call, not the statement around it: 194/lts carry the ACK
+        # hook in get_swappiness() and take the value into a local first, so
+        # their statement reads "swappiness = sc_swappiness(...)".  The exact
+        # per-shape text is pinned in REQUIRED_IN_FUNCTION below.
+        "sc_swappiness(sc, memcg);",
+        ".proactive_swappiness = swappiness,",
+        "#include <linux/parser.h>",
+        "static const match_table_t tokens = {",
+        '{ MEMORY_RECLAIM_SWAPPINESS, "swappiness=%d"},',
+        "nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;",
+        "swappiness == -1 ? NULL : &swappiness",
+        # The seven call sites, not just memory_reclaim()'s: a missed one is a
+        # compile error, and the NULL ones are what keeps every other caller's
+        # meaning ("no override") explicit rather than accidental.
+        "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\t     NULL);",
+        "gfp_mask, reclaim_options,\n\t\t\t\t\t\t    NULL);",
+        "memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL)) {",
+        "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\tNULL);",
+        "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL);",
+        "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))",
+        # ...and the manual, which is what makes the new key a documented part
+        # of the interface rather than an undocumented argument.
+        "  swappiness            Swappiness value to reclaim with",
+    ],
+    "core:proactive_reclaim_suspend_abort": [
+        # dc37771a43d4.  Both ends: the inner-loop check and the errno the
+        # handler returns, which is what lets the syscall be restarted after
+        # resume instead of failing the suspend.
+        "if (unlikely(sc->proactive && signal_pending(current)))",
+        "return -ERESTARTSYS;",
+    ],
+    "core:lru_add_drain_dead_folios": [
+        # 9669b87065a6, in 5.15's pagevec form.  The filter, the two flags it
+        # has to clear (the page bypasses __pagevec_lru_add_fn()), the batch it
+        # is freed from, and the consumer's tolerance of the vacated slot --
+        # without the last one the drain walks a NULL pvec entry.
+        "if (page_ref_freeze(page, 1)) {",
+        "__ClearPageActive(page);",
+        "__ClearPageUnevictable(page);",
+        "list_add(&page->lru, &pages_to_free);",
+        "mem_cgroup_uncharge_list(&pages_to_free);",
+        "free_unref_page_list(&pages_to_free);",
+        "/* A drained add batch may have freed this slot already. */",
+    ],
     # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
     # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
     # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
@@ -1286,6 +1367,94 @@ REQUIRED_IN_FUNCTION = {
           "__free_zspage_lockless(pool, zspage);",
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
+    ],
+    # --- Batch 37: the memory-reclaim chain, function-scoped ---------------
+    # The three groups below all rewrite memory_reclaim(), so which group got
+    # which hunk is only visible by slicing the handler: whole-file matching
+    # would pass just as happily on a tree where the cap never arrived but the
+    # parser did.  Each must_not_have is the *superseded* form, which is this
+    # batch's own failure mode -- a group whose payload a later group removed
+    # reads as "applied" from the outside.
+    "core:proactive_reclaim_batch_fidelity": [
+        # 0388536ac291's cap, inside the handler it belongs to.  The old
+        # argument is asserted gone: it is the overreclaim.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),"],
+         ["\t\t\t\t\t\tnr_to_reclaim - nr_reclaimed,\n"]),
+    ],
+    "core:proactive_reclaim_decaying_batches": [
+        # 287d5fedb377.  The decaying batch has to *replace* the fixed cap,
+        # not sit next to it, and it has to be the argument the call uses.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
+          "batch_size, GFP_KERNEL, reclaim_options);"],
+         ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX)"]),
+    ],
+    "core:proactive_reclaim_swappiness_arg": [
+        # 68cd9050d871.  The parser has to be where the bytes are read: the
+        # size still comes from the buffer, the swappiness key is matched, and
+        # the value is validated against the constants before the loop starts.
+        # must_not_have is the old single-key parse and the old -EINTR -- the
+        # latter is the *next* group's target, so it also proves this group
+        # left the failure path alone rather than half-rewriting it.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["int swappiness = -1;",
+          "substring_t args[MAX_OPT_ARGS];",
+          "nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;",
+          "while ((start = strsep(&buf, \" \")) != NULL) {",
+          "case MEMORY_RECLAIM_SWAPPINESS:",
+          "if (swappiness < MIN_SWAPPINESS || swappiness > MAX_SWAPPINESS)",
+          "swappiness == -1 ? NULL : &swappiness);"],
+         ["page_counter_memparse(buf, \"\", &nr_to_reclaim);",
+          "return -ERESTARTSYS;"]),
+        # The accessor is only worth anything if the scan balance asks it, and
+        # the field only if the definition fills it.
+        ("mm/vmscan.c", "get_scan_count",
+         ["int swappiness = sc_swappiness(sc, memcg);"],
+         ["int swappiness = mem_cgroup_swappiness(memcg);"]),
+        # get_swappiness() too -- both shapes (167/178 return the accessor,
+        # 194/lts assign it into the local the ACK hook then tunes), and both
+        # have to stop reading the memcg's own setting.
+        ("mm/vmscan.c", "get_swappiness",
+         ["sc_swappiness(sc, memcg);"],
+         ["mem_cgroup_swappiness(memcg)"]),
+        ("mm/vmscan.c", "try_to_free_mem_cgroup_pages",
+         ["int *swappiness)",
+          ".proactive_swappiness = swappiness,"],
+         []),
+    ],
+    "core:proactive_reclaim_suspend_abort": [
+        # dc37771a43d4.  Both halves, each in the function that has to carry
+        # it: the MGLRU inner loop checks, and the handler stops converting
+        # that check into an -EINTR the freezer cannot resume from.
+        ("mm/vmscan.c", "should_abort_scan",
+         ["if (unlikely(sc->proactive && signal_pending(current)))",
+          "return true;"],
+         ["if (unlikely(sc->proactive && signal_pending(current)))\n"
+          "\t\treturn false;"]),
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["return -ERESTARTSYS;"],
+         ["return -EINTR;"]),
+    ],
+    "core:lru_add_drain_dead_folios": [
+        # 9669b87065a6 in 5.15's pagevec form.  The filter has to run *before*
+        # the lruvec is taken (that is the point: it saves the lock), the two
+        # flags have to be cleared (the page skips __pagevec_lru_add_fn()), and
+        # the filtered page has to be freed from this function -- a filter that
+        # nulls the slot without freeing leaks the page.
+        ("mm/swap.c", "__pagevec_lru_add",
+         ["if (page_ref_freeze(page, 1)) {",
+          "__ClearPageActive(page);",
+          "__ClearPageUnevictable(page);",
+          "pvec->pages[i] = NULL;",
+          "free_unref_page_list(&pages_to_free);",
+          "release_pages(pvec->pages, pvec->nr);"],
+         []),
+        # ...and the consumer has to tolerate the vacated slot, or the drain
+        # dereferences a NULL entry on the very next pagevec.
+        ("mm/swap.c", "release_pages",
+         ["if (!page)\n\t\t\tcontinue;"],
+         []),
     ],
     # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
     # change rather than a rewrite is *where* each half sits: the decision in

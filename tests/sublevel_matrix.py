@@ -67,6 +67,13 @@ GROUP_COUNTS = {
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
     #
+    # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
+    # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
+    # diverged), so the rolling lts row cannot arrive pre-applied either -- and
+    # its percpu.h anchors are byte-identical to the upstream old form on all
+    # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
+    # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
+    # non-LSE fallback path is untouched on cores without FEAT_LSE.
     # Batch 35 adds four groups, all landing on every baseline: the two
     # page-cache shadow-entry sweeps (61c663e020d2, then d3db2c042591 which
     # refactors its partner's helper) and the MADV_DONTNEED pair
@@ -75,16 +82,9 @@ GROUP_COUNTS = {
     # none of the substrate they touch.  The three readahead/filemap commits of
     # the same area are *not* registered -- no baseline has a carrier for them
     # (see the exclusion record in plan.md).
-    # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
-    # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
-    # diverged), so the rolling lts row cannot arrive pre-applied either -- and
-    # its percpu.h anchors are byte-identical to the upstream old form on all
-    # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
-    # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
-    # non-LSE fallback path is untouched on cores without FEAT_LSE.
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
-    # from 40 to 41) + Batch 34's successor 35 (four page-cache/page-table
-    # groups) + the Batch-36 FUSE write-path prefault below.
+    # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
+    # Batch-36 FUSE write-path prefault below = 46.
     #
     # The Batch-36 FUSE write-path prefault (fuse_prefault_out_of_write_path)
     # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
@@ -93,7 +93,22 @@ GROUP_COUNTS = {
     # fs/fuse/, so nothing else writes the file.  Renumbered twice: the arm64
     # LSE group took "Batch 34" and the page-cache/page-table one took 35 while
     # this branch was open, so this one is 36.
-    "stable_backport_core": 46,
+    #
+    # Batch 37 adds the six-group memory-reclaim chain
+    # (proactive_reclaim_batch_fidelity, proactive_reclaim_decaying_batches,
+    # reclaim_swappiness_defines, proactive_reclaim_swappiness_arg,
+    # proactive_reclaim_suspend_abort, lru_add_drain_dead_folios).  All six
+    # apply on every baseline -- none of the commits has a Cc: stable, and
+    # 5.15 has neither memory_reclaim() nor user_proactive_reclaim() nor the
+    # post-5.17 folio_batch form of mm/swap.c -- but the first three rewrite
+    # text memcg_memory_reclaim generates, so the count moved for a *chain* of
+    # groups rather than for six independent ones.  The 194/lts swappiness
+    # vendor hook is handled by a probed step variant, not by a per-sublevel
+    # expectation, which is why PRE_APPLIED stays empty here.  This branch
+    # numbered it 34 while main numbered the arm64 LSE group 34, so the merge
+    # renumbered it after main's Batch 36.
+    # 46 (the merged main line) + Batch 37's six = 52.
+    "stable_backport_core": 52,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed
