@@ -575,12 +575,14 @@ jobs:
           desc="ABK 编译门禁内部错误"
           conclusion=""
           post_status=true      # 只有「有结论」或「根本不用编」才写 status
-          headline="$state"
+          # 评论标题：跳过类分支会自己改写（未验证 / 跳过 / 前置未就绪），其余由末尾按 state 收口。
+          headline="门禁错误"
           if [ -z "${ABK_TOKEN:-}" ] && [ "$GATE_RUN" != "false" ]; then
             # 前置没配齐、而这次本来是要真编的（GATE_RUN 不是 false，含门禁在 Token 检查处就挂掉、
             # run 都没来得及 output 的情况）：门禁根本没有派发的能力，红着喊（见 docs/pr_compile_gate.md 第 4 节）。
             # GATE_RUN=false 的跳过事件不需要凭据，交给下面的跳过语义，不连坐。
             state="failure"
+            headline="前置未就绪"
             desc="没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）"
           elif [ "$GATE_RUN" = "false" ]; then
             # commit status 按 context 取「最新一条」：跳过绝不能把已经写下的真实结论顶掉，
@@ -600,6 +602,7 @@ jobs:
             fi
             if [ "$SKIP_KIND" = "no-change" ]; then
               # 唯一可以写绿的跳过：这次改动根本没碰内核树，没有可验证的东西
+              headline="跳过"
               state="success"
               desc="跳过：$GATE_REASON（改动没碰内核树，无可验证内容）"
             else
@@ -658,6 +661,15 @@ jobs:
               *)
                 state="failure"
                 desc="ABK 构建 $conclusion" ;;
+            esac
+          fi
+
+          # 标题收口：走到这里还挂「门禁错误」的，说明是结论阶梯判出来的，按最终 state 翻译；
+          # 跳过类与前置缺失已经自己写过标题，不动它们（否则评论会出现「通过」配着红的 desc 这类错配）。
+          if [ "$headline" = "门禁错误" ]; then
+            case "$state" in
+              success) headline="通过" ;;
+              failure) headline="不通过" ;;
             esac
           fi
 
