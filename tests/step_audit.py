@@ -171,6 +171,9 @@ AUDIT_FILES = [
     # Batch 34: the non-return per-CPU atomics become load LSE atomics
     # (mainline 535fdfc5a228) -- the whole group is this header.
     "arch/arm64/include/asm/percpu.h",
+    # Batch 35: the FUSE write-path prefault (faa794dd2e17), the module's first
+    # group in fs/fuse/.
+    "fs/fuse/file.c",
 ]
 
 CHILD_MODULES = [

@@ -4390,5 +4390,32 @@ import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 35: the FUSE write path stops prefaulting its source buffer on every
+# retry.  Steps live in scripts/batch35_core_fuse_erofs.py.
+#
+#   fuse_prefault_out_of_write_path
+#                              mainline faa794dd2e17 (v6.16).  One file, and
+#                              the module's first group in fs/fuse/ -- the
+#                              file carries no other group's text, so there is
+#                              nothing to order against.
+#
+# The erofs half of this batch does not land: fb176750266a + 6422cde1b0d5
+# stand on the 5.15 -> 6.12 erofs evolution (erofs_buf/erofs_bread, the
+# parallel erofs_fileio_aops, fs/erofs/fileio.c), none of which exists on any
+# tracked baseline -- see the group module's docstring and the plan.md
+# exclusion record.  770c8d55c428 (lib/iov_iter) is inapplicable: 5.15 has no
+# page_folio()/folio_test_slab() in that file.  FUSE passthrough stays
+# unported by decision (android13-5.15 ships its own on _IOW(229,126)).
+#
+# Renumbered from 34 when this branch merged main: the arm64 LSE group landed
+# there first with the same number and the same version.  Its file keeps the
+# batch34_ prefix because it was registered under that number on main; this
+# one is batch35_.
+# ============================================================================
+import batch35_core_fuse_erofs as _b35_fuse  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b35_fuse.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()
