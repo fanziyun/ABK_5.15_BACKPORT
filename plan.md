@@ -7,8 +7,9 @@
 
 ## 交付总览（九项优化，按功能清单顺序）→ 详见 CHANGELOG.md#overview-nine — 把九项功能重排成一份交付日志并往下续写第 10 项（`8a73e95` → HEAD 的四个提交）：逐项给出批次、组名与到手证据，不新增任何批次
 
+## Batch 36(v0.38.0,已落地)→ 详见 CHANGELOG.md#batch-36 — 文件系统批次（FUSE + erofs），**只落 FUSE 一条**：mainline `faa794dd2e17`（v6.16「fuse: Move prefaulting out of hot write path」，Dave Hansen，Miklos Szeredi 收）把 `fuse_fill_write_pages()` 的源缓冲区预缺页从重试循环**头部**挪进**无进展分支**（`copy_page_from_iter_atomic()` 返回 0 那支），于是经 daemon 的每次 `write(2)` 在快路径上只碰用户态一次而不是两次；重试路径保留 fault-in，前进保证不变。上游的理由是「与 `generic_perform_write()` 同形」—— 那只对**上游 6.15+** 成立，5.15 自己的 `generic_perform_write()` **仍在循环头预缺页**，差异与为什么这不影响安全见 CHANGELOG.md#batch-35 §6。上游 hunk 是 6.x 的 folio 形态（`__filemap_get_folio`/`copy_folio_from_iter_atomic`），本组按 5.15 的 page 形态（`grab_cache_page_write_begin`/`copy_page_from_iter_atomic`）重写同样两处 ⇒ 上游形态改写、**不加深色 marker**。**erofs 半边（file-backed mount 的 `fb176750266a` + `6422cde1b0d5`）整条排除**，`770c8d55c428`（lib/iov_iter）不适用，FUSE passthrough 按决定不做 —— 三条都在「排除记录」。core 40 → **46** 组（并行落地两批：arm64 LSE +1、page-cache/page-table +4，再加本组 +1；本批因此两次改名、终为 36）
+## Batch 35(v0.37.0,已落地；四道门禁四档全绿；构建闸门与真机未跑；**编号由 34 让位而来**，见 CHANGELOG.md#batch-35 抬头)→ 详见 CHANGELOG.md#batch-35 — 主题「页缓存、readahead 与缺页/页表路径」：候选 7 条**落地 4 条、排除 3 条**。落地的是两对四组，都在 core：① 影子项清账（`61c663e020d2` 一次持锁清整个 pagevec + `d3db2c042591` 再一次遍历走完索引区间）——上游那次 **11 秒 soft-lockup** 就出在这里（`clear_shadow_entry` → `invalidate_mapping_pages` → `invalidate_bdev`）；② `MADV_DONTNEED` 的页表回收（`6375e95f381e`，`zap_details.reclaim_pt` + `try_to_free_pte()`）与它的批量 TLB flush 配套（`43c4cfde7e37`，一次 `madvise()` 一个 `mmu_gather`）。**5.15 形状改写四处关键**：无 `pmdp_get_lockless()` ⇒ 只落上游自己的持锁慢路径；无 `madvise_behavior` 结构体 ⇒ `tlb` 显式穿 `madvise_walk_vmas()` 回调；无 `MADV_DONTNEED_LOCKED` 且 `MADV_FREE` 仍自持 gather ⇒ `madvise_batch_tlb_flush()` 只列 `MADV_DONTNEED`；无 `folio_batch` ⇒ 影子项 helper 用 `pagevec`。**保留 `__clear_shadow_entry()`**（5.15 的 truncate 路径还在用）。排除了 `7a1eb89f7918`/`d5ea5e5e50df`（5.15 的 `read_pages()` 不缩窗、整文件没有 `page_cache_ra_order()`）与 `0faa77afe72b`（没有 `filemap_map_folio_range()`/`filemap_map_order0_folio()`，净引用已是 1）——见「排除记录」。core 41 → 45（含同一合并进来的 Batch 34 的 `arm64_lse_percpu_load_atomics`）
 ## Batch 34(v0.36.0,已落地)→ 详见 CHANGELOG.md#batch-34 — arm64 非返回型 per-CPU 原子改用 load LSE 原子(mainline `535fdfc5a228`,v6.18,Catalin Marinas,arm64-fixes):`__PERCPU_OP_CASE()` 的 LSE 分支加一个未使用(但非 XZR)的 `[tmp]` 目的寄存器,`stadd`/`stclr`/`stset` 三个实例化翻成 `ldadd`/`ldclr`/`ldset` —— store 形态倾向「远」执行(互联/内存子系统),load 形态「近」执行(L1),起因是 Paul E. McKenney 在 `srcu_read_{lock,unlock}*()` 的背靠背 STADD 上发现的开销。纯头文件 asm 宏改写,KMI 中性(不动任何结构体);未进 linux-5.15.y,四档基线全部适用。**反面证据已核**:上游后来在 bpf-next(merge `c2f2f005a1c2`)证实该 commit 造成 fentry 基准回归(Neoverse-V2 revert=51.770 M/s vs 含修复=43.271 M/s;x86-64 启用回归 30%),但 **5.15 的 arm64 没有 BPF trampoline**(`arch/arm64/net/bpf_jit_comp.c` 无 trampoline 代码、Kconfig 无能力 select),递归检测的 enter/exit 辅助函数在 arm64 上不可达,回归面不适用 —— 取舍已记入 CHANGELOG。**全部上游证据来自 Neoverse V2 服务器核,Snapdragon 迁移性未验证,未做设备 A/B,不主张提速**(Batch 28 先例)。core 40 → 41 组;trap 6 全开:asm 内联文本审计看不见,四档 ABK CI 编译必须全绿才算数
-## Batch 35(v0.37.0,已落地)→ 详见 CHANGELOG.md#batch-35 — 文件系统批次（FUSE + erofs），**只落 FUSE 一条**：mainline `faa794dd2e17`（v6.16「fuse: Move prefaulting out of hot write path」，Dave Hansen，Miklos Szeredi 收）把 `fuse_fill_write_pages()` 的源缓冲区预缺页从重试循环**头部**挪进**无进展分支**（`copy_page_from_iter_atomic()` 返回 0 那支），于是经 daemon 的每次 `write(2)` 在快路径上只碰用户态一次而不是两次；重试路径保留 fault-in，前进保证不变。上游的理由是「与 `generic_perform_write()` 同形」—— 那只对**上游 6.15+** 成立，5.15 自己的 `generic_perform_write()` **仍在循环头预缺页**，差异与为什么这不影响安全见 CHANGELOG.md#batch-35 §6。上游 hunk 是 6.x 的 folio 形态（`__filemap_get_folio`/`copy_folio_from_iter_atomic`），本组按 5.15 的 page 形态（`grab_cache_page_write_begin`/`copy_page_from_iter_atomic`）重写同样两处 ⇒ 上游形态改写、**不加深色 marker**。**erofs 半边（file-backed mount 的 `fb176750266a` + `6422cde1b0d5`）整条排除**，`770c8d55c428`（lib/iov_iter）不适用，FUSE passthrough 按决定不做 —— 三条都在「排除记录」。core 40 → **42** 组（本组 +1，并行落地的 arm64 LSE 组 +1；本批因此从 34 改名 35）
 
 ## Batch 33(v0.35.0,已落地)→ 详见 CHANGELOG.md#batch-33 — zsmalloc `zs_free()` 的 `class->lock` 临界区收窄（mainline `7ef28e8b8142`，系列 "mm/zsmalloc: reduce lock contention in zs_free()" v6 的第 3 个 patch）：空 zspage 的页面归还 buddy 的动作搬到 `class->lock` **之外**，锁内只留 `trylock_zspage()` + `remove_zspage()` + 每类统计（`class->stats.objs[]` 是普通 `unsigned long`、`zs_stat_dec()` 用 `-=` 更新，`zs_can_compact()` 在 `class->lock` 下经 `zs_stat_get()` 读它，那条搬不出去）。**系列前两个 patch 不移植**（`9909b088b1f0` 把 class 索引编码进 obj、`59e88952a827` 据此在 64 位免 `pool->lock`）：它们要去掉的是 `pool->lock` 读侧，而 android13-5.15 的 `mm/zsmalloc.c` **整文件没有 `pool->lock`**（五条基线 grep 均为 0）——见「排除记录」。**未做性能 A/B，不主张提速**
 
@@ -190,6 +191,22 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
   **第三种**。硬移植 patch 1 还要动 handle 编码，而 5.15 的 obj bit 0 是 `HANDLE_PIN_BIT`
   （迁移路径 `trypin_tag()` 取到后才改写 PFN），等于零收益纯风险。Batch 33 只取 patch 3。
   证据：`research/zsmalloc_lockfree/*.patch` + 本节 §2 的逐符号核对
+- [-] `7a1eb89f7918` + `d5ea5e5e50df`（mainline readahead 窗口系列「Reintroduce fix for
+  improper RA window sizing」，v6.14，Jan Kara）：**排除（前提不存在）**。这两条针对的是
+  5.18 readahead 重构之后的形态——patch 1 要删掉 `read_pages()` 里「回调没读满就缩窗」的
+  `rac->ra->size -= nr`，patch 2 要修 `page_cache_ra_order()` 的 fallback 分支。而
+  android13-5.15 的 `mm/readahead.c`：**`read_pages()` 里一处 `ra->size`/`async_size` 写入都没有**
+  （167/178/194/216 四档 `grep` 均为 0），**整文件没有 `page_cache_ra_order()`**（该函数 5.18 才有）。
+  5.15 的对应路径是 `page_cache_ra_unbounded()`，它自己就按
+  `i = ractl->_index + ractl->_nr_pages - index - 1` 跳过已在页缓存里的页。两条都没有可改的文本，
+  故不注册组
+- [-] `0faa77afe72b`（mainline「filemap: optimize folio refount update in filemap_map_pages」，
+  v6.18，Jinjiang Tu）：**排除（前提不存在）**。它省的是 `filemap_map_folio_range()` /
+  `filemap_map_order0_folio()` 里「先 `folio_ref_add`」与 `filemap_map_pages()` 里
+  「再 `folio_put`」那对重复更新。5.15 的 `filemap_map_pages()` 仍是单页 `head` /
+  `first_map_page()` 形态，**没有那两个 helper**（四档 `grep` 均为 0），页引用由
+  `next_uptodate_page()` 取走后直接转移给 PTE 映射（成功路径不 `put_page()`，失败路径才放），
+  净引用本来就是 1。无载体，故不注册组
 - [-] 4edae3ff6d4e mark_victim tracepoint：AOSP 2024-11 树已自带
 - [-] `1119609dce0875`（ACK：「EEVDF scheduling fail → 取 leftmost」）：**已覆盖**。选择器的 `if (!best)` leftmost 回退早在 `scripts/batch15_perf_eevdf.py:1138`（效果等价于它的 hunk 1），hunk 2 依赖 5.15 没有的 `se->sched_delayed`，而它那条 `printk_deferred` 照抄会误报（我们的 skip 判定在扫描**内**）；本次只补上缺的钉子。逐调用点核对与理由见 `docs/survey_eevdf_gap.md` §7.1
 - [-] mm/kfence：5.15.y 无特性提交

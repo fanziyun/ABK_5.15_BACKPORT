@@ -67,6 +67,14 @@ GROUP_COUNTS = {
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
     #
+    # Batch 35 adds four groups, all landing on every baseline: the two
+    # page-cache shadow-entry sweeps (61c663e020d2, then d3db2c042591 which
+    # refactors its partner's helper) and the MADV_DONTNEED pair
+    # (6375e95f381e's empty-PTE-page reclaim, then 43c4cfde7e37's batched TLB
+    # flush).  None of the four has a Cc: stable, and android13-5.15 carries
+    # none of the substrate they touch.  The three readahead/filemap commits of
+    # the same area are *not* registered -- no baseline has a carrier for them
+    # (see the exclusion record in plan.md).
     # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
     # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
     # diverged), so the rolling lts row cannot arrive pre-applied either -- and
@@ -74,14 +82,18 @@ GROUP_COUNTS = {
     # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
     # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
     # non-LSE fallback path is untouched on cores without FEAT_LSE.
-    # The Batch-35 FUSE write-path prefault (fuse_prefault_out_of_write_path)
+    # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
+    # from 40 to 41) + Batch 34's successor 35 (four page-cache/page-table
+    # groups) + the Batch-36 FUSE write-path prefault below.
+    #
+    # The Batch-36 FUSE write-path prefault (fuse_prefault_out_of_write_path)
     # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
     # with no Cc: stable, so no 5.15 tree carries it, and its two anchors are
     # byte-identical on all four.  It is also the module's first group in
-    # fs/fuse/, so nothing else writes the file.  The count is Batch 33 + the
-    # two groups that landed in parallel as "Batch 34" (this one renamed to 35
-    # because the arm64 LSE one merged first).
-    "stable_backport_core": 42,
+    # fs/fuse/, so nothing else writes the file.  Renumbered twice: the arm64
+    # LSE group took "Batch 34" and the page-cache/page-table one took 35 while
+    # this branch was open, so this one is 36.
+    "stable_backport_core": 46,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

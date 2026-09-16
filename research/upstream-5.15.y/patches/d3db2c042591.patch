@@ -1,0 +1,131 @@
+From d3db2c0425915f6b0f273770feee2e2f97dba6a3 Mon Sep 17 00:00:00 2001
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Date: Wed, 25 Sep 2024 15:47:16 -0700
+Subject: [PATCH] mm: optimize invalidation of shadow entries
+
+The kernel invalidates the page cache in batches of PAGEVEC_SIZE.  For
+each batch, it traverses the page cache tree and collects the entries
+(folio and shadow entries) in the struct folio_batch.  For the shadow
+entries present in the folio_batch, it has to traverse the page cache tree
+for each individual entry to remove them.  This patch optimize this by
+removing them in a single tree traversal.
+
+To evaluate the changes, we created 200GiB file on a fuse fs and in a
+memcg.  We created the shadow entries by triggering reclaim through
+memory.reclaim in that specific memcg and measure the simple
+fadvise(DONTNEED) operation.
+
+ # time xfs_io -c 'fadvise -d 0 ${file_size}' file
+
+              time (sec)
+Without       5.12 +- 0.061
+With-patch    4.19 +- 0.086 (18.16% decrease)
+
+Link: https://lkml.kernel.org/r/20240925224716.2904498-3-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Chris Mason <clm@fb.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Omar Sandoval <osandov@osandov.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+ mm/truncate.c | 46 ++++++++++++++++++----------------------------
+ 1 file changed, 18 insertions(+), 28 deletions(-)
+
+diff --git a/mm/truncate.c b/mm/truncate.c
+index 1d51c023d9c5a6..520c8cf8f58f4a 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -23,42 +23,28 @@
+ #include <linux/rmap.h>
+ #include "internal.h"
+ 
+-/*
+- * Regular page slots are stabilized by the page lock even without the tree
+- * itself locked.  These unlocked entries need verification under the tree
+- * lock.
+- */
+-static inline void __clear_shadow_entry(struct address_space *mapping,
+-				pgoff_t index, void *entry)
+-{
+-	XA_STATE(xas, &mapping->i_pages, index);
+-
+-	xas_set_update(&xas, workingset_update_node);
+-	if (xas_load(&xas) != entry)
+-		return;
+-	xas_store(&xas, NULL);
+-}
+-
+ static void clear_shadow_entries(struct address_space *mapping,
+-				 struct folio_batch *fbatch, pgoff_t *indices)
++				 unsigned long start, unsigned long max)
+ {
+-	int i;
++	XA_STATE(xas, &mapping->i_pages, start);
++	struct folio *folio;
+ 
+ 	/* Handled by shmem itself, or for DAX we do nothing. */
+ 	if (shmem_mapping(mapping) || dax_mapping(mapping))
+ 		return;
+ 
+-	spin_lock(&mapping->host->i_lock);
+-	xa_lock_irq(&mapping->i_pages);
++	xas_set_update(&xas, workingset_update_node);
+ 
+-	for (i = 0; i < folio_batch_count(fbatch); i++) {
+-		struct folio *folio = fbatch->folios[i];
++	spin_lock(&mapping->host->i_lock);
++	xas_lock_irq(&xas);
+ 
++	/* Clear all shadow entries from start to max */
++	xas_for_each(&xas, folio, max) {
+ 		if (xa_is_value(folio))
+-			__clear_shadow_entry(mapping, indices[i], folio);
++			xas_store(&xas, NULL);
+ 	}
+ 
+-	xa_unlock_irq(&mapping->i_pages);
++	xas_unlock_irq(&xas);
+ 	if (mapping_shrinkable(mapping))
+ 		inode_add_lru(mapping->host);
+ 	spin_unlock(&mapping->host->i_lock);
+@@ -481,7 +467,9 @@ unsigned long mapping_try_invalidate(struct address_space *mapping,
+ 
+ 	folio_batch_init(&fbatch);
+ 	while (find_lock_entries(mapping, &index, end, &fbatch, indices)) {
+-		for (i = 0; i < folio_batch_count(&fbatch); i++) {
++		int nr = folio_batch_count(&fbatch);
++
++		for (i = 0; i < nr; i++) {
+ 			struct folio *folio = fbatch.folios[i];
+ 
+ 			/* We rely upon deletion not changing folio->index */
+@@ -508,7 +496,7 @@ unsigned long mapping_try_invalidate(struct address_space *mapping,
+ 		}
+ 
+ 		if (xa_has_values)
+-			clear_shadow_entries(mapping, &fbatch, indices);
++			clear_shadow_entries(mapping, indices[0], indices[nr-1]);
+ 
+ 		folio_batch_remove_exceptionals(&fbatch);
+ 		folio_batch_release(&fbatch);
+@@ -612,7 +600,9 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
+ 	folio_batch_init(&fbatch);
+ 	index = start;
+ 	while (find_get_entries(mapping, &index, end, &fbatch, indices)) {
+-		for (i = 0; i < folio_batch_count(&fbatch); i++) {
++		int nr = folio_batch_count(&fbatch);
++
++		for (i = 0; i < nr; i++) {
+ 			struct folio *folio = fbatch.folios[i];
+ 
+ 			/* We rely upon deletion not changing folio->index */
+@@ -658,7 +648,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
+ 		}
+ 
+ 		if (xa_has_values)
+-			clear_shadow_entries(mapping, &fbatch, indices);
++			clear_shadow_entries(mapping, indices[0], indices[nr-1]);
+ 
+ 		folio_batch_remove_exceptionals(&fbatch);
+ 		folio_batch_release(&fbatch);

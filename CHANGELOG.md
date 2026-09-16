@@ -349,110 +349,11 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
-<a id="batch-34"></a>
-
-## Batch 34(v0.36.0)
-
-**未做设备 A/B,不主张提速。全部上游证据(SRCU 发现与 fentry 回归 alike)都来自 Neoverse V2 /
-ARM 服务器核,本模块目标是 Qualcomm Snapdragon,收益迁移性未经验证。上游该 commit 后来造成过
-实测回归(见 §3),本批把它连同「为何不适用于 5.15 arm64」一起归档。**
-
-mainline `535fdfc5a228`(v6.18,Catalin Marinas;Will Deacon 经 arm64-fixes 收,
-2025-11-11;Reported-by / Tested-by Paul E. McKenney,Reviewed-by Palmer Dabbelt)。提交本身
-**没有基准数字**:它修的是 Paul 在 SRCU 锁路径上发现的 per-CPU 原子行为问题,讨论串
-<https://lore.kernel.org/r/e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop>。
-原始 patch 存 `research/upstream-5.15.y/patches/`。
-
-### 1. 机制与改动本体
-
-FEAT_LSE 下,非返回型 `this_cpu_*()` 原子编译为 STADD/STCLR/STSET;在不少微架构上这类 store
-形态倾向**「远」执行**(互联/内存子系统,除非数据已在 L1),而背靠背的 STADD(如
-`srcu_read_{lock,unlock}*()`)还要额外付默认 posting 行为的开销。load 原子(LDADD/LDCLR/LDSET,
-目的寄存器**不用但不写 XZR**)倾向**「近」执行**(L1)。per-CPU 变量极少被并发访问同一地址,
-所以上游选择鼓励硬件「近」执行。
-
-改动只在 `arch/arm64/include/asm/percpu.h`,+11/−4,两个 hunk:
-
-| hunk | 改动 |
-|---|---|
-| `__PERCPU_OP_CASE()` 的 LSE 分支 | `#op_lse "\t%" #w "[val], %[ptr]\n"` → `#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"`(store 形态 → load 形态;`[tmp]` 在输出操作数里本来就有,`"=&r"`,零新增寄存器压力) |
-| 三个 `PERCPU_OP()` 实例化 | `stadd`/`stclr`/`stset` → `ldadd`/`ldclr`/`ldset`,带上游自己的注释与 lore 链接。`PERCPU_RET_OP(add, add, ldadd)` **本来就是 ldadd,不动** |
-
-非 LSE 回退路径(stxr/ldxr 循环)逐字节不变;LSE 编码是 `ARM64_LSE_ATOMIC_INSN` 启动期
-alternative,无 FEAT_LSE 的核运行时仍走回退分支。**KMI 中性**:纯头文件 asm 宏,不动任何结构体、
-导出符号或 KABI 槽位。归 core(先例 Batch 31 的 `arm64_pte_mkwrite_clean`),组名
-`arm64_lse_percpu_load_atomics`,`scripts/batch34_core_arm64_lse_percpu.py`,2 步全 required,
-注册在 core 末尾。core **40 → 41** 组。
-
-**上游形态改写,不加 ABK 标记**(Batch 31 先例):两个 hunk 都是逐字上游原文,目标形态兼作
-幂等探针 —— 将来若某基线自带 `535fdfc5a228`,逐字节不动、报 `already_present`。
-**未进 linux-5.15.y**(gregkh/linux compare 确认:diverged),按 porting_policy 规则 2 取
-主线形态;四档基线(167/178/194/216)上 `old` 锚点与上游 old 形态**逐字节相同**(在
-android13-5.15-2025-12 的 percpu.h 上核对;8199 字节,与 kci515 参考树一致)。
-
-### 2. 落地前必须核的反面证据:上游曾因此回归
-
-bpf-next 系列「bpf: Optimize recursion detection on arm64」(merge `c2f2f005a1c2`,
-2025-12-21)在提交正文写明:Catalin 的 `535fdfc5a228` 「seems to have caused a regression on
-the fentry benchmark」,并给出 Neoverse-V2(KVM,8 CPU)上的 `bench trig-fentry`:
-
-| 形态 | 吞吐 |
-|---|---|
-| revert 掉该修复 | **51.770 M/s** |
-| bpf-next/master(含该修复) | **43.271 M/s** |
-
-同文另写明:该改动在 **x86-64 上启用会回归 30%**,所以那个 BPF 修复只在 arm64 启用;系列本身
-改用非原子方式做递归检测来补回吞吐。**这是本批最容易被漏掉的证据,归档于此。**
-
-**5.15 是否存在该回归面 —— 落地前已核,结论:不适用,但取舍照记:**
-
-- 5.15 的 `kernel/bpf/trampoline.c` **确实有**这条 per-CPU 原子递归检测路径:
-  `__bpf_prog_enter*()` 里的 `__this_cpu_inc_return(*(prog->active))` 是**返回型**
-  (`PERCPU_RET_OP`,本来就是 ldadd,不受影响);`__bpf_prog_exit*()` 里的
-  `__this_cpu_dec(*(prog->active))` 是**非返回型**,正是本批从 STADD 翻成 LDADD 的那条。
-- 但 **5.15 的 arm64 没有 BPF trampoline 支持**:`arch/arm64/net/bpf_jit_comp.c` 整文件无
-  trampoline 代码、arm64 Kconfig 无相应能力 select(两者都是更晚的上游产物),所以
-  `__bpf_prog_enter*/__bpf_prog_exit*` 在 arm64 5.15 构建里**编译了但不可达** ——
-  `bench trig-fentry` 的回归场景在这棵树上不存在。
-- 因此本组不需要写成「BPF fentry 吞吐换 SRCU 锁延迟」的取舍声明;若未来把 BPF trampoline
-  系列移植到 5.15,必须连同这条记录一起重估。SRCU 侧的收益动机(`srcu_read_{lock,unlock}` 的
-  背靠背 STADD)在 5.15 上原样成立。
-
-### 3. 证据强度(照 Batch 28 先例,如实标注)
-
-- Paul 的 SRCU 发现、上表的 fentry 回归,**全部测在 Neoverse V2 / ARM 服务器核**。
-  Snapdragon 上 store/load 形态的「远/近」执行分界是否同形,**未验证**;
-- 本批**不主张提速**(未做设备 A/B)。它记录的是:改了什么、上游证据从哪来、回归面为何
-  不适用、迁移性未知。真机 A/B(`tools/abk_fas_check.sh` 同族方法)留给后续;
-- 收益方向上对本模块有一个间接理由:本模块自己的批次大量使用 per-CPU 计数(PSI、zram 统计、
-  memcg 事件),SRCU 读锁也在调度/回收路径上 —— 但这些都不构成本批的数字依据。
-
-### 4. 审计与 trap
-
-- `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES` 三处 fixture 同步加
-  `arch/arm64/include/asm/percpu.h`(Batch 31 同款),四棵参考树**重新拉取**(旧树缺该文件,
-  审计会以 `reference tree is missing` 拒绝而不是静默);
-- `implementation_audit.py` 加 `REQUIRED_CONTENT`(load 形态指令串、三个 ld* 实例化、
-  RET_OP 的 ldadd 上下文、lore 链接 —— 后者是这条**无标记**改写留下的痕迹)与
-  `REQUIRED_ABSENT`(store 形态指令串只存在于 `__PERCPU_OP_CASE`,其缺席证明宏真的翻了;
-  三个 st* 实例化逐行钉死,半翻不能过);
-- `smoke.sh` 加同款正反断言(负向用 `grep -E` 一次挡三个 store 实例化);
-- **trap 6 全开**:该头文件被全树包含,改动落在 asm 内联里,四道纯文本审计一道也看不出宏展开
-  是否还能编译。本批的最终门槛是 **ABK CI 四档编译全绿**,文本审计绿灯不收工。
-
-### 5. 验证
-
-- 五道门禁:py_compile / bash -n / stable_5_15_test / step_audit × 4 档 /
-  implementation_audit × 4 档 / smoke × 4 档,全部在拉取的四棵参考树上跑;
-- `sublevel_matrix.py`:core `GROUP_COUNTS` 40 → 41;`PRE_APPLIED` **不变**(四档都不预装,
-  含 lts .216 —— 5.15.y 未收即滚动分支也未收);
-- `module.conf` 0.35.0 → 0.36.0。
-
 ---
 
-<a id="batch-35"></a>
+<a id="batch-36"></a>
 
-## Batch 35(v0.37.0)
+## Batch 36(v0.38.0)
 
 主题「文件系统 —— FUSE 与 erofs」。候选三条，**只落一条**：FUSE 的预缺页搬移
 （`faa794dd2e17`）。erofs 那对（`fb176750266a` + `6422cde1b0d5`）与 lib/iov_iter 的
@@ -560,14 +461,16 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
   `stable_5_15_test.py`（新增 `test_batch35_fuse_prefault_out_of_write_path`：27 项检查，含
   trap-2 互斥、「两半不许对调」、上游形态无标记、第二遍逐字节幂等、未知形状降级且不写树，
   以及那条排除守卫 —— 它同时把 `plan.md` 里的排除记录本身钉住，将来谁要移植 erofs 就得先删它
-  并证明前提）、`step_audit`（core **211 / 212 / 203 / 203** 步，四档第二遍全部幂等）、
+  并证明前提）、`step_audit`（core **245 / 246 / 237 / 237** 步，四档第二遍全部幂等）、
   `implementation_audit`（四档本组均 `applied`，并打出 upstream-shape 的
   `no module marker` 说明）、`smoke.sh`（两遍 + 回滚；core pass1 167/178 为
-  `{'applied': 42}`、194 为 `{'already_present': 3, 'applied': 39}`、216 为
-  `{'already_present': 7, 'applied': 35}`，四档 pass2 均 `{'already_present': 42}`）。
-  **这些数字是 merge `main` 之后重测的**：并行的 arm64 LSE 组先落地并占用了「Batch 34」
-  与 v0.36.0，故本批改名 **Batch 35 / v0.37.0**、core 计为 42，`step_audit` 的步数与
-  smoke 的 pass1 字典都随之各 +1（差值正是那一组）。
+  `{'applied': 46}`、194 为 `{'already_present': 3, 'applied': 43}`、216 为
+  `{'already_present': 7, 'applied': 39}`，四档 pass2 均 `{'already_present': 46}`）。
+  **这些数字是两次 merge `main` 之后重测的**：本分支开着的时候主线并行落地了两批 —— arm64
+  LSE 组取走了「Batch 34」与 v0.36.0（core 40 → 41），page-cache/page-table 组取走了 35 与
+  v0.37.0（core 41 → 45，四组），于是本批两次改名、终为 **Batch 36 / v0.38.0**，core 计为
+  **46**。`step_audit` 的步数与 smoke 的 pass1 字典都随之变动，差值全部来自那两批，
+  本组自己那两处编辑没有变。
   本批的「两半」是标准审计看不出的那种失败（少一半都能编译、行为都错），所以专门做了
   **变异验证**：把「循环头预缺页加回来」与「重试预缺页删掉」两种错法分别打进已嫁接的树，
   `REQUIRED_IN_FUNCTION` 的函数切片断言两次都报错；`smoke.sh` 的那条否定探针在原始文件上
@@ -582,9 +485,10 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
   实测用那棵临时嫁接树的输出里，归到 `fs/fuse/` 或 `fs/erofs/` 的行数为 **0**。
   连带地，`DARK_GATES` 不需要新增条目：本批**没有**新增任何 `CONFIG_EROFS_FS_*`
   （erofs 整条排除），而 GKI 的 `gki_defconfig` 里本来只有 `CONFIG_EROFS_FS=y` 这一条与 erofs 有关。
-- `GROUP_COUNTS` core 40 → **42**（本组 +1，并行落地并先合并的 arm64 LSE 组 +1）；
-  README 普查 core 40 → **41** 时只算了自己，改按合并后的 41 并补上两个新组；
-  `module.conf` 0.35.0 → **0.37.0**（单测里钉的那对版本号同步改），两个描述字段各补一句。
+- `GROUP_COUNTS` core 40 → **46**（三次并行落地各 +1，加上本组自己的 +1）；README 普查
+  同步到 core 46、合计 70，并把三次并行落地的组与本组一起补进那串枚举（主线的 README 当时
+  连它自己的 Batch 34 都没列，只算了 44）；`module.conf` 0.35.0 → **0.38.0**（单测里钉的
+  那对版本号同步改），两个描述字段各补一句。
   顺带修掉两处陈旧数字：三份文档里的「~44 files」（`FETCH_FILES` 实际已是 77 条，本批 +1 后
   78 条）统一改成 **~78**；`docs/porting_policy.md` 的基线表按 v0.37.0 重新实测
   （core 41/41/38+3/34+7、perf 23/22+1/20+3/15+8）—— 那张表标着 v0.34.0，Batch 33 落了组
@@ -643,6 +547,246 @@ Spec 轴没有推翻本批的结论 —— erofs 那对确实不能落（`fileio
   因此本组是**快路径的启发式**，不是正确性要求；本模块不主张自己独立测过这一点，
   只主张与上游 v6.16 的形态、以及 5.15 自己的锁序一致。（这条是 Spec 轴审查的产物：
   初稿把「上游 `generic_perform_write()` 不在循环头预缺页」写成了对**本树**的描述。）
+
+<a id="batch-35"></a>
+
+## Batch 35(v0.37.0)
+
+> **编号让位（已合并完成）**：本批起草时叫 Batch 34 / v0.36.0，撞上了当时并行开着的两条
+> 都自称 Batch 34 的分支（PR #12「`fuse_fill_write_pages()`」与 PR #15「arm64 load LSE
+> percpu 原子」，都基于 `110749f`，即 Batch 33 落地点）。按本仓先例（Batch 33 为三条并行
+> 批次让位三次）**改号 34 → 35、版本 0.36.0 → 0.37.0**，锚点 `#batch-35`。随后 **PR #15
+> 以 Batch 34/v0.36.0 合入 main**（PR #12 未合），本分支已 `git merge origin/main` 收进它：
+> `GROUP_COUNTS` core 由 41（对方）与本批 4 组合并为 **45**，`module.conf` 版本取 0.37.0，
+> CHANGELOG / plan.md 里两节按倒序相邻排列（`#batch-35` 在 `#batch-34` 之前）。
+
+主题「页缓存、readahead 与缺页/页表路径」。来源 torvalds/linux 原文，patch 存
+`research/upstream-5.15.y/patches/`。候选 **7 条：落地 4 条、按「前提不存在」排除 3 条**。
+落地的四条分两对，各自按上游提交顺序注册成两个组，都在 core。
+
+### 1. 三条被排除的候选：5.15 上没有载体
+
+`grep` 实测，167/178/194/216 四条基线结果一致：
+
+| 候选 | 它改的东西 | 5.15 实测 | 结论 |
+|---|---|---|---|
+| `7a1eb89f7918` readahead: don't shorten readahead window in read_pages() | 删掉 `read_pages()` 里 `rac->ra->size -= nr` 那段（回调没读满就缩窗） | `read_pages()` 里**没有任何** `ra->size`/`async_size` 写入（`grep` 0 处，五条基线同样）；那段是 5.18 readahead 重构引入的 | 缺陷在 5.15 上**不存在** |
+| `d5ea5e5e50df` readahead: properly shorten readahead when falling back to do_page_cache_ra() | 修 `page_cache_ra_order()` 的 fallback 分支（重复读已读过的页、窗口中间多插一个预读标记） | 5.15 整文件**没有** `page_cache_ra_order()`（该函数 5.18 才有）；5.15 的对应路径 `page_cache_ra_unbounded()` 本身就按 `i = ractl->_index + ractl->_nr_pages - index - 1` 跳过已在缓存里的页 | 函数不存在 |
+| `0faa77afe72b` filemap: optimize folio refount update in filemap_map_pages | 省掉 `filemap_map_folio_range()`/`filemap_map_order0_folio()` 与 `filemap_map_pages()` 之间那次「先加后减」的引用计数 | 5.15 的 `filemap_map_pages()` 仍是单页 `head`/`first_map_page()` 形态，**没有**那两个 helper（`grep` 0）；页引用由 `next_uptodate_page()` 取走，成功路径不释放（转移给 PTE 映射）、失败路径 `put_page()` —— 净引用已经是 1 | 重复更新不存在 |
+
+三条都是「前提不存在」⇒ **不注册组**（与该系列在 Batch 33 的处置同族：`zsmalloc` 系列
+patch 1/2 也是因为 `pool->lock` 在 5.15 上整文件不存在而只落 patch 3），记入 plan.md 的
+排除记录。第 1、2 条的落点还与同文件的 `dynamic_readahead_lowmem` 组对过：那组落在
+`readahead.c` 顶部的 `#include "internal.h"` 之后，与 `read_pages()`（行 128 附近）不相邻，
+锚点不互踩——但因为载体不存在，这条核对没有转化为改动。
+
+### 2. 落地明细（两对四组）
+
+| 组 | 提交 | 落点 | 做什么 |
+|---|---|---|---|
+| `truncate_shadow_batch` | `61c663e020d2`（v6.11） | `mm/truncate.c` | 一次持有 `i_pages` 锁清掉**整个 pagevec** 的影子项，而不是每项一次「取锁 → 走树 → 放锁」；删掉 `invalidate_exceptional_entry()`/`invalidate_exceptional_entry2()` 两个逐项包装，它们的 shmem/DAX 判定搬进新 helper，DAX 判定搬到 `invalidate_inode_pages2_range()` 的调用点 |
+| `truncate_shadow_batch_sweep` | `d3db2c042591`（v6.13） | `mm/truncate.c` | 重构上一组写下的 helper：`xas_for_each()` 一次遍历 pagevec 的 `[start, max]` 索引区间，取代每项一次 `__clear_shadow_entry()`；两个调用点改用 `indices[0]`/`indices[nr-1]`，两个循环因此多一个 `int nr = pagevec_count(&pvec);` |
+| `madvise_pt_reclaim` | `6375e95f381e`（v6.14） | `include/linux/mm.h`、`mm/internal.h`、`mm/memory.c`、`mm/madvise.c` | `MADV_DONTNEED` 把刚清空的**PTE 页**还给 buddy：`zap_details` 加 `bool reclaim_pt`，`zap_pte_range()` 尾部在 `addr == end` 时调 `try_to_free_pte()`（持 pmd 锁重扫 `PTRS_PER_PTE` 项，全 none 才 `pmd_clear()` + `pte_free_tlb()` + `mm_dec_nr_ptes()`） |
+| `madvise_batch_tlb_flush` | `43c4cfde7e37`（v6.16） | `mm/internal.h`、`mm/memory.c`、`mm/madvise.c` | 一次 `madvise(MADV_DONTNEED)` 的 TLB flush 收进**一个** `mmu_gather`：`zap_page_range_single()` 拆成「取 gather 的壳」与 `zap_page_range_single_batched()`（喂 gather），`do_madvise()` 取/收 gather 并用 `madvise_batch_tlb_flush()` 决定是否批 |
+
+第 4 条提交里记录的那次 **11 秒 soft-lockup**（`watchdog: BUG: soft lockup - CPU#29 stuck for
+11s! [fio]`，栈为 `clear_shadow_entry` → `mapping_try_invalidate` → `invalidate_mapping_pages`
+→ `invalidate_bdev` → `blkdev_common_ioctl`）就是第一对的动因：不是每项一次持锁慢，而是
+**每项一次「持锁 + 走树」**，文件一大就把一个 CPU 钉在里面。
+
+#### 2.1 5.15 形状差异（逐符号核对，不是照抄；本模块一贯做法）
+
+第一对（mm/truncate.c）：
+
+| 上游写法 | 5.15 对应 |
+|---|---|
+| `struct folio_batch` / `folio_batch_count()` | `struct pagevec` / `pagevec_count()`（5.15 还没有 folio_batch） |
+| patch 5 用 `xas_lock_irq(&xas)` | `xa_lock_irq(&mapping->i_pages)`（两者等价；取后者与该文件其余部分一致，且 5.15 的 xarray 头就带 `XA_STATE` 迭代） |
+| `clear_shadow_entry()` 里另有 `spin_lock(&mapping->host->i_lock)` 与 `mapping_shrinkable()`/`inode_add_lru()` | 5.15 的对应函数**两者都没有**（那是 5.15 之后加的）⇒ 不引入，port 只做「一次持锁 + 一次遍历」 |
+| patch 5 删掉 `__clear_shadow_entry()` | **保留**：5.15 的 truncate 路径 `truncate_exceptional_pvec_entries()` 还在用它（四条基线行 93/96 各一处），而那条路先取页面锁，与这里要解决的不是同一条 |
+
+第二对（缺页/页表路径）：
+
+| 上游写法 | 5.15 对应 |
+|---|---|
+| `try_get_and_clear_pmd()` 快路径（`pmdp_get_lockless()` 无锁读 pmd，锁内试锁） | 5.15 **没有** `pmdp_get_lockless()`（四条基线 `grep` 0）⇒ 只落上游自己的 fallback `try_to_free_pte()`：它持 pmd 锁后重扫整页，因而**不依赖** zap 循环是否漏项（上游为快路径额外维护的 `any_skipped`/`can_reclaim_pt` 在 5.15 形状里不需要） |
+| `pte_offset_map_rw_nolock()` 返回 ptl，再 `if (ptl != pml) spin_lock_nested()` | `ptl = pte_lockptr(mm, pmd)` + `start_pte = pte_offset_map(pmd, addr)`，同样的 `if (ptl != pml)`。5.15 的 `pmd_lockptr()` 取**承载 pmd 项的那张表页**的锁、`ptlock_ptr()` 取 pmd **指向的**表页的锁，split ptlocks 下两者不同；折叠配置下相同，`if` 就是为此 |
+| `should_zap_cows()` 加 `details->reclaim_pt` 分支、调用点写 `even_cows = true` | 不需要：5.15 的 `should_zap_cows()` 返回 `!details->check_mapping`，`check_mapping` 为空本来就是一齐 zap |
+| 新建 `mm/pt_reclaim.c` + `mm/Kconfig` 的 `PT_RECLAIM`/`ARCH_SUPPORTS_PT_RECLAIM` + `mm/Makefile` | 不新建文件、不引入 Kconfig：三个 helper 都是 `static` 且只被 `mm/memory.c` 用。**上游 6.14 把 PT_RECLAIM 挂在 `ARCH_SUPPORTS_PT_RECLAIM` 上，而 arm64 当时没有选它**；本端口只落持锁路径（不需要 `pmdp_get_lockless()` 那类 arch 支持），而真正的内存安全前提 `MMU_GATHER_RCU_TABLE_FREE` 由 arm64 无条件 `select`（`arch/arm64/Kconfig:202`），与上游 Kconfig 的 `select` 是同一条 |
+| `free_pte()` = `pte_free_tlb()` + `mm_dec_nr_ptes()` | 同，但**多一层本树特有的屏障**：`free_pte_page()` 照抄 `free_pte_range()` 的 `#ifdef CONFIG_SPECULATIVE_PAGE_FAULT`（先取放一次 pmd 锁；`ALLOC_SPLIT_PTLOCKS` 下再 `smp_call_function(wait_for_smp_sync, …)`），因为本树允许一个不持 pmd 锁的读者握着 pte 表页的 ptl —— 上游 helper 没有对应物 |
+| `struct madvise_behavior` 携带 `*tlb` | 5.15 没有这个结构体 ⇒ `struct mmu_gather *tlb` 显式穿到 `madvise_walk_vmas()` 的 visit 回调（`NULL` = 不批），两个回调（`madvise_vma_behavior`、CONFIG_ANON_VMA_NAME 的 `madvise_vma_anon_name`）一起改签名 |
+| `madvise_batch_tlb_flush()` 列 `MADV_DONTNEED`/`MADV_DONTNEED_LOCKED`/`MADV_FREE` | 只列 `MADV_DONTNEED`：5.15 **没有** `MADV_DONTNEED_LOCKED`（`grep` 0），而 `madvise_free_single_vma()` 在 5.15 仍自己取/收 gather，批它属另一笔 |
+| `MADV_DONTNEED` 走 `zap_page_range_single()`（上游早已如此） | 5.15 走**多 VMA** 的 `zap_page_range()` ⇒ 本批先用 `zap_page_range_single()`（去掉 `static`、在 `mm/internal.h` 声明，即上游 6.x 的形状）把它换成能带 `zap_details` 的单 VMA 入口。**等价性**：`madvise_walk_vmas()` 交给该回调的 `end <= vma->vm_end`，而 `zap_page_range()` 的 `for ( ; vma && vma->vm_start < range.end; vma = vma->vm_next)` 在这个条件下恰好只跑一次 |
+
+### 3. 试错记录
+
+**3a. `new` 块是 `old` 块的子串 ⇒ 整步静默跳过。** 把 `zap_page_range_single()` 由
+`static void …` 改成 `void …` 时，`new`（`"void zap_page_range_single(struct
+vm_area_struct *vma, …)`）**逐字包含于**原始行的 `"static void zap_page_range_single(…)"`，
+`replace_once` 先查 `new` ⇒ 报 `already_present`、什么都没改，而组状态仍是 `applied`。
+`step_audit` 的 trap-1 检查抓住了它（`replacement block already exists in pristine mm/memory.c`）。
+修法：把上方的 kernel-doc 末两行（`" * The range must fit into one VMA.\n */\n"`）一起放进
+`old`/`new`，两个块就不再互为子串。这是 AGENTS.md trap 1 的一个新面孔——**不是「new 太常见」，
+而是「new 是 old 去掉一个存储类」**，正好落在「前缀」这一类里。
+
+**3b. 负向探针被自己的注释骗过（Batch 33 §3 的同族，第二次）。** `smoke.sh` 里
+`grep -q "invalidate_exceptional_entry"` 直接红，因为删掉那两个函数的**替换文本自己**
+在注释里写了它们的名字。与 Batch 33 的 `__free_zspage`/`free_zspage` 是同一族教训：
+**正向锚点要够宽才唯一，负向探针要够窄才有效**。改为 `"static int invalidate_exceptional_entry"`。
+同一族还出现两次：单测里数 `__clear_shadow_entry(` 时把注释里的名字也数了进去（改成带
+调用形状的 `"\t__clear_shadow_entry(mapping, index, page);"`）；`truncate_shadow_batch_sweep`
+的负向探针则换成带缩进的整行。
+
+**3c. 新函数插在别人 kernel-doc 与函数体之间。** 第一版把 `zap_page_range_single_batched()`
+与 `madvise_batch_tlb_flush()` 插在各自前一个函数的 `/** … */` 之后，于是那份 kerneldoc
+挂到了新函数上（名字对不上）。两处都改为**追加到前一个函数之后**（`memory.c` 把 batched
+半段放到 `zap_page_range_single()` 之后；`madvise.c` 把 `madvise_batch_tlb_flush()` 放到
+`madvise_walk_vmas()` 之后），这是 `apply_patch` 语义下的可见副作用，四道门禁都看不见。
+
+**3d. 参考树被自己写坏一次。** 用「非 dry-run」的调试脚本对 `build/abk-trees/167` 跑了全部
+组，把 35 个文件改成嫁接后的形态（`.abk-orig` 一起留下）。发现后删目录重拉。教训写在这里：
+**对着 `build/abk-trees/*` 跑组只能带 `--dry-run`**，其余入口（`smoke.sh`、
+`implementation_audit.py`）都在临时副本上工作，这也是它们安全的原因。顺带发现这批参考树里有
+43 个文件被 fetch 过程前置了 6 字节垃圾（`44 44 8e 51 10 84`），已删掉重拉并复验全树 UTF-8 可解。
+
+### 4. 验证
+
+- **五道门禁（本地可跑的四道 + 逐档全部基线）**：`py_compile`、`bash -n`（含 mksh 口径的
+  tools/ksu 脚本）、`stable_5_15_test.py`（新增 `test_batch35_pagecache_pt`：**191 项检查**，
+  含 trap-2 互斥、「两个调用点的替换文本必须逐字不同」、四个 trap-5 探针的**行为**断言
+  （载荷在 → `True`，不在 → `False`）、`zap_page_range_single` 那一步的锚点形状、以及一对
+  影子项组在合成树上的端到端与第二遍幂等）、`step_audit`（core **241 / 242 / 233 / 233** 步，
+  四档第二遍全部幂等）、`implementation_audit`（四档四组均 `applied`；新增 REQUIRED_CONTENT
+  四组、REQUIRED_ABSENT 三组、REQUIRED_IN_FUNCTION 三组——后者按函数切片钉「判定在
+  `zap_pte_range()` 尾部」「空判定在 `pmd_clear()` 之前」「`free_pte_page()` 带 SPECULATIVE
+  屏障」「gather 由调用方持有」）、`smoke.sh`（两遍 + 回滚；167/178 core pass1
+  `{'applied': 44}` → pass2 `{'already_present': 44}`，194 pass1
+  `{'applied': 41, 'already_present': 3}` → pass2 44，216 pass1
+  `{'applied': 37, 'already_present': 7}` → pass2 44；`mm/truncate.c` 与 `include/linux/mm.h`
+  的回滚逐字节比对已加入）。四组都不在任何基线的 `PRE_APPLIED` 里，`KNOWN_DEBT` 仍为空。
+- **`config_gate_audit.py` 未跑**：它要一份构建产物的 `.config`，本机没有构建树（与 Batch 32
+  同一处置）。本批**不引入任何 Kconfig 符号**，新增行也不引用任何配置门内符号：唯一的新
+  `#ifdef CONFIG_SPECULATIVE_PAGE_FAULT` 块内部的 `wait_for_smp_sync`/`smp_call_function`
+  本来就在同一个门内（`free_pte_range()` 的既有用法），`#if ALLOC_SPLIT_PTLOCKS` 同层。
+  真正的编译门是 ABK CI 的那次构建。
+- 参考树要补两个文件：`mm/truncate.c`、`include/linux/mm.h`（已进三处 fixture 列表：
+  `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES`）。
+- `GROUP_COUNTS` core 40 → **44**；`module.conf` 0.35.0 → **0.37.0**；registry 未新增 KMI 槽、
+  config 符号或导出符号（`zap_page_range_single()` 由 `static` 变外部链接，但它不是
+  `EXPORT_SYMBOL`，不进 KMI）。
+
+### 5. 已知边界
+
+- **不主张提速。** 第一对的上游数字（200GiB fuse 文件上 `fadvise(DONTNEED)` 5.12s → 4.19s）
+  与第二对的（50G mmap 循环里 VmPTE 102640KB → 240KB）都是上游合成负载，本机一次都没测；
+  本批交付的是「同样的活少走一遍树」与「空 PTE 页会还回去」，不是设备侧数字。
+- **`madvise_pt_reclaim` 是这批里最需要真机验证的一条。** 它动的是缺页/页表路径的
+  `pmd_clear()` + 释放页表，风险不在文本审计能覆盖的范围（本模块的既有先例是 MADV_COLLAPSE
+  与 arm64 `pte_mkwrite()`）。四条基线都不带上游那个 arch 门，接的是 arm64 的
+  `MMU_GATHER_RCU_TABLE_FREE`；真机上建议先跑 `MADV_DONTNEED` 密集的分配器负载（ART /
+  jemalloc 场景）再上。
+- 只批 `MADV_DONTNEED`。`MADV_FREE` 在 5.15 仍按 VMA 各自 flush，`MADV_DONTNEED_LOCKED`
+  在这个基线上不存在；两者都是「另一笔」而不是「漏了」。
+- 四条都没进 `mm/filemap.c` 与 `mm/readahead.c`：本批在这两个文件上**零改动**，Batch 30
+  的 `readahead_mmap_miss_race` 仍是该文件唯一的组。
+<a id="batch-34"></a>
+
+## Batch 34(v0.36.0)
+
+**未做设备 A/B,不主张提速。全部上游证据(SRCU 发现与 fentry 回归 alike)都来自 Neoverse V2 /
+ARM 服务器核,本模块目标是 Qualcomm Snapdragon,收益迁移性未经验证。上游该 commit 后来造成过
+实测回归(见 §3),本批把它连同「为何不适用于 5.15 arm64」一起归档。**
+
+mainline `535fdfc5a228`(v6.18,Catalin Marinas;Will Deacon 经 arm64-fixes 收,
+2025-11-11;Reported-by / Tested-by Paul E. McKenney,Reviewed-by Palmer Dabbelt)。提交本身
+**没有基准数字**:它修的是 Paul 在 SRCU 锁路径上发现的 per-CPU 原子行为问题,讨论串
+<https://lore.kernel.org/r/e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop>。
+原始 patch 存 `research/upstream-5.15.y/patches/`。
+
+### 1. 机制与改动本体
+
+FEAT_LSE 下,非返回型 `this_cpu_*()` 原子编译为 STADD/STCLR/STSET;在不少微架构上这类 store
+形态倾向**「远」执行**(互联/内存子系统,除非数据已在 L1),而背靠背的 STADD(如
+`srcu_read_{lock,unlock}*()`)还要额外付默认 posting 行为的开销。load 原子(LDADD/LDCLR/LDSET,
+目的寄存器**不用但不写 XZR**)倾向**「近」执行**(L1)。per-CPU 变量极少被并发访问同一地址,
+所以上游选择鼓励硬件「近」执行。
+
+改动只在 `arch/arm64/include/asm/percpu.h`,+11/−4,两个 hunk:
+
+| hunk | 改动 |
+|---|---|
+| `__PERCPU_OP_CASE()` 的 LSE 分支 | `#op_lse "\t%" #w "[val], %[ptr]\n"` → `#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"`(store 形态 → load 形态;`[tmp]` 在输出操作数里本来就有,`"=&r"`,零新增寄存器压力) |
+| 三个 `PERCPU_OP()` 实例化 | `stadd`/`stclr`/`stset` → `ldadd`/`ldclr`/`ldset`,带上游自己的注释与 lore 链接。`PERCPU_RET_OP(add, add, ldadd)` **本来就是 ldadd,不动** |
+
+非 LSE 回退路径(stxr/ldxr 循环)逐字节不变;LSE 编码是 `ARM64_LSE_ATOMIC_INSN` 启动期
+alternative,无 FEAT_LSE 的核运行时仍走回退分支。**KMI 中性**:纯头文件 asm 宏,不动任何结构体、
+导出符号或 KABI 槽位。归 core(先例 Batch 31 的 `arm64_pte_mkwrite_clean`),组名
+`arm64_lse_percpu_load_atomics`,`scripts/batch34_core_arm64_lse_percpu.py`,2 步全 required,
+注册在 core 末尾。core **40 → 41** 组。
+
+**上游形态改写,不加 ABK 标记**(Batch 31 先例):两个 hunk 都是逐字上游原文,目标形态兼作
+幂等探针 —— 将来若某基线自带 `535fdfc5a228`,逐字节不动、报 `already_present`。
+**未进 linux-5.15.y**(gregkh/linux compare 确认:diverged),按 porting_policy 规则 2 取
+主线形态;四档基线(167/178/194/216)上 `old` 锚点与上游 old 形态**逐字节相同**(在
+android13-5.15-2025-12 的 percpu.h 上核对;8199 字节,与 kci515 参考树一致)。
+
+### 2. 落地前必须核的反面证据:上游曾因此回归
+
+bpf-next 系列「bpf: Optimize recursion detection on arm64」(merge `c2f2f005a1c2`,
+2025-12-21)在提交正文写明:Catalin 的 `535fdfc5a228` 「seems to have caused a regression on
+the fentry benchmark」,并给出 Neoverse-V2(KVM,8 CPU)上的 `bench trig-fentry`:
+
+| 形态 | 吞吐 |
+|---|---|
+| revert 掉该修复 | **51.770 M/s** |
+| bpf-next/master(含该修复) | **43.271 M/s** |
+
+同文另写明:该改动在 **x86-64 上启用会回归 30%**,所以那个 BPF 修复只在 arm64 启用;系列本身
+改用非原子方式做递归检测来补回吞吐。**这是本批最容易被漏掉的证据,归档于此。**
+
+**5.15 是否存在该回归面 —— 落地前已核,结论:不适用,但取舍照记:**
+
+- 5.15 的 `kernel/bpf/trampoline.c` **确实有**这条 per-CPU 原子递归检测路径:
+  `__bpf_prog_enter*()` 里的 `__this_cpu_inc_return(*(prog->active))` 是**返回型**
+  (`PERCPU_RET_OP`,本来就是 ldadd,不受影响);`__bpf_prog_exit*()` 里的
+  `__this_cpu_dec(*(prog->active))` 是**非返回型**,正是本批从 STADD 翻成 LDADD 的那条。
+- 但 **5.15 的 arm64 没有 BPF trampoline 支持**:`arch/arm64/net/bpf_jit_comp.c` 整文件无
+  trampoline 代码、arm64 Kconfig 无相应能力 select(两者都是更晚的上游产物),所以
+  `__bpf_prog_enter*/__bpf_prog_exit*` 在 arm64 5.15 构建里**编译了但不可达** ——
+  `bench trig-fentry` 的回归场景在这棵树上不存在。
+- 因此本组不需要写成「BPF fentry 吞吐换 SRCU 锁延迟」的取舍声明;若未来把 BPF trampoline
+  系列移植到 5.15,必须连同这条记录一起重估。SRCU 侧的收益动机(`srcu_read_{lock,unlock}` 的
+  背靠背 STADD)在 5.15 上原样成立。
+
+### 3. 证据强度(照 Batch 28 先例,如实标注)
+
+- Paul 的 SRCU 发现、上表的 fentry 回归,**全部测在 Neoverse V2 / ARM 服务器核**。
+  Snapdragon 上 store/load 形态的「远/近」执行分界是否同形,**未验证**;
+- 本批**不主张提速**(未做设备 A/B)。它记录的是:改了什么、上游证据从哪来、回归面为何
+  不适用、迁移性未知。真机 A/B(`tools/abk_fas_check.sh` 同族方法)留给后续;
+- 收益方向上对本模块有一个间接理由:本模块自己的批次大量使用 per-CPU 计数(PSI、zram 统计、
+  memcg 事件),SRCU 读锁也在调度/回收路径上 —— 但这些都不构成本批的数字依据。
+
+### 4. 审计与 trap
+
+- `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES` 三处 fixture 同步加
+  `arch/arm64/include/asm/percpu.h`(Batch 31 同款),四棵参考树**重新拉取**(旧树缺该文件,
+  审计会以 `reference tree is missing` 拒绝而不是静默);
+- `implementation_audit.py` 加 `REQUIRED_CONTENT`(load 形态指令串、三个 ld* 实例化、
+  RET_OP 的 ldadd 上下文、lore 链接 —— 后者是这条**无标记**改写留下的痕迹)与
+  `REQUIRED_ABSENT`(store 形态指令串只存在于 `__PERCPU_OP_CASE`,其缺席证明宏真的翻了;
+  三个 st* 实例化逐行钉死,半翻不能过);
+- `smoke.sh` 加同款正反断言(负向用 `grep -E` 一次挡三个 store 实例化);
+- **trap 6 全开**:该头文件被全树包含,改动落在 asm 内联里,四道纯文本审计一道也看不出宏展开
+  是否还能编译。本批的最终门槛是 **ABK CI 四档编译全绿**,文本审计绿灯不收工。
+
+### 5. 验证
+
+- 五道门禁:py_compile / bash -n / stable_5_15_test / step_audit × 4 档 /
+  implementation_audit × 4 档 / smoke × 4 档,全部在拉取的四棵参考树上跑;
+- `sublevel_matrix.py`:core `GROUP_COUNTS` 40 → 41;`PRE_APPLIED` **不变**(四档都不预装,
+  含 lts .216 —— 5.15.y 未收即滚动分支也未收);
+- `module.conf` 0.35.0 → 0.36.0。
 
 <a id="batch-33"></a>
 

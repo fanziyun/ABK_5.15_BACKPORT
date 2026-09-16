@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.37.0", "0.37.0"], _versions)
+          _versions == ["0.38.0", "0.38.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4758,174 +4758,216 @@ def test_batch33_zsmalloc_free_out_of_lock():
               ctx_bare.read(b33.ZSMALLOC_C) == "static int x;\n")
 
 
-# The region the Batch-34 group owns, in the 5.15 page form (upstream's hunk is
-# the 6.x folio form and anchors nowhere here).  Synthetic on purpose: the real
-# anchors are proven against a fetched tree by step_audit.py.
-_BATCH35_FUSE_FILL_WRITE_PAGES = (
-    "static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,\n"
-    "\t\t\t\t     struct address_space *mapping,\n"
-    "\t\t\t\t     struct iov_iter *ii, loff_t pos,\n"
-    "\t\t\t\t     unsigned int max_pages)\n"
-    "{\n"
-    "\tstruct fuse_args_pages *ap = &ia->ap;\n"
-    "\tsize_t count = 0;\n"
-    "\tint err;\n"
-    "\n"
-    "\tdo {\n"
-    "\t\tsize_t tmp;\n"
-    "\t\tstruct page *page;\n"
-    "\t\tpgoff_t index = pos >> PAGE_SHIFT;\n"
-    "\t\tsize_t bytes = min_t(size_t, PAGE_SIZE - offset,\n"
-    "\t\t\t\t     iov_iter_count(ii));\n"
-    "\n"
-    "\t\tbytes = min_t(size_t, bytes, fc->max_write - count);\n"
-    "\n"
-    " again:\n"
-    "\t\terr = -EFAULT;\n"
-    "\t\tif (fault_in_iov_iter_readable(ii, bytes))\n"
-    "\t\t\tbreak;\n"
-    "\n"
-    "\t\terr = -ENOMEM;\n"
-    "\t\tpage = grab_cache_page_write_begin(mapping, index, 0);\n"
-    "\t\tif (!page)\n"
-    "\t\t\tbreak;\n"
-    "\n"
-    "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);\n"
-    "\t\tflush_dcache_page(page);\n"
-    "\n"
-    "\t\tif (!tmp) {\n"
-    "\t\t\tunlock_page(page);\n"
-    "\t\t\tput_page(page);\n"
-    "\t\t\tgoto again;\n"
-    "\t\t}\n"
-    "\n"
-    "\t\terr = 0;\n"
-    "\t\tcount += tmp;\n"
-    "\t} while (iov_iter_count(ii) && count < fc->max_write &&\n"
-    "\t\t ap->num_pages < max_pages && offset == 0);\n"
-    "\n"
-    "\treturn count > 0 ? count : err;\n"
-    "}\n"
-)
-
-
-def test_batch35_fuse_prefault_out_of_write_path():
-    """Batch 35: the FUSE write path prefaults only on a no-progress retry.
-
-    Three things this group gets wrong silently, so all three are pinned here
-    rather than only on a real tree: the *pairing* (either half alone compiles
-    and is wrong -- dropping the loop-head fault keeps the extra userspace
-    touch, adding the retry fault without dropping it faults twice), the
-    *absence* of an ABK marker (an upstream-shape rewrite must leave a baseline
-    that already carries faa794dd2e17 byte-identical), and the *scope* of the
-    batch (the erofs half is excluded, and an erofs or fs/super.c group
-    reappearing unnoticed is exactly how that exclusion would regress).
-    """
-    print("Batch 35 fuse_fill_write_pages() prefault move (upstream-shape rewrite)")
+def test_batch35_pagecache_pt():
+    """Batch 35: shadow-entry sweeps + the MADV_DONTNEED page-table pair."""
+    print("Batch 35: shadow-entry sweeps + MADV_DONTNEED page tables")
     import abk_stable_core as core
-    import abk_stable_display as display
-    import abk_stable_perf as perf
-    import batch35_core_fuse_erofs as b34
+    import batch35_core_pagecache_pt as b34
 
-    group = next((g for g in core.PATCH_GROUPS
-                  if g.key == "fuse_prefault_out_of_write_path"), None)
-    check("fuse_prefault_out_of_write_path group registered", group is not None)
-    if group is None:
-        return
-    check("group owns only fs/fuse/file.c",
-          group.files == [b34.FUSE_FILE_C], group.files)
-    check("the upstream commit is recorded",
-          any("faa794dd2e17" in c for c in group.commits), group.commits)
+    keys = [g.key for g in core.PATCH_GROUPS]
+    groups = {g.key: g for g in core.PATCH_GROUPS}
+    for key in ("truncate_shadow_batch", "truncate_shadow_batch_sweep",
+                "madvise_pt_reclaim", "madvise_batch_tlb_flush"):
+        check(f"{key} group registered", key in groups)
 
-    steps = b34.build_steps()
-    check("two required steps", len(steps) == 2
-          and all(req for _r, _o, _n, req in steps),
-          [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
-    for i, (_rel, _old, new_i, _req) in enumerate(steps):
-        for j in range(i + 1, len(steps)):
-            check("step %d new does not contain step %d new" % (i, j),
-                  steps[j][2] not in new_i)
-    # Each step owns one half of the pair, and the halves must not be swapped:
-    # step 0 removes the loop-head prefault, step 1 adds the retry one.
-    check("step 0 removes the loop-head prefault",
-          b34.LOOP_HEAD_PREFAULT in steps[0][1]
-          and b34.LOOP_HEAD_PREFAULT not in steps[0][2], steps[0][1][:60])
-    check("step 1 adds the prefault to the no-progress branch",
-          b34.RETRY_PREFAULT in steps[1][2]
-          and b34.RETRY_PREFAULT not in steps[1][1], steps[1][2][:60])
-    for _rel, _old, new, _req in steps:
-        check("graft text carries no ABK marker (upstream-shape)",
-              "ABK stable_515_backport" not in new, new[:60])
+    # Each pair has to be registered in dependency order: the second group of
+    # the pair rewrites text the first one wrote, and both first groups probe
+    # their own payload so the second pass stops there (trap 5).
+    check("the sweep group follows the batch group",
+          keys.index("truncate_shadow_batch")
+          < keys.index("truncate_shadow_batch_sweep"))
+    check("the tlb group follows the reclaim group",
+          keys.index("madvise_pt_reclaim")
+          < keys.index("madvise_batch_tlb_flush"))
+    check("the reclaim group does not own mm/truncate.c",
+          "mm/truncate.c" not in groups["madvise_pt_reclaim"].files)
+    check("the tlb group owns the three files it rewrites",
+          groups["madvise_batch_tlb_flush"].files
+          == ["mm/internal.h", "mm/memory.c", "mm/madvise.c"],
+          groups["madvise_batch_tlb_flush"].files)
+
+    # Trap 2 inside each group: no step may build its replacement out of a
+    # later step's (the batch clear and the call-site rewrites are four
+    # near-identical blocks, so this is exactly where it would happen).
+    for key, builder in (
+            ("truncate_shadow_batch", b34.build_shadow_batch_steps),
+            ("truncate_shadow_batch_sweep", b34.build_shadow_sweep_steps),
+            ("madvise_pt_reclaim", b34.build_pt_reclaim_steps),
+            ("madvise_batch_tlb_flush", b34.build_tlb_batch_steps)):
+        steps = builder()
+        check(f"{key}: every step is required",
+              all(req for _rel, _old, _new, req in steps),
+              [(rel, req) for rel, _o, _n, req in steps])
+        for i, (_rel, _old, new_i, _req) in enumerate(steps):
+            for j in range(i + 1, len(steps)):
+                check("%s: step %d new does not contain step %d new"
+                      % (key, i, j), steps[j][2] not in new_i)
+
+    # Trap 1: the two group-4 call-site rewrites share one replacement text
+    # (`clear_shadow_entries(mapping, indices[0], indices[nr-1]);`), which
+    # replace_once would short-circuit on after the first one landed.  They are
+    # distinguished by carrying the surrounding lines, so the two blocks must
+    # differ textually.
+    check("the two sweep call-site steps are textually distinct",
+          b34._SWEEP_BIP_CALL_NEW != b34._SWEEP_IIP_CALL_NEW)
+    check("the two sweep loop steps are textually distinct",
+          b34._SWEEP_BIP_LOOP_NEW != b34._SWEEP_IIP_LOOP_NEW)
+    # ... and the same for the two clear steps of the first group.
+    check("the two batch clear steps are textually distinct",
+          b34._BIP_CLEAR_NEW != b34._IIP_CLEAR_NEW)
+    # The one-line signature steps: the new form of zap_page_range_single() is
+    # a substring of the pristine `static void ...` line, so the block has to
+    # carry the doc comment above it or replace_once reports already_present.
+    check("the zap_page_range_single step is anchored above the signature",
+          b34._ZPS_OLD.startswith(" * The range must fit into one VMA."),
+          b34._ZPS_OLD[:40])
+    check("... and its replacement is not a substring of the pristine line",
+          b34._ZPS_NEW not in b34._ZPS_OLD)
+
+    # The trap-5 probes, asserted by behaviour rather than by source: a deleted
+    # probe is invisible on the first pass (the pair still applies) and only the
+    # second pass fails -- for the truncate pair with a blocked_by_shape, for the
+    # others with a duplicated definition reaching the compiler.
+    class _ProbeCtx:
+        def __init__(self, texts):
+            self._texts = texts
+
+        def read(self, rel):
+            return self._texts[rel]
+
+    probe_cases = (
+        (b34._shadow_batch_probe, b34.TRUNCATE,
+         b34._BATCH_FN_OLD, b34._SWEEP_FN_NEW),
+        (b34._shadow_sweep_probe, b34.TRUNCATE,
+         b34._SWEEP_FN_OLD, b34._SWEEP_FN_NEW),
+        (b34._pt_reclaim_probe, b34.MM_H, b34._ZD_OLD, b34._ZD_NEW),
+        (b34._tlb_batch_probe, b34.MADVISE, "static int x;\n",
+         b34.MADVISE_TLB_GATHER),
+    )
+    for probe, rel, before, after in probe_cases:
+        check(f"{probe.__name__}: false before its payload lands",
+              probe(_ProbeCtx({rel: before})) is False)
+        check(f"{probe.__name__}: true once its payload is in the tree",
+              probe(_ProbeCtx({rel: after})) is True)
+    # Both groups of a pair have to probe *their own* payload: a shared probe
+    # would make the first group skip on text the second one writes.
+    check("the truncate pair uses two different probes",
+          b34._shadow_batch_probe.__name__ != b34._shadow_sweep_probe.__name__)
+    check("the batch probe stops on the pagevec form, not the sweep form",
+          b34._shadow_batch_probe(_ProbeCtx({b34.TRUNCATE: b34._SWEEP_FN_NEW}))
+          is True)
+
+    # End-to-end on a synthetic tree: the first group's pagevec helper is
+    # entirely replaced by the second group's sweep, so the *end state* of the
+    # pair is what both groups are asserted against.
+    truncate_fixture = (
+        "static inline void __clear_shadow_entry(struct address_space *mapping,\n"
+        "\t\t\t\tpgoff_t index, void *entry)\n{\n"
+        "\tXA_STATE(xas, &mapping->i_pages, index);\n"
+        "\n"
+        "\txas_set_update(&xas, workingset_update_node);\n"
+        "\tif (xas_load(&xas) != entry)\n"
+        "\t\treturn;\n"
+        "\txas_store(&xas, NULL);\n}\n"
+        "\n"
+        + b34._BATCH_FN_OLD + "\n"
+        + b34._WRAPPERS_OLD + "\n"
+        "static unsigned long __invalidate_mapping_pages(struct address_space *mapping,\n"
+        "\t\tpgoff_t start, pgoff_t end, unsigned long *nr_pagevec)\n{\n"
+        "\tpgoff_t indices[PAGEVEC_SIZE];\n"
+        "\tstruct pagevec pvec;\n"
+        "\tpgoff_t index = start;\n"
+        "\tunsigned long ret;\n"
+        + b34._BIP_DECL_OLD
+        + "\n\tpagevec_init(&pvec);\n"
+        "\twhile (find_lock_entries(mapping, index, end, &pvec, indices)) {\n"
+        "\t\tfor (i = 0; i < pagevec_count(&pvec); i++) {\n"
+        "\t\t\tstruct page *page = pvec.pages[i];\n"
+        "\t\t\tindex = indices[i];\n"
+        + b34._BIP_ENTRY_OLD
+        + "\t\t\tcount += ret;\n"
+        "\t\t}\n"
+        "\t\tpagevec_remove_exceptionals(&pvec);\n"
+        "\t\tpagevec_release(&pvec);\n"
+        "\t}\n"
+        "\treturn count;\n}\n"
+        "\n"
+        "int invalidate_inode_pages2_range(struct address_space *mapping,\n"
+        "\t\t\t\t  pgoff_t start, pgoff_t end)\n{\n"
+        "\tpgoff_t indices[PAGEVEC_SIZE];\n"
+        "\tstruct pagevec pvec;\n"
+        "\tpgoff_t index;\n"
+        "\tint i;\n"
+        "\tint ret = 0;\n"
+        + b34._IIP_DECL_OLD
+        + "\n\tpagevec_init(&pvec);\n"
+        "\tindex = start;\n"
+        "\twhile (find_get_entries(mapping, index, end, &pvec, indices)) {\n"
+        "\t\tfor (i = 0; i < pagevec_count(&pvec); i++) {\n"
+        "\t\t\tstruct page *page = pvec.pages[i];\n"
+        "\t\t\tindex = indices[i];\n"
+        + b34._IIP_ENTRY_OLD
+        + "\t\t\tunlock_page(page);\n"
+        "\t\t}\n"
+        "\t\tpagevec_remove_exceptionals(&pvec);\n"
+        "\t\tpagevec_release(&pvec);\n"
+        "\t}\n"
+        "\treturn ret;\n}\n"
+        # The truncate path keeps its own __clear_shadow_entry() caller, which
+        # is why 5.15 must not delete the helper the sweep group stops using.
+        "static void truncate_exceptional_pvec_entries(struct address_space *mapping,\n"
+        "\t\t\t\tstruct pagevec *pvec, pgoff_t *indices)\n{\n"
+        "\t__clear_shadow_entry(mapping, index, page);\n}\n"
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {b34.FUSE_FILE_C: _BATCH35_FUSE_FILL_WRITE_PAGES})
+        ctx = make_ctx(tmp, {b34.TRUNCATE: truncate_fixture})
+        group = groups["truncate_shadow_batch"]
         status, detail = group.apply_fn(ctx)
-        check("the move applies on the 5.15 page shape",
-              status == "applied", (status, detail))
-        text = ctx.read(b34.FUSE_FILE_C)
+        check("the batch group applies", status == "applied", (status, detail))
+        text = ctx.read(b34.TRUNCATE)
+        check("the pagevec helper really lands first",
+              "clear_shadow_entries(struct address_space *mapping,\n"
+              "\t\t\t\t struct pagevec *pvec, pgoff_t *indices)" in text)
+        check("the per-entry wrapper definitions are gone",
+              "static int invalidate_exceptional_entry" not in text)
+        # The needle carries the call shape: the replacement blocks *document*
+        # __clear_shadow_entry() by name in a comment, so a bare symbol count
+        # would match the comment (the same trap smoke.sh records).
+        check("the truncate path's own caller survives",
+              "truncate_exceptional_pvec_entries" in text
+              and text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
 
-        check("the loop head no longer prefaults",
-              b34.LOOP_HEAD_PREFAULT not in text)
-        check("the no-progress retry does",
-              b34.RETRY_PREFAULT in text)
-        # Pairing, restated positionally: the prefault must sit *inside* the
-        # branch that just released the page, ahead of its goto.
-        check("the prefault is inside the !tmp branch",
-              text.index("if (!tmp) {")
-              < text.index(b34.RETRY_PREFAULT)
-              < text.index("\t\t\tgoto again;"))
-        # ... and the loop head still grabs the page, i.e. the label kept the
-        # rest of its body rather than the step swallowing it.
-        check("the retry label keeps its page grab",
-              text.index(" again:")
-              < text.index("page = grab_cache_page_write_begin(mapping, index, 0);"))
-        check("err = -EFAULT survives on the retry path only",
-              text.count("err = -EFAULT;") == 1, text.count("err = -EFAULT;"))
+        sweep = groups["truncate_shadow_batch_sweep"]
+        status2, detail2 = sweep.apply_fn(ctx)
+        check("the sweep group applies on top of it",
+              status2 == "applied", (status2, detail2))
+        text = ctx.read(b34.TRUNCATE)
+        check("the pagevec form is gone from the end state",
+              "&pvec, indices);" not in text)
+        check("the sweep walks the index span once",
+              "xas_for_each(&xas, page, max)" in text)
+        check("both call sites carry the batch span",
+              text.count("clear_shadow_entries(mapping, indices[0], indices[nr-1]);")
+              == 2)
+        check("both loops index by the batch size",
+              text.count("int nr = pagevec_count(&pvec);") == 2)
+        check("__clear_shadow_entry() keeps its truncate caller",
+              text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
 
-        snapshot = ctx.read(b34.FUSE_FILE_C)
-        status2, detail2 = group.apply_fn(ctx)
-        check("second pass is a no-op", status2 == "already_present",
-              (status2, detail2))
-        check("second pass is byte-identical", ctx.read(b34.FUSE_FILE_C) == snapshot)
+        # Second pass: the earlier group has to stop on its own payload rather
+        # than re-derive anchors the sweep group consumed (trap 5).
+        for name, fn in (("batch", group), ("sweep", sweep)):
+            status3, detail3 = fn.apply_fn(ctx)
+            check(f"second pass: the {name} group is already_present",
+                  status3 == "already_present", (status3, detail3))
 
-        # A tree that lacks the anchors degrades instead of half-patching: the
-        # pair is one edit, so a partial landing is the failure this group
-        # exists to avoid.
-        ctx_bare = make_ctx(tmp + "/bare", {b34.FUSE_FILE_C: "static int x;\n"})
-        status3, detail3 = group.apply_fn(ctx_bare)
-        check("degrades on an unknown shape", status3 == "blocked_by_shape",
-              (status3, detail3))
+        # A tree that lacks the anchors degrades instead of half-patching.
+        bare = make_ctx(tmp + "/bare35", {b34.TRUNCATE: "static int x;\n"})
+        status4, _detail4 = group.apply_fn(bare)
+        check("degrades on an unknown shape", status4 == "blocked_by_shape")
         check("the degraded tree is not written",
-              ctx_bare.read(b34.FUSE_FILE_C) == "static int x;\n")
-
-    # The batch's other half is excluded, not deferred silently.  This is the
-    # guard that keeps the exclusion from regressing: an erofs group (or the
-    # fs/super.c helper it would have needed) reappearing without the
-    # prerequisite backport is a mount whose every inode returns -EOPNOTSUPP.
-    groups = list(core.PATCH_GROUPS) + list(perf.PATCH_GROUPS) + \
-        list(display.PATCH_GROUPS)
-    stray = sorted({rel for g in groups for rel in g.files
-                    if rel.startswith("fs/erofs/") or rel == "fs/super.c"}
-                   | {g.key for g in groups if "erofs" in g.key})
-    check("no group grafts erofs file-backed mounts (excluded, see plan.md)",
-          not stray, stray)
-    check("no group grafts lib/iov_iter (5.15 lacks the bug it fixes)",
-          not [rel for g in groups for rel in g.files
-               if rel == "lib/iov_iter.c"])
-    check("no group grafts FUSE passthrough (android13-5.15 ships its own)",
-          not [k for k in (g.key for g in groups) if "passthrough" in k])
-
-    # The exclusion is part of the deliverable, so the record itself is pinned:
-    # a future batch that ports the erofs pair has to delete these lines and
-    # prove the prerequisites, rather than discover the gap at compile time.
-    plan = (Path(__file__).resolve().parent.parent / "plan.md").read_text(
-        encoding="utf-8")
-    for needle in ("fb176750266a", "6422cde1b0d5", "770c8d55c428",
-                   "fs/erofs/fileio.c"):
-        check("plan.md records the %s exclusion" % needle, needle in plan)
-    check("plan.md records the FUSE passthrough non-goal",
-          "passthrough" in plan and "_IOW(229,126)" in plan)
+              bare.read(b34.TRUNCATE) == "static int x;\n")
 
 
 def main():
@@ -4979,7 +5021,7 @@ def main():
     test_batch30_readahead_mmap_miss_race()
     test_batch31_arm64_pte_mkwrite_clean()
     test_batch33_zsmalloc_free_out_of_lock()
-    test_batch35_fuse_prefault_out_of_write_path()
+    test_batch35_pagecache_pt()
 
     print()
     if FAILURES:
