@@ -75,8 +75,22 @@
 
 ## 4. 一次性前置（**配齐之前不要合并到 main**）
 
-1. **secret `ABK_CI_TOKEN`** —— fine-grained PAT，只授权 `fanziyun/ABK`，权限只要 **Actions: read/write**。
+1. **secret `ABK_CI_TOKEN`** —— fine-grained PAT：**Repository access 只选 `fanziyun/ABK`**，
+   **Repository permissions 只勾 `Actions: Read and write`**，别的一个都不要给。
    `pull_request_target` 自带的 `GITHUB_TOKEN` 只能写本仓库，派发不了别的仓库的工作流，所以必须要它。
+
+   它在这个工作流里只干三件事：**派发** ABK 构建、**读** ABK 的 run/jobs/日志、取消**它自己派发过**的被顶替 run。
+
+   | 权限 | 给不给 | 原因 |
+   | --- | --- | --- |
+   | `Actions: Read and write` | ✅ 给 | 派发构建 + 读 run/日志 + 取消自己那次被顶替的 run |
+   | `Metadata: Read-only` | 自动带上 | fine-grained PAT 的强制项，只读仓库元数据 |
+   | `Contents` | ❌ 不给 | 读 `module.conf` 用本仓库的 `github.token`；读 ABK 侧工作流源码走匿名 CDN（第 7 节第 4 条） |
+   | `Pull requests` | ❌ 不给 | 评论与 status 全部用本仓库 `github.token` 写 |
+   | `Workflows` / `Administration` / `Secrets` / `Variables` / `Webhooks` | ❌ 不给 | 本工作流不碰 |
+
+   一句话：**它只能触发/取消 `fanziyun/ABK` 的 Actions 并读它的日志，写不了任何代码，也开不了、审不了、
+   合不了 PR**（那是 `Contents` 与 `Pull requests` 权限，都没给）。过期时间挑 30–90 天，到期换新。
 2. **var `ABK_CI_WORKFLOW_REF`** —— 目前填 `ci/module-ref-pin`；ABK PR #5 合并后删掉（不设即默认 `dev`）。
 3. **var `ABK_CI_EXTRA_MODULES`**（可选）—— 与出厂构建同形的其它模块描述符，换行分隔，留空＝只注入本仓库 child
    （**留空不等于出厂组合**，见第 9 节）。
@@ -91,6 +105,18 @@ gh secret set ABK_CI_TOKEN --repo $R          # 粘贴 PAT（只授权 fanziyun/
 gh variable set ABK_CI_WORKFLOW_REF --repo $R --body ci/module-ref-pin
 gh variable set ABK_CI_EXTRA_MODULES --repo $R --body ""   # 可选
 gh label create ci:compile --repo $R --description "fork PR 触发 ABK 编译门禁" --color 0e8a16
+```
+
+建好 PAT 后自己验一遍「它做不到什么」。公开仓库本来就人人可读，所以真正要守住的是**写**：
+
+```bash
+P=<新 PAT>
+# 应当成功 —— 这正是门禁唯一需要的能力
+GH_TOKEN=$P gh api "repos/fanziyun/ABK/actions/runs?per_page=1" --jq '.workflow_runs[0].id'
+# 以下都应当被拒（404/403）——写代码、开/合 PR、改仓库设置
+GH_TOKEN=$P gh api -X PUT repos/fanziyun/ABK/contents/abk-ci-probe.txt -f message=probe -f content=eA==
+GH_TOKEN=$P gh pr close 3 --repo fanziyun/ABK
+GH_TOKEN=$P gh api -X PATCH repos/fanziyun/ABK -f description=probe
 ```
 
 前置没配齐就合并，效果是**每个 PR 立刻红**，描述是 `没配置 ABK_CI_TOKEN`。这是有意的：
@@ -120,10 +146,16 @@ require 选 **`ABK kernel compile (android13-5.15-lts)`**（有编译结论的�
 2. PAT 只进需要它的 step：job 级 `GH_TOKEN` 是 `ABK_CI_TOKEN`，而**读 PR 内容**（`module.conf`）和
    **解析日志**的两步把它覆盖成 `github.token`；写 PR 评论/状态的步骤也用 `github.token`。
    往 job 级 env 里塞新东西（或给这两步改回 PAT）之前，先想清楚这一步会不会拿到 PR 控制的输入。
-3. `;ref=refs/pull/<N>/head` 只让 ABK 去 clone PR 的 ref，不改变上面两条。secret 只授 `fanziyun/ABK` 的 Actions 读写。
-4. `ABK_CI_EXTRA_MODULES` 是「把任意模块描述符塞进 ABK 构建」的开关（仓库 variable 只有维护者能改）—— 改它等于
+3. `;ref=refs/pull/<N>/head` 只让 ABK 去 clone PR 的 ref，不改变上面两条。secret 只授 `fanziyun/ABK` 的
+   `Actions` 读写 —— **不要顺手给它 `Contents`**：PAT 能写代码，这个 secret 就从「能派发构建」升级成
+   「能改 fanziyun/ABK 的源码」，而门禁一行都不需要它（第 4 节第 1 条的权限表）。
+4. **凭据最小化是刻意做出来的，别改回去**：契约预检读的是 ABK 侧工作流的源码，走的是
+   `raw.githubusercontent.com` 的**匿名** CDN（公开仓库人人可读），不用 token；
+   早先那版用 `gh api .../contents`，那需要 `Contents: read`。同理，读本仓库的 `module.conf` 也只用
+   `github.token`。加任何新的跨仓库读取之前先问一句：这一步非用那个 PAT 不可吗？
+5. `ABK_CI_EXTRA_MODULES` 是「把任意模块描述符塞进 ABK 构建」的开关（仓库 variable 只有维护者能改）—— 改它等于
    决定 ABK 构建机上会跑谁的代码，所以它和 secret 一样是可信输入，别开放给 PR 作者。
-5. 评论内容含 ABK 日志原文，而日志里有 PR 作者控制的部分：证据行会先剥掉 markdown 围栏与 `<!--` 注释，
+6. 评论内容含 ABK 日志原文，而日志里有 PR 作者控制的部分：证据行会先剥掉 markdown 围栏与 `<!--` 注释，
    就地更新只认 `github-actions[bot]` 自己发的评论，避免被劫持。
 
 ## 8. 排查表（描述 → 原因 → 处理）
