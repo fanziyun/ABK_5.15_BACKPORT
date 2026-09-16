@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.39.0", "0.39.0"], _versions)
+          _versions == ["0.40.0", "0.40.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4758,6 +4758,189 @@ def test_batch33_zsmalloc_free_out_of_lock():
               ctx_bare.read(b33.ZSMALLOC_C) == "static int x;\n")
 
 
+def _batch37_memory_reclaim_fixture(b37):
+    """A synthetic ``memory_reclaim()`` in the shape memcg_memory_reclaim makes.
+
+    Assembled out of the batch module's own pre-image constants, so the fixture
+    cannot drift from the anchors the steps are written against (the module's
+    `_*_OLD` blocks are exactly what the group before each one leaves behind).
+    """
+    return (
+        b37._TOKENS_OLD
+        + "\t\t\t      size_t nbytes, loff_t off)\n"
+        "{\n"
+        + b37._PARSER_OLD
+        + "\n"
+        + b37._BATCH_DECL_OLD
+        + b37._SIGNAL_OLD
+        + "\t\t * hope of introducing more evictable pages for\n"
+        "\t\t * try_to_free_mem_cgroup_pages().\n"
+        "\t\t */\n"
+        "\t\tif (!nr_retries)\n"
+        "\t\t\tlru_add_drain_all();\n"
+        "\n"
+        + b37._CALL_OLD
+        + "\n"
+        "\t\tif (!reclaimed && !nr_retries--)\n"
+        "\t\t\treturn -EAGAIN;\n"
+        "\n"
+        "\t\tnr_reclaimed += reclaimed;\n"
+        "\t}\n"
+        "\n"
+        "\treturn nbytes;\n"
+        "}\n"
+    )
+
+
+def test_batch37_reclaim_paths():
+    """Batch 37: the memory.reclaim chain plus the lru_add drain filter."""
+    print("Batch 37: proactive reclaim's batch, swappiness= and suspend abort")
+    import abk_stable_core as core
+    import batch37_core_reclaim_paths as b37
+
+    keys = ["proactive_reclaim_batch_fidelity",
+            "proactive_reclaim_decaying_batches",
+            "reclaim_swappiness_defines",
+            "proactive_reclaim_swappiness_arg",
+            "proactive_reclaim_suspend_abort",
+            "lru_add_drain_dead_folios"]
+    groups = {g.key: g for g in core.PATCH_GROUPS if g.key in keys}
+    check("all six Batch 37 groups are registered", set(groups) == set(keys),
+          sorted(groups))
+    if set(groups) != set(keys):
+        return
+    # Registration order is load-bearing (trap 5): each superseded group must
+    # run before the group that rewrites its output, and the defines must
+    # precede the parser that validates against them.
+    order = [g.key for g in core.PATCH_GROUPS if g.key in keys]
+    check("the chain is registered in dependency order", order == keys, order)
+    for group in groups.values():
+        check(f"{group.key} declares its own files",
+              group.files and all(isinstance(f, str) for f in group.files),
+              group.files)
+
+    # Trap 2 across the whole chain: no step may build its replacement out of a
+    # later step's replacement, which replace_once would short-circuit.
+    chain_steps = [dict(zip(["rel", "old", "new", "req"], s))
+                   for s in b37.build_steps_batch_fidelity()]
+    chain_steps += [dict(zip(["rel", "old", "new", "req"], s))
+                    for s in b37.build_steps_decaying_batches()]
+    chain_steps += [dict(zip(["rel", "old", "new", "req"], s))
+                    for s in b37.build_steps_swappiness_arg()]
+    for i, a in enumerate(chain_steps):
+        for j, b in enumerate(chain_steps):
+            if i >= j or a["rel"] != b["rel"]:
+                continue
+            check(f"chain step {i} does not contain step {j}",
+                  not (a["new"] in b["new"] and i < j)
+                  and not (b["new"] in a["new"] and j < i))
+
+    # Trap 5, first link: the memcg group must stop on its own handler.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/memcontrol.c":
+                             b37.MEMORY_RECLAIM_MARKER + "\n"
+                             "static ssize_t memory_reclaim(struct kernfs_open_file *of,"
+                             " char *buf,\n"})
+        status, _detail = core._memcg_reclaim_apply(ctx)
+        check("memcg_memory_reclaim stops on its own marker",
+              status == "already_present" and ctx.pending_writes() == [],
+              (status, ctx.pending_writes()))
+
+    # ...and the two superseded groups in the middle of the chain.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/memcontrol.c": b37.DECAYING_BATCH_DECL})
+        status, _d = groups["proactive_reclaim_batch_fidelity"].apply_fn(ctx)
+        check("the fixed cap does not reappear once the batch decays",
+              status == "already_present" and ctx.pending_writes() == [], status)
+        status2, _d2 = groups["proactive_reclaim_decaying_batches"].apply_fn(ctx)
+        check("the decaying batch is recognised on a second pass",
+              status2 == "already_present" and ctx.pending_writes() == [], status2)
+
+    # End to end over a synthetic handler: the four groups in chain order.
+    fixture = _batch37_memory_reclaim_fixture(b37)
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "mm/memcontrol.c": (
+                fixture
+                + b37._INCLUDE_OLD
+                + b37._SWAPPINESS_WRITE_OLD
+                + b37._CALL_RECLAIM_HIGH_OLD + b37._CALL_TRY_CHARGE_OLD
+                + b37._CALL_RESIZE_MAX_OLD + b37._CALL_FORCE_EMPTY_OLD
+                + b37._CALL_HIGH_WRITE_OLD + b37._CALL_MAX_WRITE_OLD),
+            "mm/vmscan.c": (
+                b37._SC_FIELD_OLD + b37._SC_HELPER_OLD + b37._SC_HELPER_NO_MEMCG_OLD
+                + b37._GET_SCAN_COUNT_OLD + b37._SWAPPINESS_LITERAL_FP_OLD
+                + b37._GET_SWAPPINESS_OLD
+                + b37._TTFMCP_OLD + "};\n}\n"
+                + b37._SHOULD_ABORT_OLD),
+            "include/linux/swap.h": b37._DEFINES_OLD + b37._PROTO_OLD,
+            "Documentation/admin-guide/cgroup-v2.rst": b37._DOC_OLD,
+        })
+        for key in keys[:5]:
+            status, detail = groups[key].apply_fn(ctx)
+            check(f"{key} applies over the synthetic handler",
+                  status == "applied", (status, detail))
+        mc = ctx.read("mm/memcontrol.c")
+        vm = ctx.read("mm/vmscan.c")
+        check("the batch decays rather than capping",
+              b37.DECAYING_BATCH_DECL in mc and b37.SWAP_CLUSTER_BATCH not in mc)
+        check("the swappiness key is parsed and reaches the reclaim call",
+              b37.SWAPPINESS_ARG in mc and '"swappiness=%d"' in mc)
+        check("the freezer's signal is not converted to -EINTR",
+              b37.SUSPEND_ABORT_ERRNO in mc
+              and "return -EINTR;" not in mc.split("memory_reclaim")[-1])
+        check("the scan balance and the MGLRU abort both learned about it",
+              "sc_swappiness(sc, memcg)" in vm
+              and b37.SUSPEND_ABORT_GUARD in vm)
+        check("the manual documents the nested key",
+              "Swappiness value to reclaim with"
+              in ctx.read("Documentation/admin-guide/cgroup-v2.rst"))
+
+        snap = {rel: ctx.read(rel) for rel in ctx.pending_writes()}
+        for key in keys[:5]:
+            status, detail = groups[key].apply_fn(ctx)
+            check(f"{key} is idempotent", status == "already_present", (status, detail))
+        for rel, text in snap.items():
+            check(f"second pass is byte-identical for {rel}", ctx.read(rel) == text)
+
+    # The lru_add filter, in 5.15's pagevec shape.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/swap.c": b37._LRU_ADD_OLD + b37._RELEASE_OLD})
+        status, detail = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
+        check("the dead-page filter applies", status == "applied", (status, detail))
+        swap = ctx.read("mm/swap.c")
+        check("a page on its last reference is taken out of the add batch",
+              b37.DEAD_PAGE_FILTER in swap
+              and "free_unref_page_list(&pages_to_free);" in swap)
+        # The two flags the page no longer clears through __pagevec_lru_add_fn().
+        check("the flags the LRU add would have cleared are cleared here",
+              "__ClearPageActive(page);" in swap
+              and "__ClearPageUnevictable(page);" in swap)
+        # Deliberate 5.15 omission: upstream's deferred-split unqueue touches
+        # page[2], which for the order-0 pages that really linger in the batch
+        # is a neighbouring allocation -- not a list head.  The added comment
+        # names the helper, so the assertion is on the *call*, not the name.
+        check("the deferred-split unqueue is not carried onto the page API",
+              "folio_unqueue_deferred_split(folio);" not in swap
+              and "list_del(page_deferred_list(page));" not in swap)
+        check("release_pages() tolerates the vacated slot",
+              "if (!page)\n\t\t\tcontinue;" in swap)
+        snapshot = ctx.read("mm/swap.c")
+        status2, _d2 = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
+        check("the lru_add group is idempotent", status2 == "already_present", status2)
+        check("the lru_add group's second pass is byte-identical",
+              ctx.read("mm/swap.c") == snapshot)
+
+    # Degradation, not half-patching: an unknown shape must not be written.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/swap.c": "static int x;\n"})
+        status, _d = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
+        check("the lru_add group degrades on an unknown shape",
+              status == "blocked_by_shape", status)
+        check("the degraded tree is not written",
+              ctx.read("mm/swap.c") == "static int x;\n")
+
+
 def test_batch35_pagecache_pt():
     """Batch 35: shadow-entry sweeps + the MADV_DONTNEED page-table pair."""
     print("Batch 35: shadow-entry sweeps + MADV_DONTNEED page tables")
@@ -5021,6 +5204,7 @@ def main():
     test_batch30_readahead_mmap_miss_race()
     test_batch31_arm64_pte_mkwrite_clean()
     test_batch33_zsmalloc_free_out_of_lock()
+    test_batch37_reclaim_paths()
     test_batch35_pagecache_pt()
 
     print()

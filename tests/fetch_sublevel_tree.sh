@@ -128,6 +128,8 @@ FETCH_FILES=(
   # Batch 35: the FUSE write-path prefault (faa794dd2e17).  The module's first
   # group in fs/fuse/ -- the file is the whole group.
   fs/fuse/file.c
+  # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
+  mm/swap.c
 )
 
 decode() {

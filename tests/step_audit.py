@@ -180,6 +180,8 @@ AUDIT_FILES = [
     # Batch 35: the FUSE write-path prefault (faa794dd2e17), the module's first
     # group in fs/fuse/.
     "fs/fuse/file.c",
+    # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
+    "mm/swap.c",
 ]
 
 CHILD_MODULES = [

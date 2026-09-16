@@ -349,7 +349,7 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
-<a id="batch-37"></a>
+<a id="batch-37-mglru"></a>
 
 ## Batch 37(v0.39.0)
 
@@ -482,6 +482,62 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
   implementation_audit 的 REQUIRED_CONTENT 检查器随之扩展出 (rel, needle)
   逐文件形式（向后兼容，两批共用）。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
+---
+
+<a id="batch-37"></a>
+
+## Batch 37(v0.39.0)
+
+> **编号让位（已合并完成）**：本批起草时叫 Batch 34 / v0.36.0，与同时并行开着的两条
+> 都自称 Batch 34 的分支撞号（PR #12「`fuse_fill_write_pages()`」与 PR #15「arm64
+> load LSE percpu 原子」，都基于 `110749f`，即 Batch 33 落地点）。按本仓先例改号
+> 34 → **37**、版本 0.36.0 → **0.39.0**，锚点 `#batch-37`：主线用 34/v0.36.0 落了 arm64
+> LSE、35/v0.37.0 落了 page-cache/page-table 那一对、36/v0.38.0 落了 FUSE 预缺页，本批
+> 排在它们之后。`GROUP_COUNTS` core 由 46 计为 **52**（主线 46 + 本批六组），四节按倒序
+> 相邻排列（`#batch-37` 在 `#batch-36` 之前）。
+
+内存回收路径系列六组，全部落在 `mm/` 的主动回收（`memory.reclaim`）与页面归还热路径上。原始补丁均来自
+`torvalds/linux` 归档在 `research/upstream-5.15.y/patches/`，通过 `python research/hunks.py` 转换。
+六个 commit 按依赖与调用链顺序排列（`0388536ac291`、`287d5fedb377`、`410abb20acae`、`68cd9050d871`、
+`dc37771a43d4`、`9669b87065a6`）。
+
+### 1. 为什么这六个 commit 是一条不可分割的链条
+
+| # | commit | 版本 | 角色 |
+|---|---|---|---|
+| 1 | `0388536ac291` | v6.6 | 修复主动回收严重过量：单次调用限制在 `SWAP_CLUSTER_MAX`（32 页） |
+| 2 | `287d5fedb377` | v6.9 | `Fixes: 0388536ac291`：32 页固定批量启动停止开销过大，改成衰减批量 `(reclaim-reclaimed)/4` |
+| 3 | `410abb20acae` | v6.11 | 新增 `MIN_SWAPPINESS 0` / `MAX_SWAPPINESS 200` 宏，第 4 条的语法解析器直接引用它们 |
+| 4 | `68cd9050d871` | v6.11 | `memory.reclaim` 新增 `swappiness=` 嵌套键（改写 UAPI，同步改 `Documentation/admin-guide/cgroup-v2.rst`） |
+| 5 | `dc37771a43d4` | v7.2 | `Fixes: 287d5fedb377`：suspend 冻结提早中止主动回收，返回 `-ERESTARTSYS` 使系统恢复后透明重试 |
+| 6 | `9669b87065a6` | v7.2 | `mm/swap.c` `lru_add` 批次提早释放死页面，免去两次无意义的 `lruvec` 锁竞争 |
+
+- **第 1、2 条必须同批**：第 1 条把批量卡死在 32 页，大请求吞吐暴跌（上游数据：整 cgroup 回收由 68047 页/秒跌至 13742 页/秒）；第 2 条改成衰减批量才拉回到 67352 页/秒。单落一条是退化。
+- **第 3、4 条是同一上游系列**（Dan Schatzberg，Meta）：第 4 条的解析器 `match_int()` 后直接用 `MIN_SWAPPINESS` 与 `MAX_SWAPPINESS` 校验，第 3 条是其前置依赖。
+- **第 5 条由第 2 条引出**：第 2 条引入衰减批量后，初始单步可能高达数百 MB，MGLRU 的内层循环 `should_abort_scan()` 之前没有检查 `signal_pending`，导致 Android 设备实测触发 PM freezer 超时；本组直接配合本模块已有的 `cached_freeze_reclaim`。
+- **第 6 条单文件优化**：`mm/swap.c` 适配 5.15 的 `struct pagevec` 与 `page_ref_freeze()`，不需要任何结构体改动。
+
+### 2. 落地明细（`scripts/batch37_core_reclaim_paths.py`）
+
+新增六个 `PatchGroup`，全部编入 `core` 子脚本：
+
+1. `core:proactive_reclaim_batch_fidelity`：改写 `memory_reclaim()` 内部对 `try_to_free_mem_cgroup_pages()` 的调用参数为 `min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX)`。自身探针阻止在后续组生效后重复应用。
+2. `core:proactive_reclaim_decaying_batches`：引入 `unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;`，并将调用参数改为 `batch_size`。
+3. `core:reclaim_swappiness_defines`：在 `include/linux/swap.h`、`mm/vmscan.c` 和 `mm/memcontrol.c` 中落地 `MIN_SWAPPINESS` / `MAX_SWAPPINESS` 宏及使用点。
+4. `core:proactive_reclaim_swappiness_arg`：18 步事务性替换，涉及 `include/linux/swap.h`（原型新增 `int *swappiness`）、`mm/vmscan.c`（`scan_control` 增加字段、两个 `sc_swappiness()` 访问器、`get_scan_count()`/`get_swappiness()` 接入、`try_to_free_mem_cgroup_pages()` 赋值）、`mm/memcontrol.c`（包含 `<linux/parser.h>`、六处既有调用传 NULL、parser 与 match 表、`memory_reclaim` 传参）、以及 `Documentation/admin-guide/cgroup-v2.rst`。
+5. `core:proactive_reclaim_suspend_abort`：`mm/vmscan.c` 的 `should_abort_scan()` 增加 `unlikely(sc->proactive && signal_pending(current))` 提早退出；`mm/memcontrol.c` 中的退出码由 `-EINTR` 替换为 `-ERESTARTSYS`。
+6. `core:lru_add_drain_dead_folios`：`mm/swap.c` 在 `__pagevec_lru_add()` 循环中调用 `page_ref_freeze(page, 1)` 截断死页面并清 `PG_active` 与 `PG_unevictable`，直接移入 `pages_to_free` 走 `free_unref_page_list()`；`release_pages()` 增加空槽容忍。
+
+### 3. 陷阱与处置（Trap 5 与 ACK Vendor Hook 适配）
+
+- **Trap 5（前置生成文本改写）**：`memory_reclaim()` 并非 5.15 原生函数，而是本模块 `memcg_memory_reclaim` 组生成的文本；Batch 37 的前三个组又接连三次改写该函数里的调用行。为防第二遍执行时因找不到未修改前的原块而重新追加整个函数，`memcg_memory_reclaim` 增加了基于 `MEMORY_RECLAIM_MARKER` 的幂等探针，前序被取代组也增加了对应探针。
+- **ACK Vendor Hook 形态适配**：在 `get_swappiness()` 处，167/178 基线直接返回 `mem_cgroup_swappiness(memcg)`，而 194 与 216（lts）基线带有 `trace_android_vh_tune_swappiness(&swappiness);`。`_get_swappiness_step(ctx)` 通过块探针自适应选择两套锚点之一，确保全四档基线均能精准匹配并保持幂等。
+
+### 4. 验证结论
+
+- `tests/sublevel_matrix.py`：`GROUP_COUNTS` 的 `stable_backport_core` 由 46 递增为 52，四档基线 `PRE_APPLIED` 保持全空（六组在四档均需实际落地且全部成功）。
+- 五道/七道门禁全绿：`py_compile`、`bash -n`、`stable_5_15_test.py`（167 项断言全部通过）、`step_audit.py`（四档 167/178/194/216 步数全平且二遍幂等）、`implementation_audit.py`（四档全部通过）、`smoke.sh`（四档二遍幂等 + 回滚逐字节恢复原状）、`config_gate_audit.py`（使用 216 真实 CI 配置验证无暗门与无用代码）。
+
 ---
 
 <a id="batch-36"></a>

@@ -647,45 +647,86 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
-    # Batch 36.  The tables themselves are pinned (a missing item reads as
-    # zero and neither the compile nor the structural audits can see it), the
-    # allocations must name the compact structs, and the index-table init must
-    # sit in the root css_alloc branch where upstream put its own init call.
-    "core:memcg_stats_percpu_slim": [
-        "ABK stable_515_backport: memcg_stats_percpu_slim",
-        "struct abk_vmstats_percpu",
-        "struct abk_lruvec_stats_percpu",
-        "__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
-        "__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
-        "static void init_memcg_stats(void)",
-        "static void init_memcg_events(void)",
-        "init_memcg_stats();\n\t\tinit_memcg_events();",
-        "static const unsigned int memcg_node_stat_items[] = {",
-        "static const unsigned int memcg_stat_items[] = {",
-        "static const unsigned int memcg_vm_event_items[] = {",
-
-        # The item tables, item by item: dropping any of these silently zeroes
-        # that stat.  State table = memory_stats[] + memcg1_stats[] readers
-        # (26 node items + 3 MEMCG items); events = every count_memcg_events*/
-        # writer on this baseline (13 + THP pair).
-        "NR_INACTIVE_ANON,\n\tNR_ACTIVE_ANON,\n\tNR_INACTIVE_FILE,\n\tNR_ACTIVE_FILE,\n\tNR_UNEVICTABLE,",
-        "NR_SLAB_RECLAIMABLE_B,\n\tNR_SLAB_UNRECLAIMABLE_B,",
-        "WORKINGSET_REFAULT_ANON,\n\tWORKINGSET_REFAULT_FILE,\n\tWORKINGSET_ACTIVATE_ANON,\n\tWORKINGSET_ACTIVATE_FILE,\n\tWORKINGSET_RESTORE_ANON,\n\tWORKINGSET_RESTORE_FILE,\n\tWORKINGSET_NODERECLAIM,",
-        "NR_ANON_MAPPED,\n\tNR_FILE_MAPPED,\n\tNR_FILE_PAGES,\n\tNR_FILE_DIRTY,\n\tNR_WRITEBACK,\n\tNR_SHMEM,\n\tNR_SHMEM_THPS,\n\tNR_FILE_THPS,\n\tNR_ANON_THPS,\n\tNR_KERNEL_STACK_KB,\n\tNR_PAGETABLE,",
-        "#ifdef CONFIG_SWAP\n\tNR_SWAPCACHE,\n#endif",
-        "MEMCG_SWAP,\n\tMEMCG_SOCK,\n\tMEMCG_PERCPU_B,",
-        "PGPGIN,\n\tPGPGOUT,\n\tPGFAULT,\n\tPGMAJFAULT,\n\tPGREFILL,\n\tPGSCAN_KSWAPD,\n\tPGSCAN_DIRECT,\n\tPGSTEAL_KSWAPD,\n\tPGSTEAL_DIRECT,\n\tPGACTIVATE,\n\tPGDEACTIVATE,\n\tPGLAZYFREE,\n\tPGLAZYFREED,",
-        "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n\tTHP_FAULT_ALLOC,\n\tTHP_COLLAPSE_ALLOC,\n#endif",
-
-        # The header keeps every struct member: nothing may shrink the
-        # KMI-visible aggregates (the group blob spans mm/memcontrol.c and
-        # include/linux/memcontrol.h, so plain strings pin both files).
-        # lruvec_page_state_local() moved out of line, not deleted: the
-        # prototype wrapping is the header's, the longer one the .c body's.
-        "struct lruvec_stats {\n\t/* Aggregated (CPU and subtree) state */\n\tlong state[NR_VM_NODE_STAT_ITEMS];",
-        "struct memcg_vmstats {",
-        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
-        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
+    # --- Batch 37: the memory-reclaim chain --------------------------------
+    # Six groups rewriting one path, so each entry is pinned against the blob
+    # *as it stands when that group runs* (implementation_audit applies them in
+    # registry order): 0388536ac291's cap is visible here even though the third
+    # group removes it again.
+    "core:proactive_reclaim_batch_fidelity": [
+        # 0388536ac291.  The cap is the whole commit; the group's second-pass
+        # behaviour is what DECAYING_BATCH_DECL's own entry below pins.
+        "min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),",
+    ],
+    "core:proactive_reclaim_decaying_batches": [
+        # 287d5fedb377.  Both halves: the declaration and the argument that
+        # replaced the fixed cap.  A tree with only the declaration still
+        # overreclaims; one with only the argument does not compile.
+        "/* Will converge on zero, but reclaim enforces a minimum */",
+        "unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
+        "batch_size, GFP_KERNEL, reclaim_options);",
+    ],
+    "core:reclaim_swappiness_defines": [
+        # 410abb20acae.  The two constants plus the two literals they take
+        # over on 5.15; the third hunk of that commit (the MGLRU paths) has no
+        # 200 literal here and is deliberately left byte-identical.
+        "#define MIN_SWAPPINESS 0",
+        "#define MAX_SWAPPINESS 200",
+        "\tfp = (MAX_SWAPPINESS - swappiness) * (total_cost + 1);",
+        "\tif (val > MAX_SWAPPINESS)",
+    ],
+    "core:proactive_reclaim_swappiness_arg": [
+        # 68cd9050d871.  The value has to reach the scan balance from the
+        # request, not from the memcg's own setting: the accessor, its two
+        # callers, the field, the prototype, the definition, and the parser
+        # that fills it.  A port that only adds the argument would leave
+        # get_scan_count() reading mem_cgroup_swappiness() and the knob inert.
+        "int *swappiness",
+        "int *proactive_swappiness;",
+        "static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)",
+        "int swappiness = sc_swappiness(sc, memcg);",
+        # The bare call, not the statement around it: 194/lts carry the ACK
+        # hook in get_swappiness() and take the value into a local first, so
+        # their statement reads "swappiness = sc_swappiness(...)".  The exact
+        # per-shape text is pinned in REQUIRED_IN_FUNCTION below.
+        "sc_swappiness(sc, memcg);",
+        ".proactive_swappiness = swappiness,",
+        "#include <linux/parser.h>",
+        "static const match_table_t tokens = {",
+        '{ MEMORY_RECLAIM_SWAPPINESS, "swappiness=%d"},',
+        "nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;",
+        "swappiness == -1 ? NULL : &swappiness",
+        # The seven call sites, not just memory_reclaim()'s: a missed one is a
+        # compile error, and the NULL ones are what keeps every other caller's
+        # meaning ("no override") explicit rather than accidental.
+        "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\t     NULL);",
+        "gfp_mask, reclaim_options,\n\t\t\t\t\t\t    NULL);",
+        "memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL)) {",
+        "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\tNULL);",
+        "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL);",
+        "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))",
+        # ...and the manual, which is what makes the new key a documented part
+        # of the interface rather than an undocumented argument.
+        "  swappiness            Swappiness value to reclaim with",
+    ],
+    "core:proactive_reclaim_suspend_abort": [
+        # dc37771a43d4.  Both ends: the inner-loop check and the errno the
+        # handler returns, which is what lets the syscall be restarted after
+        # resume instead of failing the suspend.
+        "if (unlikely(sc->proactive && signal_pending(current)))",
+        "return -ERESTARTSYS;",
+    ],
+    "core:lru_add_drain_dead_folios": [
+        # 9669b87065a6, in 5.15's pagevec form.  The filter, the two flags it
+        # has to clear (the page bypasses __pagevec_lru_add_fn()), the batch it
+        # is freed from, and the consumer's tolerance of the vacated slot --
+        # without the last one the drain walks a NULL pvec entry.
+        "if (page_ref_freeze(page, 1)) {",
+        "__ClearPageActive(page);",
+        "__ClearPageUnevictable(page);",
+        "list_add(&page->lru, &pages_to_free);",
+        "mem_cgroup_uncharge_list(&pages_to_free);",
+        "free_unref_page_list(&pages_to_free);",
+        "/* A drained add batch may have freed this slot already. */",
     ],
     # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
     # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
@@ -746,6 +787,53 @@ REQUIRED_CONTENT = {
         "PERCPU_RET_OP(add, add, ldadd)\n",
         "e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop",
     ],
+"core:fuse_prefault_out_of_write_path": [
+        # The pair, in the 5.15 *page* form.  Upstream's hunk is written
+        # against the 6.x folio form (__filemap_get_folio /
+        # copy_folio_from_iter_atomic), which anchors nowhere on any baseline,
+        # so the port had to be written in this spelling -- pinned because a
+        # rewrite that reads faithfully but calls the wrong helper is the one
+        # way this could land and do nothing.  Ordering and both halves are in
+        # REQUIRED_IN_FUNCTION below.
+        "while not holding the page lock:",
+        "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
+    ],
+    "core:memcg_stats_percpu_slim": [
+        "ABK stable_515_backport: memcg_stats_percpu_slim",
+        "struct abk_vmstats_percpu",
+        "struct abk_lruvec_stats_percpu",
+        "__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+        "__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+        "static void init_memcg_stats(void)",
+        "static void init_memcg_events(void)",
+        "init_memcg_stats();\n\t\tinit_memcg_events();",
+        "static const unsigned int memcg_node_stat_items[] = {",
+        "static const unsigned int memcg_stat_items[] = {",
+        "static const unsigned int memcg_vm_event_items[] = {",
+
+        # The item tables, item by item: dropping any of these silently zeroes
+        # that stat.  State table = memory_stats[] + memcg1_stats[] readers
+        # (26 node items + 3 MEMCG items); events = every count_memcg_events*/
+        # writer on this baseline (13 + THP pair).
+        "NR_INACTIVE_ANON,\n\tNR_ACTIVE_ANON,\n\tNR_INACTIVE_FILE,\n\tNR_ACTIVE_FILE,\n\tNR_UNEVICTABLE,",
+        "NR_SLAB_RECLAIMABLE_B,\n\tNR_SLAB_UNRECLAIMABLE_B,",
+        "WORKINGSET_REFAULT_ANON,\n\tWORKINGSET_REFAULT_FILE,\n\tWORKINGSET_ACTIVATE_ANON,\n\tWORKINGSET_ACTIVATE_FILE,\n\tWORKINGSET_RESTORE_ANON,\n\tWORKINGSET_RESTORE_FILE,\n\tWORKINGSET_NODERECLAIM,",
+        "NR_ANON_MAPPED,\n\tNR_FILE_MAPPED,\n\tNR_FILE_PAGES,\n\tNR_FILE_DIRTY,\n\tNR_WRITEBACK,\n\tNR_SHMEM,\n\tNR_SHMEM_THPS,\n\tNR_FILE_THPS,\n\tNR_ANON_THPS,\n\tNR_KERNEL_STACK_KB,\n\tNR_PAGETABLE,",
+        "#ifdef CONFIG_SWAP\n\tNR_SWAPCACHE,\n#endif",
+        "MEMCG_SWAP,\n\tMEMCG_SOCK,\n\tMEMCG_PERCPU_B,",
+        "PGPGIN,\n\tPGPGOUT,\n\tPGFAULT,\n\tPGMAJFAULT,\n\tPGREFILL,\n\tPGSCAN_KSWAPD,\n\tPGSCAN_DIRECT,\n\tPGSTEAL_KSWAPD,\n\tPGSTEAL_DIRECT,\n\tPGACTIVATE,\n\tPGDEACTIVATE,\n\tPGLAZYFREE,\n\tPGLAZYFREED,",
+        "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n\tTHP_FAULT_ALLOC,\n\tTHP_COLLAPSE_ALLOC,\n#endif",
+
+        # The header keeps every struct member: nothing may shrink the
+        # KMI-visible aggregates (the group blob spans mm/memcontrol.c and
+        # include/linux/memcontrol.h, so plain strings pin both files).
+        # lruvec_page_state_local() moved out of line, not deleted: the
+        # prototype wrapping is the header's, the longer one the .c body's.
+        "struct lruvec_stats {\n\t/* Aggregated (CPU and subtree) state */\n\tlong state[NR_VM_NODE_STAT_ITEMS];",
+        "struct memcg_vmstats {",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
+    ],
     "core:mglru_clean_workingset": [
         # 9cbfd1c3c83b, portable remainder: the workingset_refault() lock
         # assertion must sit at the entry, before the MGLRU dispatch, so it
@@ -774,7 +862,6 @@ REQUIRED_CONTENT = {
         # and the simplified aging verdict are the behavioural pins.  The old
         # exact-sync rule (anon min = min(anon,file), file min = max(...)) and
         # the can_swap walk field must be gone.
-        "#define MIN_SWAPPINESS 0\n#define MAX_SWAPPINESS 200",
         "unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];",
         "\tint swappiness;\n\tbool full_scan;",
         "#define evictable_min_seq(min_seq, swappiness)",
@@ -788,8 +875,6 @@ REQUIRED_CONTENT = {
         "if (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)",
         "n[2] = READ_ONCE(lrugen->protected[hist][type][tier]);",
         "int swappiness = get_swappiness(lruvec, sc);",
-        "if (!sc->may_swap)\n\t\treturn 0;",
-        "mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)",
     ],
     "core:mglru_rework_type_selection": [
         # 37a260870f2c.  The summed-tier read_ctrl_pos() loop, the 2:3 margin,
@@ -828,17 +913,6 @@ REQUIRED_CONTENT = {
         "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);",
     ],
-    "core:fuse_prefault_out_of_write_path": [
-            # The pair, in the 5.15 *page* form.  Upstream's hunk is written
-            # against the 6.x folio form (__filemap_get_folio /
-            # copy_folio_from_iter_atomic), which anchors nowhere on any baseline,
-            # so the port had to be written in this spelling -- pinned because a
-            # rewrite that reads faithfully but calls the wrong helper is the one
-            # way this could land and do nothing.  Ordering and both halves are in
-            # REQUIRED_IN_FUNCTION below.
-            "while not holding the page lock:",
-            "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
-    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -848,22 +922,6 @@ REQUIRED_CONTENT = {
 # file only, for absence claims a *neighbouring* group's legitimate content
 # in a shared file would otherwise defeat).
 REQUIRED_ABSENT = {
-    # Batch 36.  Whole-file absence of the raw per-cpu dereferences: every
-    # access now goes through the abk_ helpers, so any surviving
-    # "vmstats_percpu->" / "lruvec_stats_percpu->" field access compiles
-    # cleanly and indexes the compacted object with the old offsets.  This
-    # is the check that catches a half-converted accessor the
-    # function-scoped pins do not cover.
-    "core:memcg_stats_percpu_slim": [
-        "vmstats_percpu->state[idx]",
-        "vmstats_percpu->events[idx]",
-        "vmstats_percpu->events[event]",
-        "vmstats_percpu->nr_page_events",
-        "vmstats_percpu->targets[target]",
-        "lruvec_stats_percpu->state[idx]",
-        "alloc_percpu_gfp(struct memcg_vmstats_percpu",
-        "alloc_percpu_gfp(struct lruvec_stats_percpu",
-    ],
     "perf:psi_oncpu_state_mask": [
         # The counter and the old "identical state makes the walk safe" trick
         # have to be gone, not merely bypassed: both were the failure mode.
@@ -1096,6 +1154,26 @@ REQUIRED_ABSENT = {
         # zap_pte_range() and the whole change is a no-op.
         ["mm/madvise.c", "\tzap_page_range(vma, start, end - start);"],
     ],
+"core:fuse_prefault_out_of_write_path": [
+        # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
+        # marker-free, or a future baseline carrying the commit could not be
+        # recognised -- the module's own marker would sit *inside* the block the
+        # already_present short-circuit compares against, so that tree would
+        # report blocked_by_missing_anchor instead of already_present.  Same
+        # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
+        # is this module's only group there.
+        ["fs/fuse/file.c", "ABK stable_515_backport:"],
+    ],
+    "core:memcg_stats_percpu_slim": [
+        "vmstats_percpu->state[idx]",
+        "vmstats_percpu->events[idx]",
+        "vmstats_percpu->events[event]",
+        "vmstats_percpu->nr_page_events",
+        "vmstats_percpu->targets[target]",
+        "lruvec_stats_percpu->state[idx]",
+        "alloc_percpu_gfp(struct memcg_vmstats_percpu",
+        "alloc_percpu_gfp(struct lruvec_stats_percpu",
+    ],
     "core:mglru_rework_aging_feedback": [
         # The can_swap walk field, the exact-sync min_seq rule, the
         # tier-minus-one protection index and the boolean swappiness call
@@ -1106,7 +1184,6 @@ REQUIRED_ABSENT = {
         ["mm/vmscan.c", "min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);"],
         ["mm/vmscan.c", "get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS"],
         ["mm/vmscan.c", "swappiness > 200)"],
-        ["mm/vmscan.c", "mem_cgroup_get_nr_swap_pages(memcg) <= 0)"],
         ["mm/vmscan.c", "min_seq[!can_swap]"],
         ["mm/vmscan.c", "walk->can_swap"],
     ],
@@ -1122,16 +1199,6 @@ REQUIRED_ABSENT = {
         # The exact min_seq token match is the misattribution being fixed.
         ["mm/workingset.c",
          "if ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))"],
-    ],
-    "core:fuse_prefault_out_of_write_path": [
-            # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
-            # marker-free, or a future baseline carrying the commit could not be
-            # recognised -- the module's own marker would sit *inside* the block the
-            # already_present short-circuit compares against, so that tree would
-            # report blocked_by_missing_anchor instead of already_present.  Same
-            # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
-            # is this module's only group there.
-            ["fs/fuse/file.c", "ABK stable_515_backport:"],
     ],
 }
 
@@ -1176,17 +1243,6 @@ REQUIRED_PAIRING = {
 
 
 REQUIRED_IN_FUNCTION = {
-    "core:mglru_rework_refault_detection": [
-        # The windowed recency test must land in lru_gen_refault() itself;
-        # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
-        # the shadow token), so the absence claim cannot be file-wide.
-        ("mm/workingset.c", "lru_gen_refault",
-         ["unsigned long seq;",
-          "unsigned long diff;",
-          "if (diff >= MAX_NR_GENS)",
-          "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));"],
-         ["unsigned long min_seq;"]),
-    ],
     "perf:psi_oncpu_state_mask": [
         # The flag must be handled where the mask is built, and it must never
         # reach the task counters.
@@ -1463,79 +1519,93 @@ REQUIRED_IN_FUNCTION = {
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
     ],
-    # Batch 36.  The whole change is the mapping: per-cpu slots are compact
-    # and item-indexed, the embedded aggregates stay raw-indexed, and any
-    # accessor still touching vmstats_percpu/lruvec_stats_percpu with a raw
-    # enum index compiles cleanly and reads/writes the wrong slot.  Function
-    # scoping is what pins every site; whole-file must-not-have cannot be used
-    # because the aggregates' own raw-indexed arrays are supposed to stay.
-    "core:memcg_stats_percpu_slim": [
-        ("mm/memcontrol.c", "__mod_memcg_state",
-         ["i = memcg_stats_index(idx);",
-          "if (i < 0)",
-          "abk_vmstats_percpu_of(memcg)->state[i], val"],
-         ["vmstats_percpu->state[idx]"]),
-        ("mm/memcontrol.c", "memcg_page_state_local",
-         ["i = memcg_stats_index(idx);",
-          "abk_vmstats_percpu_of(memcg)->state[i], cpu"],
-         ["vmstats_percpu->state[idx]"]),
-        ("mm/memcontrol.c", "__mod_memcg_lruvec_state",
-         ["i = memcg_stats_index(idx);",
-          "abk_vmstats_percpu_of(memcg)->state[i], val",
-          "abk_lruvec_stats_percpu_of(pn)->state[i], val"],
-         ["vmstats_percpu->state[idx]",
-          "lruvec_stats_percpu->state[idx]"]),
-        ("mm/memcontrol.c", "__count_memcg_events",
-         ["i = memcg_events_index(idx);",
-          "abk_vmstats_percpu_of(memcg)->events[i], count"],
-         ["vmstats_percpu->events[idx]"]),
-        ("mm/memcontrol.c", "memcg_events_local",
-         ["i = memcg_events_index(event);",
-          "abk_vmstats_percpu_of(memcg)->events[i], cpu"],
-         ["vmstats_percpu->events[event]"]),
-        ("mm/memcontrol.c", "lruvec_page_state_local",
-         ["i = memcg_stats_index(idx);",
-          "abk_lruvec_stats_percpu_of(pn)->state[i], cpu"],
-         ["lruvec_stats_percpu->state[idx]"]),
-        ("mm/memcontrol.c", "mem_cgroup_css_rstat_flush",
-         ["struct abk_vmstats_percpu *statc",
-          "per_cpu_ptr(abk_vmstats_percpu_of(memcg), cpu)",
-          "for (i = 0; i < NR_MEMCG_VMSTAT_SIZE; i++)",
-          "int item = i < NR_MEMCG_NODE_STAT_ITEMS ?",
-          "memcg->vmstats.state[item] += delta",
-          "for (i = 0; i < NR_MEMCG_VM_EVENTS; i++)",
-          "int event = memcg_vm_event_items[i];",
-          "memcg->vmstats.events[event] += delta",
-          "struct abk_lruvec_stats_percpu *lstatc",
-          "per_cpu_ptr(abk_lruvec_stats_percpu_of(pn), cpu)",
-          "for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)",
-          "int item = memcg_node_stat_items[i];",
-          "pn->lruvec_stats.state[item] += delta"],
-         ["for (i = 0; i < MEMCG_NR_STAT; i++)",
-          "for (i = 0; i < NR_VM_EVENT_ITEMS; i++)",
-          "for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)"]),
-        ("mm/memcontrol.c", "mem_cgroup_charge_statistics",
-         ["abk_vmstats_percpu_of(memcg)->nr_page_events"],
-         ["vmstats_percpu->nr_page_events"]),
-        ("mm/memcontrol.c", "mem_cgroup_event_ratelimit",
-         ["abk_vmstats_percpu_of(memcg)->nr_page_events",
-          "abk_vmstats_percpu_of(memcg)->targets[target]"],
-         ["vmstats_percpu->nr_page_events",
-          "vmstats_percpu->targets[target]"]),
-        # uncharge_batch() adds to nr_page_events outside the charge/ratelimit
-        # pair; missing it compiles cleanly and corrupts the v1 page-event
-        # counters on every uncharge (the first enumeration pass missed it).
-        ("mm/memcontrol.c", "uncharge_batch",
-         ["abk_vmstats_percpu_of(ug->memcg)->nr_page_events"],
-         ["vmstats_percpu->nr_page_events"]),
-        ("mm/memcontrol.c", "alloc_mem_cgroup_per_node_info",
-         ["__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
-          "__alignof__(struct abk_lruvec_stats_percpu)"],
-         ["alloc_percpu_gfp(struct lruvec_stats_percpu"]),
-        ("mm/memcontrol.c", "mem_cgroup_alloc",
-         ["__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
-          "__alignof__(struct abk_vmstats_percpu)"],
-         ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
+    # --- Batch 37: the memory-reclaim chain, function-scoped ---------------
+    # The three groups below all rewrite memory_reclaim(), so which group got
+    # which hunk is only visible by slicing the handler: whole-file matching
+    # would pass just as happily on a tree where the cap never arrived but the
+    # parser did.  Each must_not_have is the *superseded* form, which is this
+    # batch's own failure mode -- a group whose payload a later group removed
+    # reads as "applied" from the outside.
+    "core:proactive_reclaim_batch_fidelity": [
+        # 0388536ac291's cap, inside the handler it belongs to.  The old
+        # argument is asserted gone: it is the overreclaim.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),"],
+         ["\t\t\t\t\t\tnr_to_reclaim - nr_reclaimed,\n"]),
+    ],
+    "core:proactive_reclaim_decaying_batches": [
+        # 287d5fedb377.  The decaying batch has to *replace* the fixed cap,
+        # not sit next to it, and it has to be the argument the call uses.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
+          "batch_size, GFP_KERNEL, reclaim_options);"],
+         ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX)"]),
+    ],
+    "core:proactive_reclaim_swappiness_arg": [
+        # 68cd9050d871.  The parser has to be where the bytes are read: the
+        # size still comes from the buffer, the swappiness key is matched, and
+        # the value is validated against the constants before the loop starts.
+        # must_not_have is the old single-key parse and the old -EINTR -- the
+        # latter is the *next* group's target, so it also proves this group
+        # left the failure path alone rather than half-rewriting it.
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["int swappiness = -1;",
+          "substring_t args[MAX_OPT_ARGS];",
+          "nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;",
+          "while ((start = strsep(&buf, \" \")) != NULL) {",
+          "case MEMORY_RECLAIM_SWAPPINESS:",
+          "if (swappiness < MIN_SWAPPINESS || swappiness > MAX_SWAPPINESS)",
+          "swappiness == -1 ? NULL : &swappiness);"],
+         ["page_counter_memparse(buf, \"\", &nr_to_reclaim);",
+          "return -ERESTARTSYS;"]),
+        # The accessor is only worth anything if the scan balance asks it, and
+        # the field only if the definition fills it.
+        ("mm/vmscan.c", "get_scan_count",
+         ["int swappiness = sc_swappiness(sc, memcg);"],
+         ["int swappiness = mem_cgroup_swappiness(memcg);"]),
+        # get_swappiness() too -- both shapes (167/178 return the accessor,
+        # 194/lts assign it into the local the ACK hook then tunes), and both
+        # have to stop reading the memcg's own setting.
+        ("mm/vmscan.c", "get_swappiness",
+         ["sc_swappiness(sc, memcg);"],
+         ["mem_cgroup_swappiness(memcg)"]),
+        ("mm/vmscan.c", "try_to_free_mem_cgroup_pages",
+         ["int *swappiness)",
+          ".proactive_swappiness = swappiness,"],
+         []),
+    ],
+    "core:proactive_reclaim_suspend_abort": [
+        # dc37771a43d4.  Both halves, each in the function that has to carry
+        # it: the MGLRU inner loop checks, and the handler stops converting
+        # that check into an -EINTR the freezer cannot resume from.
+        ("mm/vmscan.c", "should_abort_scan",
+         ["if (unlikely(sc->proactive && signal_pending(current)))",
+          "return true;"],
+         ["if (unlikely(sc->proactive && signal_pending(current)))\n"
+          "\t\treturn false;"]),
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["return -ERESTARTSYS;"],
+         ["return -EINTR;"]),
+    ],
+    "core:lru_add_drain_dead_folios": [
+        # 9669b87065a6 in 5.15's pagevec form.  The filter has to run *before*
+        # the lruvec is taken (that is the point: it saves the lock), the two
+        # flags have to be cleared (the page skips __pagevec_lru_add_fn()), and
+        # the filtered page has to be freed from this function -- a filter that
+        # nulls the slot without freeing leaks the page.
+        ("mm/swap.c", "__pagevec_lru_add",
+         ["if (page_ref_freeze(page, 1)) {",
+          "__ClearPageActive(page);",
+          "__ClearPageUnevictable(page);",
+          "pvec->pages[i] = NULL;",
+          "free_unref_page_list(&pages_to_free);",
+          "release_pages(pvec->pages, pvec->nr);"],
+         []),
+        # ...and the consumer has to tolerate the vacated slot, or the drain
+        # dereferences a NULL entry on the very next pagevec.
+        ("mm/swap.c", "release_pages",
+         ["if (!page)\n\t\t\tcontinue;"],
+         []),
     ],
     # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
     # change rather than a rewrite is *where* each half sits: the decision in
@@ -1620,6 +1690,85 @@ REQUIRED_IN_FUNCTION = {
           "\t\tpage = grab_cache_page_write_begin(mapping, index, 0);"],
          [" again:\n"
           "\t\terr = -EFAULT;\n"]),
+    ],
+    "core:mglru_rework_refault_detection": [
+        # The windowed recency test must land in lru_gen_refault() itself;
+        # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
+        # the shadow token), so the absence claim cannot be file-wide.
+        ("mm/workingset.c", "lru_gen_refault",
+         ["unsigned long seq;",
+          "unsigned long diff;",
+          "if (diff >= MAX_NR_GENS)",
+          "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));"],
+         ["unsigned long min_seq;"]),
+    ],
+    "core:memcg_stats_percpu_slim": [
+        ("mm/memcontrol.c", "__mod_memcg_state",
+         ["i = memcg_stats_index(idx);",
+          "if (i < 0)",
+          "abk_vmstats_percpu_of(memcg)->state[i], val"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "memcg_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], cpu"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__mod_memcg_lruvec_state",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], val",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], val"],
+         ["vmstats_percpu->state[idx]",
+          "lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__count_memcg_events",
+         ["i = memcg_events_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->events[i], count"],
+         ["vmstats_percpu->events[idx]"]),
+        ("mm/memcontrol.c", "memcg_events_local",
+         ["i = memcg_events_index(event);",
+          "abk_vmstats_percpu_of(memcg)->events[i], cpu"],
+         ["vmstats_percpu->events[event]"]),
+        ("mm/memcontrol.c", "lruvec_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], cpu"],
+         ["lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "mem_cgroup_css_rstat_flush",
+         ["struct abk_vmstats_percpu *statc",
+          "per_cpu_ptr(abk_vmstats_percpu_of(memcg), cpu)",
+          "for (i = 0; i < NR_MEMCG_VMSTAT_SIZE; i++)",
+          "int item = i < NR_MEMCG_NODE_STAT_ITEMS ?",
+          "memcg->vmstats.state[item] += delta",
+          "for (i = 0; i < NR_MEMCG_VM_EVENTS; i++)",
+          "int event = memcg_vm_event_items[i];",
+          "memcg->vmstats.events[event] += delta",
+          "struct abk_lruvec_stats_percpu *lstatc",
+          "per_cpu_ptr(abk_lruvec_stats_percpu_of(pn), cpu)",
+          "for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)",
+          "int item = memcg_node_stat_items[i];",
+          "pn->lruvec_stats.state[item] += delta"],
+         ["for (i = 0; i < MEMCG_NR_STAT; i++)",
+          "for (i = 0; i < NR_VM_EVENT_ITEMS; i++)",
+          "for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)"]),
+        ("mm/memcontrol.c", "mem_cgroup_charge_statistics",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
+        ("mm/memcontrol.c", "mem_cgroup_event_ratelimit",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events",
+          "abk_vmstats_percpu_of(memcg)->targets[target]"],
+         ["vmstats_percpu->nr_page_events",
+          "vmstats_percpu->targets[target]"]),
+        # uncharge_batch() adds to nr_page_events outside the charge/ratelimit
+        # pair; missing it compiles cleanly and corrupts the v1 page-event
+        # counters on every uncharge (the first enumeration pass missed it).
+        ("mm/memcontrol.c", "uncharge_batch",
+         ["abk_vmstats_percpu_of(ug->memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
+        ("mm/memcontrol.c", "alloc_mem_cgroup_per_node_info",
+         ["__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+          "__alignof__(struct abk_lruvec_stats_percpu)"],
+         ["alloc_percpu_gfp(struct lruvec_stats_percpu"]),
+        ("mm/memcontrol.c", "mem_cgroup_alloc",
+         ["__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+          "__alignof__(struct abk_vmstats_percpu)"],
+         ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
     ],
 }
 
