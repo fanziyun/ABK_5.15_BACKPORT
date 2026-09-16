@@ -250,6 +250,19 @@ REQUIRED_CONTENT = {
         # an ineligible current, which hides the skip buddy that
         # yield_task_fair() sets, so sched_yield() ends up weaker than stock CFS.
         "!abk_eevdf_eligible(curr, avruntime)",
+        # The null-safety guarantee, and the reason it is pinned here: ACK
+        # 1119609dce0875 ("ANDROID: if EEVDF scheduling fail, picking leftmost,
+        # to avoid NULL pointer") is the downstream mitigation for a NULL deref
+        # in pick_next_entity().  pick_next_task_fair() hands the result
+        # straight to group_cfs_rq(), so a NULL there is a fatal fault, not a
+        # fallback to idle.  The overflow that triggers it upstream
+        # (vruntime_eligible()'s ``key * load``) cannot occur here --
+        # docs/survey_eevdf_gap.md 4.3 shows abk_eevdf_eligible() is a
+        # subtraction and a sign test -- but the selector must still never
+        # return NULL when it finds no eligible entity.  This line is the whole
+        # of that guarantee, the ACK patch's hunk 1 in effect, and it is one
+        # edit away from being lost.
+        "best = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);",
         # ...and the guards that preserve a userspace-provided request size.
         "if (!se->slice)",
         # The !EEVDF halves.  See REQUIRED_PAIRING for why they are required.

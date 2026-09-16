@@ -590,6 +590,52 @@ Both are small, local, and preserve the existing anchors — worth doing as thei
 regardless of whether S3 is ever attempted, and they make S3's diff smaller by removing
 the `refresh_deadline`-in-loop pattern first.
 
+### 7.1 The overflow mitigation from the Android common kernel — **already present**
+
+`1119609dce0875` ("ANDROID: if EEVDF scheduling fail, picking leftmost, to avoid NULL
+pointer", jiangyongfu-bit / johnstultz-work) is an **android common kernel** patch, not
+mainline, which is why it sits in this annex rather than in §3. It is the downstream
+*mitigation* for the same bug `b6eee96843e8` fixes upstream (§4.3): `vruntime_eligible()`
+keeps returning false because `(vruntime - cfs_rq->min_vruntime) * load` overflows, the
+selector finds nothing eligible, returns NULL, and its caller dereferences it. The commit
+carries the crash: `Unable to handle kernel NULL pointer dereference at virtual address
+00000000000000a0`, `lr : pick_next_task_fair+0x240/0x670`, with `vruntime = 0x1FD286B87E3`,
+`cfs_rq->min_vruntime = 0x9E040BCE59A` and `avg_load = 0x16E699` — which is what the
+overflow argument is computed from.
+
+Its two hunks, and why neither is needed here:
+
+1. **Selector: `if (!best) best = __pick_first_entity(cfs_rq);` — already implemented, and
+   in effect identical.** `abk_pick_eevdf()` carries
+   `if (!best) best = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);`
+   (`scripts/batch15_perf_eevdf.py:1138`). The `curr` arm is dead rather than an extra
+   policy: line 1106 already nulls an ineligible or off-rq `curr`, and line 1120 promotes
+   any surviving `curr` to `best`, so reaching the fallback with `curr != NULL` is
+   impossible — the expression reduces exactly to the patch's leftmost pick.
+2. **`pick_next_entity()`: `if (se && se->sched_delayed)` — not applicable.** 5.15 has no
+   `se->sched_delayed` and no delayed dequeue; that field is 6.12+ and is KMI-blocked here
+   because the `sched_entity` reserve run is exhausted (§5, AGENTS.md).
+
+The patch's `printk_deferred("EEVDF scheduling fail, picking leftmost\n")` should **not** be
+copied either, and the reason is a real difference in shape. Upstream tests `cfs_rq->skip`
+*outside* the selector, so an empty `best` there means the scheduler is genuinely
+inconsistent. This reconstruction tests skip **inside** the scan
+(`if (cfs_rq->skip == se) continue;`, `scripts/batch15_perf_eevdf.py:1132`), so "found no
+eligible entity" is also reached in a legitimate case — the eligible leftmost *is* the skip
+buddy — where the fallback is doing exactly its job. Copying the printk would have bought
+log spam in normal operation.
+
+What was actually missing was never the logic but the **proof**: nothing asserted the
+fallback exists, so the guarantee this patch is about could have been deleted silently —
+the same class of gap Batch 28 found elsewhere. It is now pinned in
+`tests/implementation_audit.py` (`perf:sched_eevdf_pick_logic`).
+
+One residual, left honest: the guarantee is that the selector never returns NULL *when it
+finds no eligible entity*. If the rb-tree is genuinely empty **and** `curr` is NULL, the
+fallback returns NULL — as does upstream's, which cannot fall back to a non-existent
+entity. On 5.15 that state is unreachable from `pick_next_entity()`: `nr_running > 0` is
+established before the pick, and with no delayed dequeue every on-rq entity is in the tree.
+
 ---
 
 ## 8. The three most worthwhile missing optimizations

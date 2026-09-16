@@ -7,6 +7,7 @@
 
 ## 交付总览（九项优化，按功能清单顺序）→ 详见 CHANGELOG.md#overview-nine — 把九项功能重排成一份交付日志并往下续写第 10 项（`8a73e95` → HEAD 的四个提交）：逐项给出批次、组名与到手证据，不新增任何批次
 
+
 ## v0.30.1(zram writeback 崩溃修复；已落地；真机已复测)→ 详见 CHANGELOG.md#v0-30-1 — 往 `page_index=1` 写 `writeback` 把内核打挂：Batch 14 的 `zram_writeback_bounds` **无条件**覆盖了 PAGE 模式的单次边界，而 sweep 循环把 `nr_pages` 当**次数**用（不是 `index` 上界）⇒ index 跑到 `N + nr_pages − 1` 越界；修复是在范围检查之后恢复 PAGE 模式 `nr_pages = 1`，同批带 companion v0.10.0 的 writeback 触发器与第二条 SELinux 规则
 
 ## Batch 28(v0.31.1,已落地；已刷已复测；存活性修复版同版本已刷已复测)→ 详见 CHANGELOG.md#batch-28 — EEVDF **现代版本差异审计**（`docs/survey_eevdf_gap.md`，对 6.6 → 7.3 逐提交比对）落地 S/A 两级：`cfs_rq` 累加器让选择器 O(1)、deadline 刷新搬进 `update_curr()`、`RUN_TO_PARITY`、EEVDF 唤醒抢占、`PREEMPT_SHORT`、EEVDF yield、新任务放置；槽 4 由 Batch 16 的「退回 RESERVE」翻案重新认领 `u64 slice`（保留槽因此用尽 ⇒ 6.12+ 的 `min_slice`/`max_slice`/`vprot`/`sched_delayed` 记为超出边界）。随后的逐特性存活审计（44 agent）查出 4 处空实现且全为本批引入，按「补全而非删除」修完并真机复测；**未做性能 A/B，不主张提速**
@@ -159,6 +160,7 @@ registry、三档锚点/幂等/回滚审计全绿、ABK CI 编译通过，
 ## 排除记录（不再重议）
 
 - [-] 4edae3ff6d4e mark_victim tracepoint：AOSP 2024-11 树已自带
+- [-] `1119609dce0875`（ACK：「EEVDF scheduling fail → 取 leftmost」）：**已覆盖**。选择器的 `if (!best)` leftmost 回退早在 `scripts/batch15_perf_eevdf.py:1138`（效果等价于它的 hunk 1），hunk 2 依赖 5.15 没有的 `se->sched_delayed`，而它那条 `printk_deferred` 照抄会误报（我们的 skip 判定在扫描**内**）；本次只补上缺的钉子。逐调用点核对与理由见 `docs/survey_eevdf_gap.md` §7.1
 - [-] mm/kfence：5.15.y 无特性提交
 - [-] timer_shutdown 全套 / NLM_F_BULK / PTP / netns defer free / dst 访问器改名 / hugetlb 系 / 纯重命名类：政策排除（见 survey）
 
