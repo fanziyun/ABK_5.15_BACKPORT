@@ -76,6 +76,10 @@ AUDIT_FILES = [
     "mm/oom_kill.c",
     "mm/vmscan.c",
     "mm/memcontrol.c",
+    # Batch 37 (MGLRU v4 series): the workingset and deactivation groups
+    # anchor in these.
+    "mm/workingset.c",
+    "mm/swap.c",
     "include/linux/swap.h",
     "include/linux/cgroup-defs.h",
     "include/linux/cpuset.h",

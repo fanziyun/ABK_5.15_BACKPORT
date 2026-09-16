@@ -687,7 +687,6 @@ REQUIRED_CONTENT = {
         "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
         "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
     ],
-
     # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
     # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
     # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
@@ -746,6 +745,88 @@ REQUIRED_CONTENT = {
         "PERCPU_OP(or, orr, ldset)",
         "PERCPU_RET_OP(add, add, ldadd)\n",
         "e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop",
+    ],
+    "core:mglru_clean_workingset": [
+        # 9cbfd1c3c83b, portable remainder: the workingset_refault() lock
+        # assertion must sit at the entry, before the MGLRU dispatch, so it
+        # covers both paths.  The test_recent()/lru_gen_test_recent() halves
+        # of the upstream commit have no 6.1-shape counterpart here and are
+        # deliberately not carried.
+        "VM_BUG_ON_PAGE(!PageLocked(page), page);"
+    ],
+    "core:mglru_optimize_deactivation": [
+        # cc8ec7be78ff, pagevec re-authoring.  The helper must read the
+        # generation back (gen < 0 -> avoid the shuffle) and compare it
+        # against min_seq; the deactivate paths must consult it before they
+        # queue a pagevec move.
+        "static bool lru_gen_clear_refs(struct page *page)",
+        "return gen == lru_gen_from_seq(READ_ONCE(lruvec->lrugen.min_seq[type]));",
+        "if (lru_gen_enabled() && lru_gen_clear_refs(page))\n\t\treturn;",
+        "if (lru_gen_enabled() ? lru_gen_clear_refs(page)\n"
+        "\t\t\t\t\t      : !PageActive(page))",
+        "bool active = PageActive(page) || lru_gen_enabled();",
+        "if (lru_gen_enabled())\n\t\t\tlru_gen_clear_refs(page);\n"
+        "\t\telse\n\t\t\tClearPageReferenced(page);",
+    ],
+    "core:mglru_rework_aging_feedback": [
+        # 798c0330c2ca.  The array, the walk field and the two macros are the
+        # structural core; the sentinel arithmetic (type ? ... : !swappiness)
+        # and the simplified aging verdict are the behavioural pins.  The old
+        # exact-sync rule (anon min = min(anon,file), file min = max(...)) and
+        # the can_swap walk field must be gone.
+        "#define MIN_SWAPPINESS 0\n#define MAX_SWAPPINESS 200",
+        "unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];",
+        "\tint swappiness;\n\tbool full_scan;",
+        "#define evictable_min_seq(min_seq, swappiness)",
+        "#define for_each_evictable_type(type, swappiness)",
+        "if (type ? swappiness > MAX_SWAPPINESS : !swappiness)",
+        "if (walk->swappiness > MAX_SWAPPINESS)\n\t\treturn true;",
+        "if (min_seq[LRU_GEN_ANON] > seq && min_seq[LRU_GEN_FILE] < seq)",
+        "WRITE_ONCE(lrugen->protected[hist][type][tier],\n"
+        "\t\t\t\t   lrugen->protected[hist][type][tier] + delta);",
+        "return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;",
+        "if (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)",
+        "n[2] = READ_ONCE(lrugen->protected[hist][type][tier]);",
+        "int swappiness = get_swappiness(lruvec, sc);",
+        "if (!sc->may_swap)\n\t\treturn 0;",
+        "mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)",
+    ],
+    "core:mglru_rework_type_selection": [
+        # 37a260870f2c.  The summed-tier read_ctrl_pos() loop, the 2:3 margin,
+        # the total-tier type comparison and the single-pre-choice
+        # isolate_pages() loop are the content; the per-tier gain array and
+        # the shared tier_idx out-param must be gone.
+        "pos->refaulted = pos->total = 0;",
+        "for (i = tier % MAX_NR_TIERS; i <= min(tier, MAX_NR_TIERS - 1); i++) {",
+        "gain factor (2:3)",
+        "read_ctrl_pos(lruvec, type, 0, 2, &sp);",
+        "read_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);",
+        "read_ctrl_pos(lruvec, LRU_GEN_FILE, MAX_NR_TIERS, MAX_SWAPPINESS - swappiness, &pv);",
+        "if (swappiness <= MIN_SWAPPINESS + 1)\n\t\treturn LRU_GEN_FILE;",
+        "int type = get_type_to_scan(lruvec, swappiness);",
+        "\tint scanned;\n\t\tint tier = get_tier_idx(lruvec, type);",
+    ],
+    "core:mglru_rework_refault_detection": [
+        # b1a71694fb00, page-shaped: the recency test must be a windowed
+        # distance against max_seq, and the internal refaulted[] counter must
+        # keep landing in the min_seq[type] history bucket the way the
+        # already-carried accounting fix (3af0191a594d) left it.
+        "seq = READ_ONCE(lrugen->max_seq) & (EVICTION_MASK >> LRU_REFS_WIDTH);",
+        "if (diff >= MAX_NR_GENS)\n\t\tgoto unlock;",
+        "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));",
+    ],
+    "core:mglru_wake_flushers": [
+        # 1bc542c6a0d1.  Both accounting feeds (sort_page's dirty page and
+        # scan_pages' isolated counts), the stat carry-out of
+        # shrink_page_list() and the end-of-cycle wake predicate.
+        "\tbool dirty, writeback;",
+        "sc->nr.file_taken += delta;",
+        "\tif (type == LRU_GEN_FILE)\n\t\tsc->nr.file_taken += isolated;",
+        "sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;",
+        "if (PageLocked(page) || writeback ||\n"
+        "\t    (type == LRU_GEN_FILE && dirty)) {",
+        "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
+        "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);",
     ],
 }
 
@@ -988,6 +1069,33 @@ REQUIRED_ABSENT = {
         # zap_pte_range() and the whole change is a no-op.
         ["mm/madvise.c", "\tzap_page_range(vma, start, end - start);"],
     ],
+    "core:mglru_rework_aging_feedback": [
+        # The can_swap walk field, the exact-sync min_seq rule, the
+        # tier-minus-one protection index and the boolean swappiness call
+        # shape are all pre-798c0330c2ca and must be gone.
+        ["include/linux/mmzone.h", "bool can_swap;"],
+        ["include/linux/mmzone.h", "MAX_NR_TIERS - 1];"],
+        ["mm/vmscan.c", "VM_WARN_ON_ONCE(!full_scan && (type == LRU_GEN_FILE || can_swap));"],
+        ["mm/vmscan.c", "min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);"],
+        ["mm/vmscan.c", "get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS"],
+        ["mm/vmscan.c", "swappiness > 200)"],
+        ["mm/vmscan.c", "mem_cgroup_get_nr_swap_pages(memcg) <= 0)"],
+        ["mm/vmscan.c", "min_seq[!can_swap]"],
+        ["mm/vmscan.c", "walk->can_swap"],
+    ],
+    "core:mglru_rework_type_selection": [
+        # The first-tier gain array and the tier_idx out-param are the
+        # pre-37a260870f2c shapes.
+        ["mm/vmscan.c", "int gain[ANON_AND_FILE] = { swappiness, 200 - swappiness };"],
+        ["mm/vmscan.c", "get_type_to_scan(lruvec, swappiness, &tier);"],
+        ["mm/vmscan.c", "*tier_idx = tier - 1;"],
+        ["mm/vmscan.c", "else if (swappiness == 200)"],
+    ],
+    "core:mglru_rework_refault_detection": [
+        # The exact min_seq token match is the misattribution being fixed.
+        ["mm/workingset.c",
+         "if ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))"],
+    ],
 }
 
 # Function-scoped assertions.  REQUIRED_CONTENT above is whole-file substring
@@ -1031,6 +1139,17 @@ REQUIRED_PAIRING = {
 
 
 REQUIRED_IN_FUNCTION = {
+    "core:mglru_rework_refault_detection": [
+        # The windowed recency test must land in lru_gen_refault() itself;
+        # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
+        # the shadow token), so the absence claim cannot be file-wide.
+        ("mm/workingset.c", "lru_gen_refault",
+         ["unsigned long seq;",
+          "unsigned long diff;",
+          "if (diff >= MAX_NR_GENS)",
+          "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));"],
+         ["unsigned long min_seq;"]),
+    ],
     "perf:psi_oncpu_state_mask": [
         # The flag must be handled where the mask is built, and it must never
         # reach the task counters.
@@ -1429,60 +1548,6 @@ REQUIRED_IN_FUNCTION = {
           "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
          []),
     ],
-    # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
-    # change rather than a rewrite is *where* each half sits: the decision in
-    # zap_pte_range()'s tail (not in zap_pmd_range(), where a THP collapse could
-    # have replaced the pmd), the emptiness test before pmd_clear() (the reverse
-    # order frees a page table a skipped entry still points into), and the
-    # gather owned by the caller (a per-VMA gather is what the commit removes).
-    "core:madvise_pt_reclaim": [
-        ("mm/memory.c", "zap_pte_range",
-         ["unsigned long start = addr;",
-          "if (reclaim_pt_is_enabled(start, end, details))",
-          "try_to_free_pte(mm, pmd, start, tlb);"],
-         ["pmd_clear(pmd);"]),
-        ("mm/memory.c", "try_to_free_pte",
-         ["start_pte = pte_offset_map(pmd, addr);",
-          "if (!pte_none(*pte)) {",
-          "pmd_clear(pmd);",
-          "free_pte_page(tlb, pmd, pmdval, addr);"],
-         ["pte_free_tlb"]),
-        # The barrier this tree needs and upstream's helper has no counterpart
-        # for (CONFIG_SPECULATIVE_PAGE_FAULT): without it a reader that holds
-        # the ptl of the page table we are about to free races the free.
-        ("mm/memory.c", "free_pte_page",
-         ["#ifdef CONFIG_SPECULATIVE_PAGE_FAULT",
-          "smp_call_function(wait_for_smp_sync, NULL, 1);",
-          "pte_free_tlb(tlb, token, addr);",
-          "mm_dec_nr_ptes(tlb->mm);"],
-         []),
-    ],
-    "core:madvise_batch_tlb_flush": [
-        ("mm/madvise.c", "do_madvise",
-         ["if (madvise_batch_tlb_flush(behavior)) {",
-          "tlb_gather_mmu(&tlb, mm);",
-          "madvise_walk_vmas(mm, start, end, behavior, tlbp,",
-          "if (tlbp)\n\t\ttlb_finish_mmu(&tlb);"],
-         []),
-        # Batching means exactly that the per-VMA helper no longer gathers.
-        ("mm/madvise.c", "madvise_dontneed_single_vma",
-         ["zap_page_range_single_batched(tlb, vma, start, end - start, &details);"],
-         ["tlb_gather_mmu"]),
-    ],
-    # The pair has to reach both invalidate paths, and the loop bound has to be
-    # the batch size the call site indexes with -- a port that changed only the
-    # helper would pass a whole-file substring check on either half.
-    "core:truncate_shadow_batch_sweep": [
-        ("mm/truncate.c", "__invalidate_mapping_pages",
-         ["int nr = pagevec_count(&pvec);",
-          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
-         []),
-        ("mm/truncate.c", "invalidate_inode_pages2_range",
-         ["int nr = pagevec_count(&pvec);",
-          "xa_has_values = true;",
-          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
-         []),
-    ],
 }
 
 
@@ -1565,8 +1630,19 @@ def run_tree(source):
                 if key in REQUIRED_CONTENT and status in ("applied", "partial"):
                     blob = "".join(ctx.read(f) for f in group.files
                                    if ctx.path(f).exists())
-                    missing = [needle for needle in REQUIRED_CONTENT[key]
-                               if needle not in blob]
+                    # A bare needle checks the whole-file blob; a
+                    # (rel, needle) pair checks one file only, for claims a
+                    # neighbouring group's content in the same blob would
+                    # otherwise satisfy.
+                    missing = []
+                    for needle in REQUIRED_CONTENT[key]:
+                        if isinstance(needle, (list, tuple)):
+                            rel, sub = needle
+                            if not (ctx.path(rel).exists()
+                                    and sub in ctx.read(rel)):
+                                missing.append(f"{sub!r} not in {rel}")
+                        elif needle not in blob:
+                            missing.append(needle)
                     if missing:
                         problems.append(f"{child}/{group.key}: missing "
                                         f"feature content {missing}")

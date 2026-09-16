@@ -82,13 +82,21 @@ GROUP_COUNTS = {
     # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
     # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
     # non-LSE fallback path is untouched on cores without FEAT_LSE.
-    # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
-    # from 40 to 41) + this batch's four page-cache/page-table groups.
-    # Batch 36 adds one memcg-stats group (mm/memcontrol.c +
-    # include/linux/memcontrol.h), applying on every baseline: the percpu
-    # stats compaction is 6.10 work no 5.15 tree carries, and the anchors
-    # are byte-identical on all four.
-    "stable_backport_core": 46,
+    # Batch 37 adds six MGLRU v4 groups, all landing on every baseline: the
+    # baseline MGLRU is the 6.1 "minimal implementation" backport (page-based
+    # lru_gen_struct/lists, sort_page/scan_pages/evict_pages) and carries none
+    # of the 6.2-6.14 MGLRU evolution the series assumes -- verified identical
+    # shape on all four trees, so nothing arrives pre-applied.  3af0191a594d
+    # (workingset accounting) is NOT registered: the ACK backport already
+    # carries its accounting (verified line-by-line in lru_gen_refault()),
+    # which is why mglru_rework_refault_detection anchors the post-fix shape.
+    # mglru_rework_type_selection is a second-pass group: it rewrites
+    # read_ctrl_pos()/isolate_pages() and consumes the evictable_min_seq/
+    # for_each_evictable_type macros and the reindexed protected[] that
+    # mglru_rework_aging_feedback generates.
+    # 46 on the merged base (Batch 35's 45 + Batch 36's memcg_stats_percpu_slim)
+    # + this batch's six MGLRU groups.
+    "stable_backport_core": 52,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

@@ -349,6 +349,134 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-37"></a>
+
+## Batch 37(v0.39.0)
+
+主题「MGLRU v6.14 性能优化系列」。来源 torvalds/linux v6.14 的
+"mm/mglru: performance optimizations, v4"（Yu Zhao，2024-12-31，lore
+20241231043538.4075764-1-yuzhao@google.com；封面 0/7 + 7 个补丁——任务书里
+「8 个」是把封面计入）。本批把 plan.md 延后项 `mglru_612_refresh` **重新定性**：
+对象不是 6.12，正是这 7 个补丁；按用户决定落地 6 组、放弃 2 条。
+
+### 0. 审计先行：基线形态判定（决定锚点怎么挂）
+
+- 四档基线（.167/.178/.194/.216）的 MGLRU **逐文件同形**（swap.c/vmscan.c/
+  workingset.c/mm_inline.h/mmzone.h diff 全空或仅 vendor hook），都是 6.1
+  「最小实现」回移的 page 形态：`struct lru_gen_struct` + `lrugen->lists[][][]`、
+  `page_lru_gen`/`page_lru_refs`/`page_inc_refs`、`sort_page`/`scan_pages`/
+  `evict_pages`、`void lru_gen_look_around`、`inc_max_seq(lruvec, can_swap,
+  full_scan)`。
+- 系列的 diff 上下文是 6.13/6.14 folio 形态，且假设 6.2–6.13 的中间演化
+  （`inc_max_seq` 的 seq 参数、`should_run_aging` 重构、`lru_gen_test_recent`
+  拆分、`ptep/pmdp_clear_young_notify`、`pte_offset_map_rw_nolock`、
+  `folio_update_gen`/`lru_gen_set_refs`——基线 grep 全 0）。⇒ **7 个补丁零上下文
+  直贴全部被拒，且没有一个是基线已带**；每个组都按基线自己的文本重写锚点，
+  语义对齐「补丁 5 之后、补丁 6 之前」的中间形态（补丁 6 已放弃）。
+- 结构体层锚点反而与 6.14 的 old 形态一致：`mmzone.h` 的
+  `protected[...][MAX_NR_TIERS - 1]` 与 `bool can_swap`。
+- `get_swappiness()` 基线已返回 int（ACK 带了 `mem_cgroup_swappiness()`），
+  比纯 6.1 新；per-memcg swappiness 读侧保留基线实现。
+
+### 1. 落地明细（6 组，全 core）
+
+| 组 | 上游 | 内容 | 5.15 形状改写 |
+|---|---|---|---|
+| `mglru_clean_workingset` | `9cbfd1c3c83b` (1/7) | `workingset_refault()` 锁断言上移到入口，MGLRU 路径也被覆盖 | 基线单入口已同时覆盖两路径 ⇒ 断言落 decl 块后（`bool workingset; int memcgid;` 锚，.194+ 的 `android_vh_count_workingset_refault` hook 在钩前不受影响）；`workingset_test_recent()`/`lru_gen_test_recent()` 的 RCU 重构与 tryget 半 **无载体不搬**（基线整段在一个 rcu_read_lock 里，无 tryget/put 对可镜像） |
+| `mglru_optimize_deactivation` | `cc8ec7be78ff` (2/7) | deactivate 在 MGLRU 下原地清 `LRU_REFS`、最老代免 LRU 搬移；`lru_lazyfree`/`lru_deactivate_file_fn` 跟进 | pagevec 形状重写：`lru_gen_clear_refs(struct page *)`（`page_lruvec` 基线没有 ⇒ `mem_cgroup_page_lruvec(page_memcg(page), page_pgdat(page))`；`!CONFIG_LRU_GEN` 带 `return false` 桩，编译门安全）；`deactivate_page()` 条件重排 |
+| `mglru_rework_aging_feedback` | `798c0330c2ca` (3/7) | `protected[]` 补齐 tier 0（tier-1→tier 重索引）；`can_swap:bool`→`swappiness:int`（`>MAX_SWAPPINESS` = anon-only 哨兵）；`min_seq[]` 允许漂移 `MAX_NR_GENS-MIN_NR_GENS-1`；aging feedback 简化为「最老可回收代恰好 MIN_NR_GENS 落后」；`MIN_SWAPPINESS`/`MAX_SWAPPINESS` 进 swap.h（6.14 同位置）；`get_swappiness()` 加 `!may_swap` 早退、swap-size 守卫对齐 `< MIN_LRU_BATCH` | 31 步全 required；`for_each_evictable_type` 落到 `iterate_mm_list`/`should_skip_vma`/`try_to_inc_min_seq`/`should_run_aging`/`isolate_pages`；基线自有管线（`age_lruvec`/`get_nr_to_scan` 带 `need_aging`、`try_to_inc_max_seq` 的 `sc` 参数、`inc_max_seq` 的 `android_vh_mglru_new_gen`）**全部保留**；`run_aging`/`run_cmd`（debugfs）同规则 |
+| `mglru_rework_type_selection` | `37a260870f2c` (4/7) | `read_ctrl_pos()` 逐 tier 求和（tier 0 有了保护史）；`get_tier_idx()` margin 1:2→2:3；`get_type_to_scan()` 比较 anon/file 总 tier、自带哨兵分支；`isolate_pages()` 去掉 min_seq 预选与共享 tier | 依赖前组的宏与重索引；按 trap 5，前组不触碰本组改写的四个函数、本组不改写前组的输出 ⇒ 两次幂等靠 `replace_once` 的 new 优先即可 |
+| `mglru_rework_refault_detection` | `b1a71694fb00` (5/7) | recency 判定从「token 与 min_seq[type] 精确相等」放宽为「距 `max_seq` 不超过 `MAX_NR_GENS` 代」——系列 TPC-C −57% workingset_refault_file 的主角 | 基线的 recency 内联在 `lru_gen_refault()`（无 `lru_gen_test_recent()`），锚 `memcg_id`（下划线）消歧 **`lru_gen_eviction()` 的同款 decl 三连**；`abs_diff()` 是 6.9+ ⇒ 就地内联大小比较；`hist` 仍取 `min_seq[type]` 桶（=已带的 `3af0191a594d` 记账） |
+| `mglru_wake_flushers` | `1bc542c6a0d1` (v6.13) | MGLRU 回收路径全程无 flusher 唤醒 ⇒ cgroup 被 dirty file 页塞满时直奔 memcg OOM：`sort_page()` 记 dirty/unqueued_dirty、`scan_pages()` 记 file_taken、`evict_pages()` 把 stat 带出 `shrink_page_list()`、shrink 循环尾 `unqueued_dirty == file_taken` 即 `wakeup_flusher_threads()` | 基线 `scan_pages` 无 trace 调用 ⇒ 锚 PGSCAN 计数块；上游的 `shrink_node` memset 半 **不需要**：基线 `shrink_node()` 本来就每轮 `memset(&sc->nr, 0, ...)` |
+
+### 2. 排除记录（2 条放弃 + 2 条核销）
+
+- **`4d5d14a01e2c`（6/7，rework workingset protection）——放弃**。用户拍板
+  「6、7 收益不高难度大」。`LRU_REFS_FLAGS` 语义重定义（`PG_referenced|PG_workingset`
+  → `LRU_REFS_MASK|PG_referenced`）+ `lru_gen_folio_seq()` 重写落代 + 四处文件
+  联动，且 `mm_inline.h` 的 MGLRU 段是 page 形态（`lru_gen_add_page`），
+  翻译量与风险都不成比例。
+- **`a52dcec56c5b`（7/7，fix PTE-mapped large folios）及其依赖
+  `1d4832becdc2`（v6.13，`{ptep,pmdp}_clear_young_notify`）——放弃**。收益依赖
+  大 folio（上游数字基于 16KB THP），本机 4KB 页 + madvise-only THP 实际拿到的
+  ≈ 0；落地要先补 6.12/6.13 的整套基础设施（notify 助手 + mmu_notifier 接线 +
+  `pte_offset_map_rw_nolock`/`pmdp_get_lockless` + rmap 重构）。挂回
+  `large_folio_mthp_substrate` 之后再议。
+- **`3af0191a594d`（v6.5，Multi-gen LRU: fix workingset accounting）——基线已带，
+  不注册**。逐行核对基线 `lru_gen_refault()`：`WORKINGSET_REFAULT` 已无条件记账、
+  recent 才记 `WORKINGSET_ACTIVATE`、`sort_page()` 保护路径无重复 ACTIVATE——
+  三个部分全是修复后形态。LMKD 依赖的 refault 统计没有缺口。
+- **`1bc542c6a0d1` 的 Fixes 目标 `14aa8b2d5c2e`（v6.2）基线本来就没有** ⇒ 基线
+  MGLRU 从回移起就带着这个 OOM 暴露，防护是净新增而非对齐。
+
+### 3. KMI
+
+- 唯一布局位移：`lru_gen_struct.protected[]` `MAX_NR_TIERS-1` → `MAX_NR_TIERS`
+  （4×2×3 → 4×2×4 个 `unsigned long`，+64B），`struct lruvec` 内其后的
+  `mm_state`/`pgdat`/`ANDROID_VENDOR_DATA(1)` 后移，`lruvec` 及嵌入者
+  （`mem_cgroup_per_node`/`pgdat`）变大。该数组扩容不是加字段、无
+  `ANDROID_KABI_RESERVE` 槽可借，**经用户确认接受**（3/4/6 打包的先决条件；
+  6 虽随后放弃，3 照做）。
+- 页标志布局零变化：`LRU_REFS_WIDTH` 不动，`PG_workingset`/`PG_referenced`
+  只改语义不改位。`lru_gen_mm_walk` 是 kmalloc 私有结构，`can_swap`→`swappiness`
+  不进 KMI。
+
+### 4. 已知口径限制
+
+- 只宣传 refault 直降与 OOM 防护：patch 5 的 TPC-C −57% 是整个系列的数字
+  （主要来自 5+6 组合），本批只落 5 ⇒ 报告口径为「recency 判据修复后的
+  workingset 归因准确性」，不主张单机吞吐百分比。
+- a52dcec56c5b 的「kernel build sys time −2–5%（16KB THP 机器）」**不引用**：
+  本机 4KB。
+- 未做真机 A/B，不主张设备侧提速（Batch 28/30/34 先例）。
+
+### 5. 调试/试错记录
+
+- 首轮 dry-run：`get_pfn_page` 续行是 4 tab+空格而非 5 tab；
+  `walk_pte_range`/`walk_pmd_range_locked` 的 `get_pfn_page(...)` 两处同文，
+  靠后随行（`ptep_` vs `pmdp_`）消歧；`try_to_inc_max_seq` 续行 3 tab+7 空格。
+- `.194` 漂移两处：`workingset_refault()` decl 块后多了 vendor hook ⇒ 断言锚
+  收窄到 decl 对；`get_swappiness()` 头部多了 `int swappiness;`、尾部 return
+  被 `android_vh_tune_swappiness` 包住 ⇒ 只锚中段 guard 块（四档唯一），
+  头尾一概不碰。
+- `implementation_audit` 逮住一处**真错**：refault 组的 decl 步最初锚
+  `token/min_seq/lruvec` 三连，`replace_once` 命中了 `lru_gen_eviction()` 的同款
+  （该函数合法保留自己的 `min_seq`）——改用 `memcg_id` 下划线消歧后修正，
+  并在 REQUIRED_IN_FUNCTION 里函数级钉死（`lru_gen_refault` 体内不得再有
+  `unsigned long min_seq;`）。
+- `mm/workingset.c`/`mm/swap.c` 原不在 `FETCH_FILES`/`AUDIT_FILES`/`SMOKE_FILES`
+  ⇒ 按 AGENTS.md「扩清单重抓，不绕过」处理，四棵树已增量补齐（smoke 首轮
+  blocked_by_shape×3 就是 SMOKE_FILES 缺文件暴露的，补齐后全绿）。
+
+### 6. 验证结果
+
+- `python3 -m py_compile scripts/*.py tests/*.py`：过。
+- `bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh`：过。
+- `python3 tests/stable_5_15_test.py`：全绿（含 matrix↔registry 计数断言）。
+- `tests/step_audit.py` ×四档（.167/.178/.194/.216）：全绿，两遍幂等。
+- `tests/implementation_audit.py` ×四档：全绿（新增 6 组内容锚 +
+  `REQUIRED_IN_FUNCTION` 函数级钉 + REQUIRED_ABSENT 旧形态清场）。
+- `tests/smoke.sh` ×四档（两遍幂等 + 回滚）：全绿。
+- `tests/config_gate_audit.py`：本批未加任何 CONFIG 门（`LRU_GEN` 原为 y，
+  swap.h 两个宏是常量非符号）⇒ 无新 DARK_GATES；沿用上批构建工件不重跑。
+- **ABK CI 真编译：未跑**——本批改 mm/vmscan.c/swap.c/workingset.c，按 AGENTS.md
+  这是 config gate 之后的唯一真门；四档 CI 必须全绿才算数（trap 6/7 全开：
+  `lru_gen_clear_refs` 的 `!CONFIG_LRU_GEN` 桩、`#ifdef CONFIG_LRU_GEN` 内符号
+  全部在门内）。
+
+### 7. 审计基线与并行批次
+
+- 基线：167 = deprecated/android13-5.15-2024-11，178 = deprecated/
+  android13-5.15-2025-03，194 = android13-5.15-2025-12，216 = android13-5.15-lts
+  （抓取时 Makefile SUBLEVEL 实测）。
+- **与 Batch 36 并行开发**：两个会话同时改动共享文件（abk_stable_core.py、
+  sublevel_matrix 计数、implementation_audit 条目、CHANGELOG/plan.md、
+  module.conf 版本位）与实现审计器，期间发生过相互覆盖与一次中途语法损坏；
+  Batch 36 最终先行提交（2fa80e1），本批在其上重放剩余改动并全量重跑门禁。
+  implementation_audit 的 REQUIRED_CONTENT 检查器随之扩展出 (rel, needle)
+  逐文件形式（向后兼容，两批共用）。
+- core 46 → 52（45 + Batch 36 的 1 + 本批的 6）。
+
 <a id="batch-35"></a>
 
 ## Batch 36(v0.38.0)
