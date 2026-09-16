@@ -121,6 +121,8 @@ SMOKE_FILES=(
   # Batch 34: the non-return per-CPU atomics become load LSE atomics
   # (mainline 535fdfc5a228) -- the whole group is this header.
   arch/arm64/include/asm/percpu.h
+  # Batch 35: the FUSE write-path prefault (faa794dd2e17).
+  fs/fuse/file.c
 )
 
 WORK="$(mktemp -d)"
@@ -441,6 +443,24 @@ grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 cfr_reclaim counters missing"
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 memory.reclaim entry missing"
+
+# Batch 35: the write source buffer is prefaulted where the copy made no
+# progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves
+# are load-bearing and neither is visible in a pass-1 status: without the first
+# the common path keeps its extra userspace touch (the whole point of the
+# commit), and without the second the loop loses its forward-progress guarantee
+# while still reading as a faithful port.  No ABK marker by design -- this is an
+# upstream-shape rewrite -- so the call site itself is the assertion.
+grep -q "while not holding the page lock:" "$KERNEL_ROOT/common/fs/fuse/file.c" \
+  || fail "fuse write prefault did not move into the no-progress retry path"
+if ! "$python_bin" - "$KERNEL_ROOT/common/fs/fuse/file.c" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+sys.exit(1 if " again:\n\t\terr = -EFAULT;\n" in text else 0)
+PY
+then
+  fail "fuse_fill_write_pages() still prefaults its source buffer on every retry"
+fi
 
 # Batch 13: the customize_alloc_gfp hook (declare/call/export) must be in the
 # tree and the ABK fast-fail policy must really register on it.  The hook

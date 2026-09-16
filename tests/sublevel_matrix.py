@@ -94,9 +94,21 @@ GROUP_COUNTS = {
     # read_ctrl_pos()/isolate_pages() and consumes the evictable_min_seq/
     # for_each_evictable_type macros and the reindexed protected[] that
     # mglru_rework_aging_feedback generates.
-    # 46 on the merged base (Batch 35's 45 + Batch 36's memcg_stats_percpu_slim)
-    # + this batch's six MGLRU groups.
-    "stable_backport_core": 52,
+    # 47 on the merged base (Batch 35's 45 + the two parallel Batch 36s:
+    # memcg_stats_percpu_slim and the FUSE write-path prefault) + this batch's
+    # six MGLRU groups.
+    "stable_backport_core": 53,
+    # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
+    # from 40 to 41) + Batch 34's successor 35 (four page-cache/page-table
+    # groups) + the Batch-36 FUSE write-path prefault below.
+    #
+    # The Batch-36 FUSE write-path prefault (fuse_prefault_out_of_write_path)
+    # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
+    # with no Cc: stable, so no 5.15 tree carries it, and its two anchors are
+    # byte-identical on all four.  It is also the module's first group in
+    # fs/fuse/, so nothing else writes the file.  Renumbered twice: the arm64
+    # LSE group took "Batch 34" and the page-cache/page-table one took 35 while
+    # this branch was open, so this one is 36.
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

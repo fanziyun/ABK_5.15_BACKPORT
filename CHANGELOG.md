@@ -459,10 +459,16 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 - `tests/smoke.sh` ×四档（两遍幂等 + 回滚）：全绿。
 - `tests/config_gate_audit.py`：本批未加任何 CONFIG 门（`LRU_GEN` 原为 y，
   swap.h 两个宏是常量非符号）⇒ 无新 DARK_GATES；沿用上批构建工件不重跑。
-- **ABK CI 真编译：未跑**——本批改 mm/vmscan.c/swap.c/workingset.c，按 AGENTS.md
-  这是 config gate 之后的唯一真门；四档 CI 必须全绿才算数（trap 6/7 全开：
-  `lru_gen_clear_refs` 的 `!CONFIG_LRU_GEN` 桩、`#ifdef CONFIG_LRU_GEN` 内符号
-  全部在门内）。
+- **ABK CI 真编译：首轮失败，根因即 trap 6，已修待复跑**。run 35148785651
+  （ABK-CI pr17-2cc696e，job 5.15.X-android13-lts）编译 `mm/swap.c` 报两个错，
+  都是文本审计看不见的那一类：
+  `mm/swap.c:439:46: error: use of undeclared identifier 'LRU_REFS_FLAGS'`
+  （该宏在本树是 `mm/vmscan.c` 的文件内定义，`mm/swap.c` 看不到）与
+  `mm/swap.c:441:52: error: too many arguments to function call, expected single
+  argument 'page', have 2 arguments`（5.15 的 `mem_cgroup_page_lruvec()` 只收 page，
+  二参形态是 5.16+）。修复落 commit `9739f34`：掩码就地展开为
+  `BIT(PG_referenced) | BIT(PG_workingset)`、改单参调用。该轮其余五组无编译错误。
+  四档 CI 全绿仍是本批唯一未闭合的门。
 
 ### 7. 审计基线与并行批次
 
@@ -475,9 +481,207 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
   Batch 36 最终先行提交（2fa80e1），本批在其上重放剩余改动并全量重跑门禁。
   implementation_audit 的 REQUIRED_CONTENT 检查器随之扩展出 (rel, needle)
   逐文件形式（向后兼容，两批共用）。
-- core 46 → 52（45 + Batch 36 的 1 + 本批的 6）。
+- core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
+---
 
-<a id="batch-35"></a>
+<a id="batch-36"></a>
+
+## Batch 36(v0.38.0)
+
+主题「文件系统 —— FUSE 与 erofs」。候选三条，**只落一条**：FUSE 的预缺页搬移
+（`faa794dd2e17`）。erofs 那对（`fb176750266a` + `6422cde1b0d5`）与 lib/iov_iter 的
+`770c8d55c428` 都按「前提不存在」排除，FUSE passthrough 按决定不做 —— 四条的去留与证据见 §1/§3，
+完整记录在 `plan.md` 的「排除记录」。原始 patch 存 `research/upstream-5.15.y/patches/`。
+
+### 1. erofs file-backed mount 为什么不能落
+
+上游这两条是**一个特性的头和尾**，中间还夹着两条本批未点名的 commit：
+
+| 顺序 | commit | 内容 |
+|---|---|---|
+| 1 | `fb176750266a`（v6.12） | 挂载管道：Kconfig `EROFS_FS_BACKED_BY_FILE`、`sbi->fdev`、`erofs_fc_get_tree()` 的 `-ENOTBLK` 回退 |
+| 2-3 | `ce63cb62d794` / `283213718f5d`（v6.12） | **新建 `fs/erofs/fileio.c`**：非压缩与压缩 inode 的 file-backed 数据通路 |
+| 4 | `6422cde1b0d5`（v6.13） | 默认行为切换，改写的正是第 2-3 条新建的那个文件 |
+
+`fb176750266a` 自己在 `inode.c` 里写得很清楚：`/* XXX: data I/Os will be implemented in the
+following patches */`，并把 fileio 模式的 inode 直接判 `-EOPNOTSUPP`。**只落点名的两条，得到的
+是一个能挂上、而每个 inode 的数据都返回 `-EOPNOTSUPP` 的挂载** —— 上游自己的中间态。那是桩，
+不是嫁接；本模块的 `implementation_audit` 正是为「编译得过、行为等于源内核」这种形状准备的。
+
+要在这棵树上真跑起来，得先回移 5.15 → 6.12 的整段 erofs 演进。实测前提（167/178/194/216
+**四条基线**的 `fs/erofs/` grep；四条 `internal.h` 同为 15955 字节且逐字节相同）：
+
+| 符号 / 文件 | 上游用到它的地方 | android13-5.15 |
+|---|---|---|
+| `erofs_is_fscache_mode()` | `data.c` 选 metabuf mapping | **0 处** |
+| `erofs_bread()` / `struct erofs_buf` | 整套元数据读取（上游约 5.19 起的 metabuf 层） | **0 处** |
+| `devs->flatdev` / `sbi->s_fscache` / `packed_inode` | device / ondemand / inline 打包 inode | **0 处** |
+| `erofs_pos()` / `erofs_fill_from_devinfo()` | `erofs_map_dev()` 的 6.x 形态 | **0 处** |
+| `fs/erofs/fileio.c` | 数据通路本体 | **不存在** |
+| `super_set_sysfs_name_generic()` | `erofs_set_sysfs_name()` | **0 处** |
+
+ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都是一堵墙：
+
+- 元数据：`erofs_get_meta_page()` 直接读 `sb->s_bdev->bd_inode->i_mapping`，**没有**可指向
+  某个文件 mapping 的间接层（上游那个 `buf->mapping` 字段就是为此加的）；
+- 数据：`erofs_iomap_begin()` 把 `iomap->bdev = mdev.m_bdev` 交给 iomap，**无 bdev 的映射无处
+  提交** —— 这正是上游必须让 erofs 走自己的 `fileio.c` 而不是 iomap 的原因；
+- 设备：`struct erofs_device_info` 里是 `struct block_device *bdev`，上游要的是
+  `struct file *bdev_file`。
+
+顺带说明**为什么也不单独落** `fs/super.c` 的 `get_tree_bdev_flags()`（上游 `4021e685139d`，
+`erofs_fc_get_tree()` 的回退要用它）：它的唯一消费者就是 erofs，而 5.15 的 `get_tree_bdev()`
+走 `blkdev_get_by_path()` → `lookup_bdev()`，对非块设备**本来就以 `-ENOTBLK` 返回**（实测
+`block/bdev.c`：`error = -ENOTBLK; if (!S_ISBLK(inode->i_mode)) goto out_path_put;`
+—— 顺带一条容易踩空的事实：**这仓的块设备代码在 `block/bdev.c`，不是上游的
+`fs/block_dev.c`**，后者在本树里不存在、按上游路径去找会 404） ——
+回退逻辑在 5.15 上不需要这个 helper。上游引入它只是为了让 `GET_TREE_BDEV_QUIET_LOOKUP` 能压掉
+那句误导性的 `Can't lookup blockdev` 打印（上游 **v6.6** 把 `get_tree_bdev()` 改成了
+`lookup_bdev()` + `sget_dev()` 的形态 —— v6.5 还是 `blkdev_get_by_path()`，错误路径才变得需要区分）。在没有消费者的树里加一个
+死 helper，只会多一份要跟着上游走的 VFS 面。
+
+### 2. 落地明细
+
+新组 `core:fuse_prefault_out_of_write_path`（`scripts/batch35_core_fuse_erofs.py`，
+2 步全 required，注册在 core 末尾、`__main__` 守卫之前）。源是 mainline `faa794dd2e17`
+（「fuse: Move prefaulting out of hot write path」，Dave Hansen，Miklos Szeredi 收，v6.16）。
+
+`fuse_fill_write_pages()` 在重试循环**头部**做 `fault_in_iov_iter_readable()`，于是经 daemon 的
+每次 `write(2)` 要碰两次用户态：显式预缺页一次，`copy_page_from_iter_atomic()` 里再一次。
+`generic_perform_write()` 不这么做 —— 它只在拷贝**没进展**（返回 0）时才补一次预缺页，而那正是
+保证前进所必需的那一次。本组把这个判断搬进 `!tmp` 分支：
+
+| 位置 | 改动 |
+|---|---|
+| ` again:` 标签 | 删掉 `err = -EFAULT;` + `if (fault_in_iov_iter_readable(...)) break;`，标签之后直接就是原有的 `err = -ENOMEM;` + 取页 |
+| `if (!tmp) { … goto again; }` | `unlock_page()`/`put_page()` 之后、`goto again` 之前插入预缺页，失败则 `err = -EFAULT; break;` |
+
+**是按 5.15 的 page 形态重写，不是照抄。** 上游那条 hunk 写的是 6.x 的 folio 形态
+（`__filemap_get_folio()` / `copy_folio_from_iter_atomic()` / `folio_unlock()` /
+`folio_put()`，并且 `err` 由取 folio 的错误推出），5.15 还是 page 形态，连被删的那两行都不在
+同一个文本位置。因此本组是**上游形态改写、不加 ABK 标记**：将来若有基线自带这条 commit，
+必须逐字节不动地报 `already_present`，而标记会正好落进幂等短路要比对的那段文本里，把
+`already_present` 变成 `blocked_by_missing_anchor`。`implementation_audit.py` 为此按文件钉了
+**标记的缺席**（与 `customize_alloc_gfp_vh` 同规格）。
+
+`err` 语义逐条对齐：旧代码是靠「重试跳回循环头、循环头先设 `err = -EFAULT` 再 fault」来兜底的，
+新代码在分支里设同一个值，于是 `return count > 0 ? count : err` 在「没写进任何字节」时仍返回
+`-EFAULT`、在「写进去一部分」时仍返回计数。行为差异只落在**真出错**那一支：现在会先分配再释放
+一个 page 才发现指针坏了 —— 这正是上游拿来做交换的那一项。
+
+### 3. 另外两条的评估
+
+- **`770c8d55c428`（lib/iov_iter：「fix to increase non slab folio refcount」）：不适用。**
+  这是 `Fixes: b9c0e49abfca`（"mm: decline to manipulate the refcount on a slab page"）的回移，
+  修的是 `__iov_iter_get_pages_alloc()` 里 `page_folio(page)` 该取 `page + k` 的 bug。
+  5.15 的 `lib/iov_iter.c` 里 `page_folio()` 与 `folio_test_slab()` **一个都没有** —— 缺陷不存在。
+- **FUSE passthrough（mainline v6.9）：按决定不做。** android13-5.15 已自带另一套实现，
+  ioctl 编号 `_IOW(229,126)`（上游是 `_IOW(229,1)` / `_IOW(229,2)`）。两者不冲突，但
+  MediaProvider 的 `FuseDaemon` 没有迁到上游 API，装了也没有调用者 ⇒ 等于往树里加第二份不可达
+  实现。本批与 FUSE 同域、最容易顺手带上，所以写进 `plan.md` 的排除记录，并且单测里加了一条
+  「没有任何组注册 passthrough / fs/erofs / lib/iov_iter」的守卫。
+
+### 4. 验证
+
+- **四条基线逐锚点核对**（167/178/194/lts-.216）：两个 `old` 各**唯一**（各 1 处）、两个 `new`
+  各 0 处、`fs/fuse/file.c` 里 ABK 标记 0 处。四条基线的文件只差三处、且都在别处
+  （`fuse_dax_break_layouts()` 的第三参数 `0` vs `-1`、`fuse_direct_io` 的
+  `.len = len` vs `.len = min_t(size_t, len, UINT_MAX & PAGE_MASK)`、194+ 多一句
+  `if (!err && outarg.size > len) err = -EIO;`），锚点区域逐字节相同（167/178 各 84609 字节，
+  194/216 各 84695 字节）。用的是手写校验脚本而非 `research/hunks.py`：`.patch` 的上下文是
+  6.x 的 folio 形态，转换器在这里用不上（同 Batch 33）。
+- **四档全绿**（167/178/194/216）：`py_compile`、`bash -n`（含 mksh 口径的 tools/ksu 脚本）、
+  `stable_5_15_test.py`（新增 `test_batch35_fuse_prefault_out_of_write_path`：27 项检查，含
+  trap-2 互斥、「两半不许对调」、上游形态无标记、第二遍逐字节幂等、未知形状降级且不写树，
+  以及那条排除守卫 —— 它同时把 `plan.md` 里的排除记录本身钉住，将来谁要移植 erofs 就得先删它
+  并证明前提）、`step_audit`（core **245 / 246 / 237 / 237** 步，四档第二遍全部幂等）、
+  `implementation_audit`（四档本组均 `applied`，并打出 upstream-shape 的
+  `no module marker` 说明）、`smoke.sh`（两遍 + 回滚；core pass1 167/178 为
+  `{'applied': 46}`、194 为 `{'already_present': 3, 'applied': 43}`、216 为
+  `{'already_present': 7, 'applied': 39}`，四档 pass2 均 `{'already_present': 46}`）。
+  **这些数字是两次 merge `main` 之后重测的**：本分支开着的时候主线并行落地了两批 —— arm64
+  LSE 组取走了「Batch 34」与 v0.36.0（core 40 → 41），page-cache/page-table 组取走了 35 与
+  v0.37.0（core 41 → 45，四组），于是本批两次改名、终为 **Batch 36 / v0.38.0**，core 计为
+  **46**。`step_audit` 的步数与 smoke 的 pass1 字典都随之变动，差值全部来自那两批，
+  本组自己那两处编辑没有变。
+  本批的「两半」是标准审计看不出的那种失败（少一半都能编译、行为都错），所以专门做了
+  **变异验证**：把「循环头预缺页加回来」与「重试预缺页删掉」两种错法分别打进已嫁接的树，
+  `REQUIRED_IN_FUNCTION` 的函数切片断言两次都报错；`smoke.sh` 的那条否定探针在原始文件上
+  触发、在嫁接后安静。
+- 三处 fixture 同步加 `fs/fuse/file.c`（`FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES`）——
+  `step_audit.py` 的 `check_fixture_coverage()` 会拒收只加一半的树。
+- **`config_gate_audit.py`：没有构建产物，跑不出结论，如实记下。** 本机工作树里没有 `.config`，
+  该审计按设计拒绝在缺 `.config` 时打出绿色（AGENTS.md：它「要构建产物，所以是发布时跑，
+  不是按组跑」）。把 `gki_defconfig` 当 `.config` 顶上去跑只能得到其它组的假红（它不是构建产物），
+  这个动作没有意义。本批与它的关系可以**机械地**确认：本组新增的 10 行里
+  `#if` / `IS_ENABLED(` **0 行**，因此 class-A / class-B 的归因扫描根本看不见它 ——
+  实测用那棵临时嫁接树的输出里，归到 `fs/fuse/` 或 `fs/erofs/` 的行数为 **0**。
+  连带地，`DARK_GATES` 不需要新增条目：本批**没有**新增任何 `CONFIG_EROFS_FS_*`
+  （erofs 整条排除），而 GKI 的 `gki_defconfig` 里本来只有 `CONFIG_EROFS_FS=y` 这一条与 erofs 有关。
+- `GROUP_COUNTS` core 40 → **46**（三次并行落地各 +1，加上本组自己的 +1）；README 普查
+  同步到 core 46、合计 70，并把三次并行落地的组与本组一起补进那串枚举（主线的 README 当时
+  连它自己的 Batch 34 都没列，只算了 44）；`module.conf` 0.35.0 → **0.38.0**（单测里钉的
+  那对版本号同步改），两个描述字段各补一句。
+  顺带修掉两处陈旧数字：三份文档里的「~44 files」（`FETCH_FILES` 实际已是 77 条，本批 +1 后
+  78 条）统一改成 **~78**；`docs/porting_policy.md` 的基线表按 v0.37.0 重新实测
+  （core 41/41/38+3/34+7、perf 23/22+1/20+3/15+8）—— 那张表标着 v0.34.0，Batch 33 落了组
+  却没更新，已经落后两批。
+
+### 5. 审查（两轴：Standards / Spec）与修订
+
+两轴各一个 sub-agent：Standards（本仓 `AGENTS.md` / `docs/group_recipe.md` /
+`docs/porting_policy.md` + Code Smell 基线）与 Spec（动手前的约定，含「erofs 那对到底能不能落」
+这一条）。Spec 轴跑了**两轮**（第一轮 sub-agent 被推理网关 502 掐断，换一轮重跑），第二轮在
+第一轮的基础上继续追。两轮查出并修掉的：
+
+| 轴 | 发现 | 处理 |
+|---|---|---|
+| Spec | **`generic_perform_write()` 的论据在本树上不成立**：我按上游 commit message 写它「只在无进展分支 fault」，但 5.15 的 `mm/filemap.c` 里它**仍在循环头** fault（`Bring in the user page that we will copy from _first_`）。那句话对 v6.15+ 的上游为真 | docstring 改写成可核对的形态：分别陈述「上游为什么这么做」与「5.15 上为什么仍然安全」（新 fault 落在 `unlock_page()`/`put_page()` 之后，且 `copy_page_from_iter_atomic()` 不 fault），并显式声明这是**上游的**理由、本模块没有独立测量。plan.md 的「与 `generic_perform_write()` 同形」同样加了限定。见 §6 |
+| Spec | 「5.15 的 `get_tree_bdev()` 对非块设备以 `-ENOTBLK` 返回」这条论据，初稿只写到函数名、没写可核对的出处（而按上游路径去 `fs/block_dev.c` 找会 404 —— 这仓的块设备代码在 `block/bdev.c`） | 实测 `block/bdev.c` 的 `lookup_bdev()`（`error = -ENOTBLK; if (!S_ISBLK(inode->i_mode)) goto out_path_put;`）并把路径这条容易踩空的差异写进模块 docstring / plan.md / 本节 §1 |
+| Standards | 模块 docstring 的 grep 证据表把符号拼成 `super_sysfs_name_generic`（真名是 `super_set_sysfs_name_generic`），`plan.md` / CHANGELOG 用的是对的 —— 一张「grep 结果」的表列了一个从未被搜索过的串 | 改成真名并把表格重排（每行一个符号），三处拼写现在一致 |
+| Standards | 同一段说前提是「194 与 lts 两棵树的 grep」，而 `plan.md` / CHANGELOG 都写成「四条基线」—— 两边必有一处夸大 | 补测 167/178 的 `fs/erofs/`，把「四条基线」**做成事实**：四条 `internal.h` 同为 15955 字节，列出的 10 个符号在四条上各 0 处，`fileio.c` 不在任何一条的 `Makefile` 里 |
+| Standards | 「文件跨基线只差两处」与 CHANGELOG 的「三处」不一致 | 统一成三处（`fuse_dax_break_layouts()` 第三参数、`->len` 截断、`outarg.size` 检查） |
+| Standards | `tests/implementation_audit.py` 里留了一句起草期的死表达式 `"copy_page_from_iter_atomic" if False else "..."`，同时那条 `fault_in_iov_iter_readable(ii, bytes)` 钉的串在两种形态下都成立、没有判别力 | 死表达式删掉；只留两条真正能判别 5.15 page 形态的钉子，顺序与两半由 `REQUIRED_IN_FUNCTION` 负责 |
+| Standards | `docs/porting_policy.md` 的基线表标着 v0.34.0、core 39/39/36/32，落后两批（Batch 33 落了组没更新） | 按 v0.37.0 重新实测更新（见 §4） |
+
+表里的行是两轴各自的产出；**第二轮 Spec 审查另外揪出四处「记录不准」**，都不改结论、但都会让记录
+本身不可信，已逐条改掉：
+
+| 轴 | 发现 | 处理 |
+|---|---|---|
+| Spec | **「原生 `read_folio` 取代了 iomap」是错的**：上游 erofs 到 v6.12、乃至 v6.16 的 bdev 通路**仍然是 iomap**（`erofs_read_folio()` → `iomap_read_folio(..., &erofs_iomap_ops)`，v6.12 里 `iomap` 出现 37 次、v6.16 里 41 次）。file-backed mount 是**并列**加一套 `erofs_fileio_aops`，不是替换 iomap —— 这反而让「前置链」变短了 | 模块 docstring / `plan.md` / 本节 §1 全部改写：前置是 **metabuf 层 + `fileio.c`**，并显式写明「不是取代 iomap」以及上游仍在 iomap 的版本证据 |
+| Spec | **fscache/ondemand 被当成前置，其实不是**：上游把 fileio 与 fscache 当**互斥模式**（`erofs_is_fileio_mode()` 为真时 `erofs_is_fscache_mode()` 返回假），回移它是另一个独立选择 | 从三处前置链里去掉，`plan.md` 的 `[~]` 追问项里补一句「不在链上」 |
+| Spec | 两处版本归属错：`struct erofs_buf`「6.4 的 metabuf 层」（实测 v5.19/v6.0–v6.3 各 7 处，早已存在）；`get_tree_bdev()` 改成 `lookup_bdev()`+`sget_dev()`「6.11」（实测 **v6.6**：v6.5 仍是 `blkdev_get_by_path()`、v6.6 起才是新形态并带上那句 `Can't lookup blockdev`） | 分别改成「约 5.19 起」与「**v6.6**（v6.5 还是 `blkdev_get_by_path()`）」 |
+| Spec | 「只有 167 的 `inode.c` 有差异」对 lts 不成立（216 另有 `decompressor.c`/`dir.c`/`zdata.c`/`zdata.h` 差异）—— 我那条只比了下载到的 6 个文件就写成了全目录结论 | 收窄成实测到的那一条：四条 `internal.h` 同为 15955 字节**且逐字节相同**（结论不受影响：11 个符号在四条上仍各 0 处） |
+
+Spec 轴没有推翻本批的结论 —— erofs 那对确实不能落（`fileio.c` 与 metabuf 层是硬前置），
+`get_tree_bdev()` 确实以 `-ENOTBLK` 返回（它在真实基线里追到了 `block/bdev.c` 的 `lookup_bdev()`），
+`770c8d55c428` 确实无处可改，边界（无 f2fs/ufs、无 passthrough）也确实没被越过。
+改完按 §4 的数字复跑了四条基线的 `step_audit` / `implementation_audit` / `smoke.sh`，全绿。
+
+### 6. 已知边界
+
+- **不主张设备侧提速。** 上游这条 commit 的收益是「每次 `write(2)` 少一次用户态访问」，
+  属系统性开销；本模块没有做真机 A/B，也不拿它当提速项报。
+- 只动 `fuse_fill_write_pages()` 的预缺页位置，**不改** FUSE 的写路径结构：`fuse_perform_write()`
+  的循环、`fuse_send_write_pages()` 的 daemon 往返、`ia->write.page_locked` 的单页锁定分支
+  全部原样。
+- 5.15 上这条路径的读者是 FUSE 的普通写（含 MediaProvider 的 FuseDaemon 场景）；passthrough
+  路径不经过这里，而本批也没动 passthrough。
+- **上游那条 commit 的理由在这棵树上不成立，已按事实写明。** 它的 commit message 说这是
+  「Make fuse_fill_write_pages() consistent with generic_perform_write()」。这句话对上游成立：
+  v6.15/v6.16 的 `generic_perform_write()` 只在**无进展**分支 fault，注释写着
+  `'folio' is now unlocked and faults on it can be handled. Ensure forward progress by trying
+  to fault it in now.`。但 **5.15 的 `generic_perform_write()` 仍把 fault 放在循环头**
+  （`mm/filemap.c`，注释 `Bring in the user page that we will copy from _first_`），所以
+  「同形」在 167/178/194/216 上**都不成立**。真正保证安全的是新 fault 的**落点**：
+  它在 `unlock_page()`/`put_page()` **之后**，没有在持页锁的情况下取缺页，而
+  `copy_page_from_iter_atomic()` 本身不会 fault —— 这也正是上游注释点名的那个条件。
+  因此本组是**快路径的启发式**，不是正确性要求；本模块不主张自己独立测过这一点，
+  只主张与上游 v6.16 的形态、以及 5.15 自己的锁序一致。（这条是 Spec 轴审查的产物：
+  初稿把「上游 `generic_perform_write()` 不在循环头预缺页」写成了对**本树**的描述。）
+
+<a id="batch-36-memcg"></a>
 
 ## Batch 36(v0.38.0)
 
@@ -593,6 +797,8 @@ memory for the lruvec and memcg stats），Shakeel Butt，patch 存
 `blocked_by_shape`（锚点未过），会连带共享工作树的 step_audit 报红。本批提交经临时 index
 **只包含 Batch 36 的文件集**（不含任何 mglru 改动），上述门禁全部在「HEAD + 仅本批」的隔离
 worktree 里验证；Batch 37 在制品原样留在工作树，由其后续批次自行收尾。
+
+<a id="batch-35"></a>
 
 ## Batch 35(v0.37.0)
 
@@ -831,8 +1037,6 @@ the fentry benchmark」,并给出 Neoverse-V2(KVM,8 CPU)上的 `bench trig-fentr
 - `sublevel_matrix.py`:core `GROUP_COUNTS` 40 → 41;`PRE_APPLIED` **不变**(四档都不预装,
   含 lts .216 —— 5.15.y 未收即滚动分支也未收);
 - `module.conf` 0.35.0 → 0.36.0。
-
----
 
 <a id="batch-33"></a>
 
