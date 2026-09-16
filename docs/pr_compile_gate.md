@@ -123,6 +123,12 @@ GH_TOKEN=$P gh api -X PATCH repos/fanziyun/ABK -f description=probe
 跳过类事件（draft、doc-only、非 `ci:compile` 标签）本来就不需要用凭据，所以不连坐 —— 否则 PAT 一到期，
 连只改文档的 PR 都会红。这是有意的：宁可红着喊出声、也不让编译门禁假装通过，但也不给不需要编译的 PR 制造噪音。
 
+**轮换 / 到期。** PAT 到期或轮换那天，只需要重跑一次上面那条 `gh secret set`（交互输入新值），
+不需要动任何别的东西：门禁的其余部分与本仓库的 `GITHUB_TOKEN` 无关。换完验一次的方法：
+给任意一个改到内核树、还没结论的 PR 打/重打 `ci:compile` 标签，看那条
+`ABK kernel compile (android13-5.15-lts)` 是否从 `pending` 走到终态。
+期间 draft / 纯文档 PR 照常不受影响 —— 那是第 9 号改动特意保证的：跳过类事件不需要凭据，不连坐。
+
 ## 5. 手动重跑
 
 - 给 PR 打 / 重打 `ci:compile` 标签（同仓库 PR 也认，是最轻的重跑方式）；
