@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.32.0", "0.32.0"], _versions)
+          _versions == ["0.33.0", "0.33.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4428,6 +4428,89 @@ def test_batch30_readahead_mmap_miss_race():
               status3 == "blocked_by_shape", status3)
         check("a degraded group writes nothing",
               ctx3.pending_writes() == [], ctx3.pending_writes())
+# Minimal arm64/include/asm/pgtable.h shapes -- only what the Batch 31 group
+# anchors on.  The `pte_sw_dirty()` macro is the 5.15 spelling the fix relies
+# on (and it is why this is portable at all: the macro predates the commit).
+_BATCH31_PGTABLE_167 = (
+    "#define pte_sw_dirty(pte)\t(!!(pte_val(pte) & PTE_DIRTY))\n"
+    "\n"
+    "static inline pte_t pte_mkwrite(pte_t pte)\n"
+    "{\n"
+    "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
+    "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));\n"
+    "\treturn pte;\n"
+    "}\n"
+)
+
+_BATCH31_PGTABLE_216 = (
+    "#define pte_sw_dirty(pte)\t(!!(pte_val(pte) & PTE_DIRTY))\n"
+    "\n"
+    "static inline pte_t pte_mkwrite(pte_t pte)\n"
+    "{\n"
+    "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
+    "\tif (pte_sw_dirty(pte))\n"
+    "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));\n"
+    "\treturn pte;\n"
+    "}\n"
+)
+
+
+def test_batch31_arm64_pte_mkwrite_clean():
+    """The port source is 5.15.y's shape, and the target form is the probe.
+
+    Two things this group gets wrong silently if they drift, so both are pinned
+    here rather than only on a real tree: the *name* (mainline's
+    `pte_mkwrite_novma()` arrives with the v6.6 rename 2f0584f3f4bd -- pasting
+    that hunk anchors nowhere on all four baselines, and shows up only as
+    `blocked_by_shape` on a real one), and the *absence* of an ABK marker (an
+    upstream-shape rewrite must leave a baseline that already carries 5.15.196
+    byte-identical, which is what makes 216 report already_present).
+    """
+    print("Batch 31 arm64 pte_mkwrite() dirty guard (upstream-shape rewrite)")
+    import abk_stable_core as core
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "arm64_pte_mkwrite_clean"), None)
+    check("arm64_pte_mkwrite_clean group registered", group is not None)
+    if group is None:
+        return
+    check("group targets the arm64 pte helper",
+          group.files == ["arch/arm64/include/asm/pgtable.h"], group.files)
+    check("both the 5.15.y and the mainline commit are recorded",
+          any("8a2375b0e9b8" in c for c in group.commits)
+          and any("143937ca51cc" in c for c in group.commits), group.commits)
+    for blob in (core._ARM64_PTE_MKWRITE_OLD, core._ARM64_PTE_MKWRITE_NEW):
+        check("the graft speaks the 5.15 name, not mainline's",
+              "static inline pte_t pte_mkwrite(pte_t pte)" in blob
+              and "pte_mkwrite_novma" not in blob, blob[:60])
+        check("graft text carries no ABK marker (upstream-shape)",
+              "ABK stable_515_backport" not in blob, blob[:60])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            "arch/arm64/include/asm/pgtable.h": _BATCH31_PGTABLE_167,
+        })
+        status, detail = core._arm64_pte_mkwrite_clean_apply(ctx)
+        check("guard applies on the 5.15.167 shape",
+              status == "applied", (status, detail))
+        text = ctx.read("arch/arm64/include/asm/pgtable.h")
+        check("PTE_RDONLY is cleared only for a software-dirty PTE",
+              "if (pte_sw_dirty(pte))\n"
+              "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));" in text)
+
+        ctx2 = make_ctx(tmp, {"arch/arm64/include/asm/pgtable.h": text})
+        status2, detail2 = core._arm64_pte_mkwrite_clean_apply(ctx2)
+        check("second pass is already_present on the grafted text",
+              status2 == "already_present", (status2, detail2))
+
+        ctx3 = make_ctx(tmp, {
+            "arch/arm64/include/asm/pgtable.h": _BATCH31_PGTABLE_216,
+        })
+        status3, detail3 = core._arm64_pte_mkwrite_clean_apply(ctx3)
+        check("the 5.15.196 shape reports already_present",
+              status3 == "already_present", (status3, detail3))
+        check("a baseline that already has the guard is left byte-identical",
+              ctx3.read("arch/arm64/include/asm/pgtable.h") == _BATCH31_PGTABLE_216)
 
 
 def main():
@@ -4478,6 +4561,7 @@ def main():
     test_kstack_slot_shape_selection()
     test_batch27_launch_bench()
     test_batch30_readahead_mmap_miss_race()
+    test_batch31_arm64_pte_mkwrite_clean()
 
     print()
     if FAILURES:

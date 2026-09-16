@@ -4241,5 +4241,80 @@ import batch30_core_mmap_miss_races as _b30_mmr  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b30_mmr.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 31: arm64 pte_mkwrite() stops dirtying a clean PTE.
+#
+# Mainline 143937ca51cc (v6.18, Huang Ying) makes pte_mkwrite_novma() clear
+# PTE_RDONLY only when the PTE is already software-dirty, so a page can be
+# mapped writable *and* clean.  linux-5.15.y took the same patch as
+# 8a2375b0e9b8 and it is in v5.15.196 onwards; android13-5.15-lts (SUBLEVEL
+# 216) carries it, the three release baselines (167/178/194) do not.
+#
+# Why it matters on this baseline: arm64's protection_map defines PAGE_SHARED
+# as "shared+writable pages are clean by default, hence PTE_RDONLY|PTE_WRITE",
+# so clearing PTE_RDONLY is precisely what marks a page hardware-dirty
+# (pte_hw_dirty() == pte_write() && !(pte_val(pte) & PTE_RDONLY)).  Every
+# caller that makes a *clean* pte writable therefore reported the page dirty
+# with nobody having written it, and try_to_unmap() turns that into
+# set_page_dirty() at reclaim -- an unwritten page gets written back.  The live
+# 5.15 call sites are the ones that restore a writable mapping after a
+# transient unmap (remove_migration_pte(), do_numa_page(), userfaultfd); the
+# motivating do_swap_page() case in the commit message is mainline-only, since
+# 5.15's do_swap_page() pairs pte_mkwrite with pte_mkdirty.
+#
+# The target form is the 5.15.y form, not mainline's: 5.15 has pte_mkwrite(),
+# not pte_mkwrite_novma() (that name arrives with the v6.6 rename 2f0584f3f4bd,
+# the first step of the vma-aware pte_mkwrite() series), so a verbatim mainline
+# hunk anchors nowhere on any of the four baselines.
+#
+# No ABK marker comment, deliberately: this is an upstream-shape rewrite, so the
+# target form doubles as the idempotency probe -- on 216 the file is left
+# byte-identical and the group reports already_present (PRE_APPLIED there).  A
+# marker line would break that probe and turn 216 into blocked_by_shape.
+# ============================================================================
+
+_ARM64_PTE_MKWRITE_OLD = (
+    "static inline pte_t pte_mkwrite(pte_t pte)\n"
+    "{\n"
+    "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
+    "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));\n"
+    "\treturn pte;\n"
+    "}"
+)
+
+_ARM64_PTE_MKWRITE_NEW = (
+    "static inline pte_t pte_mkwrite(pte_t pte)\n"
+    "{\n"
+    "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
+    "\tif (pte_sw_dirty(pte))\n"
+    "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));\n"
+    "\treturn pte;\n"
+    "}"
+)
+
+
+def _arm64_pte_mkwrite_clean_apply(ctx):
+    """5.15.196's pte_mkwrite(): only clear PTE_RDONLY for a sw-dirty PTE."""
+    status, _results, detail = apply_steps(
+        ctx, [("arch/arm64/include/asm/pgtable.h",
+               _ARM64_PTE_MKWRITE_OLD, _ARM64_PTE_MKWRITE_NEW, True)]
+    )
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "arm64_pte_mkwrite_clean",
+        "arm64 pte_mkwrite() stops dirtying a clean PTE, so a writable mapping "
+        "can report clean and an unwritten page is not written back at reclaim "
+        "(5.15.196; mainline 143937ca51cc, v6.18)",
+        ["8a2375b0e9b8 (5.15.196)", "143937ca51cc (v6.18)"],
+        ["arch/arm64/include/asm/pgtable.h"],
+        _arm64_pte_mkwrite_clean_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()

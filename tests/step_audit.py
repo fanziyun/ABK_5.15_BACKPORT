@@ -161,6 +161,8 @@ AUDIT_FILES = [
     # FETCH_FILES for reference reads (the module touched no group there until
     # now), so only the fixture list needed the entry.
     "mm/filemap.c",
+    # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
+    "arch/arm64/include/asm/pgtable.h",
 ]
 
 CHILD_MODULES = [
