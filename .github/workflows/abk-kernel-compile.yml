@@ -129,18 +129,19 @@ jobs:
             echo "skip_kind=$skip_kind"
           } >> "$GITHUB_OUTPUT"
 
-          # 前置没配齐就红着喊：宁可靠红喊出声，也不要让编译门禁假装通过（见 docs/pr_compile_gate.md）。
+          # 先定「这次到底编不编」，再谈凭据：跳过类事件（draft、doc-only、非 ci:compile 标签）本来就不需要
+          # 凭据，凭据缺失不该把它们连坐成红 —— 尤其是 PAT 到期那天，别让全仓库的 PR 一起变红。
+          # 真正要派发时缺凭据才红着喊：宁可靠红喊出声，也不要让编译门禁假装通过（见 docs/pr_compile_gate.md）。
           # 放在写 output 之后，这样 Report 步骤仍有 pr/head_sha 可写状态与评论。
-          if [ -z "${{ secrets.ABK_CI_TOKEN }}" ]; then
-            echo "::error::secret ABK_CI_TOKEN 缺失（见 docs/pr_compile_gate.md），PR 编译门禁无法派发 ABK 构建"
-            exit 1
-          fi
-
           if [ -n "$reason" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "reason=$reason" >> "$GITHUB_OUTPUT"
             echo "::notice::跳过 ABK 编译门禁：$reason"
           else
+            if [ -z "${{ secrets.ABK_CI_TOKEN }}" ]; then
+              echo "::error::secret ABK_CI_TOKEN 缺失（见 docs/pr_compile_gate.md），PR 编译门禁无法派发 ABK 构建"
+              exit 1
+            fi
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "reason=" >> "$GITHUB_OUTPUT"
             echo "::notice::将对 PR #$pr ($head_sha) 派发 ABK 编译"
@@ -575,8 +576,10 @@ jobs:
           conclusion=""
           post_status=true      # 只有「有结论」或「根本不用编」才写 status
           headline="$state"
-          if [ -z "${ABK_TOKEN:-}" ]; then
-            # 前置没配齐：门禁根本没有派发的能力，红着喊（见 docs/pr_compile_gate.md 第 4 节）
+          if [ -z "${ABK_TOKEN:-}" ] && [ "$GATE_RUN" != "false" ]; then
+            # 前置没配齐、而这次本来是要真编的（GATE_RUN 不是 false，含门禁在 Token 检查处就挂掉、
+            # run 都没来得及 output 的情况）：门禁根本没有派发的能力，红着喊（见 docs/pr_compile_gate.md 第 4 节）。
+            # GATE_RUN=false 的跳过事件不需要凭据，交给下面的跳过语义，不连坐。
             state="failure"
             desc="没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）"
           elif [ "$GATE_RUN" = "false" ]; then
