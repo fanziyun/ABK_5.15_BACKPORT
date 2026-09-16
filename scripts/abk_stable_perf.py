@@ -2476,3 +2476,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ci gate self-test marker (ref-pin verification); safe no-op, removed with the branch.
