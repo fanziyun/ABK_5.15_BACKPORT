@@ -798,6 +798,121 @@ REQUIRED_CONTENT = {
         "while not holding the page lock:",
         "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
     ],
+    "core:memcg_stats_percpu_slim": [
+        "ABK stable_515_backport: memcg_stats_percpu_slim",
+        "struct abk_vmstats_percpu",
+        "struct abk_lruvec_stats_percpu",
+        "__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+        "__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+        "static void init_memcg_stats(void)",
+        "static void init_memcg_events(void)",
+        "init_memcg_stats();\n\t\tinit_memcg_events();",
+        "static const unsigned int memcg_node_stat_items[] = {",
+        "static const unsigned int memcg_stat_items[] = {",
+        "static const unsigned int memcg_vm_event_items[] = {",
+
+        # The item tables, item by item: dropping any of these silently zeroes
+        # that stat.  State table = memory_stats[] + memcg1_stats[] readers
+        # (26 node items + 3 MEMCG items); events = every count_memcg_events*/
+        # writer on this baseline (13 + THP pair).
+        "NR_INACTIVE_ANON,\n\tNR_ACTIVE_ANON,\n\tNR_INACTIVE_FILE,\n\tNR_ACTIVE_FILE,\n\tNR_UNEVICTABLE,",
+        "NR_SLAB_RECLAIMABLE_B,\n\tNR_SLAB_UNRECLAIMABLE_B,",
+        "WORKINGSET_REFAULT_ANON,\n\tWORKINGSET_REFAULT_FILE,\n\tWORKINGSET_ACTIVATE_ANON,\n\tWORKINGSET_ACTIVATE_FILE,\n\tWORKINGSET_RESTORE_ANON,\n\tWORKINGSET_RESTORE_FILE,\n\tWORKINGSET_NODERECLAIM,",
+        "NR_ANON_MAPPED,\n\tNR_FILE_MAPPED,\n\tNR_FILE_PAGES,\n\tNR_FILE_DIRTY,\n\tNR_WRITEBACK,\n\tNR_SHMEM,\n\tNR_SHMEM_THPS,\n\tNR_FILE_THPS,\n\tNR_ANON_THPS,\n\tNR_KERNEL_STACK_KB,\n\tNR_PAGETABLE,",
+        "#ifdef CONFIG_SWAP\n\tNR_SWAPCACHE,\n#endif",
+        "MEMCG_SWAP,\n\tMEMCG_SOCK,\n\tMEMCG_PERCPU_B,",
+        "PGPGIN,\n\tPGPGOUT,\n\tPGFAULT,\n\tPGMAJFAULT,\n\tPGREFILL,\n\tPGSCAN_KSWAPD,\n\tPGSCAN_DIRECT,\n\tPGSTEAL_KSWAPD,\n\tPGSTEAL_DIRECT,\n\tPGACTIVATE,\n\tPGDEACTIVATE,\n\tPGLAZYFREE,\n\tPGLAZYFREED,",
+        "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n\tTHP_FAULT_ALLOC,\n\tTHP_COLLAPSE_ALLOC,\n#endif",
+
+        # The header keeps every struct member: nothing may shrink the
+        # KMI-visible aggregates (the group blob spans mm/memcontrol.c and
+        # include/linux/memcontrol.h, so plain strings pin both files).
+        # lruvec_page_state_local() moved out of line, not deleted: the
+        # prototype wrapping is the header's, the longer one the .c body's.
+        "struct lruvec_stats {\n\t/* Aggregated (CPU and subtree) state */\n\tlong state[NR_VM_NODE_STAT_ITEMS];",
+        "struct memcg_vmstats {",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
+    ],
+    "core:mglru_clean_workingset": [
+        # 9cbfd1c3c83b, portable remainder: the workingset_refault() lock
+        # assertion must sit at the entry, before the MGLRU dispatch, so it
+        # covers both paths.  The test_recent()/lru_gen_test_recent() halves
+        # of the upstream commit have no 6.1-shape counterpart here and are
+        # deliberately not carried.
+        "VM_BUG_ON_PAGE(!PageLocked(page), page);"
+    ],
+    "core:mglru_optimize_deactivation": [
+        # cc8ec7be78ff, pagevec re-authoring.  The helper must read the
+        # generation back (gen < 0 -> avoid the shuffle) and compare it
+        # against min_seq; the deactivate paths must consult it before they
+        # queue a pagevec move.
+        "static bool lru_gen_clear_refs(struct page *page)",
+        "return gen == lru_gen_from_seq(READ_ONCE(lruvec->lrugen.min_seq[type]));",
+        "if (lru_gen_enabled() && lru_gen_clear_refs(page))\n\t\treturn;",
+        "if (lru_gen_enabled() ? lru_gen_clear_refs(page)\n"
+        "\t\t\t\t\t      : !PageActive(page))",
+        "bool active = PageActive(page) || lru_gen_enabled();",
+        "if (lru_gen_enabled())\n\t\t\tlru_gen_clear_refs(page);\n"
+        "\t\telse\n\t\t\tClearPageReferenced(page);",
+    ],
+    "core:mglru_rework_aging_feedback": [
+        # 798c0330c2ca.  The array, the walk field and the two macros are the
+        # structural core; the sentinel arithmetic (type ? ... : !swappiness)
+        # and the simplified aging verdict are the behavioural pins.  The old
+        # exact-sync rule (anon min = min(anon,file), file min = max(...)) and
+        # the can_swap walk field must be gone.
+        "unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];",
+        "\tint swappiness;\n\tbool full_scan;",
+        "#define evictable_min_seq(min_seq, swappiness)",
+        "#define for_each_evictable_type(type, swappiness)",
+        "if (type ? swappiness > MAX_SWAPPINESS : !swappiness)",
+        "if (walk->swappiness > MAX_SWAPPINESS)\n\t\treturn true;",
+        "if (min_seq[LRU_GEN_ANON] > seq && min_seq[LRU_GEN_FILE] < seq)",
+        "WRITE_ONCE(lrugen->protected[hist][type][tier],\n"
+        "\t\t\t\t   lrugen->protected[hist][type][tier] + delta);",
+        "return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;",
+        "if (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)",
+        "n[2] = READ_ONCE(lrugen->protected[hist][type][tier]);",
+        "int swappiness = get_swappiness(lruvec, sc);",
+    ],
+    "core:mglru_rework_type_selection": [
+        # 37a260870f2c.  The summed-tier read_ctrl_pos() loop, the 2:3 margin,
+        # the total-tier type comparison and the single-pre-choice
+        # isolate_pages() loop are the content; the per-tier gain array and
+        # the shared tier_idx out-param must be gone.
+        "pos->refaulted = pos->total = 0;",
+        "for (i = tier % MAX_NR_TIERS; i <= min(tier, MAX_NR_TIERS - 1); i++) {",
+        "gain factor (2:3)",
+        "read_ctrl_pos(lruvec, type, 0, 2, &sp);",
+        "read_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);",
+        "read_ctrl_pos(lruvec, LRU_GEN_FILE, MAX_NR_TIERS, MAX_SWAPPINESS - swappiness, &pv);",
+        "if (swappiness <= MIN_SWAPPINESS + 1)\n\t\treturn LRU_GEN_FILE;",
+        "int type = get_type_to_scan(lruvec, swappiness);",
+        "\tint scanned;\n\t\tint tier = get_tier_idx(lruvec, type);",
+    ],
+    "core:mglru_rework_refault_detection": [
+        # b1a71694fb00, page-shaped: the recency test must be a windowed
+        # distance against max_seq, and the internal refaulted[] counter must
+        # keep landing in the min_seq[type] history bucket the way the
+        # already-carried accounting fix (3af0191a594d) left it.
+        "seq = READ_ONCE(lrugen->max_seq) & (EVICTION_MASK >> LRU_REFS_WIDTH);",
+        "if (diff >= MAX_NR_GENS)\n\t\tgoto unlock;",
+        "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));",
+    ],
+    "core:mglru_wake_flushers": [
+        # 1bc542c6a0d1.  Both accounting feeds (sort_page's dirty page and
+        # scan_pages' isolated counts), the stat carry-out of
+        # shrink_page_list() and the end-of-cycle wake predicate.
+        "\tbool dirty, writeback;",
+        "sc->nr.file_taken += delta;",
+        "\tif (type == LRU_GEN_FILE)\n\t\tsc->nr.file_taken += isolated;",
+        "sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;",
+        "if (PageLocked(page) || writeback ||\n"
+        "\t    (type == LRU_GEN_FILE && dirty)) {",
+        "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
+        "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1048,6 +1163,42 @@ REQUIRED_ABSENT = {
         # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
         # is this module's only group there.
         ["fs/fuse/file.c", "ABK stable_515_backport:"],
+    ],
+    "core:memcg_stats_percpu_slim": [
+        "vmstats_percpu->state[idx]",
+        "vmstats_percpu->events[idx]",
+        "vmstats_percpu->events[event]",
+        "vmstats_percpu->nr_page_events",
+        "vmstats_percpu->targets[target]",
+        "lruvec_stats_percpu->state[idx]",
+        "alloc_percpu_gfp(struct memcg_vmstats_percpu",
+        "alloc_percpu_gfp(struct lruvec_stats_percpu",
+    ],
+    "core:mglru_rework_aging_feedback": [
+        # The can_swap walk field, the exact-sync min_seq rule, the
+        # tier-minus-one protection index and the boolean swappiness call
+        # shape are all pre-798c0330c2ca and must be gone.
+        ["include/linux/mmzone.h", "bool can_swap;"],
+        ["include/linux/mmzone.h", "MAX_NR_TIERS - 1];"],
+        ["mm/vmscan.c", "VM_WARN_ON_ONCE(!full_scan && (type == LRU_GEN_FILE || can_swap));"],
+        ["mm/vmscan.c", "min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);"],
+        ["mm/vmscan.c", "get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS"],
+        ["mm/vmscan.c", "swappiness > 200)"],
+        ["mm/vmscan.c", "min_seq[!can_swap]"],
+        ["mm/vmscan.c", "walk->can_swap"],
+    ],
+    "core:mglru_rework_type_selection": [
+        # The first-tier gain array and the tier_idx out-param are the
+        # pre-37a260870f2c shapes.
+        ["mm/vmscan.c", "int gain[ANON_AND_FILE] = { swappiness, 200 - swappiness };"],
+        ["mm/vmscan.c", "get_type_to_scan(lruvec, swappiness, &tier);"],
+        ["mm/vmscan.c", "*tier_idx = tier - 1;"],
+        ["mm/vmscan.c", "else if (swappiness == 200)"],
+    ],
+    "core:mglru_rework_refault_detection": [
+        # The exact min_seq token match is the misattribution being fixed.
+        ["mm/workingset.c",
+         "if ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))"],
     ],
 }
 
@@ -1540,6 +1691,85 @@ REQUIRED_IN_FUNCTION = {
          [" again:\n"
           "\t\terr = -EFAULT;\n"]),
     ],
+    "core:mglru_rework_refault_detection": [
+        # The windowed recency test must land in lru_gen_refault() itself;
+        # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
+        # the shadow token), so the absence claim cannot be file-wide.
+        ("mm/workingset.c", "lru_gen_refault",
+         ["unsigned long seq;",
+          "unsigned long diff;",
+          "if (diff >= MAX_NR_GENS)",
+          "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));"],
+         ["unsigned long min_seq;"]),
+    ],
+    "core:memcg_stats_percpu_slim": [
+        ("mm/memcontrol.c", "__mod_memcg_state",
+         ["i = memcg_stats_index(idx);",
+          "if (i < 0)",
+          "abk_vmstats_percpu_of(memcg)->state[i], val"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "memcg_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], cpu"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__mod_memcg_lruvec_state",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], val",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], val"],
+         ["vmstats_percpu->state[idx]",
+          "lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__count_memcg_events",
+         ["i = memcg_events_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->events[i], count"],
+         ["vmstats_percpu->events[idx]"]),
+        ("mm/memcontrol.c", "memcg_events_local",
+         ["i = memcg_events_index(event);",
+          "abk_vmstats_percpu_of(memcg)->events[i], cpu"],
+         ["vmstats_percpu->events[event]"]),
+        ("mm/memcontrol.c", "lruvec_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], cpu"],
+         ["lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "mem_cgroup_css_rstat_flush",
+         ["struct abk_vmstats_percpu *statc",
+          "per_cpu_ptr(abk_vmstats_percpu_of(memcg), cpu)",
+          "for (i = 0; i < NR_MEMCG_VMSTAT_SIZE; i++)",
+          "int item = i < NR_MEMCG_NODE_STAT_ITEMS ?",
+          "memcg->vmstats.state[item] += delta",
+          "for (i = 0; i < NR_MEMCG_VM_EVENTS; i++)",
+          "int event = memcg_vm_event_items[i];",
+          "memcg->vmstats.events[event] += delta",
+          "struct abk_lruvec_stats_percpu *lstatc",
+          "per_cpu_ptr(abk_lruvec_stats_percpu_of(pn), cpu)",
+          "for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)",
+          "int item = memcg_node_stat_items[i];",
+          "pn->lruvec_stats.state[item] += delta"],
+         ["for (i = 0; i < MEMCG_NR_STAT; i++)",
+          "for (i = 0; i < NR_VM_EVENT_ITEMS; i++)",
+          "for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)"]),
+        ("mm/memcontrol.c", "mem_cgroup_charge_statistics",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
+        ("mm/memcontrol.c", "mem_cgroup_event_ratelimit",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events",
+          "abk_vmstats_percpu_of(memcg)->targets[target]"],
+         ["vmstats_percpu->nr_page_events",
+          "vmstats_percpu->targets[target]"]),
+        # uncharge_batch() adds to nr_page_events outside the charge/ratelimit
+        # pair; missing it compiles cleanly and corrupts the v1 page-event
+        # counters on every uncharge (the first enumeration pass missed it).
+        ("mm/memcontrol.c", "uncharge_batch",
+         ["abk_vmstats_percpu_of(ug->memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
+        ("mm/memcontrol.c", "alloc_mem_cgroup_per_node_info",
+         ["__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+          "__alignof__(struct abk_lruvec_stats_percpu)"],
+         ["alloc_percpu_gfp(struct lruvec_stats_percpu"]),
+        ("mm/memcontrol.c", "mem_cgroup_alloc",
+         ["__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+          "__alignof__(struct abk_vmstats_percpu)"],
+         ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
+    ],
 }
 
 
@@ -1622,8 +1852,19 @@ def run_tree(source):
                 if key in REQUIRED_CONTENT and status in ("applied", "partial"):
                     blob = "".join(ctx.read(f) for f in group.files
                                    if ctx.path(f).exists())
-                    missing = [needle for needle in REQUIRED_CONTENT[key]
-                               if needle not in blob]
+                    # A bare needle checks the whole-file blob; a
+                    # (rel, needle) pair checks one file only, for claims a
+                    # neighbouring group's content in the same blob would
+                    # otherwise satisfy.
+                    missing = []
+                    for needle in REQUIRED_CONTENT[key]:
+                        if isinstance(needle, (list, tuple)):
+                            rel, sub = needle
+                            if not (ctx.path(rel).exists()
+                                    and sub in ctx.read(rel)):
+                                missing.append(f"{sub!r} not in {rel}")
+                        elif needle not in blob:
+                            missing.append(needle)
                     if missing:
                         problems.append(f"{child}/{group.key}: missing "
                                         f"feature content {missing}")

@@ -39,10 +39,14 @@ SMOKE_FILES=(
   mm/oom_kill.c
   mm/vmscan.c
   mm/memcontrol.c
+  # Batch 37 (MGLRU v4): the workingset and deactivation groups anchor here.
+  mm/workingset.c
+  mm/swap.c
   include/linux/swap.h
   include/linux/cgroup-defs.h
   include/linux/cpuset.h
   include/linux/mmzone.h
+  include/linux/memcontrol.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
   include/linux/psi_types.h

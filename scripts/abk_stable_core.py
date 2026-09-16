@@ -1346,6 +1346,1167 @@ def _memcg_reclaim_apply(ctx):
 
 
 # ---------------------------------------------------------------------------
+# MGLRU performance optimizations, v4 (v6.14, Yu Zhao) -- re-authored onto the
+# 6.1-shape (page-based) MGLRU the android13-5.15 ACK carries.  The upstream
+# diffs are folio-era and assume 6.2-6.13 intermediates that this baseline
+# never gained, so every anchor below is the baseline's own text, not the
+# upstream old block.
+# ---------------------------------------------------------------------------
+
+def _mglru_clean_workingset_apply(ctx):
+    """v6.14 9cbfd1c3c83b (clean up workingset), portable remainder.
+
+    Upstream moves the workingset_refault() lock assertion to cover both the
+    conventional and the MGLRU paths.  This baseline's workingset_refault()
+    already covers both paths from a single entry (lru_gen_refault() is called
+    inline), so the assertion lands at the entry.  The other two hunks of the
+    commit restructure workingset_test_recent()/lru_gen_test_recent(), which
+    the 6.1-shape baseline does not have, and pin the eviction memcg for a
+    caller that sleeps outside RCU -- the baseline path stays inside one
+    rcu_read_lock() section and has no tryget/put pair to mirror, so those
+    hunks are intentionally not carried.
+    """
+    steps = [
+        # Anchored on the last two declarations: 5.15.194+ inserts the
+        # android_vh_count_workingset_refault() hook between them and the MGLRU
+        # dispatch, so a wider block only matches on .167/.178.  The
+        # workingset_eviction() decl block also ends in "int memcgid;", hence
+        # the leading "bool workingset;".
+        ("mm/workingset.c",
+         "\tbool workingset;\n"
+         "\tint memcgid;\n",
+         "\tbool workingset;\n"
+         "\tint memcgid;\n"
+         "\n"
+         "\tVM_BUG_ON_PAGE(!PageLocked(page), page);\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _mglru_optimize_deactivation_apply(ctx):
+    """v6.14 cc8ec7be78ff (optimize deactivation), pagevec re-authoring.
+
+    Upstream short-circuits deactivate_file_folio()/folio_deactivate() under
+    MGLRU: instead of shuffling the page between LRU lists just to drop its
+    refs, clear LRU_REFS in place and skip the move entirely when the page
+    already sits in the oldest generation.  This baseline drains deactivations
+    through pagevecs (pagevec_lru_move_fn), so the same semantics land in
+    deactivate_file_page()/deactivate_page()/lru_lazyfree_fn() with a
+    page-based lru_gen_clear_refs() helper.
+    """
+    steps = [
+        # lru_gen_clear_refs(): clear LRU_REFS in place, report whether the
+        # page can avoid the LRU shuffle (already in the oldest generation).
+        ("mm/swap.c",
+         "#else\n"
+         "static void page_inc_refs(struct page *page)\n"
+         "{\n"
+         "}\n"
+         "#endif /* CONFIG_LRU_GEN */\n",
+         "#else\n"
+         "static void page_inc_refs(struct page *page)\n"
+         "{\n"
+         "}\n"
+         "#endif /* CONFIG_LRU_GEN */\n"
+         "\n"
+         "#ifdef CONFIG_LRU_GEN\n"
+         "/* ABK stable_515_backport: v6.14 cc8ec7be78ff, pagevec shape */\n"
+         "static bool lru_gen_clear_refs(struct page *page)\n"
+         "{\n"
+         "\tint gen;\n"
+         "\tint type;\n"
+         "\tstruct lruvec *lruvec;\n"
+         "\n"
+         "\tgen = page_lru_gen(page);\n"
+         "\tif (gen < 0)\n"
+         "\t\treturn true;\n"
+         "\n"
+         "\ttype = page_is_file_lru(page);\n"
+         "\t/*\n"
+         "\t * LRU_REFS_FLAGS is a mm/vmscan.c file-local define on this tree\n"
+         "\t * (BIT(PG_referenced) | BIT(PG_workingset)); spell it out here\n"
+         "\t * because mm/swap.c cannot see it.\n"
+         "\t */\n"
+         "\tset_mask_bits(&page->flags, LRU_REFS_MASK | BIT(PG_referenced) |\n"
+         "\t\t\t      BIT(PG_workingset), 0);\n"
+         "\n"
+         "\tlruvec = mem_cgroup_page_lruvec(page);\n"
+         "\t/* whether can do without shuffling under the LRU lock */\n"
+         "\treturn gen == lru_gen_from_seq(READ_ONCE(lruvec->lrugen.min_seq[type]));\n"
+         "}\n"
+         "#else\n"
+         "static bool lru_gen_clear_refs(struct page *page)\n"
+         "{\n"
+         "\treturn false;\n"
+         "}\n"
+         "#endif /* CONFIG_LRU_GEN */\n",
+         T),
+        # PGDEACTIVATE accounting: under MGLRU every deactivation counts, not
+        # just ones coming off the active list.
+        ("mm/swap.c",
+         "static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec)\n"
+         "{\n"
+         "\tbool active = PageActive(page);\n",
+         "static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec)\n"
+         "{\n"
+         "\tbool active = PageActive(page) || lru_gen_enabled();\n",
+         T),
+        # lazyfree: drop the tier refs instead of the conventional PG_referenced.
+        ("mm/swap.c",
+         "\t\tdel_page_from_lru_list(page, lruvec);\n"
+         "\t\tClearPageActive(page);\n"
+         "\t\tClearPageReferenced(page);\n"
+         "\t\t/*\n"
+         "\t\t * Lazyfree pages are clean anonymous pages.  They have\n",
+         "\t\tdel_page_from_lru_list(page, lruvec);\n"
+         "\t\tClearPageActive(page);\n"
+         "\t\tif (lru_gen_enabled())\n"
+         "\t\t\tlru_gen_clear_refs(page);\n"
+         "\t\telse\n"
+         "\t\t\tClearPageReferenced(page);\n"
+         "\t\t/*\n"
+         "\t\t * Lazyfree pages are clean anonymous pages.  They have\n",
+         T),
+        # deactivate_file_page(): pages in the oldest generation need no move.
+        ("mm/swap.c",
+         "\tif (PageUnevictable(page))\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tif (likely(get_page_unless_zero(page))) {\n"
+         "\t\tstruct pagevec *pvec;\n",
+         "\tif (PageUnevictable(page))\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tif (lru_gen_enabled() && lru_gen_clear_refs(page))\n"
+         "\t\treturn;\n"
+         "\n"
+         "\tif (likely(get_page_unless_zero(page))) {\n"
+         "\t\tstruct pagevec *pvec;\n",
+         T),
+        # deactivate_page(): MGLRU decides via refs, the conventional LRU via
+        # PG_active.
+        ("mm/swap.c",
+         "void deactivate_page(struct page *page)\n"
+         "{\n"
+         "\tif (PageLRU(page) && !PageUnevictable(page) &&\n"
+         "\t    (PageActive(page) || lru_gen_enabled())) {\n"
+         "\t\tstruct pagevec *pvec;\n"
+         "\n"
+         "\t\tlocal_lock(&lru_pvecs.lock);\n"
+         "\t\tpvec = this_cpu_ptr(&lru_pvecs.lru_deactivate);\n",
+         "void deactivate_page(struct page *page)\n"
+         "{\n"
+         "\tstruct pagevec *pvec;\n"
+         "\n"
+         "\tif (PageLRU(page) && !PageUnevictable(page)) {\n"
+         "\t\tif (lru_gen_enabled() ? lru_gen_clear_refs(page)\n"
+         "\t\t\t\t\t      : !PageActive(page))\n"
+         "\t\t\treturn;\n"
+         "\n"
+         "\t\tlocal_lock(&lru_pvecs.lock);\n"
+         "\t\tpvec = this_cpu_ptr(&lru_pvecs.lru_deactivate);\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _mglru_rework_aging_feedback_apply(ctx):
+    """v6.14 798c0330c2ca (rework aging feedback), int-swappiness port.
+
+    Carries: min_seq[] may drift apart by up to MAX_NR_GENS-MIN_NR_GENS-1;
+    protected[] gains the first tier (tier-1 -> tier reindex); lru_gen_mm_walk
+    carries the full swappiness value instead of a can_swap bool with the
+    >MAX_SWAPPINESS "anon only" sentinel; the aging feedback simplifies to
+    "age when the oldest evictable generation is exactly MIN_NR_GENS behind".
+    Re-authored for the 6.1-shape functions (lru_gen_struct/lists, sort_page,
+    evict_pages, age_lruvec, get_nr_to_scan with need_aging); the per-memcg
+    swappiness read stays on the baseline's mem_cgroup_swappiness().
+    MIN/MAX_SWAPPINESS and get_swappiness()'s !may_swap short-circuit are NOT
+    added here: upstream 410abb20acae/68cd9050d871 own them and this module
+    lands that series as the batch37 reclaim chain, registered after this
+    group -- adding them twice would both duplicate the defines and pull the
+    anchor out from under the swappiness-argument group.
+    """
+    steps = [
+        # -- include/linux/mmzone.h: min_seq[] semantics, protected[] tier 0,
+        #    walk swappiness --
+        ("include/linux/mmzone.h",
+         " * stored in min_seq[] separately for anon and file types as clean file pages\n"
+         " * can be evicted regardless of swap constraints.\n"
+         " *\n"
+         " * Normally anon and file min_seq are in sync. But if swapping is constrained,\n"
+         " * e.g., out of swap space, file min_seq is allowed to advance and leave anon\n"
+         " * min_seq behind.\n",
+         " * stored in min_seq[] separately for anon and file types so that they can be\n"
+         " * incremented independently. Ideally min_seq[] are kept in sync when both anon\n"
+         " * and file types are evictable. However, to adapt to situations like extreme\n"
+         " * swappiness, they are allowed to be out of sync by at most\n"
+         " * MAX_NR_GENS-MIN_NR_GENS-1.\n",
+         T),
+        ("include/linux/mmzone.h",
+         "\t/* the first tier doesn't need protection, hence the minus one */\n"
+         "\tunsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS - 1];\n",
+         "\t/* can only be modified under the LRU lock */\n"
+         "\tunsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];\n",
+         T),
+        ("include/linux/mmzone.h",
+         "\tint batched;\n"
+         "\tbool can_swap;\n"
+         "\tbool full_scan;\n",
+         "\tint batched;\n"
+         "\tint swappiness;\n"
+         "\tbool full_scan;\n",
+         T),
+        # -- mm/vmscan.c: the two evictable-type macros --
+        ("mm/vmscan.c",
+         "#define for_each_gen_type_zone(gen, type, zone)\t\t\t\t\\\n"
+         "\tfor ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)\t\t\t\\\n"
+         "\t\tfor ((type) = 0; (type) < ANON_AND_FILE; (type)++)\t\\\n"
+         "\t\t\tfor ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)\n",
+         "#define for_each_gen_type_zone(gen, type, zone)\t\t\t\t\\\n"
+         "\tfor ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)\t\t\t\\\n"
+         "\t\tfor ((type) = 0; (type) < ANON_AND_FILE; (type)++)\t\\\n"
+         "\t\t\tfor ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)\n"
+         "\n"
+         "#define evictable_min_seq(min_seq, swappiness)\t\t\t\t\\\n"
+         "\tmin((min_seq)[!(swappiness)], (min_seq)[(swappiness) <= MAX_SWAPPINESS])\n"
+         "\n"
+         "#define for_each_evictable_type(type, swappiness)\t\t\t\\\n"
+         "\tfor ((type) = !(swappiness); (type) <= ((swappiness) <= MAX_SWAPPINESS); (type)++)\n",
+         T),
+        # -- seq_is_valid(): each type may drift within its own bounds --
+        ("mm/vmscan.c",
+         "static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)\n"
+         "{\n"
+         "\t/* see the comment on lru_gen_struct */\n"
+         "\treturn get_nr_gens(lruvec, LRU_GEN_FILE) >= MIN_NR_GENS &&\n"
+         "\t       get_nr_gens(lruvec, LRU_GEN_FILE) <= get_nr_gens(lruvec, LRU_GEN_ANON) &&\n"
+         "\t       get_nr_gens(lruvec, LRU_GEN_ANON) <= MAX_NR_GENS;\n",
+         "static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)\n"
+         "{\n"
+         "\tint type;\n"
+         "\n"
+         "\tfor (type = 0; type < ANON_AND_FILE; type++) {\n"
+         "\t\tint n = get_nr_gens(lruvec, type);\n"
+         "\n"
+         "\t\tif (n < MIN_NR_GENS || n > MAX_NR_GENS)\n"
+         "\t\t\treturn false;\n"
+         "\t}\n"
+         "\n"
+         "\treturn true;\n",
+         T),
+        # -- iterate_mm_list(): size check over the evictable types --
+        ("mm/vmscan.c",
+         "\tfor (type = !walk->can_swap; type < ANON_AND_FILE; type++) {\n"
+         "\t\tsize += type ? get_mm_counter(mm, MM_FILEPAGES) :",
+         "\tfor_each_evictable_type(type, walk->swappiness) {\n"
+         "\t\tsize += type ? get_mm_counter(mm, MM_FILEPAGES) :",
+         T),
+        # -- should_skip_vma(): swappiness is the full value now --
+        ("mm/vmscan.c",
+         "\tif (vma_is_anonymous(vma))\n"
+         "\t\treturn !walk->can_swap;\n",
+         "\tif (vma_is_anonymous(vma))\n"
+         "\t\treturn !walk->swappiness;\n",
+         T),
+        ("mm/vmscan.c",
+         "\tif (shmem_mapping(mapping))\n"
+         "\t\treturn !walk->can_swap;\n"
+         "\n"
+         "\t/* to exclude special mappings like dax, etc. */\n"
+         "\treturn !mapping->a_ops->readpage;\n",
+         "\tif (shmem_mapping(mapping))\n"
+         "\t\treturn !walk->swappiness;\n"
+         "\n"
+         "\tif (walk->swappiness > MAX_SWAPPINESS)\n"
+         "\t\treturn true;\n"
+         "\n"
+         "\t/* to exclude special mappings like dax, etc. */\n"
+         "\treturn !mapping->a_ops->readpage;\n",
+         T),
+        # -- get_pfn_page(): the COW guard goes away with real swappiness --
+        ("mm/vmscan.c",
+         "static struct page *get_pfn_page(unsigned long pfn, struct mem_cgroup *memcg,\n"
+         "\t\t\t\t struct pglist_data *pgdat, bool can_swap)\n"
+         "{\n"
+         "\tstruct page *page;\n"
+         "\n"
+         "\t/* try to avoid unnecessary memory loads */\n"
+         "\tif (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\tpage = compound_head(pfn_to_page(pfn));\n"
+         "\tif (page_to_nid(page) != pgdat->node_id)\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\tif (page_memcg_rcu(page) != memcg)\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\t/* file VMAs can contain anon pages from COW */\n"
+         "\tif (!page_is_file_lru(page) && !can_swap)\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\treturn page;\n"
+         "}\n",
+         "static struct page *get_pfn_page(unsigned long pfn, struct mem_cgroup *memcg,\n"
+         "\t\t\t\t struct pglist_data *pgdat)\n"
+         "{\n"
+         "\tstruct page *page;\n"
+         "\n"
+         "\t/* try to avoid unnecessary memory loads */\n"
+         "\tif (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\tpage = compound_head(pfn_to_page(pfn));\n"
+         "\tif (page_to_nid(page) != pgdat->node_id)\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\tif (page_memcg_rcu(page) != memcg)\n"
+         "\t\treturn NULL;\n"
+         "\n"
+         "\treturn page;\n"
+         "}\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat, walk->can_swap);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tif (!ptep_test_and_clear_young(args->vma, addr, pte + i))\n",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tif (!ptep_test_and_clear_young(args->vma, addr, pte + i))\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat, walk->can_swap);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tgoto next;\n",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tgoto next;\n",
+         T),
+        ("mm/vmscan.c",
+         "\tstruct page *page = pvmw->page;\n"
+         "\tbool can_swap = !page_is_file_lru(page);\n"
+         "\tstruct mem_cgroup *memcg = page_memcg(page);\n",
+         "\tstruct page *page = pvmw->page;\n"
+         "\tstruct mem_cgroup *memcg = page_memcg(page);\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat, can_swap);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tif (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))\n",
+         "\t\tpage = get_pfn_page(pfn, memcg, pgdat);\n"
+         "\t\tif (!page)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tif (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))\n",
+         T),
+        # -- inc_min_seq(): account protection at the page's own tier --
+        ("mm/vmscan.c",
+         "static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)\n"
+         "{\n"
+         "\tint zone;\n"
+         "\tint remaining = MAX_LRU_BATCH;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tint new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);\n"
+         "\n"
+         "\tif (type == LRU_GEN_ANON && !can_swap)\n"
+         "\t\tgoto done;\n"
+         "\n"
+         "\t/* prevent cold/hot inversion if full_scan is true */\n"
+         "\tfor (zone = 0; zone < MAX_NR_ZONES; zone++) {\n"
+         "\t\tstruct list_head *head = &lrugen->lists[old_gen][type][zone];\n"
+         "\n"
+         "\t\twhile (!list_empty(head)) {\n"
+         "\t\t\tstruct page *page = lru_to_page(head);\n"
+         "\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(PageUnevictable(page), page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(PageActive(page), page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(page_is_file_lru(page) != type, page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(page_zonenum(page) != zone, page);\n"
+         "\n"
+         "\t\t\tnew_gen = page_inc_gen(lruvec, page, false);\n"
+         "\t\t\tlist_move_tail(&page->lru, &lrugen->lists[new_gen][type][zone]);\n"
+         "\n"
+         "\t\t\tif (!--remaining)\n"
+         "\t\t\t\treturn false;\n"
+         "\t\t}\n"
+         "\t}\n",
+         "static bool inc_min_seq(struct lruvec *lruvec, int type, int swappiness)\n"
+         "{\n"
+         "\tint zone;\n"
+         "\tint remaining = MAX_LRU_BATCH;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tint hist = lru_hist_from_seq(lrugen->min_seq[type]);\n"
+         "\tint new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);\n"
+         "\n"
+         "\tif (type ? swappiness > MAX_SWAPPINESS : !swappiness)\n"
+         "\t\tgoto done;\n"
+         "\n"
+         "\t/* prevent cold/hot inversion if the type is evictable */\n"
+         "\tfor (zone = 0; zone < MAX_NR_ZONES; zone++) {\n"
+         "\t\tstruct list_head *head = &lrugen->lists[old_gen][type][zone];\n"
+         "\n"
+         "\t\twhile (!list_empty(head)) {\n"
+         "\t\t\tstruct page *page = lru_to_page(head);\n"
+         "\t\t\tint refs = page_lru_refs(page);\n"
+         "\t\t\tint tier = lru_tier_from_refs(refs);\n"
+         "\t\t\tint delta = thp_nr_pages(page);\n"
+         "\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(PageUnevictable(page), page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(PageActive(page), page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(page_is_file_lru(page) != type, page);\n"
+         "\t\t\tVM_WARN_ON_ONCE_PAGE(page_zonenum(page) != zone, page);\n"
+         "\n"
+         "\t\t\tnew_gen = page_inc_gen(lruvec, page, false);\n"
+         "\t\t\tlist_move_tail(&page->lru, &lrugen->lists[new_gen][type][zone]);\n"
+         "\n"
+         "\t\t\tWRITE_ONCE(lrugen->protected[hist][type][tier],\n"
+         "\t\t\t\t   lrugen->protected[hist][type][tier] + delta);\n"
+         "\n"
+         "\t\t\tif (!--remaining)\n"
+         "\t\t\t\treturn false;\n"
+         "\t\t}\n"
+         "\t}\n",
+         T),
+        # -- try_to_inc_min_seq(): per-type drift bound --
+        ("mm/vmscan.c",
+         "static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)\n"
+         "{\n"
+         "\tint gen, type, zone;\n"
+         "\tbool success = false;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tDEFINE_MIN_SEQ(lruvec);\n"
+         "\n"
+         "\tVM_WARN_ON_ONCE(!seq_is_valid(lruvec));\n"
+         "\n"
+         "\t/* find the oldest populated generation */\n"
+         "\tfor (type = !can_swap; type < ANON_AND_FILE; type++) {\n"
+         "\t\twhile (min_seq[type] + MIN_NR_GENS <= lrugen->max_seq) {\n"
+         "\t\t\tgen = lru_gen_from_seq(min_seq[type]);\n"
+         "\n"
+         "\t\t\tfor (zone = 0; zone < MAX_NR_ZONES; zone++) {\n"
+         "\t\t\t\tif (!list_empty(&lrugen->lists[gen][type][zone]))\n"
+         "\t\t\t\t\tgoto next;\n"
+         "\t\t\t}\n"
+         "\n"
+         "\t\t\tmin_seq[type]++;\n"
+         "\t\t}\n"
+         "next:\n"
+         "\t\t;\n"
+         "\t}\n"
+         "\n"
+         "\t/* see the comment on lru_gen_struct */\n"
+         "\tif (can_swap) {\n"
+         "\t\tmin_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);\n"
+         "\t\tmin_seq[LRU_GEN_FILE] = max(min_seq[LRU_GEN_ANON], lrugen->min_seq[LRU_GEN_FILE]);\n"
+         "\t}\n"
+         "\n"
+         "\tfor (type = !can_swap; type < ANON_AND_FILE; type++) {\n"
+         "\t\tif (min_seq[type] == lrugen->min_seq[type])\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\treset_ctrl_pos(lruvec, type, true);\n"
+         "\t\tWRITE_ONCE(lrugen->min_seq[type], min_seq[type]);\n"
+         "\t\tsuccess = true;\n"
+         "\t}\n"
+         "\n"
+         "\treturn success;\n"
+         "}\n",
+         "static bool try_to_inc_min_seq(struct lruvec *lruvec, int swappiness)\n"
+         "{\n"
+         "\tint gen, type, zone;\n"
+         "\tbool success = false;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tDEFINE_MIN_SEQ(lruvec);\n"
+         "\n"
+         "\tVM_WARN_ON_ONCE(!seq_is_valid(lruvec));\n"
+         "\n"
+         "\t/* find the oldest populated generation */\n"
+         "\tfor_each_evictable_type(type, swappiness) {\n"
+         "\t\twhile (min_seq[type] + MIN_NR_GENS <= lrugen->max_seq) {\n"
+         "\t\t\tgen = lru_gen_from_seq(min_seq[type]);\n"
+         "\n"
+         "\t\t\tfor (zone = 0; zone < MAX_NR_ZONES; zone++) {\n"
+         "\t\t\t\tif (!list_empty(&lrugen->lists[gen][type][zone]))\n"
+         "\t\t\t\t\tgoto next;\n"
+         "\t\t\t}\n"
+         "\n"
+         "\t\t\tmin_seq[type]++;\n"
+         "\t\t}\n"
+         "next:\n"
+         "\t\t;\n"
+         "\t}\n"
+         "\n"
+         "\t/* see the comment on lru_gen_struct */\n"
+         "\tif (swappiness && swappiness <= MAX_SWAPPINESS) {\n"
+         "\t\tunsigned long seq = lrugen->max_seq - MIN_NR_GENS;\n"
+         "\n"
+         "\t\tif (min_seq[LRU_GEN_ANON] > seq && min_seq[LRU_GEN_FILE] < seq)\n"
+         "\t\t\tmin_seq[LRU_GEN_ANON] = seq;\n"
+         "\t\telse if (min_seq[LRU_GEN_FILE] > seq && min_seq[LRU_GEN_ANON] < seq)\n"
+         "\t\t\tmin_seq[LRU_GEN_FILE] = seq;\n"
+         "\t}\n"
+         "\n"
+         "\tfor_each_evictable_type(type, swappiness) {\n"
+         "\t\tif (min_seq[type] <= lrugen->min_seq[type])\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\treset_ctrl_pos(lruvec, type, true);\n"
+         "\t\tWRITE_ONCE(lrugen->min_seq[type], min_seq[type]);\n"
+         "\t\tsuccess = true;\n"
+         "\t}\n"
+         "\n"
+         "\treturn success;\n"
+         "}\n",
+         T),
+        # -- inc_max_seq(): no WARN, no while-retry --
+        ("mm/vmscan.c",
+         "static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool full_scan)\n"
+         "{\n"
+         "\tint prev, next;\n"
+         "\tint type, zone;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "restart:\n"
+         "\tspin_lock_irq(&lruvec->lru_lock);\n"
+         "\n"
+         "\tVM_WARN_ON_ONCE(!seq_is_valid(lruvec));\n"
+         "\n"
+         "\tfor (type = ANON_AND_FILE - 1; type >= 0; type--) {\n"
+         "\t\tif (get_nr_gens(lruvec, type) != MAX_NR_GENS)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tVM_WARN_ON_ONCE(!full_scan && (type == LRU_GEN_FILE || can_swap));\n"
+         "\n"
+         "\t\twhile (!inc_min_seq(lruvec, type, can_swap)) {\n"
+         "\t\t\tspin_unlock_irq(&lruvec->lru_lock);\n"
+         "\t\t\tcond_resched();\n"
+         "\t\t\tspin_lock_irq(&lruvec->lru_lock);\n"
+         "\t\t}\n"
+         "\t\tif (inc_min_seq(lruvec, type, can_swap))\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tspin_unlock_irq(&lruvec->lru_lock);\n"
+         "\t\tcond_resched();\n"
+         "\t\tgoto restart;\n"
+         "\n"
+         "\t}\n",
+         "static void inc_max_seq(struct lruvec *lruvec, int swappiness, bool full_scan)\n"
+         "{\n"
+         "\tint prev, next;\n"
+         "\tint type, zone;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "restart:\n"
+         "\tspin_lock_irq(&lruvec->lru_lock);\n"
+         "\n"
+         "\tVM_WARN_ON_ONCE(!seq_is_valid(lruvec));\n"
+         "\n"
+         "\tfor (type = 0; type < ANON_AND_FILE; type++) {\n"
+         "\t\tif (get_nr_gens(lruvec, type) != MAX_NR_GENS)\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tif (inc_min_seq(lruvec, type, swappiness))\n"
+         "\t\t\tcontinue;\n"
+         "\n"
+         "\t\tspin_unlock_irq(&lruvec->lru_lock);\n"
+         "\t\tcond_resched();\n"
+         "\t\tgoto restart;\n"
+         "\t}\n",
+         T),
+        # -- try_to_inc_max_seq(): carry swappiness into the walk --
+        ("mm/vmscan.c",
+         "static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,\n"
+         "\t\t\t       struct scan_control *sc, bool can_swap, bool full_scan)\n",
+         "static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,\n"
+         "\t\t\t       struct scan_control *sc, int swappiness, bool full_scan)\n",
+         T),
+        ("mm/vmscan.c",
+         "\twalk->can_swap = can_swap;\n"
+         "\twalk->full_scan = full_scan;\n",
+         "\twalk->swappiness = swappiness;\n"
+         "\twalk->full_scan = full_scan;\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tinc_max_seq(lruvec, can_swap, full_scan);\n",
+         "\t\tinc_max_seq(lruvec, swappiness, full_scan);\n",
+         T),
+        # -- should_run_aging(): evictable-only totals, simpler feedback --
+        ("mm/vmscan.c",
+         "static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,\n"
+         "\t\t\t     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)\n"
+         "{\n"
+         "\tint gen, type, zone;\n"
+         "\tunsigned long old = 0;\n"
+         "\tunsigned long young = 0;\n"
+         "\tunsigned long total = 0;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
+         "\n"
+         "\tfor (type = !can_swap; type < ANON_AND_FILE; type++) {\n"
+         "\t\tunsigned long seq;\n"
+         "\n"
+         "\t\tfor (seq = min_seq[type]; seq <= max_seq; seq++) {\n"
+         "\t\t\tunsigned long size = 0;\n"
+         "\n"
+         "\t\t\tgen = lru_gen_from_seq(seq);\n"
+         "\n"
+         "\t\t\tfor (zone = 0; zone < MAX_NR_ZONES; zone++)\n"
+         "\t\t\t\tsize += max_t(long, READ_ONCE(lrugen->nr_pages[gen][type][zone]),\n"
+         "\t\t\t\t\t\t0);\n"
+         "\n"
+         "\t\t\ttotal += size;\n"
+         "\t\t\tif (seq == max_seq)\n"
+         "\t\t\t\tyoung += size;\n"
+         "\t\t\telse if (seq + MIN_NR_GENS == max_seq)\n"
+         "\t\t\t\told += size;\n"
+         "\t\t}\n"
+         "\t}\n"
+         "\n"
+         "\t/* try to scrape all its memory if this memcg was deleted */\n"
+         "\t*nr_to_scan = mem_cgroup_online(memcg) ? (total >> sc->priority) : total;\n"
+         "\n"
+         "\t/*\n"
+         "\t * The aging tries to be lazy to reduce the overhead, while the eviction\n"
+         "\t * stalls when the number of generations reaches MIN_NR_GENS. Hence, the\n"
+         "\t * ideal number of generations is MIN_NR_GENS+1.\n"
+         "\t */\n"
+         "\tif (min_seq[!can_swap] + MIN_NR_GENS > max_seq)\n"
+         "\t\treturn true;\n"
+         "\tif (min_seq[!can_swap] + MIN_NR_GENS < max_seq)\n"
+         "\t\treturn false;\n"
+         "\n"
+         "\t/*\n"
+         "\t * It's also ideal to spread pages out evenly, i.e., 1/(MIN_NR_GENS+1)\n"
+         "\t * of the total number of pages for each generation. A reasonable range\n"
+         "\t * for this average portion is [1/MIN_NR_GENS, 1/(MIN_NR_GENS+2)]. The\n"
+         "\t * aging cares about the upper bound of hot pages, while the eviction\n"
+         "\t * cares about the lower bound of cold pages.\n"
+         "\t */\n"
+         "\tif (young * MIN_NR_GENS > total)\n"
+         "\t\treturn true;\n"
+         "\tif (old * (MIN_NR_GENS + 2) < total)\n"
+         "\t\treturn true;\n"
+         "\n"
+         "\treturn false;\n"
+         "}\n",
+         "static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,\n"
+         "\t\t\t     struct scan_control *sc, int swappiness, unsigned long *nr_to_scan)\n"
+         "{\n"
+         "\tint gen, type, zone;\n"
+         "\tunsigned long size = 0;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
+         "\n"
+         "\t*nr_to_scan = 0;\n"
+         "\t/* have to run aging, since eviction is not possible anymore */\n"
+         "\tif (evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS > max_seq)\n"
+         "\t\treturn true;\n"
+         "\n"
+         "\tfor_each_evictable_type(type, swappiness) {\n"
+         "\t\tunsigned long seq;\n"
+         "\n"
+         "\t\tfor (seq = min_seq[type]; seq <= max_seq; seq++) {\n"
+         "\t\t\tgen = lru_gen_from_seq(seq);\n"
+         "\n"
+         "\t\t\tfor (zone = 0; zone < MAX_NR_ZONES; zone++)\n"
+         "\t\t\t\tsize += max_t(long, READ_ONCE(lrugen->nr_pages[gen][type][zone]),\n"
+         "\t\t\t\t\t\t0);\n"
+         "\t\t}\n"
+         "\t}\n"
+         "\n"
+         "\t/* try to scrape all its memory if this memcg was deleted */\n"
+         "\t*nr_to_scan = mem_cgroup_online(memcg) ? (size >> sc->priority) : size;\n"
+         "\n"
+         "\t/* better to run aging even though eviction is still possible */\n"
+         "\treturn evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;\n"
+         "}\n",
+         T),
+        # -- age_lruvec(): birth time of the oldest evictable generation --
+        ("mm/vmscan.c",
+         "\tif (min_ttl) {\n"
+         "\t\tint gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);\n",
+         "\tif (min_ttl) {\n"
+         "\t\tint gen = lru_gen_from_seq(evictable_min_seq(min_seq, swappiness));\n",
+         T),
+        # -- get_nr_to_scan(): int swappiness end to end --
+        ("mm/vmscan.c",
+         "static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,\n"
+         "\t\t\t\t    bool can_swap, bool *need_aging)\n",
+         "static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,\n"
+         "\t\t\t\t    int swappiness, bool *need_aging)\n",
+         T),
+        ("mm/vmscan.c",
+         "\t*need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, can_swap, &nr_to_scan);\n",
+         "\t*need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, swappiness, &nr_to_scan);\n",
+         T),
+        ("mm/vmscan.c",
+         "\tif (try_to_inc_max_seq(lruvec, max_seq, sc, can_swap, false))\n"
+         "\t\treturn nr_to_scan;\n"
+         "done:\n"
+         "\treturn min_seq[!can_swap] + MIN_NR_GENS <= max_seq ? nr_to_scan : 0;\n",
+         "\tif (try_to_inc_max_seq(lruvec, max_seq, sc, swappiness, false))\n"
+         "\t\treturn nr_to_scan;\n"
+         "done:\n"
+         "\treturn evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS <= max_seq ?\n"
+         "\t\tnr_to_scan : 0;\n",
+         T),
+        # -- sort_page(): protection counters reindex with the array --
+        ("mm/vmscan.c",
+         "\t\tWRITE_ONCE(lrugen->protected[hist][type][tier - 1],\n"
+         "\t\t\t   lrugen->protected[hist][type][tier - 1] + delta);\n",
+         "\t\tWRITE_ONCE(lrugen->protected[hist][type][tier],\n"
+         "\t\t\t   lrugen->protected[hist][type][tier] + delta);\n",
+         T),
+        # -- reset_ctrl_pos(): tier 0 participates in the EMA --
+        ("mm/vmscan.c",
+         "\t\t\tsum = lrugen->avg_total[type][tier] +\n"
+         "\t\t\t      atomic_long_read(&lrugen->evicted[hist][type][tier]);\n"
+         "\t\t\tif (tier)\n"
+         "\t\t\t\tsum += lrugen->protected[hist][type][tier - 1];\n"
+         "\t\t\tWRITE_ONCE(lrugen->avg_total[type][tier], sum / 2);\n",
+         "\t\t\tsum = lrugen->avg_total[type][tier] +\n"
+         "\t\t\t      lrugen->protected[hist][type][tier] +\n"
+         "\t\t\t      atomic_long_read(&lrugen->evicted[hist][type][tier]);\n"
+         "\t\t\tWRITE_ONCE(lrugen->avg_total[type][tier], sum / 2);\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tif (clear) {\n"
+         "\t\t\tatomic_long_set(&lrugen->refaulted[hist][type][tier], 0);\n"
+         "\t\t\tatomic_long_set(&lrugen->evicted[hist][type][tier], 0);\n"
+         "\t\t\tif (tier)\n"
+         "\t\t\t\tWRITE_ONCE(lrugen->protected[hist][type][tier - 1], 0);\n"
+         "\t\t}\n",
+         "\t\tif (clear) {\n"
+         "\t\t\tatomic_long_set(&lrugen->refaulted[hist][type][tier], 0);\n"
+         "\t\t\tatomic_long_set(&lrugen->evicted[hist][type][tier], 0);\n"
+         "\t\t\tWRITE_ONCE(lrugen->protected[hist][type][tier], 0);\n"
+         "\t\t}\n",
+         T),
+        # -- evict_pages(): stall detection over the evictable types --
+        ("mm/vmscan.c",
+         "\tstruct lru_gen_mm_walk *walk;\n"
+         "\tbool skip_retry = false;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n",
+         "\tstruct lru_gen_mm_walk *walk;\n"
+         "\tbool skip_retry = false;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n",
+         T),
+        ("mm/vmscan.c",
+         "\tscanned += try_to_inc_min_seq(lruvec, swappiness);\n"
+         "\n"
+         "\tif (get_nr_gens(lruvec, !swappiness) == MIN_NR_GENS)\n"
+         "\t\tscanned = 0;\n",
+         "\tscanned += try_to_inc_min_seq(lruvec, swappiness);\n"
+         "\n"
+         "\tif (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)\n"
+         "\t\tscanned = 0;\n",
+         T),
+        # -- seq_show: the first tier's protection is real now --
+        ("mm/vmscan.c",
+         "\t\t\t\tif (tier)\n"
+         "\t\t\t\t\tn[2] = READ_ONCE(lrugen->protected[hist][type][tier - 1]);\n",
+         "\t\t\t\tn[2] = READ_ONCE(lrugen->protected[hist][type][tier]);\n",
+         T),
+        # -- lru_gen_shrink_lruvec(): get_swappiness() owns the whole value --
+        ("mm/vmscan.c",
+         "\twhile (true) {\n"
+         "\t\tint delta;\n"
+         "\t\tint swappiness;\n"
+         "\t\tunsigned long nr_to_scan;\n"
+         "\n"
+         "\t\tif (sc->may_swap)\n"
+         "\t\t\tswappiness = get_swappiness(lruvec, sc);\n"
+         "\t\telse if (!cgroup_reclaim(sc) && get_swappiness(lruvec, sc))\n"
+         "\t\t\tswappiness = 1;\n"
+         "\t\telse\n"
+         "\t\t\tswappiness = 0;\n"
+         "\n"
+         "\t\tnr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);\n",
+         "\twhile (true) {\n"
+         "\t\tint delta;\n"
+         "\t\tint swappiness = get_swappiness(lruvec, sc);\n"
+         "\t\tunsigned long nr_to_scan;\n"
+         "\n"
+         "\t\tnr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);\n",
+         T),
+        # -- run_aging()/run_cmd(): debugfs paths follow the same rules --
+        ("mm/vmscan.c",
+         "static int run_aging(struct lruvec *lruvec, unsigned long seq, struct scan_control *sc,\n"
+         "\t\t     bool can_swap, bool full_scan)\n"
+         "{\n"
+         "\tDEFINE_MAX_SEQ(lruvec);\n"
+         "\tDEFINE_MIN_SEQ(lruvec);\n"
+         "\n"
+         "\tif (seq < max_seq)\n"
+         "\t\treturn 0;\n"
+         "\n"
+         "\tif (seq > max_seq)\n"
+         "\t\treturn -EINVAL;\n"
+         "\n"
+         "\tif (!full_scan && min_seq[!can_swap] + MAX_NR_GENS - 1 <= max_seq)\n"
+         "\t\treturn -ERANGE;\n"
+         "\n"
+         "\ttry_to_inc_max_seq(lruvec, max_seq, sc, can_swap, full_scan);\n",
+         "static int run_aging(struct lruvec *lruvec, unsigned long seq, struct scan_control *sc,\n"
+         "\t\t     int swappiness, bool full_scan)\n"
+         "{\n"
+         "\tDEFINE_MAX_SEQ(lruvec);\n"
+         "\tDEFINE_MIN_SEQ(lruvec);\n"
+         "\n"
+         "\tif (seq < max_seq)\n"
+         "\t\treturn 0;\n"
+         "\n"
+         "\tif (seq > max_seq)\n"
+         "\t\treturn -EINVAL;\n"
+         "\n"
+         "\tif (!full_scan && evictable_min_seq(min_seq, swappiness) + MAX_NR_GENS - 1 <= max_seq)\n"
+         "\t\treturn -ERANGE;\n"
+         "\n"
+         "\ttry_to_inc_max_seq(lruvec, max_seq, sc, swappiness, full_scan);\n",
+         T),
+        ("mm/vmscan.c",
+         "\telse if (swappiness > 200)\n"
+         "\t\tgoto done;\n",
+         "\telse if (swappiness > MAX_SWAPPINESS + 1)\n"
+         "\t\tgoto done;\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _mglru_rework_type_selection_apply(ctx):
+    """v6.14 37a260870f2c (rework type selection).
+
+    read_ctrl_pos() sums every tier up to the requested one (tier 0 gains a
+    protection history via 798c0330c2ca); get_tier_idx() tightens the margin
+    to 2:3; get_type_to_scan() compares the summed tiers of anon vs file and
+    owns the swappiness sentinels itself; isolate_pages() drops the
+    min_seq-based pre-choice and the shared tier index.  Lands after
+    mglru_rework_aging_feedback, whose evictable_min_seq/for_each_evictable_type
+    macros and reindexed protected[] this group's new code requires.
+    """
+    steps = [
+        ("mm/vmscan.c",
+         "static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,\n"
+         "\t\t\t  struct ctrl_pos *pos)\n"
+         "{\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tint hist = lru_hist_from_seq(lrugen->min_seq[type]);\n"
+         "\n"
+         "\tpos->refaulted = lrugen->avg_refaulted[type][tier] +\n"
+         "\t\t\t atomic_long_read(&lrugen->refaulted[hist][type][tier]);\n"
+         "\tpos->total = lrugen->avg_total[type][tier] +\n"
+         "\t\t     atomic_long_read(&lrugen->evicted[hist][type][tier]);\n"
+         "\tif (tier)\n"
+         "\t\tpos->total += lrugen->protected[hist][type][tier - 1];\n"
+         "\tpos->gain = gain;\n"
+         "}\n",
+         "static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,\n"
+         "\t\t\t  struct ctrl_pos *pos)\n"
+         "{\n"
+         "\tint i;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tint hist = lru_hist_from_seq(lrugen->min_seq[type]);\n"
+         "\n"
+         "\tpos->gain = gain;\n"
+         "\tpos->refaulted = pos->total = 0;\n"
+         "\n"
+         "\tfor (i = tier % MAX_NR_TIERS; i <= min(tier, MAX_NR_TIERS - 1); i++) {\n"
+         "\t\tpos->refaulted += lrugen->avg_refaulted[type][i] +\n"
+         "\t\t\t\t  atomic_long_read(&lrugen->refaulted[hist][type][i]);\n"
+         "\t\tpos->total += lrugen->avg_total[type][i] +\n"
+         "\t\t\t      lrugen->protected[hist][type][i] +\n"
+         "\t\t\t      atomic_long_read(&lrugen->evicted[hist][type][i]);\n"
+         "\t}\n"
+         "}\n",
+         T),
+        ("mm/vmscan.c",
+         "\t/*\n"
+         "\t * To leave a margin for fluctuations, use a larger gain factor (1:2).\n"
+         "\t * This value is chosen because any other tier would have at least twice\n"
+         "\t * as many refaults as the first tier.\n"
+         "\t */\n"
+         "\tread_ctrl_pos(lruvec, type, 0, 1, &sp);\n"
+         "\tfor (tier = 1; tier < MAX_NR_TIERS; tier++) {\n"
+         "\t\tread_ctrl_pos(lruvec, type, tier, 2, &pv);\n"
+         "\t\tif (!positive_ctrl_err(&sp, &pv))\n"
+         "\t\t\tbreak;\n"
+         "\t}\n",
+         "\t/*\n"
+         "\t * To leave a margin for fluctuations, use a larger gain factor (2:3).\n"
+         "\t * This value is chosen because any other tier would have at least twice\n"
+         "\t * as many refaults as the first tier.\n"
+         "\t */\n"
+         "\tread_ctrl_pos(lruvec, type, 0, 2, &sp);\n"
+         "\tfor (tier = 1; tier < MAX_NR_TIERS; tier++) {\n"
+         "\t\tread_ctrl_pos(lruvec, type, tier, 3, &pv);\n"
+         "\t\tif (!positive_ctrl_err(&sp, &pv))\n"
+         "\t\t\tbreak;\n"
+         "\t}\n",
+         T),
+        ("mm/vmscan.c",
+         "static int get_type_to_scan(struct lruvec *lruvec, int swappiness, int *tier_idx)\n"
+         "{\n"
+         "\tint type, tier;\n"
+         "\tstruct ctrl_pos sp, pv;\n"
+         "\tint gain[ANON_AND_FILE] = { swappiness, 200 - swappiness };\n"
+         "\n"
+         "\t/*\n"
+         "\t * Compare the first tier of anon with that of file to determine which\n"
+         "\t * type to scan. Also need to compare other tiers of the selected type\n"
+         "\t * with the first tier of the other type to determine the last tier (of\n"
+         "\t * the selected type) to evict.\n"
+         "\t */\n"
+         "\tread_ctrl_pos(lruvec, LRU_GEN_ANON, 0, gain[LRU_GEN_ANON], &sp);\n"
+         "\tread_ctrl_pos(lruvec, LRU_GEN_FILE, 0, gain[LRU_GEN_FILE], &pv);\n"
+         "\ttype = positive_ctrl_err(&sp, &pv);\n"
+         "\n"
+         "\tread_ctrl_pos(lruvec, !type, 0, gain[!type], &sp);\n"
+         "\tfor (tier = 1; tier < MAX_NR_TIERS; tier++) {\n"
+         "\t\tread_ctrl_pos(lruvec, type, tier, gain[type], &pv);\n"
+         "\t\tif (!positive_ctrl_err(&sp, &pv))\n"
+         "\t\t\tbreak;\n"
+         "\t}\n"
+         "\n"
+         "\t*tier_idx = tier - 1;\n"
+         "\n"
+         "\treturn type;\n"
+         "}\n",
+         "static int get_type_to_scan(struct lruvec *lruvec, int swappiness)\n"
+         "{\n"
+         "\tstruct ctrl_pos sp, pv;\n"
+         "\n"
+         "\tif (swappiness <= MIN_SWAPPINESS + 1)\n"
+         "\t\treturn LRU_GEN_FILE;\n"
+         "\n"
+         "\tif (swappiness >= MAX_SWAPPINESS)\n"
+         "\t\treturn LRU_GEN_ANON;\n"
+         "\n"
+         "\t/*\n"
+         "\t * Compare the sum of all tiers of anon with that of file to determine\n"
+         "\t * which type to scan.\n"
+         "\t */\n"
+         "\tread_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);\n"
+         "\tread_ctrl_pos(lruvec, LRU_GEN_FILE, MAX_NR_TIERS, MAX_SWAPPINESS - swappiness, &pv);\n"
+         "\n"
+         "\treturn positive_ctrl_err(&sp, &pv);\n"
+         "}\n",
+         T),
+        ("mm/vmscan.c",
+         "\tint i;\n"
+         "\tint type;\n"
+         "\tint scanned;\n"
+         "\tint tier = -1;\n"
+         "\tDEFINE_MIN_SEQ(lruvec);\n"
+         "\n"
+         "\t/*\n"
+         "\t * Try to make the obvious choice first. When anon and file are both\n"
+         "\t * available from the same generation, interpret swappiness 1 as file\n"
+         "\t * first and 200 as anon first.\n"
+         "\t */\n"
+         "\tif (!swappiness)\n"
+         "\t\ttype = LRU_GEN_FILE;\n"
+         "\telse if (min_seq[LRU_GEN_ANON] < min_seq[LRU_GEN_FILE])\n"
+         "\t\ttype = LRU_GEN_ANON;\n"
+         "\telse if (swappiness == 1)\n"
+         "\t\ttype = LRU_GEN_FILE;\n"
+         "\telse if (swappiness == 200)\n"
+         "\t\ttype = LRU_GEN_ANON;\n"
+         "\telse\n"
+         "\t\ttype = get_type_to_scan(lruvec, swappiness, &tier);\n"
+         "\n"
+         "\tfor (i = !swappiness; i < ANON_AND_FILE; i++) {\n"
+         "\t\tif (tier < 0)\n"
+         "\t\t\ttier = get_tier_idx(lruvec, type);\n"
+         "\n"
+         "\t\tscanned = scan_pages(lruvec, sc, type, tier, list);\n"
+         "\t\tif (scanned)\n"
+         "\t\t\tbreak;\n"
+         "\n"
+         "\t\ttype = !type;\n"
+         "\t\ttier = -1;\n"
+         "\t}\n"
+         "\n"
+         "\t*type_scanned = type;\n"
+         "\n"
+         "\treturn scanned;\n"
+         "}\n",
+         "\tint i;\n"
+         "\tint type = get_type_to_scan(lruvec, swappiness);\n"
+         "\n"
+         "\tfor_each_evictable_type(i, swappiness) {\n"
+         "\t\tint scanned;\n"
+         "\t\tint tier = get_tier_idx(lruvec, type);\n"
+         "\n"
+         "\t\t*type_scanned = type;\n"
+         "\n"
+         "\t\tscanned = scan_pages(lruvec, sc, type, tier, list);\n"
+         "\t\tif (scanned)\n"
+         "\t\t\treturn scanned;\n"
+         "\n"
+         "\t\ttype = !type;\n"
+         "\t}\n"
+         "\n"
+         "\treturn 0;\n"
+         "}\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _mglru_rework_refault_detection_apply(ctx):
+    """v6.14 b1a71694fb00 (rework refault detection).
+
+    The MGLRU recency test compared the shadow token against min_seq[type]
+    exactly, so every token whose generation had aged out of the minimal
+    window reported "not recent" and its refault was misattributed as a
+    workingset activation; the reworked test accepts any eviction within the
+    last MAX_NR_GENS generations of max_seq.  This is the bulk of the TPC-C
+    workingset_refault_file reduction (-57%) the series reports.  The
+    baseline's recency test is inlined in lru_gen_refault() (there is no
+    lru_gen_test_recent() helper), and abs_diff() postdates 5.15, so the
+    distance is computed locally.
+    """
+    steps = [
+        # Anchored through memcg_id (with the underscore): lru_gen_eviction()
+        # declares the same token/min_seq/lruvec trio and must stay untouched.
+        ("mm/workingset.c",
+         "\tint memcg_id;\n"
+         "\tbool workingset;\n"
+         "\tunsigned long token;\n"
+         "\tunsigned long min_seq;\n",
+         "\tint memcg_id;\n"
+         "\tbool workingset;\n"
+         "\tunsigned long token;\n"
+         "\tunsigned long seq;\n"
+         "\tunsigned long diff;\n",
+         T),
+        ("mm/workingset.c",
+         "\tmod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);\n"
+         "\n"
+         "\tmin_seq = READ_ONCE(lrugen->min_seq[type]);\n"
+         "\tif ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))\n"
+         "\t\tgoto unlock;\n"
+         "\n"
+         "\thist = lru_hist_from_seq(min_seq);\n",
+         "\tmod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);\n"
+         "\n"
+         "\t/* ABK stable_515_backport: v6.14 b1a71694fb00, abs_diff() is 6.9+ */\n"
+         "\tseq = READ_ONCE(lrugen->max_seq) & (EVICTION_MASK >> LRU_REFS_WIDTH);\n"
+         "\tdiff = seq > (token >> LRU_REFS_WIDTH) ?\n"
+         "\t       seq - (token >> LRU_REFS_WIDTH) : (token >> LRU_REFS_WIDTH) - seq;\n"
+         "\tif (diff >= MAX_NR_GENS)\n"
+         "\t\tgoto unlock;\n"
+         "\n"
+         "\thist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+def _mglru_wake_flushers_apply(ctx):
+    """v6.13 1bc542c6a0d1 (wake up flushers conditionally to avoid cgroup OOM).
+
+    The MGLRU eviction path never woke flushers, so a cgroup full of dirty
+    file pages at the tail of its LRU thrashed straight into memcg OOM.  Track
+    dirty/unqueued-dirty file pages through sort_page()/scan_pages(), carry
+    the unqueued-dirty count out of shrink_page_list(), and wake flushers when
+    every file page taken turned out to be unqueued dirty.  The upstream
+    hunk's shrink_node memset is unnecessary here: this baseline's
+    shrink_node() already memsets sc->nr on every iteration.
+    """
+    steps = [
+        ("mm/vmscan.c",
+         "static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc,\n"
+         "\t\t       int tier_idx)\n"
+         "{\n"
+         "\tbool success;\n",
+         "static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc,\n"
+         "\t\t       int tier_idx)\n"
+         "{\n"
+         "\tbool success;\n"
+         "\tbool dirty, writeback;\n",
+         T),
+        ("mm/vmscan.c",
+         "\t/* waiting for writeback */\n"
+         "\tif (PageLocked(page) || PageWriteback(page) ||\n"
+         "\t    (type == LRU_GEN_FILE && PageDirty(page))) {\n",
+         "\tdirty = PageDirty(page);\n"
+         "\twriteback = PageWriteback(page);\n"
+         "\tif (type == LRU_GEN_FILE && dirty) {\n"
+         "\t\tsc->nr.file_taken += delta;\n"
+         "\t\tif (!writeback)\n"
+         "\t\t\tsc->nr.unqueued_dirty += delta;\n"
+         "\t}\n"
+         "\n"
+         "\t/* waiting for writeback */\n"
+         "\tif (PageLocked(page) || writeback ||\n"
+         "\t    (type == LRU_GEN_FILE && dirty)) {\n",
+         T),
+        ("mm/vmscan.c",
+         "\t__count_memcg_events(memcg, item, isolated);\n"
+         "\t__count_memcg_events(memcg, PGREFILL, sorted);\n"
+         "\t__count_vm_events(PGSCAN_ANON + type, isolated);\n",
+         "\t__count_memcg_events(memcg, item, isolated);\n"
+         "\t__count_memcg_events(memcg, PGREFILL, sorted);\n"
+         "\t__count_vm_events(PGSCAN_ANON + type, isolated);\n"
+         "\tif (type == LRU_GEN_FILE)\n"
+         "\t\tsc->nr.file_taken += isolated;\n",
+         T),
+        ("mm/vmscan.c",
+         "retry:\n"
+         "\treclaimed = shrink_page_list(&list, pgdat, sc, &stat, false);\n"
+         "\tsc->nr_reclaimed += reclaimed;\n",
+         "retry:\n"
+         "\treclaimed = shrink_page_list(&list, pgdat, sc, &stat, false);\n"
+         "\tsc->nr.unqueued_dirty += stat.nr_unqueued_dirty;\n"
+         "\tsc->nr_reclaimed += reclaimed;\n",
+         T),
+        ("mm/vmscan.c",
+         "\t\tcond_resched();\n"
+         "\t}\n"
+         "\n"
+         "\t/* see the comment in lru_gen_age_node() */\n",
+         "\t\tcond_resched();\n"
+         "\t}\n"
+         "\n"
+         "\t/*\n"
+         "\t * If too many file cache in the coldest generation can't be evicted\n"
+         "\t * due to being dirty, wake up the flusher.\n"
+         "\t */\n"
+         "\tif (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
+         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n"
+         "\n"
+         "\t/* see the comment in lru_gen_age_node() */\n",
+         T),
+    ]
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
 # reclaim-path chain (Batch 37): the memory.reclaim batch fidelity, the
 # swappiness= argument, the suspend abort and the lru_add drain.
 # Steps live in scripts/batch37_core_reclaim_paths.py.  Registered on its own
@@ -2527,6 +3688,48 @@ PATCH_GROUPS = [
         ["include/linux/swap.h", "mm/vmscan.c", "mm/memcontrol.c",
          "Documentation/admin-guide/cgroup-v2.rst"],
         _memcg_reclaim_apply,
+    ),
+    PatchGroup(
+        "mglru_clean_workingset",
+        "MGLRU v4: workingset_refault() lock assertion covers the MGLRU path too (v6.14 9cbfd1c3c83b; the test_recent restructure has no 6.1-shape counterpart)",
+        ["9cbfd1c3c83b (v6.14)"],
+        ["mm/workingset.c"],
+        _mglru_clean_workingset_apply,
+    ),
+    PatchGroup(
+        "mglru_optimize_deactivation",
+        "MGLRU v4: deactivation clears LRU_REFS in place and skips the LRU shuffle when the page is in the oldest generation (v6.14 cc8ec7be78ff, re-authored onto pagevec drain)",
+        ["cc8ec7be78ff (v6.14)"],
+        ["mm/swap.c"],
+        _mglru_optimize_deactivation_apply,
+    ),
+    PatchGroup(
+        "mglru_rework_aging_feedback",
+        "MGLRU v4: min_seq[] may drift by MAX_NR_GENS-MIN_NR_GENS-1, protected[] gains tier 0, full int swappiness with the >MAX_SWAPPINESS anon-only sentinel, simpler aging feedback (v6.14 798c0330c2ca)",
+        ["798c0330c2ca (v6.14)"],
+        ["include/linux/swap.h", "include/linux/mmzone.h", "mm/vmscan.c"],
+        _mglru_rework_aging_feedback_apply,
+    ),
+    PatchGroup(
+        "mglru_rework_type_selection",
+        "MGLRU v4: type selection sums all tiers per type, tightens the tier margin to 2:3, and reads full-protection history (v6.14 37a260870f2c; needs mglru_rework_aging_feedback)",
+        ["37a260870f2c (v6.14)"],
+        ["mm/vmscan.c"],
+        _mglru_rework_type_selection_apply,
+    ),
+    PatchGroup(
+        "mglru_rework_refault_detection",
+        "MGLRU v4: refault recency accepts any eviction within the last MAX_NR_GENS generations instead of an exact min_seq match (v6.14 b1a71694fb00; the TPC-C -57% workingset_refault_file result)",
+        ["b1a71694fb00 (v6.14)"],
+        ["mm/workingset.c"],
+        _mglru_rework_refault_detection_apply,
+    ),
+    PatchGroup(
+        "mglru_wake_flushers",
+        "MGLRU: wake flushers when every file page taken in a reclaim cycle is unqueued dirty, keeping dirty-tail cgroups from memcg OOM (v6.13 1bc542c6a0d1)",
+        ["1bc542c6a0d1 (v6.13)"],
+        ["mm/vmscan.c"],
+        _mglru_wake_flushers_apply,
     ),
 ]
 
@@ -4453,6 +5656,10 @@ import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
 PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 
 # ============================================================================
+import batch36_core_memcg_stats_slim as _b36_mss  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b36_mss.build_groups(PatchGroup)
+
 # Batch 35: the FUSE write path stops prefaulting its source buffer on every
 # retry.  Steps live in scripts/batch35_core_fuse_erofs.py.
 #
@@ -4478,6 +5685,35 @@ PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 import batch35_core_fuse_erofs as _b35_fuse  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b35_fuse.build_groups(PatchGroup)
+# Batch 36: the memcg per-cpu stats objects shrink to the accounted items.
+# Steps live in scripts/batch36_core_memcg_stats_slim.py.
+#
+#   memcg_stats_percpu_slim   mainline 70a64b7919cb + ff48c71c26aa (v6.10,
+#                             Shakeel Butt) -- index the memcg stats arrays
+#                             through item -> slot tables so the per-memcg,
+#                             per-cpu objects only carry items memcg actually
+#                             accounts.  Both commits land as one group: the
+#                             dynamic-allocation half alone buys nothing.
+#
+# KMI reshape, deliberately not the upstream shape: the ABI XML
+# (android/abi_gki_aarch64.xml) tracks struct mem_cgroup and struct
+# mem_cgroup_per_node with full layouts, and 5.15 embeds the memcg_vmstats /
+# lruvec_stats aggregates in them, so upstream's embedded-array shrink cannot
+# land (see plan.md and the batch docstring for the measured verdict).  What
+# lands instead keeps the header byte-identical and compacts only the two
+# per-cpu heap objects behind the unchanged __percpu pointer fields, via
+# private structs and __alloc_percpu_gfp().  The aggregates stay raw-indexed,
+# so the rstat flush maps compact slots back to items.  The item tables are
+# re-derived for 5.15 (memory_stats[]/memcg1_stats[] readers vs the full
+# count_memcg_events* writer set) -- a missing item reads as zero and no text
+# audit can see it, hence the implementation_audit pins.
+#
+# The header edit moves lruvec_page_state_local() out of line (its inline body
+# would index the compacted object with raw offsets); static inline, no
+# struct member moves, no export added.  No other group writes into the stats
+# accessors, the rstat flush or this header, so there is nothing to order
+# against.
+# =====================================================================
 
 # ============================================================================
 # Batch 37: the memory-reclaim path -- proactive reclaim's batch fidelity, its

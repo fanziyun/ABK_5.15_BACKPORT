@@ -60,13 +60,11 @@ GROUP_COUNTS = {
     # the zram_writeback_complete() that zram_writeback_batching generates
     # (that group probes zram_account_writeback_submit now) and the
     # zram_free_page() huge block, which is identical on every baseline.
-    #
     # The Batch-33 zsmalloc free path (zsmalloc_free_zspage_out_of_lock) applies
     # on every baseline: android13-5.15 has no pool->lock in mm/zsmalloc.c on
     # any of them, so the mainline series patches 1-2 are inapplicable and only
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
-    #
     # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
     # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
     # diverged), so the rolling lts row cannot arrive pre-applied either -- and
@@ -82,10 +80,25 @@ GROUP_COUNTS = {
     # none of the substrate they touch.  The three readahead/filemap commits of
     # the same area are *not* registered -- no baseline has a carrier for them
     # (see the exclusion record in plan.md).
+    # Batch 37 adds six MGLRU v4 groups, all landing on every baseline: the
+    # baseline MGLRU is the 6.1 "minimal implementation" backport (page-based
+    # lru_gen_struct/lists, sort_page/scan_pages/evict_pages) and carries none
+    # of the 6.2-6.14 MGLRU evolution the series assumes -- verified identical
+    # shape on all four trees, so nothing arrives pre-applied.  3af0191a594d
+    # (workingset accounting) is NOT registered: the ACK backport already
+    # carries its accounting (verified line-by-line in lru_gen_refault()),
+    # which is why mglru_rework_refault_detection anchors the post-fix shape.
+    # mglru_rework_type_selection is a second-pass group: it rewrites
+    # read_ctrl_pos()/isolate_pages() and consumes the evictable_min_seq/
+    # for_each_evictable_type macros and the reindexed protected[] that
+    # mglru_rework_aging_feedback generates.
+    # 47 on the merged base (Batch 35's 45 + the two parallel Batch 36s:
+    # memcg_stats_percpu_slim and the FUSE write-path prefault) + this batch's
+    # six MGLRU groups.
+    "stable_backport_core": 59,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
-    #
     # The Batch-36 FUSE write-path prefault (fuse_prefault_out_of_write_path)
     # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
     # with no Cc: stable, so no 5.15 tree carries it, and its two anchors are
@@ -93,7 +106,6 @@ GROUP_COUNTS = {
     # fs/fuse/, so nothing else writes the file.  Renumbered twice: the arm64
     # LSE group took "Batch 34" and the page-cache/page-table one took 35 while
     # this branch was open, so this one is 36.
-    #
     # Batch 37 adds the six-group memory-reclaim chain
     # (proactive_reclaim_batch_fidelity, proactive_reclaim_decaying_batches,
     # reclaim_swappiness_defines, proactive_reclaim_swappiness_arg,
@@ -108,7 +120,6 @@ GROUP_COUNTS = {
     # numbered it 34 while main numbered the arm64 LSE group 34, so the merge
     # renumbered it after main's Batch 36.
     # 46 (the merged main line) + Batch 37's six = 52.
-    "stable_backport_core": 52,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed
@@ -214,7 +225,6 @@ PRE_APPLIED = {
 # sublevel -> child -> group key -> expected degraded status.
 # Disjoint from PRE_APPLIED: a group either arrives upstream-clean or is a
 # tracked debt; never both.
-#
 # Empty for the three Batch-14 zram writeback groups: each one lands on a
 # pristine 167/178/194/216 tree.  zram_wb_teardown does not depend on the series
 # partner be48c412f6eb (zero-sized backing device rejection, 5.15.168+) -- that
