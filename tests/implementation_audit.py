@@ -612,6 +612,16 @@ REQUIRED_CONTENT = {
         "ABK stable_515_backport: 34efe1c3b688",
         "if (!mode)",
     ],
+    "core:arm64_pte_mkwrite_clean": [
+        # 8a2375b0e9b8 / mainline 143937ca51cc.  The guard is the whole group,
+        # and it is deliberately written without an ABK marker (upstream-shape
+        # rewrite: the target form is the idempotency probe, so 216 stays
+        # byte-identical).  Pin the guarded clear itself -- the bare
+        # `pte_sw_dirty(pte))` test would also match pte_modify()'s own use of
+        # the macro further down the same file, which the pristine one has.
+        "if (pte_sw_dirty(pte))\n"
+        "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -795,6 +805,13 @@ REQUIRED_ABSENT = {
         # whose idle pages are sparse it recompresses far less than asked.
         ["drivers/block/zram/zram_drv.c",
          "\t\tnum_recomp_pages--;\n\t\tzram_slot_lock(zram, index);"],
+    ],
+    "core:arm64_pte_mkwrite_clean": [
+        # The unconditional clear is the defect: it makes every writable PTE
+        # hardware-dirty, which try_to_unmap() then reports as a dirty page at
+        # reclaim.  It must be gone, not merely bypassed.
+        "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
+        "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
     ],
 }
 

@@ -349,6 +349,106 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-31"></a>
+
+## Batch 31(v0.33.0)
+
+起因是一次核查：**6.18 的 `143937ca51cc` 要不要 backport**。结论是「不是必须，但够格」，本批把它
+落成一个最小的 core 组。`module.conf` 0.32.0 → **0.33.0**，`GROUP_COUNTS` core **37 → 38**
+（本批与 Batch 30 同一天从各自的 PR 落地，两批都动了 core 计数：Batch 30 的
+`readahead_mmap_miss_race` 先取走 0.32.0 与 37，本批合并 main 后顺延为 0.33.0 与 38）。
+
+### 1. 候选溯源：上游 5.15.y 自己已经收过它
+
+`143937ca51cc`（`arm64, mm: avoid always making PTE dirty in pte_mkwrite()`，Huang Ying，
+Catalin Marinas 合入，v6.18）把 `pte_mkwrite_novma()` 里的无条件清 `PTE_RDONLY` 改成**只在
+PTE 已经是 software-dirty 时清**，于是一个页可以「可写且干净」。关键的两条核对结果：
+
+- **上游 5.15.y 已 backport**：stable 提交 `8a2375b0e9b8`，落在 **v5.15.196**（`.195` 仍是旧
+  形态，`.196` 起是新形态，按 tag 逐个取文件核对）；AOSP `android13-5.15-lts`（SUBLEVEL 216）
+  已带上，而三条发布基线 167/178/194 都还是旧形态。
+- 所以**目标形态必须取 5.15.y 的形态**：5.15 里这个 helper 叫 `pte_mkwrite()`，没有
+  `pte_mkwrite_novma()`（那是 v6.6 的改名 `2f0584f3f4bd` 才引入的名字，是 vma-aware
+  `pte_mkwrite()` 三步计划的第一步，本身「No functional change」）。照抄 mainline 的 hunk 在四档
+  基线上**一处锚点也匹配不上**。
+
+### 2. 这个缺陷在 5.15 上为什么是真的（而不是照抄 commit message）
+
+arm64 的 `PAGE_SHARED` 是**默认干净**的，`pgtable-prot.h` 的原话：
+"shared+writable pages are clean by default, hence PTE_RDONLY|PTE_WRITE"。因此「清掉
+`PTE_RDONLY`」**正是**把一个页标成 hardware dirty 的动作
+（`pte_hw_dirty(pte) == pte_write(pte) && !(pte_val(pte) & PTE_RDONLY)`）：任何把**干净** PTE
+改成可写的调用点，都会把一个没人写过的页报成脏页；而 `try_to_unmap()` 在回收时读 `pte_dirty()`
+并 `set_page_dirty()`，于是这个页被写回去（本机是写进 zram）。
+
+但**必须逐调用点核过**才算数，因为提交动机里那条在 5.15 不存在：
+
+| 5.15 上真实存在 | 说明 |
+|---|---|
+| `remove_migration_pte()` | `mk_pte(new, vma->vm_page_prot)` 出来的是 `PAGE_SHARED`（`PTE_RDONLY|PTE_WRITE`），`PTE_DIRTY` 未置位，`maybe_mkwrite()` 一调就把干净页标脏 |
+| `do_numa_page()` | 同一形态（`pte_modify()` 之后按 `was_writable` 补 `pte_mkwrite()`） |
+| userfaultfd | `mfill_atomic_pte()` 同族 |
+
+| 5.15 上**不存在** | 说明 |
+|---|---|
+| `do_swap_page()`「读缺页把独占页映射成可写且干净」 | 5.15 只在 `FAULT_FLAG_WRITE && reuse_swap_page()` 分支写 `maybe_mkwrite(pte_mkdirty(pte), vma)`，可写与脏**永远成对**（`mm/memory.c:3909`） |
+
+**价值边界（写在最前面，别误读为普遍收益）**：commit message 里的 23.9% 是「arm64 服务器 +
+磁盘 swap + redis 只读负载 + 工作集大于内存」量出来的。本机是 zram swap、且 writeback 在
+本机基本不会被触发（见 Batch 17 §10），因此本批**只主张「少标脏」这一定性结论，不主张提速，
+也没有做 A/B**。
+
+### 3. 落地
+
+单文件单步（`arch/arm64/include/asm/pgtable.h`，即 `pte_mkwrite()` 整个函数体）：
+
+```c
+ 	pte = set_pte_bit(pte, __pgprot(PTE_WRITE));
+-	pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
++	if (pte_sw_dirty(pte))
++		pte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));
+```
+
+- **上游形态改写，不加 marker**：目标形态本身就是幂等探针。不这么做的话，`.216` 上会先
+  匹配不到 `new`、再匹配不到 `old`，直接退化成 `blocked_by_shape` —— 而不是 `already_present`。
+  同理 `REQUIRED_CONTENT` 只钉带 guard 的那两行（裸 `pte_sw_dirty(pte))` 在 pristine 的
+  `pte_modify()` 里本来就有，钉不住东西），`REQUIRED_ABSENT` 钉旧的两行仍在不在。
+- 不做 `hard=True`：shape 不认识时按政策**降级报告**，不 abort 整条构建。
+
+### 4. 验证
+
+四档基线干跑（`scripts/abk_stable_core.py --dry-run`）+ 四道门禁：
+
+| 基线 | `arm64_pte_mkwrite_clean` | core 首趟总计 |
+|---|---|---|
+| 167 | `applied` | 38 applied |
+| 178 | `applied` | 38 applied |
+| 194 | `applied` | 35 applied + 3 present |
+| 216 | `already_present` | 31 applied + 7 present |
+
+（合并 Batch 30 后重测；相较本批单独落地的 37/37/34+3/30+7 各多一组，就是 Batch 30 的
+`readahead_mmap_miss_race`。）
+
+`tests/sublevel_matrix.py` 的 `PRE_APPLIED["216"]` 因此多一条（5.15.196 在滚动分支上已经过去），
+`docs/porting_policy.md` 的基线表**按本次实测重刷**（原先 core/perf 两列都落后于 registry 好几个
+批次，顺带纠正 perf 列）。
+
+这个组是**本模块第一个 `arch/arm64` C 落点**（此前只碰 `arch/arm64/configs/gki_defconfig`），
+所以 fixture 三处同步新增，缺一处就会出现「组跑到不存在的文件上、报成形状问题」的假故障：
+
+- `tests/fetch_sublevel_tree.sh` `FETCH_FILES`（参考树，四档已重取该文件）；
+- `tests/step_audit.py` `AUDIT_FILES`（`check_fixture_coverage()` 会强制这条）；
+- `tests/smoke.sh` `SMOKE_FILES`。
+
+KMI 无影响：inline helper 内部两行，不增删任何导出结构成员、不新增符号。
+
+### 5. 边界
+
+- 不 port mainline 侧的名字（`pte_mkwrite_novma()`）与 6.3 的 vma-aware 拆分 —— 5.15 的形状不
+  支持，且那属于「为改而改」。
+- 不碰 `pte_modify()` / `ptep_set_wrprotect()`：它们在 5.15 已经自己处理 hw-dirty 的搬移
+  （`pte_modify()` 尾部的 "if we end up clearing hw dirtiness for a sw-dirty PTE, set hardware
+  dirtiness again"），本组与它们正交。
 <a id="batch-30"></a>
 
 ## Batch 30(v0.32.0)

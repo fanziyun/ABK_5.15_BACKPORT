@@ -54,7 +54,9 @@ GROUP_COUNTS = {
     # (e338d8353154, mm/filemap.c do_async_mmap_readahead) applies on every
     # baseline: no Cc: stable, so no 5.15 tree carries it, and its anchor is
     # byte-identical on all four.
-    "stable_backport_core": 37,
+    # Batch 31 adds the arm64 pte_mkwrite() dirty guard (5.15.196), the module's
+    # first arch/arm64 C source.
+    "stable_backport_core": 38,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed
@@ -127,6 +129,9 @@ PRE_APPLIED = {
             "pagealloc_cpuset_bailout",
             "pagealloc_high_fraction_lockfree",
             "cgroup_destroy_wq_split",
+            # 5.15.196 pte_mkwrite() dirty guard: the rolling branch is past
+            # that point, so the helper already has the guarded clear.
+            "arm64_pte_mkwrite_clean",
         },
         "stable_perf_backport": {
             "sched_nohz_idle_balance_series",

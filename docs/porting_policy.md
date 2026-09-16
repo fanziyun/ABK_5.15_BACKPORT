@@ -201,10 +201,13 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 35 applied | 20 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 35 applied | 19 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 32 applied + 3 present | 17 applied + 3 present |
-| 216 | `android13-5.15-lts` | rolling | 29 applied + 6 present | 12 applied + 8 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 38 applied | 23 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 38 applied | 22 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 35 applied + 3 present | 20 applied + 3 present |
+| 216 | `android13-5.15-lts` | rolling | 31 applied + 7 present | 15 applied + 8 present |
+
+(Re-measured on the v0.33.0 registry against the four fetched reference trees;
+the counts move with every batch, so they are a snapshot, not an invariant.)
 
 The display child is the odd one out: its single revert group reports
 `already_present` on 167/178 (which never carried the 5.15.185 check) and
@@ -219,6 +222,7 @@ any child degrades on any supported baseline.  Groups the baseline pre-empts:
   `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194),
   `sched_steal_time_excess_drop` (5.15.179) and `semaphore_wake_q` (5.15.180).
 - **216** — the 194 set plus `fdtable_replace_fd_errno` (5.15.195),
+  `arm64_pte_mkwrite_clean` (5.15.196, the module's first `arch/arm64` group),
   `pagealloc_thisnode_thp_noreclaim` (5.15.202),
   `pagealloc_high_fraction_lockfree` (5.15.200),
   `release_sock_cond_resched` (5.15.197), `sched_rt_optimizations`

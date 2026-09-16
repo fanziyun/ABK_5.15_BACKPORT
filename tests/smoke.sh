@@ -108,6 +108,8 @@ SMOKE_FILES=(
   include/linux/tick.h
   kernel/time/tick-sched.c
   kernel/sched/idle.c
+  # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
+  arch/arm64/include/asm/pgtable.h
 )
 
 WORK="$(mktemp -d)"
