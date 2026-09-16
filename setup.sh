@@ -26,6 +26,12 @@ if [ -n "${ABK_MODULE_CHILD_ID:-}" ]; then
   abk_log "module-set child: ${ABK_MODULE_CHILD_ID}"
 fi
 
+# [PR 编译门禁端到端自检] 这行只存在于测试 PR 的 commit 上。它在 ABK 构建日志里出现，
+# 就证明 ABK 真的 checkout 了 refs/pull/<N>/head（也就是本 PR 的 commit）并执行了本目录的
+# setup.sh —— 光靠 gate 回写的 head_sha 只能证明派发 payload，证不了 checkout。
+# 测试结束后随 PR 一起撤销，不要合进 main。
+abk_log "ABK_CI_SELFTEST_MARKER=gate-e2e-v1"
+
 case "$CUSTOM_EXTERNAL_MODULE_STAGE" in
   after_patch)
     abk_stable_backport_apply_selected
