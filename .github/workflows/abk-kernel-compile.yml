@@ -1,0 +1,695 @@
+name: ABK kernel compile gate
+
+# 派发 fanziyun/ABK 的「Android 内核构建-自定义」(kernel-custom.yml)，把**本 PR 的 commit**
+# 钉进 custom_external_modules 的描述符（;ref=refs/pull/<N>/head），再把结果回写到 PR。
+#
+# 安全边界：本工作流**永不 checkout PR 代码**，只用 GitHub API；PR 代码只在 ABK 的构建 job
+# 里被执行（那是 ABK 自己的权限模型）。因此这里用 pull_request_target 拿 write token + secrets
+# 是安全的 —— 后续任何往本文件加 actions/checkout 的改动都必须被否决。
+#
+# 一次性前置（见 docs/pr_compile_gate.md）：
+#   secret ABK_CI_TOKEN          fine-grained PAT，仅 fanziyun/ABK，Actions: read/write
+#   var    ABK_CI_EXTRA_MODULES  与出厂构建同形的其它模块描述符，换行分隔（留空=只注入本仓库 child）
+#   var    ABK_CI_WORKFLOW_REF   ABK 侧工作流 ref，默认 dev
+#   var    ABK_CI_VERSION_BASE   版本名前缀，默认 -202609202-FanZiyun
+#   var    ABK_CI_BUILD_TIME     固定构建时间，默认 Sun Dec 01 08:10:00 UTC 2024
+#
+# 触发策略：同仓库分支 PR 自动；fork PR 需维护者打 ci:compile 标签。
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to compile-check
+        required: true
+        type: string
+      abk_ref:
+        description: "ABK workflow ref (default: vars.ABK_CI_WORKFLOW_REF or dev)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  # 无关标签（labeled 但标签不是 ci:compile）走自己的组，免得把正在等的那次真门禁取消掉。
+  group: abk-compile-${{ github.event.pull_request.number || inputs.pr_number }}-${{ (github.event_name == 'labeled' && github.event.label.name != 'ci:compile') && 'skip' || 'run' }}
+  cancel-in-progress: true
+
+jobs:
+  abk-compile:
+    name: Dispatch ABK kernel build
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      ABK_REPO: fanziyun/ABK
+      ABK_WORKFLOW: kernel-custom.yml
+      ABK_WORKFLOW_REF: ${{ inputs.abk_ref || vars.ABK_CI_WORKFLOW_REF || 'dev' }}
+      ABK_EXTRA_MODULES: ${{ vars.ABK_CI_EXTRA_MODULES }}
+      ABK_BUILD_TIME: ${{ vars.ABK_CI_BUILD_TIME || 'Sun Dec 01 08:10:00 UTC 2024' }}
+      ABK_VERSION_BASE: ${{ vars.ABK_CI_VERSION_BASE || '-202609202-FanZiyun' }}
+      STATUS_CONTEXT: ABK kernel compile (android13-5.15-lts)
+      # ABK run 里内核构建 job 的名字前缀 = <kernel>.<sub_level>-<android>-<os_patch>，
+      # 用来把「编译挂了」和「同 run 别的 job 挂了」分开（见 docs/pr_compile_gate.md 第 9 节）。
+      ABK_JOB_PREFIX: 5.15.X-android13-lts
+      WAIT_MINUTES: "90"
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_LABEL: ${{ github.event.label.name }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+      GH_TOKEN: ${{ secrets.ABK_CI_TOKEN }}
+    steps:
+      - name: Resolve PR and gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr="$PR_NUMBER"
+          if [ -z "${pr:-}" ] || [ "$pr" = "null" ]; then
+            echo "::notice::非 PR 上下文，跳过。"
+            { echo "pr="; echo "run=false"; echo "reason=不是 PR 事件"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pull="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr")"
+          state="$(jq -r .state <<<"$pull")"
+          draft="$(jq -r .draft <<<"$pull")"
+          head_sha="$(jq -r .head.sha <<<"$pull")"
+          head_repo="$(jq -r .head.repo.full_name <<<"$pull")"
+          labels="$(jq -r '[.labels[].name] | join(",")' <<<"$pull")"
+          reason=""
+
+          # 跳过分两类：no-change（改动没碰内核树，没有可验证的东西）与 not-verified（这轮没编，
+          # 但代码可能影响内核）。后者绝不写成功状态，见 docs/pr_compile_gate.md 第 3 节。
+          skip_kind=""
+          if [ "$EVENT_NAME" = "labeled" ] && [ "$EVENT_LABEL" != "ci:compile" ]; then
+            reason="标签 '$EVENT_LABEL' 不是 ci:compile"
+            skip_kind="not-verified"
+          fi
+          if [ -z "$reason" ] && [ "$state" != "open" ]; then
+            reason="PR 状态是 $state"
+            skip_kind="not-verified"
+          fi
+          if [ -z "$reason" ] && [ "$draft" = "true" ]; then
+            reason="draft PR"
+            skip_kind="not-verified"
+          fi
+          if [ -z "$reason" ] && [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            if ! printf '%s\n' "$labels" | tr ',' '\n' | grep -qx 'ci:compile'; then
+              reason="fork PR 未打 ci:compile 标签"
+              skip_kind="not-verified"
+            fi
+          fi
+
+          files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$pr/files" --jq '.[].filename')"
+          if [ -z "$reason" ]; then
+            need_compile="$(printf '%s\n' "$files" | grep -cv -E '^(docs/|research/|tmp/|\.claude/|\.github/)|^CHANGELOG\.md$' || true)"
+            if [ "$need_compile" = "0" ]; then
+              reason="改动全在 docs/research/tmp/.claude/.github/CHANGELOG，无需编译"
+              skip_kind="no-change"
+            fi
+          fi
+
+          printf '%s\n' "$pr" > pr.txt
+          printf '%s\n' "$head_sha" > head_sha.txt
+          printf '%s\n' "$skip_kind" > skip_kind.txt
+          {
+            echo "pr=$pr"
+            echo "head_sha=$head_sha"
+            echo "head_repo=$head_repo"
+            echo "skip_kind=$skip_kind"
+          } >> "$GITHUB_OUTPUT"
+
+          # 前置没配齐就红着喊：宁可靠红喊出声，也不要让编译门禁假装通过（见 docs/pr_compile_gate.md）。
+          # 放在写 output 之后，这样 Report 步骤仍有 pr/head_sha 可写状态与评论。
+          if [ -z "${{ secrets.ABK_CI_TOKEN }}" ]; then
+            echo "::error::secret ABK_CI_TOKEN 缺失（见 docs/pr_compile_gate.md），PR 编译门禁无法派发 ABK 构建"
+            exit 1
+          fi
+
+          if [ -n "$reason" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$reason" >> "$GITHUB_OUTPUT"
+            echo "::notice::跳过 ABK 编译门禁：$reason"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            echo "::notice::将对 PR #$pr ($head_sha) 派发 ABK 编译"
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+              -f state="pending" \
+              -f context="$STATUS_CONTEXT" \
+              -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              -f description="ABK 编译中（最多 $WAIT_MINUTES 分钟）" > /dev/null
+          fi
+
+          {
+            echo "### ABK compile gate"
+            echo ""
+            echo "- PR: #$pr ($head_sha)"
+            echo "- 来源: $head_repo"
+            if [ -n "$reason" ]; then
+              echo "- 结论: **跳过** —— $reason"
+            else
+              echo "- 结论: 派发 ABK 编译"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build dispatch payload
+        id: payload
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
+          PR: ${{ steps.gate.outputs.pr }}
+        run: |
+          set -euo pipefail
+          # 同仓库 PR 按 sha 取即可；fork PR 的 commit 只在 refs/pull/<N>/head 上可达，
+          # 按 sha 解析 Contents API 可能 404，所以回退到 PR ref。
+          if ! gh api "repos/$GITHUB_REPOSITORY/contents/module.conf?ref=$HEAD_SHA" \
+                 -H 'Accept: application/vnd.github.raw' > module.conf.head 2>/dev/null; then
+            gh api "repos/$GITHUB_REPOSITORY/contents/module.conf?ref=refs/pull/$PR/head" \
+              -H 'Accept: application/vnd.github.raw' > module.conf.head
+          fi
+
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          raw = open("module.conf.head", encoding="utf-8").read()
+          # module.conf 是 shell 赋值文件（ABK 自己也用 shell 读它），这里按同一种语法抓它：
+          # 描述里出现单引号时 module.conf 自己就先坏了，所以这个正则与 ABK 同寿。
+          items = re.search(r"ABK_MODULE_SET_ITEMS='(.*?)'", raw, re.S)
+          if not items:
+              sys.exit("module.conf 里没有 ABK_MODULE_SET_ITEMS，无法确定要注入的 child")
+          children = []
+          for line in items.group(1).splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              child = line.split("|")[0].strip()
+              if not child:
+                  continue
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+", child):
+                  sys.exit("child id 非法: " + repr(child))
+              children.append(child)
+          if not children:
+              sys.exit("ABK_MODULE_SET_ITEMS 解析不到任何 child")
+
+          version = re.search(r'ABK_MODULE_VERSION="([^"]*)"', raw)
+          module_id = re.search(r'ABK_MODULE_ID="([^"]*)"', raw)
+          pr = os.environ["PR"]
+          head_sha = os.environ["HEAD_SHA"]
+          marker = "pr" + pr + "-" + head_sha[:7]
+          repo_url = "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
+
+          blocks = []
+          extra = os.environ.get("ABK_EXTRA_MODULES", "").strip()
+          if extra:
+              blocks.extend(b.strip() for b in extra.splitlines() if b.strip())
+          for child in children:
+              blocks.append("set:" + repo_url + "#" + child + ";after_patch;ref=refs/pull/" + pr + "/head")
+
+          payload = {
+              "ref": os.environ["ABK_WORKFLOW_REF"],
+              "inputs": {
+                  "android_version": "android13",
+                  "kernel_version": "5.15",
+                  "sub_level": "X",
+                  "os_patch_level": "lts",
+                  "revision": "r11",
+                  "kernelsu_variant": "None",
+                  "kernelsu_branch": "Stable(标准)",
+                  "custom_ref": "",
+                  "version": os.environ["ABK_VERSION_BASE"] + "-" + marker,
+                  "build_time": os.environ["ABK_BUILD_TIME"],
+                  "virtualization_support": "678",
+                  "use_zram": True,
+                  "use_bbg": False,
+                  "use_ddk": False,
+                  "use_ntsync": True,
+                  "use_networking": False,
+                  "use_kpm": False,
+                  "use_rekernel": False,
+                  "cancel_susfs": True,
+                  "supp_op": False,
+                  "zram_full_algo": True,
+                  "zram_extra_algos": "",
+                  "kpm_password": "",
+                  "custom_external_modules": "|".join(blocks),
+                  "custom_kernel_options": "CONFIG_ZRAM_WRITEBACK=y",
+              },
+          }
+          with open("payload.json", "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+          with open("marker.txt", "w", encoding="utf-8") as handle:
+              handle.write(marker)
+          with open("expected_ref.txt", "w", encoding="utf-8") as handle:
+              handle.write("refs/pull/" + pr + "/head")
+          with open("expected_version.txt", "w", encoding="utf-8") as handle:
+              handle.write(version.group(1) if version else "")
+          print("marker=" + marker)
+          print("children=" + " ".join(children))
+          print("module_id=" + (module_id.group(1) if module_id else "?"))
+          print("module_version=" + (version.group(1) if version else "?"))
+          PY
+
+          echo "--- 注入描述符"
+          jq -r '.inputs.custom_external_modules' payload.json | tr '|' '\n' | sed 's/^/  /'
+
+      - name: Cancel superseded run for this PR
+        id: cancel
+        if: steps.gate.outputs.run == 'true'
+        env:
+          PR: ${{ steps.gate.outputs.pr }}
+        run: |
+          set -euo pipefail
+          wf_id="$(gh api "repos/$ABK_REPO/actions/workflows/$ABK_WORKFLOW" --jq .id)"
+          # 不要 --paginate：多页会被包成外层数组，jq '.workflow_runs[]' 就失效；
+          # 而我们要找的「本 PR 尚未完成」的 run 一定在最新一页里。
+          gh api "repos/$ABK_REPO/actions/runs?workflow_id=$wf_id&event=workflow_dispatch&per_page=100" > runs.json
+          jq -r --arg p "-pr$PR-" '.workflow_runs[] | select(.status != "completed") | select(.display_title | contains($p)) | .id' runs.json > stale.txt
+          while read -r rid; do
+            [ -n "$rid" ] || continue
+            echo "取消被顶替的 run $rid"
+            gh api -X POST "repos/$ABK_REPO/actions/runs/$rid/cancel" >/dev/null || true
+          done < stale.txt
+
+      - name: Dispatch ABK build
+        id: dispatch
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.ABK_CI_TOKEN }}" ]; then
+            echo "::error::secret ABK_CI_TOKEN 缺失，无法派发 ABK 构建（见 docs/pr_compile_gate.md）"
+            printf '%s\n' "no-token" > conclusion.txt
+            exit 1
+          fi
+          gh api "repos/$ABK_REPO" --jq .full_name > /dev/null
+          # 钉住 PR 用的是描述符第三字段 ;ref=，只有 fanziyun/ABK#5 之后的 kernel-custom.yml 认识它。
+          # 目标 ref 不认识，就会白等 90 分钟、最后报成「编的不是这份代码」，所以先验一遍契约。
+          if ! gh api "repos/$ABK_REPO/contents/.github/workflows/$ABK_WORKFLOW?ref=$ABK_WORKFLOW_REF" \
+                -H 'Accept: application/vnd.github.raw' 2>/dev/null | grep -q 'run-name: ABK-CI'; then
+            echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_WORKFLOW_REF 指到 ci/module-ref-pin，见 docs/pr_compile_gate.md"
+            printf '%s\n' "no-ref-support" > conclusion.txt
+            exit 1
+          fi
+          date -u +%Y-%m-%dT%H:%M:%SZ > dispatched_at.txt
+          gh api -X POST "repos/$ABK_REPO/actions/workflows/$ABK_WORKFLOW/dispatches" --input payload.json
+          echo "已派发：ref=$ABK_WORKFLOW_REF marker=$(cat marker.txt)"
+
+      - name: Wait for the ABK run
+        id: wait
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          marker="$(cat marker.txt)"
+          # run-name 是 "ABK-CI <version>"，而 version 是 <前缀>-<marker>，所以只能子串匹配；
+          # dispatched_at.txt 是派发前一刻的 UTC 时间，用它把同一 marker 的旧 run 挡掉。
+          since="$(date -u -d "$(cat dispatched_at.txt) - 120 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 1970-01-01T00:00:00Z)"
+          wf_id="$(gh api "repos/$ABK_REPO/actions/workflows/$ABK_WORKFLOW" --jq .id)"
+          deadline=$(( $(date -u +%s) + WAIT_MINUTES * 60 ))
+          run_id=""
+          while [ -z "$run_id" ]; do
+            if [ "$(date -u +%s)" -ge "$deadline" ]; then
+              echo "::error::在 ABK 里找不到 marker=$marker 的 run（等待超时）"
+              printf '%s\n' "not-found" > conclusion.txt
+              exit 1
+            fi
+            gh api "repos/$ABK_REPO/actions/runs?workflow_id=$wf_id&event=workflow_dispatch&per_page=50" > runs.json
+            run_id="$(jq -r --arg m "$marker" --arg since "$since" '[.workflow_runs[] | select(.display_title | contains($m)) | select(.created_at >= $since)] | sort_by(.created_at) | .[-1].id // empty' runs.json)"
+            [ -n "$run_id" ] || sleep 20
+          done
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$run_id" > run_id.txt
+          printf 'https://github.com/%s/actions/runs/%s\n' "$ABK_REPO" "$run_id" > run_url.txt
+          echo "ABK run: $(cat run_url.txt)"
+          while :; do
+            gh api "repos/$ABK_REPO/actions/runs/$run_id" \
+              --jq '.status + " " + (.conclusion // "pending")' > state.txt
+            read -r run_state run_conclusion < state.txt
+            echo "status: $run_state $run_conclusion"
+            if [ "$run_state" = "completed" ]; then
+              printf '%s\n' "$run_conclusion" > conclusion.txt
+              break
+            fi
+            if [ "$(date -u +%s)" -ge "$deadline" ]; then
+              echo "::error::ABK run $run_id 超时（$WAIT_MINUTES 分钟）未完成"
+              # 超时不等于编不过：顺手取消这个 run，别让它继续烧 CI（结论仍按「超时未完成」报）
+              gh api -X POST "repos/$ABK_REPO/actions/runs/$run_id/cancel" > /dev/null 2>&1 || true
+              printf '%s\n' "timeout" > conclusion.txt
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "conclusion=$(cat conclusion.txt)"
+
+      - name: Collect evidence from the ABK log
+        id: evidence
+        if: always() && steps.gate.outputs.run == 'true' && steps.wait.outputs.run_id != ''
+        env:
+          RUN_ID: ${{ steps.wait.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh run view "$RUN_ID" --repo "$ABK_REPO" --log > abk.log || echo "::warning::日志下载失败"
+          wc -l abk.log || true
+          python3 - <<'PY'
+          import json, pathlib, re
+
+          log = pathlib.Path("abk.log").read_text(encoding="utf-8", errors="replace")
+
+
+          def clean(text):
+              """日志原文里有 PR 作者能影响的内容：剥掉 markdown 围栏与 HTML 注释，并限长。"""
+              out = re.sub(r"\x1b\[[0-9;]*m", "", text)
+              out = out.replace("```", "'''").replace("<!--", "<!- -").replace("-->", "- ->")
+              return out.strip()[:300]
+          head_sha = pathlib.Path("head_sha.txt").read_text(encoding="utf-8").strip()
+          expected_version = pathlib.Path("expected_version.txt").read_text(encoding="utf-8").strip()
+
+          head_lines = [ln.strip() for ln in log.splitlines() if "head_sha:" in ln]
+          pinned_lines = [ln.strip() for ln in log.splitlines()
+                          if "pinned_ref:" in ln or "fetch ref:" in ln]
+          version_lines = [ln.strip() for ln in log.splitlines() if "[ABK module] version" in ln]
+          # 模块现在的输出格式（scripts/abk_backport_engine.py::_log_summary）：
+          #   [ABK stable_515_backport] <child>/<group_key>: <status>
+          #   [ABK stable_515_backport] <child>: {"applied": N, ...}
+          summary_lines = [ln.strip() for ln in log.splitlines()
+                           if "[ABK stable_515_backport]" in ln and "{" in ln]
+          group_lines = []
+          for match in re.finditer(
+                  r"\[ABK stable_515_backport\] ([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+): ([a-z_]+)", log):
+              entry = match.group(1) + "/" + match.group(2) + ": " + match.group(3)
+              if entry not in group_lines:
+                  group_lines.append(entry)
+          if not group_lines:  # 旧格式兜底（v0.17 前后的 ABK-CORE-<n>: <status>）
+              for match in re.finditer(r"(ABK-(?:CORE|PERF|DISPLAY)-\d+):\s*([a-z_]+)", log):
+                  entry = match.group(1) + ": " + match.group(2)
+                  if entry not in group_lines:
+                      group_lines.append(entry)
+          # 只留真错误：GitHub 会把整段脚本逐行回显（带 ANSI 粗体前缀），那些 echo "::error::…"
+          # 源码行不是错误——真正的注解在日志里长成 ##[error]。
+          error_lines = []
+          for ln in log.splitlines():
+              if "\x1b[" in ln:
+                  continue
+              if not ("##[error]" in ln or "error: " in ln or "Error: " in ln
+                      or "fatal error" in ln or "undefined reference" in ln):
+                  continue
+              stripped = ln.strip()
+              if stripped and stripped not in error_lines:
+                  error_lines.append(stripped)
+              if len(error_lines) >= 8:
+                  break
+
+          head_sha_lines = len(head_lines)
+          # 模块自报的分组状态：applied/already_present/skip_suite_processed/report_only 之外都算可疑
+          # （partial / blocked_by_* 正是「编过了但 graft 没落地」那类，见 docs/pr_compile_gate.md 第 9 节）。
+          GOOD_STATUSES = {"applied", "already_present", "skip_suite_processed", "report_only"}
+          bad_groups = [ln for ln in group_lines if ln.rsplit(": ", 1)[-1] not in GOOD_STATUSES]
+          bad_groups_text = "; ".join(clean(g) for g in bad_groups[:3])
+
+          expected_ref = ""
+          if pathlib.Path("expected_ref.txt").exists():
+              expected_ref = pathlib.Path("expected_ref.txt").read_text(encoding="utf-8").strip()
+
+          head_sha_ok = any(head_sha and head_sha in ln for ln in head_lines)
+          pinned_ok = None
+          if expected_ref:
+              pinned_ok = any(expected_ref in ln for ln in pinned_lines)
+          version_ok = None
+          if expected_version:
+              version_ok = any(expected_version in ln for ln in version_lines)
+
+          lines = []
+          lines.append("### 取证（ABK 日志）")
+          lines.append("")
+          lines.append("- 期望编入的 commit: `" + (head_sha or "?") + "`")
+          lines.append("- 日志里的 head_sha 行: " + (str(len(head_lines)) + " 条"))
+          lines.append("- **自证 head_sha " + ("对得上** ✅" if head_sha_ok else "对不上** ❌（编的不是这份代码）"))
+          if pinned_ok is None:
+              lines.append("- 钉住的 ref 自证: 跳过（payload 没写出 expected_ref.txt）")
+          else:
+              lines.append("- **钉住的 ref 自证 " + ("对得上** ✅" if pinned_ok else
+                           "对不上** ❌（ABK 日志里的 pinned_ref 不含 " + expected_ref + "）"))
+          if version_ok is None:
+              lines.append("- 模块版本自证: 跳过（module.conf 里没读到 ABK_MODULE_VERSION）")
+          else:
+              lines.append("- 模块版本自证: " + ("对得上** ✅" if version_ok else
+                           "对不上** ❌（期望 " + expected_version + "，日志 "
+                           + (clean(version_lines[0]) if version_lines else "无") + "）"))
+          if not group_lines:
+              lines.append("- 模块自报状态: 日志里没有分组状态行（吃不掉整份日志时可能被截断）")
+          elif bad_groups:
+              lines.append("- **模块自报状态: " + str(len(bad_groups)) + " 组可疑** ❌（" + bad_groups_text + "）")
+          else:
+              lines.append("- 模块自报状态: " + str(len(group_lines)) + " 组全部落地 ✅")
+          lines.append("")
+          if pinned_lines:
+              lines.append("<details><summary>pinned ref / head_sha</summary>")
+              lines.append("")
+              lines.append("```")
+              lines.extend([clean(x) for x in (pinned_lines[:12] + head_lines[:12])])
+              lines.append("```")
+              lines.append("</details>")
+              lines.append("")
+          if summary_lines:
+              lines.append("**模块分组汇总**")
+              lines.append("")
+              lines.append("```")
+              lines.extend([clean(x) for x in summary_lines[:8]])
+              lines.append("```")
+              lines.append("")
+          if group_lines:
+              lines.append("<details><summary>分组状态（" + str(len(group_lines)) + " 条）</summary>")
+              lines.append("")
+              lines.append("```")
+              lines.extend([clean(x) for x in group_lines[:60]])
+              lines.append("```")
+              lines.append("</details>")
+              lines.append("")
+          if error_lines:
+              lines.append("**日志里的首批 error**")
+              lines.append("")
+              lines.append("```")
+              lines.extend([clean(x) for x in error_lines])
+              lines.append("```")
+          pathlib.Path("evidence.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          pathlib.Path("asserts.json").write_text(
+              json.dumps({"head_sha_ok": bool(head_sha_ok), "pinned_ok": pinned_ok,
+                          "version_ok": version_ok, "head_sha_lines": head_sha_lines,
+                          "group_lines": len(group_lines), "bad_groups": bad_groups_text},
+                         indent=2),
+              encoding="utf-8")
+          print("head_sha_ok=" + str(head_sha_ok) + " pinned_ok=" + str(pinned_ok)
+                + " version_ok=" + str(version_ok))
+          print("group_statuses=" + str(len(group_lines)) + " bad=" + str(len(bad_groups))
+                + " errors=" + str(len(error_lines)))
+          PY
+
+      - name: Upload debug bundle
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: abk-compile-gate-${{ github.run_id }}
+          path: |
+            payload.json
+            abk.log
+            evidence.md
+            asserts.json
+            conclusion.txt
+            marker.txt
+            expected_version.txt
+            expected_ref.txt
+            dispatched_at.txt
+            pr.txt
+            head_sha.txt
+            run_id.txt
+            run_url.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Report result to the PR
+        id: report
+        if: always() && steps.gate.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ABK_TOKEN: ${{ secrets.ABK_CI_TOKEN }}
+          RUN_ID: ${{ steps.wait.outputs.run_id }}
+          GATE_RUN: ${{ steps.gate.outputs.run }}
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
+          SKIP_KIND: ${{ steps.gate.outputs.skip_kind }}
+        run: |
+          set -euo pipefail
+          pr="${{ steps.gate.outputs.pr }}"
+          head_sha="$(cat head_sha.txt 2>/dev/null || true)"
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -f run_url.txt ]; then run_url="$(cat run_url.txt)"; fi
+
+          # run 级结论会把同一 run 里 get-manager 之类的 job 一起算进来：只有内核编译 job 失败才算
+          # 编译红，其它 job 失败按 ABK 侧故障报（见 docs/pr_compile_gate.md 第 9 节）。
+          assign_job_verdict() {
+            local jobs_json kernel_failed other_failed
+            jobs_json="$(mktemp)"
+            if [ -n "${ABK_TOKEN:-}" ] && [ -n "${RUN_ID:-}" ]; then
+              GH_TOKEN="$ABK_TOKEN" gh api "repos/$ABK_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+                > "$jobs_json" 2>/dev/null || true
+            fi
+            kernel_failed="$(jq -r --arg p "$ABK_JOB_PREFIX" \
+              '[.jobs[]? | select(.conclusion == "failure") | select(.name | startswith($p)) | .name] | join(", ")' \
+              "$jobs_json" 2>/dev/null || true)"
+            other_failed="$(jq -r --arg p "$ABK_JOB_PREFIX" \
+              '[.jobs[]? | select(.conclusion == "failure") | select((.name | startswith($p)) | not) | .name] | join(", ")' \
+              "$jobs_json" 2>/dev/null || true)"
+            rm -f "$jobs_json"
+            if [ -n "$kernel_failed" ]; then
+              state="failure"
+              desc="内核编译失败（job: ${kernel_failed:0:60}）"
+            elif [ -n "$other_failed" ]; then
+              state="error"
+              desc="ABK 侧其它 job 失败：${other_failed:0:50}（内核编译结果未知）"
+            else
+              state="failure"
+              desc="ABK 构建 $conclusion"
+            fi
+          }
+
+          state="error"
+          desc="ABK 编译门禁内部错误"
+          conclusion=""
+          post_status=true      # 只有「有结论」或「根本不用编」才写 status
+          headline="$state"
+          if [ -z "${ABK_TOKEN:-}" ]; then
+            # 前置没配齐：门禁根本没有派发的能力，红着喊（见 docs/pr_compile_gate.md 第 4 节）
+            state="failure"
+            desc="没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）"
+          elif [ "$GATE_RUN" = "false" ]; then
+            # commit status 按 context 取「最新一条」：跳过绝不能把已经写下的真实结论顶掉，
+            # 否则给 PR 随便加个标签就能把红刷绿（见 docs/pr_compile_gate.md 第 3 节）。
+            if [ -n "$head_sha" ]; then
+              prior="$(gh api "repos/$GITHUB_REPOSITORY/commits/$head_sha/status" \
+                --jq '.statuses[] | [.context, .description] | @tsv' 2>/dev/null \
+                | awk -F '\t' -v c="$STATUS_CONTEXT" '$1 == c { print $2; exit }' || true)"
+              case "${prior:-}" in
+                ""|跳过*) ;;
+                *)
+                  echo "::notice::本 sha 上已有结论「$prior」，本次跳过事件不覆盖它"
+                  echo "已有结论「$prior」，跳过事件不覆盖。" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                  ;;
+              esac
+            fi
+            if [ "$SKIP_KIND" = "no-change" ]; then
+              # 唯一可以写绿的跳过：这次改动根本没碰内核树，没有可验证的东西
+              state="success"
+              desc="跳过：$GATE_REASON（改动没碰内核树，无可验证内容）"
+            else
+              #「没编」不等于「编过了」：不写 status，让 required 检查停在 Expected，只留一条评论说明
+              post_status=false
+              headline="未验证"
+              desc="没编译：$GATE_REASON"
+            fi
+          elif [ -f conclusion.txt ] && [ -f asserts.json ]; then
+            conclusion="$(cat conclusion.txt)"
+            head_sha_ok="$(jq -r '.head_sha_ok' asserts.json)"
+            pinned_ok="$(jq -r '.pinned_ok' asserts.json)"
+            version_ok="$(jq -r '.version_ok' asserts.json)"
+            head_lines="$(jq -r '.head_sha_lines' asserts.json)"
+            bad_groups="$(jq -r '.bad_groups // ""' asserts.json)"
+            if [ "$head_lines" = "0" ]; then
+              state="failure"
+              desc="取证失败：ABK 日志里没有 head_sha 行，拿不到归属证据"
+            elif [ "$head_sha_ok" != "true" ]; then
+              state="failure"
+              desc="编的不是这份代码：ABK 日志里的 head_sha 对不上"
+            elif [ "$pinned_ok" = "false" ]; then
+              state="failure"
+              desc="ABK 没按钉住的 ref 检出模块（日志里没有对应的 pinned_ref）"
+            elif [ "$conclusion" = "success" ] && [ "$version_ok" = "false" ]; then
+              state="failure"
+              desc="编译通过但模块版本对不上，八成编的不是这份代码"
+            elif [ "$conclusion" = "success" ] && [ -n "$bad_groups" ]; then
+              state="failure"
+              desc="编译通过但有没落地的组：${bad_groups:0:70}"
+            elif [ "$conclusion" = "success" ]; then
+              state="success"
+              desc="内核编译通过"
+            else
+              assign_job_verdict
+            fi
+          elif [ -f conclusion.txt ]; then
+            conclusion="$(cat conclusion.txt)"
+            case "$conclusion" in
+              success)
+                # 绿必须带证据：取证步骤炸掉时报「通过（取证未完成）」＝没有任何归属证明的绿。
+                state="failure"
+                desc="ABK 构建成功但取证失败，无法证明编的是这份代码（见 job 日志）" ;;
+              timeout)
+                state="failure"
+                desc="ABK 构建超时未完成" ;;
+              not-found)
+                state="failure"
+                desc="没在 ABK 里找到对应的 run" ;;
+              no-token)
+                state="failure"
+                desc="没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）" ;;
+              no-ref-support)
+                state="failure"
+                desc="ABK@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref=（见 docs/pr_compile_gate.md）" ;;
+              *)
+                state="failure"
+                desc="ABK 构建 $conclusion" ;;
+            esac
+          fi
+
+          if [ "$post_status" = "true" ]; then
+            echo "state=$state desc=$desc"
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+              -f state="$state" \
+              -f context="$STATUS_CONTEXT" \
+              -f target_url="$run_url" \
+              -f description="$desc"
+          else
+            echo "state=(not posted) headline=$headline desc=$desc"
+          fi
+
+          marker='<!-- abk-compile-gate -->'
+          {
+            echo "$marker"
+            echo "## ABK 编译门禁：$headline"
+            echo ""
+            echo "- 状态检查: `$STATUS_CONTEXT`"
+            echo "- 结论: **$desc**"
+            echo "- PR 的 commit: `$head_sha`"
+            if [ -n "$conclusion" ] && [ -n "${RUN_ID:-}" ]; then
+              echo "- ABK 构建: [run $RUN_ID]($run_url) —— `$conclusion`"
+            elif [ "$GATE_RUN" != "true" ]; then
+              echo "- 未派发构建：$GATE_REASON"
+            else
+              echo "- 构建信息: 见 [本次门禁 job]($run_url)"
+            fi
+            echo "- 重跑方式：再推一次，或给 PR 打/重打 `ci:compile` 标签，或手动 dispatch 本工作流"
+            echo ""
+            if [ -f evidence.md ]; then cat evidence.md; fi
+          } > comment.md
+
+          # 只认自己（github-actions[bot]）留的评论：否则 PR 作者可以先发一条带同样标记的评论，
+          # 把「就地更新」这个位置劫持走。body 走 --input JSON，避开 -f 的转义与超长单行。
+          jq -n --rawfile body comment.md '{body: $body}' > comment.json
+          cid="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- abk-compile-gate -->")) | .id] | first // ""' \
+            | head -1 || true)"
+          if [ -n "${cid:-}" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$cid" --input comment.json > /dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$pr/comments" --input comment.json > /dev/null
+          fi
+
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$post_status" = "true" ] && [ "$state" != "success" ]; then
+            echo "::error::$desc（$run_url）"
+            exit 1
+          fi
