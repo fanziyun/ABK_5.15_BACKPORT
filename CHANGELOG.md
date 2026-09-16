@@ -349,6 +349,107 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-34"></a>
+
+## Batch 34(v0.36.0)
+
+**未做设备 A/B,不主张提速。全部上游证据(SRCU 发现与 fentry 回归 alike)都来自 Neoverse V2 /
+ARM 服务器核,本模块目标是 Qualcomm Snapdragon,收益迁移性未经验证。上游该 commit 后来造成过
+实测回归(见 §3),本批把它连同「为何不适用于 5.15 arm64」一起归档。**
+
+mainline `535fdfc5a228`(v6.18,Catalin Marinas;Will Deacon 经 arm64-fixes 收,
+2025-11-11;Reported-by / Tested-by Paul E. McKenney,Reviewed-by Palmer Dabbelt)。提交本身
+**没有基准数字**:它修的是 Paul 在 SRCU 锁路径上发现的 per-CPU 原子行为问题,讨论串
+<https://lore.kernel.org/r/e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop>。
+原始 patch 存 `research/upstream-5.15.y/patches/`。
+
+### 1. 机制与改动本体
+
+FEAT_LSE 下,非返回型 `this_cpu_*()` 原子编译为 STADD/STCLR/STSET;在不少微架构上这类 store
+形态倾向**「远」执行**(互联/内存子系统,除非数据已在 L1),而背靠背的 STADD(如
+`srcu_read_{lock,unlock}*()`)还要额外付默认 posting 行为的开销。load 原子(LDADD/LDCLR/LDSET,
+目的寄存器**不用但不写 XZR**)倾向**「近」执行**(L1)。per-CPU 变量极少被并发访问同一地址,
+所以上游选择鼓励硬件「近」执行。
+
+改动只在 `arch/arm64/include/asm/percpu.h`,+11/−4,两个 hunk:
+
+| hunk | 改动 |
+|---|---|
+| `__PERCPU_OP_CASE()` 的 LSE 分支 | `#op_lse "\t%" #w "[val], %[ptr]\n"` → `#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"`(store 形态 → load 形态;`[tmp]` 在输出操作数里本来就有,`"=&r"`,零新增寄存器压力) |
+| 三个 `PERCPU_OP()` 实例化 | `stadd`/`stclr`/`stset` → `ldadd`/`ldclr`/`ldset`,带上游自己的注释与 lore 链接。`PERCPU_RET_OP(add, add, ldadd)` **本来就是 ldadd,不动** |
+
+非 LSE 回退路径(stxr/ldxr 循环)逐字节不变;LSE 编码是 `ARM64_LSE_ATOMIC_INSN` 启动期
+alternative,无 FEAT_LSE 的核运行时仍走回退分支。**KMI 中性**:纯头文件 asm 宏,不动任何结构体、
+导出符号或 KABI 槽位。归 core(先例 Batch 31 的 `arm64_pte_mkwrite_clean`),组名
+`arm64_lse_percpu_load_atomics`,`scripts/batch34_core_arm64_lse_percpu.py`,2 步全 required,
+注册在 core 末尾。core **40 → 41** 组。
+
+**上游形态改写,不加 ABK 标记**(Batch 31 先例):两个 hunk 都是逐字上游原文,目标形态兼作
+幂等探针 —— 将来若某基线自带 `535fdfc5a228`,逐字节不动、报 `already_present`。
+**未进 linux-5.15.y**(gregkh/linux compare 确认:diverged),按 porting_policy 规则 2 取
+主线形态;四档基线(167/178/194/216)上 `old` 锚点与上游 old 形态**逐字节相同**(在
+android13-5.15-2025-12 的 percpu.h 上核对;8199 字节,与 kci515 参考树一致)。
+
+### 2. 落地前必须核的反面证据:上游曾因此回归
+
+bpf-next 系列「bpf: Optimize recursion detection on arm64」(merge `c2f2f005a1c2`,
+2025-12-21)在提交正文写明:Catalin 的 `535fdfc5a228` 「seems to have caused a regression on
+the fentry benchmark」,并给出 Neoverse-V2(KVM,8 CPU)上的 `bench trig-fentry`:
+
+| 形态 | 吞吐 |
+|---|---|
+| revert 掉该修复 | **51.770 M/s** |
+| bpf-next/master(含该修复) | **43.271 M/s** |
+
+同文另写明:该改动在 **x86-64 上启用会回归 30%**,所以那个 BPF 修复只在 arm64 启用;系列本身
+改用非原子方式做递归检测来补回吞吐。**这是本批最容易被漏掉的证据,归档于此。**
+
+**5.15 是否存在该回归面 —— 落地前已核,结论:不适用,但取舍照记:**
+
+- 5.15 的 `kernel/bpf/trampoline.c` **确实有**这条 per-CPU 原子递归检测路径:
+  `__bpf_prog_enter*()` 里的 `__this_cpu_inc_return(*(prog->active))` 是**返回型**
+  (`PERCPU_RET_OP`,本来就是 ldadd,不受影响);`__bpf_prog_exit*()` 里的
+  `__this_cpu_dec(*(prog->active))` 是**非返回型**,正是本批从 STADD 翻成 LDADD 的那条。
+- 但 **5.15 的 arm64 没有 BPF trampoline 支持**:`arch/arm64/net/bpf_jit_comp.c` 整文件无
+  trampoline 代码、arm64 Kconfig 无相应能力 select(两者都是更晚的上游产物),所以
+  `__bpf_prog_enter*/__bpf_prog_exit*` 在 arm64 5.15 构建里**编译了但不可达** ——
+  `bench trig-fentry` 的回归场景在这棵树上不存在。
+- 因此本组不需要写成「BPF fentry 吞吐换 SRCU 锁延迟」的取舍声明;若未来把 BPF trampoline
+  系列移植到 5.15,必须连同这条记录一起重估。SRCU 侧的收益动机(`srcu_read_{lock,unlock}` 的
+  背靠背 STADD)在 5.15 上原样成立。
+
+### 3. 证据强度(照 Batch 28 先例,如实标注)
+
+- Paul 的 SRCU 发现、上表的 fentry 回归,**全部测在 Neoverse V2 / ARM 服务器核**。
+  Snapdragon 上 store/load 形态的「远/近」执行分界是否同形,**未验证**;
+- 本批**不主张提速**(未做设备 A/B)。它记录的是:改了什么、上游证据从哪来、回归面为何
+  不适用、迁移性未知。真机 A/B(`tools/abk_fas_check.sh` 同族方法)留给后续;
+- 收益方向上对本模块有一个间接理由:本模块自己的批次大量使用 per-CPU 计数(PSI、zram 统计、
+  memcg 事件),SRCU 读锁也在调度/回收路径上 —— 但这些都不构成本批的数字依据。
+
+### 4. 审计与 trap
+
+- `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES` 三处 fixture 同步加
+  `arch/arm64/include/asm/percpu.h`(Batch 31 同款),四棵参考树**重新拉取**(旧树缺该文件,
+  审计会以 `reference tree is missing` 拒绝而不是静默);
+- `implementation_audit.py` 加 `REQUIRED_CONTENT`(load 形态指令串、三个 ld* 实例化、
+  RET_OP 的 ldadd 上下文、lore 链接 —— 后者是这条**无标记**改写留下的痕迹)与
+  `REQUIRED_ABSENT`(store 形态指令串只存在于 `__PERCPU_OP_CASE`,其缺席证明宏真的翻了;
+  三个 st* 实例化逐行钉死,半翻不能过);
+- `smoke.sh` 加同款正反断言(负向用 `grep -E` 一次挡三个 store 实例化);
+- **trap 6 全开**:该头文件被全树包含,改动落在 asm 内联里,四道纯文本审计一道也看不出宏展开
+  是否还能编译。本批的最终门槛是 **ABK CI 四档编译全绿**,文本审计绿灯不收工。
+
+### 5. 验证
+
+- 五道门禁:py_compile / bash -n / stable_5_15_test / step_audit × 4 档 /
+  implementation_audit × 4 档 / smoke × 4 档,全部在拉取的四棵参考树上跑;
+- `sublevel_matrix.py`:core `GROUP_COUNTS` 40 → 41;`PRE_APPLIED` **不变**(四档都不预装,
+  含 lts .216 —— 5.15.y 未收即滚动分支也未收);
+- `module.conf` 0.35.0 → 0.36.0。
+
+---
+
 <a id="batch-33"></a>
 
 ## Batch 33(v0.35.0)

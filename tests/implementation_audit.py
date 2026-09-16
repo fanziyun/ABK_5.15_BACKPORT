@@ -647,6 +647,21 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
+    "core:arm64_lse_percpu_load_atomics": [
+        # 535fdfc5a228.  The whole graft is two verbatim upstream hunks in one
+        # header: the LSE branch gains a [tmp] destination (store form -> load
+        # form) and the three non-return instantiations flip stadd/stclr/stset
+        # -> ldadd/ldclr/ldset.  The lore link rides in the same hunk and is
+        # the trail this deliberately markerless (upstream-shape) rewrite
+        # leaves behind, so it is pinned too.  The RET_OP ldadd is upstream
+        # context and must survive untouched between the flipped ops.
+        '#op_lse "\\t%" #w "[val], %" #w "[tmp], %[ptr]\\n"',
+        "PERCPU_OP(add, add, ldadd)",
+        "PERCPU_OP(andnot, bic, ldclr)",
+        "PERCPU_OP(or, orr, ldset)",
+        "PERCPU_RET_OP(add, add, ldadd)\n",
+        "e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -837,6 +852,18 @@ REQUIRED_ABSENT = {
         # reclaim.  It must be gone, not merely bypassed.
         "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
         "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
+    ],
+    "core:arm64_lse_percpu_load_atomics": [
+        # The store forms must be gone, not merely bypassed: a tree that kept
+        # one of them compiles and quietly behaves like the baseline on that
+        # one op.  The bare store-form instruction string lives only in
+        # __PERCPU_OP_CASE (the RET_OP case is `[ret]`, the LL/SC branches are
+        # op_llsc), so its absence proves the macro really flipped; the three
+        # instantiations are pinned per line so a half-flip cannot pass.
+        '#op_lse "\\t%" #w "[val], %[ptr]\\n"',
+        "PERCPU_OP(add, add, stadd)",
+        "PERCPU_OP(andnot, bic, stclr)",
+        "PERCPU_OP(or, orr, stset)",
     ],    "core:zram_wb_slot_preserve": [
         # The shape the fix removes.  The whole point is that the *absence* is
         # load-bearing: a tree that kept the save/restore dance would still pass
