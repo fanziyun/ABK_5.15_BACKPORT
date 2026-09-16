@@ -119,8 +119,9 @@ GH_TOKEN=$P gh pr close 3 --repo fanziyun/ABK
 GH_TOKEN=$P gh api -X PATCH repos/fanziyun/ABK -f description=probe
 ```
 
-前置没配齐就合并，效果是**每个 PR 立刻红**，描述是 `没配置 ABK_CI_TOKEN`。这是有意的：
-宁可红着喊出声，也不要让编译门禁假装通过。
+前置没配齐（或 PAT 到期）时，**只有「真的要编」的 PR 会红**，描述是 `没配置 ABK_CI_TOKEN`；
+跳过类事件（draft、doc-only、非 `ci:compile` 标签）本来就不需要用凭据，所以不连坐 —— 否则 PAT 一到期，
+连只改文档的 PR 都会红。这是有意的：宁可红着喊出声、也不让编译门禁假装通过，但也不给不需要编译的 PR 制造噪音。
 
 ## 5. 手动重跑
 
