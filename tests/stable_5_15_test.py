@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.34.0", "0.34.0"], _versions)
+          _versions == ["0.35.0", "0.35.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4676,6 +4676,88 @@ def test_batch31_arm64_pte_mkwrite_clean():
               ctx3.read("arch/arm64/include/asm/pgtable.h") == _BATCH31_PGTABLE_216)
 
 
+def test_batch33_zsmalloc_free_out_of_lock():
+    """Batch 33: zs_free() returns a dead zspage's pages outside class->lock."""
+    print("Batch 33: zsmalloc_free_zspage_out_of_lock (free after the unlock)")
+    import abk_stable_core as core
+    import batch33_core_zsmalloc_free as b33
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zsmalloc_free_zspage_out_of_lock"), None)
+    check("zsmalloc_free_zspage_out_of_lock group registered", group is not None)
+    if group is None:
+        return
+    check("batch30 owns only mm/zsmalloc.c",
+          group.files == [b33.ZSMALLOC_C], group.files)
+
+    steps = b33.build_steps()
+    check("three required steps", len(steps) == 3
+          and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j in range(i + 1, len(steps)):
+            check("step %d new does not contain step %d new" % (i, j),
+                  steps[j][2] not in new_i)
+
+    # The region this group owns: the two helpers, then zs_free()'s declaration
+    # head and its tail.  Kept synthetic -- the real anchors are proven against
+    # a fetched tree by step_audit.py.
+    fixture = (
+        "static void free_zspage(struct zs_pool *pool, struct size_class *class,\n"
+        "\t\t\t\tstruct zspage *zspage)\n{\n"
+        "\tremove_zspage(class, zspage, ZS_EMPTY);\n"
+        "\t__free_zspage(pool, class, zspage);\n}\n\n"
+        + b33._ZF_OLD + "\n"
+        + b33._ZS_FREE_DECL_OLD
+        + "\tbool isolated;\n\n"
+        "\tspin_lock(&class->lock);\n"
+        + b33._ZS_FREE_TAIL_OLD
+        + "\tunpin_tag(handle);\n"
+        "\tcache_free_handle(pool, handle);\n}\n"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b33.ZSMALLOC_C: fixture})
+        status, detail = group.apply_fn(ctx)
+        check("all three steps land", status == "applied", (status, detail))
+        text = ctx.read(b33.ZSMALLOC_C)
+
+        check("the split helper is defined exactly once",
+              text.count(b33.LOCKLESS_HELPER) == 1)
+        check("the old locked tail is gone", b33.LOCKED_TAIL not in text)
+        check("zs_free() frees after dropping class->lock",
+              b33.FREE_OUTSIDE_LOCK in text)
+        # The pages move with the helper: put_page() must now sit above the
+        # wrapper's assert, not inside it.
+        check("the locked wrapper no longer touches the pages",
+              text.index("put_page(page);")
+              < text.index("assert_spin_locked(&class->lock);"))
+        # The wrapper's only remaining job is the locked class stat: class->stats
+        # .objs[] is a plain unsigned long (zs_stat_dec() does -=), so it cannot
+        # move out with the pages.
+        check("the class stat stays inside the locked wrapper",
+              "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"
+              in text.split("assert_spin_locked(&class->lock);")[1])
+        check("the provenance marker is carried twice (helper + call site)",
+              text.count(b33.MARKER) == 2, text.count(b33.MARKER))
+
+        snapshot = ctx.read(b33.ZSMALLOC_C)
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass is a no-op", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical", ctx.read(b33.ZSMALLOC_C) == snapshot)
+
+        # A tree that lacks the anchors degrades instead of half-patching: a
+        # renamed helper nothing calls would change no behaviour at all.
+        ctx_bare = make_ctx(tmp + "/bare", {b33.ZSMALLOC_C: "static int x;\n"})
+        status3, detail3 = group.apply_fn(ctx_bare)
+        check("degrades on an unknown shape", status3 == "blocked_by_shape",
+              (status3, detail3))
+        check("the degraded tree is not written",
+              ctx_bare.read(b33.ZSMALLOC_C) == "static int x;\n")
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -4726,6 +4808,7 @@ def main():
     test_batch27_launch_bench()
     test_batch30_readahead_mmap_miss_race()
     test_batch31_arm64_pte_mkwrite_clean()
+    test_batch33_zsmalloc_free_out_of_lock()
 
     print()
     if FAILURES:

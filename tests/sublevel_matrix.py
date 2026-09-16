@@ -60,7 +60,13 @@ GROUP_COUNTS = {
     # the zram_writeback_complete() that zram_writeback_batching generates
     # (that group probes zram_account_writeback_submit now) and the
     # zram_free_page() huge block, which is identical on every baseline.
-    "stable_backport_core": 39,
+    #
+    # The Batch-33 zsmalloc free path (zsmalloc_free_zspage_out_of_lock) applies
+    # on every baseline: android13-5.15 has no pool->lock in mm/zsmalloc.c on
+    # any of them, so the mainline series patches 1-2 are inapplicable and only
+    # the page-free-outside-class->lock hunk is ported.  Its anchors are
+    # pristine text no other group writes.
+    "stable_backport_core": 40,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

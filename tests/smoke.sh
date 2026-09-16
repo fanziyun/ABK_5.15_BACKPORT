@@ -278,6 +278,16 @@ if grep -q "struct psi_group \*psi;" "$KERNEL_ROOT/common/include/linux/cgroup-d
 fi
 grep -q "calculate_zspage_chain_size" "$KERNEL_ROOT/common/mm/zsmalloc.c" \
   || fail "zsmalloc chain sizing missing"
+# zsmalloc_free_zspage_out_of_lock: a dead zspage's pages must go back to the
+# buddy allocator after class->lock is dropped.  Both halves matter -- a renamed
+# helper that nothing calls would leave the old locked free exactly where it was.
+grep -q "__free_zspage_lockless(struct zs_pool \*pool," "$KERNEL_ROOT/common/mm/zsmalloc.c" \
+  || fail "zsmalloc zs_free() page-return was not split out of __free_zspage()"
+# [^_] keeps this off __free_zspage(pool, class, zspage);, which contains the
+# same call text and still stands in free_zspage().
+if grep -q "[^_]free_zspage(pool, class, zspage);" "$KERNEL_ROOT/common/mm/zsmalloc.c"; then
+  fail "zs_free() kept the class->lock-held free_zspage() call"
+fi
 grep -q "config RCU_NOCB_CPU_DEFAULT_ALL" \
   "$KERNEL_ROOT/common/kernel/rcu/Kconfig" \
   || fail "RCU default-all Kconfig option missing"
