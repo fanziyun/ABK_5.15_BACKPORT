@@ -647,6 +647,50 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
+    # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
+    # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
+    # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
+    # pinned, because a port that keeps only the first would take the lock once
+    # per pagevec but still walk the tree once per entry -- which is the half of
+    # the upstream fix that the soft-lockup report is actually about.
+    "core:truncate_shadow_batch": [
+        "clear_shadow_entries",
+        "xa_has_values",
+        "ABK stable_515_backport: 61c663e020d2",
+    ],
+    "core:truncate_shadow_batch_sweep": [
+        "static void clear_shadow_entries(struct address_space *mapping,\n"
+        "\t\t\t\t unsigned long start, unsigned long max)",
+        "xas_for_each(&xas, page, max)",
+        "clear_shadow_entries(mapping, indices[0], indices[nr-1]);",
+        "int nr = pagevec_count(&pvec);",
+        "ABK stable_515_backport: d3db2c042591",
+    ],
+    # The MADV_DONTNEED pair.  reclaim_pt_is_enabled() is the gate, and the
+    # emptiness decision under the pmd lock plus the pte_free_tlb() release are
+    # what make the page table actually go back: a port that only cleared the
+    # pmd would leak the page table instead of freeing it, and every structural
+    # audit would still pass.
+    "core:madvise_pt_reclaim": [
+        "bool reclaim_pt;",
+        "reclaim_pt_is_enabled",
+        "try_to_free_pte",
+        "pmd_clear(pmd);",
+        "pte_free_tlb(tlb, token, addr);",
+        "mm_dec_nr_ptes(tlb->mm);",
+        "\t\t.reclaim_pt = true,",
+        "ABK stable_515_backport: 6375e95f381e",
+    ],
+    "core:madvise_batch_tlb_flush": [
+        "madvise_batch_tlb_flush",
+        "void zap_page_range_single_batched(struct mmu_gather *tlb,",
+        # The gather has to be taken by the caller and handed *down*: the
+        # per-VMA call itself must no longer be the one that gathers.
+        "\t\ttlb_gather_mmu(&tlb, mm);",
+        "\tif (tlbp)\n\t\ttlb_finish_mmu(&tlb);",
+        "zap_page_range_single_batched(tlb, vma, start, end - start, &details);",
+        "ABK stable_515_backport: 43c4cfde7e37",
+    ],
     "core:arm64_lse_percpu_load_atomics": [
         # 535fdfc5a228.  The whole graft is two verbatim upstream hunks in one
         # header: the LSE branch gains a [tmp] destination (store form -> load
@@ -875,6 +919,33 @@ REQUIRED_ABSENT = {
         ["drivers/block/zram/zram_drv.c",
          "\t\tsize = zram_get_obj_size(zram, index);"],
         ["drivers/block/zram/zram_drv.c", "\t\tif (huge)"],
+    ],
+    # Batch 35: the per-entry shadow machinery has to be *gone*, not merely
+    # bypassed.  Both invalidate paths used to call the wrappers that are
+    # deleted here, and a port that deleted the wrappers without moving their
+    # callers would not compile -- but one that kept the wrappers and added a
+    # second clear path would keep taking the lock per entry, which is the
+    # defect.  Scoped to mm/truncate.c: nothing else may define those names.
+    "core:truncate_shadow_batch": [
+        ["mm/truncate.c",
+         "static int invalidate_exceptional_entry(struct address_space *mapping,"],
+        ["mm/truncate.c",
+         "static int invalidate_exceptional_entry2(struct address_space *mapping,"],
+        ["mm/truncate.c", "\tclear_shadow_entry(mapping, index, entry);"],
+        ["mm/truncate.c", "count += invalidate_exceptional_entry(mapping,"],
+    ],
+    "core:truncate_shadow_batch_sweep": [
+        # The pagevec-shaped helper must not survive the pair: leaving it behind
+        # would mean the per-entry __clear_shadow_entry() loop is still the one
+        # the invalidate paths run.
+        ["mm/truncate.c", "clear_shadow_entries(mapping, &pvec, indices);"],
+        ["mm/truncate.c", "\t\t\t__clear_shadow_entry(mapping, indices[i], page);"],
+    ],
+    "core:madvise_pt_reclaim": [
+        # MADV_DONTNEED must not still go through the multi-VMA zap with no
+        # details: that is the shape where the reclaim mark never reaches
+        # zap_pte_range() and the whole change is a no-op.
+        ["mm/madvise.c", "\tzap_page_range(vma, start, end - start);"],
     ],
 }
 
@@ -1194,6 +1265,60 @@ REQUIRED_IN_FUNCTION = {
           "__free_zspage_lockless(pool, zspage);",
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
+    ],
+    # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
+    # change rather than a rewrite is *where* each half sits: the decision in
+    # zap_pte_range()'s tail (not in zap_pmd_range(), where a THP collapse could
+    # have replaced the pmd), the emptiness test before pmd_clear() (the reverse
+    # order frees a page table a skipped entry still points into), and the
+    # gather owned by the caller (a per-VMA gather is what the commit removes).
+    "core:madvise_pt_reclaim": [
+        ("mm/memory.c", "zap_pte_range",
+         ["unsigned long start = addr;",
+          "if (reclaim_pt_is_enabled(start, end, details))",
+          "try_to_free_pte(mm, pmd, start, tlb);"],
+         ["pmd_clear(pmd);"]),
+        ("mm/memory.c", "try_to_free_pte",
+         ["start_pte = pte_offset_map(pmd, addr);",
+          "if (!pte_none(*pte)) {",
+          "pmd_clear(pmd);",
+          "free_pte_page(tlb, pmd, pmdval, addr);"],
+         ["pte_free_tlb"]),
+        # The barrier this tree needs and upstream's helper has no counterpart
+        # for (CONFIG_SPECULATIVE_PAGE_FAULT): without it a reader that holds
+        # the ptl of the page table we are about to free races the free.
+        ("mm/memory.c", "free_pte_page",
+         ["#ifdef CONFIG_SPECULATIVE_PAGE_FAULT",
+          "smp_call_function(wait_for_smp_sync, NULL, 1);",
+          "pte_free_tlb(tlb, token, addr);",
+          "mm_dec_nr_ptes(tlb->mm);"],
+         []),
+    ],
+    "core:madvise_batch_tlb_flush": [
+        ("mm/madvise.c", "do_madvise",
+         ["if (madvise_batch_tlb_flush(behavior)) {",
+          "tlb_gather_mmu(&tlb, mm);",
+          "madvise_walk_vmas(mm, start, end, behavior, tlbp,",
+          "if (tlbp)\n\t\ttlb_finish_mmu(&tlb);"],
+         []),
+        # Batching means exactly that the per-VMA helper no longer gathers.
+        ("mm/madvise.c", "madvise_dontneed_single_vma",
+         ["zap_page_range_single_batched(tlb, vma, start, end - start, &details);"],
+         ["tlb_gather_mmu"]),
+    ],
+    # The pair has to reach both invalidate paths, and the loop bound has to be
+    # the batch size the call site indexes with -- a port that changed only the
+    # helper would pass a whole-file substring check on either half.
+    "core:truncate_shadow_batch_sweep": [
+        ("mm/truncate.c", "__invalidate_mapping_pages",
+         ["int nr = pagevec_count(&pvec);",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
+        ("mm/truncate.c", "invalidate_inode_pages2_range",
+         ["int nr = pagevec_count(&pvec);",
+          "xa_has_values = true;",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
     ],
 }
 

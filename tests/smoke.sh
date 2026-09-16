@@ -110,6 +110,10 @@ SMOKE_FILES=(
   kernel/sched/idle.c
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
   arch/arm64/include/asm/pgtable.h
+  # Batch 35: the page-cache shadow sweeps (mm/truncate.c) and the
+  # struct zap_details the MADV_DONTNEED page-table reclaim marks (mm.h).
+  mm/truncate.c
+  include/linux/mm.h
   # Batch 34: the non-return per-CPU atomics become load LSE atomics
   # (mainline 535fdfc5a228) -- the whole group is this header.
   arch/arm64/include/asm/percpu.h
@@ -542,6 +546,42 @@ else
   echo "  fs/file.c marker not expected on 5.15.$SUB_LEVEL (baseline already upstream)"
 fi
 
+# Batch 35: the page-cache shadow sweeps and the MADV_DONTNEED page-table pair.
+# None of the four commits has a Cc: stable and no baseline carries its
+# substrate (no page_cache_ra_order(), no folio_batched filemap_map_pages(),
+# per-entry clear_shadow_entry()), so all four apply everywhere and the
+# assertions are unconditional.  Each pair is pinned on the *end state* of both
+# commits, not just the first: a run that landed 61c663e020d2 but not
+# d3db2c042591 would still take the i_pages lock once per pagevec while walking
+# the tree once per entry, which is the half the soft-lockup report is about.
+grep -qF "clear_shadow_entries(mapping, indices[0], indices[nr-1]);" \
+  "$KERNEL_ROOT/common/mm/truncate.c" \
+  || fail "shadow-entry sweep (d3db2c042591) missing in mm/truncate.c"
+# The needle carries the definition, not the bare name: the replacement blocks
+# *document* the deleted wrappers by name in a comment, so a bare symbol needle
+# would match that comment and fail the assertion it exists to protect.
+if grep -q "static int invalidate_exceptional_entry" \
+     "$KERNEL_ROOT/common/mm/truncate.c"; then
+  fail "per-entry shadow helpers survived in mm/truncate.c"
+fi
+grep -q "reclaim_pt_is_enabled" "$KERNEL_ROOT/common/mm/memory.c" \
+  || fail "MADV_DONTNEED page-table reclaim gate missing in mm/memory.c"
+grep -q "try_to_free_pte" "$KERNEL_ROOT/common/mm/memory.c" \
+  || fail "page-table emptiness re-check missing in mm/memory.c"
+grep -q "bool reclaim_pt;" "$KERNEL_ROOT/common/include/linux/mm.h" \
+  || fail "zap_details.reclaim_pt does not exist"
+grep -q "madvise_batch_tlb_flush" "$KERNEL_ROOT/common/mm/madvise.c" \
+  || fail "MADV_DONTNEED tlb batching missing in mm/madvise.c"
+grep -qF "zap_page_range_single_batched(tlb, vma, start, end - start, &details);" \
+  "$KERNEL_ROOT/common/mm/madvise.c" \
+  || fail "MADV_DONTNEED still gathers its own tlb per VMA"
+# The per-VMA helper must not gather for itself any more: that is the whole
+# difference between a batched flush and the 5.15 shape.
+if awk '/^static long madvise_dontneed_single_vma\(/,/^}/' \
+     "$KERNEL_ROOT/common/mm/madvise.c" | grep -q "tlb_gather_mmu"; then
+  fail "madvise_dontneed_single_vma() still owns its mmu_gather"
+fi
+
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
@@ -564,6 +604,18 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/mm/filemap.c" \
         "$KERNEL_ROOT/common/mm/filemap.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/filemap.c"
+fi
+# Batch 35 is the first group to write mm/truncate.c and the first to touch
+# include/linux/mm.h; both have to come back byte-identical too.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/truncate.c" \
+        "$KERNEL_ROOT/common/mm/truncate.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/truncate.c"
+fi
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/include/linux/mm.h" \
+        "$KERNEL_ROOT/common/include/linux/mm.h" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for include/linux/mm.h"
 fi
 
 echo "SMOKE OK"

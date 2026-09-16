@@ -349,6 +349,147 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-35"></a>
+
+## Batch 35(v0.37.0)
+
+> **编号让位（已合并完成）**：本批起草时叫 Batch 34 / v0.36.0，撞上了当时并行开着的两条
+> 都自称 Batch 34 的分支（PR #12「`fuse_fill_write_pages()`」与 PR #15「arm64 load LSE
+> percpu 原子」，都基于 `110749f`，即 Batch 33 落地点）。按本仓先例（Batch 33 为三条并行
+> 批次让位三次）**改号 34 → 35、版本 0.36.0 → 0.37.0**，锚点 `#batch-35`。随后 **PR #15
+> 以 Batch 34/v0.36.0 合入 main**（PR #12 未合），本分支已 `git merge origin/main` 收进它：
+> `GROUP_COUNTS` core 由 41（对方）与本批 4 组合并为 **45**，`module.conf` 版本取 0.37.0，
+> CHANGELOG / plan.md 里两节按倒序相邻排列（`#batch-35` 在 `#batch-34` 之前）。
+
+主题「页缓存、readahead 与缺页/页表路径」。来源 torvalds/linux 原文，patch 存
+`research/upstream-5.15.y/patches/`。候选 **7 条：落地 4 条、按「前提不存在」排除 3 条**。
+落地的四条分两对，各自按上游提交顺序注册成两个组，都在 core。
+
+### 1. 三条被排除的候选：5.15 上没有载体
+
+`grep` 实测，167/178/194/216 四条基线结果一致：
+
+| 候选 | 它改的东西 | 5.15 实测 | 结论 |
+|---|---|---|---|
+| `7a1eb89f7918` readahead: don't shorten readahead window in read_pages() | 删掉 `read_pages()` 里 `rac->ra->size -= nr` 那段（回调没读满就缩窗） | `read_pages()` 里**没有任何** `ra->size`/`async_size` 写入（`grep` 0 处，五条基线同样）；那段是 5.18 readahead 重构引入的 | 缺陷在 5.15 上**不存在** |
+| `d5ea5e5e50df` readahead: properly shorten readahead when falling back to do_page_cache_ra() | 修 `page_cache_ra_order()` 的 fallback 分支（重复读已读过的页、窗口中间多插一个预读标记） | 5.15 整文件**没有** `page_cache_ra_order()`（该函数 5.18 才有）；5.15 的对应路径 `page_cache_ra_unbounded()` 本身就按 `i = ractl->_index + ractl->_nr_pages - index - 1` 跳过已在缓存里的页 | 函数不存在 |
+| `0faa77afe72b` filemap: optimize folio refount update in filemap_map_pages | 省掉 `filemap_map_folio_range()`/`filemap_map_order0_folio()` 与 `filemap_map_pages()` 之间那次「先加后减」的引用计数 | 5.15 的 `filemap_map_pages()` 仍是单页 `head`/`first_map_page()` 形态，**没有**那两个 helper（`grep` 0）；页引用由 `next_uptodate_page()` 取走，成功路径不释放（转移给 PTE 映射）、失败路径 `put_page()` —— 净引用已经是 1 | 重复更新不存在 |
+
+三条都是「前提不存在」⇒ **不注册组**（与该系列在 Batch 33 的处置同族：`zsmalloc` 系列
+patch 1/2 也是因为 `pool->lock` 在 5.15 上整文件不存在而只落 patch 3），记入 plan.md 的
+排除记录。第 1、2 条的落点还与同文件的 `dynamic_readahead_lowmem` 组对过：那组落在
+`readahead.c` 顶部的 `#include "internal.h"` 之后，与 `read_pages()`（行 128 附近）不相邻，
+锚点不互踩——但因为载体不存在，这条核对没有转化为改动。
+
+### 2. 落地明细（两对四组）
+
+| 组 | 提交 | 落点 | 做什么 |
+|---|---|---|---|
+| `truncate_shadow_batch` | `61c663e020d2`（v6.11） | `mm/truncate.c` | 一次持有 `i_pages` 锁清掉**整个 pagevec** 的影子项，而不是每项一次「取锁 → 走树 → 放锁」；删掉 `invalidate_exceptional_entry()`/`invalidate_exceptional_entry2()` 两个逐项包装，它们的 shmem/DAX 判定搬进新 helper，DAX 判定搬到 `invalidate_inode_pages2_range()` 的调用点 |
+| `truncate_shadow_batch_sweep` | `d3db2c042591`（v6.13） | `mm/truncate.c` | 重构上一组写下的 helper：`xas_for_each()` 一次遍历 pagevec 的 `[start, max]` 索引区间，取代每项一次 `__clear_shadow_entry()`；两个调用点改用 `indices[0]`/`indices[nr-1]`，两个循环因此多一个 `int nr = pagevec_count(&pvec);` |
+| `madvise_pt_reclaim` | `6375e95f381e`（v6.14） | `include/linux/mm.h`、`mm/internal.h`、`mm/memory.c`、`mm/madvise.c` | `MADV_DONTNEED` 把刚清空的**PTE 页**还给 buddy：`zap_details` 加 `bool reclaim_pt`，`zap_pte_range()` 尾部在 `addr == end` 时调 `try_to_free_pte()`（持 pmd 锁重扫 `PTRS_PER_PTE` 项，全 none 才 `pmd_clear()` + `pte_free_tlb()` + `mm_dec_nr_ptes()`） |
+| `madvise_batch_tlb_flush` | `43c4cfde7e37`（v6.16） | `mm/internal.h`、`mm/memory.c`、`mm/madvise.c` | 一次 `madvise(MADV_DONTNEED)` 的 TLB flush 收进**一个** `mmu_gather`：`zap_page_range_single()` 拆成「取 gather 的壳」与 `zap_page_range_single_batched()`（喂 gather），`do_madvise()` 取/收 gather 并用 `madvise_batch_tlb_flush()` 决定是否批 |
+
+第 4 条提交里记录的那次 **11 秒 soft-lockup**（`watchdog: BUG: soft lockup - CPU#29 stuck for
+11s! [fio]`，栈为 `clear_shadow_entry` → `mapping_try_invalidate` → `invalidate_mapping_pages`
+→ `invalidate_bdev` → `blkdev_common_ioctl`）就是第一对的动因：不是每项一次持锁慢，而是
+**每项一次「持锁 + 走树」**，文件一大就把一个 CPU 钉在里面。
+
+#### 2.1 5.15 形状差异（逐符号核对，不是照抄；本模块一贯做法）
+
+第一对（mm/truncate.c）：
+
+| 上游写法 | 5.15 对应 |
+|---|---|
+| `struct folio_batch` / `folio_batch_count()` | `struct pagevec` / `pagevec_count()`（5.15 还没有 folio_batch） |
+| patch 5 用 `xas_lock_irq(&xas)` | `xa_lock_irq(&mapping->i_pages)`（两者等价；取后者与该文件其余部分一致，且 5.15 的 xarray 头就带 `XA_STATE` 迭代） |
+| `clear_shadow_entry()` 里另有 `spin_lock(&mapping->host->i_lock)` 与 `mapping_shrinkable()`/`inode_add_lru()` | 5.15 的对应函数**两者都没有**（那是 5.15 之后加的）⇒ 不引入，port 只做「一次持锁 + 一次遍历」 |
+| patch 5 删掉 `__clear_shadow_entry()` | **保留**：5.15 的 truncate 路径 `truncate_exceptional_pvec_entries()` 还在用它（四条基线行 93/96 各一处），而那条路先取页面锁，与这里要解决的不是同一条 |
+
+第二对（缺页/页表路径）：
+
+| 上游写法 | 5.15 对应 |
+|---|---|
+| `try_get_and_clear_pmd()` 快路径（`pmdp_get_lockless()` 无锁读 pmd，锁内试锁） | 5.15 **没有** `pmdp_get_lockless()`（四条基线 `grep` 0）⇒ 只落上游自己的 fallback `try_to_free_pte()`：它持 pmd 锁后重扫整页，因而**不依赖** zap 循环是否漏项（上游为快路径额外维护的 `any_skipped`/`can_reclaim_pt` 在 5.15 形状里不需要） |
+| `pte_offset_map_rw_nolock()` 返回 ptl，再 `if (ptl != pml) spin_lock_nested()` | `ptl = pte_lockptr(mm, pmd)` + `start_pte = pte_offset_map(pmd, addr)`，同样的 `if (ptl != pml)`。5.15 的 `pmd_lockptr()` 取**承载 pmd 项的那张表页**的锁、`ptlock_ptr()` 取 pmd **指向的**表页的锁，split ptlocks 下两者不同；折叠配置下相同，`if` 就是为此 |
+| `should_zap_cows()` 加 `details->reclaim_pt` 分支、调用点写 `even_cows = true` | 不需要：5.15 的 `should_zap_cows()` 返回 `!details->check_mapping`，`check_mapping` 为空本来就是一齐 zap |
+| 新建 `mm/pt_reclaim.c` + `mm/Kconfig` 的 `PT_RECLAIM`/`ARCH_SUPPORTS_PT_RECLAIM` + `mm/Makefile` | 不新建文件、不引入 Kconfig：三个 helper 都是 `static` 且只被 `mm/memory.c` 用。**上游 6.14 把 PT_RECLAIM 挂在 `ARCH_SUPPORTS_PT_RECLAIM` 上，而 arm64 当时没有选它**；本端口只落持锁路径（不需要 `pmdp_get_lockless()` 那类 arch 支持），而真正的内存安全前提 `MMU_GATHER_RCU_TABLE_FREE` 由 arm64 无条件 `select`（`arch/arm64/Kconfig:202`），与上游 Kconfig 的 `select` 是同一条 |
+| `free_pte()` = `pte_free_tlb()` + `mm_dec_nr_ptes()` | 同，但**多一层本树特有的屏障**：`free_pte_page()` 照抄 `free_pte_range()` 的 `#ifdef CONFIG_SPECULATIVE_PAGE_FAULT`（先取放一次 pmd 锁；`ALLOC_SPLIT_PTLOCKS` 下再 `smp_call_function(wait_for_smp_sync, …)`），因为本树允许一个不持 pmd 锁的读者握着 pte 表页的 ptl —— 上游 helper 没有对应物 |
+| `struct madvise_behavior` 携带 `*tlb` | 5.15 没有这个结构体 ⇒ `struct mmu_gather *tlb` 显式穿到 `madvise_walk_vmas()` 的 visit 回调（`NULL` = 不批），两个回调（`madvise_vma_behavior`、CONFIG_ANON_VMA_NAME 的 `madvise_vma_anon_name`）一起改签名 |
+| `madvise_batch_tlb_flush()` 列 `MADV_DONTNEED`/`MADV_DONTNEED_LOCKED`/`MADV_FREE` | 只列 `MADV_DONTNEED`：5.15 **没有** `MADV_DONTNEED_LOCKED`（`grep` 0），而 `madvise_free_single_vma()` 在 5.15 仍自己取/收 gather，批它属另一笔 |
+| `MADV_DONTNEED` 走 `zap_page_range_single()`（上游早已如此） | 5.15 走**多 VMA** 的 `zap_page_range()` ⇒ 本批先用 `zap_page_range_single()`（去掉 `static`、在 `mm/internal.h` 声明，即上游 6.x 的形状）把它换成能带 `zap_details` 的单 VMA 入口。**等价性**：`madvise_walk_vmas()` 交给该回调的 `end <= vma->vm_end`，而 `zap_page_range()` 的 `for ( ; vma && vma->vm_start < range.end; vma = vma->vm_next)` 在这个条件下恰好只跑一次 |
+
+### 3. 试错记录
+
+**3a. `new` 块是 `old` 块的子串 ⇒ 整步静默跳过。** 把 `zap_page_range_single()` 由
+`static void …` 改成 `void …` 时，`new`（`"void zap_page_range_single(struct
+vm_area_struct *vma, …)`）**逐字包含于**原始行的 `"static void zap_page_range_single(…)"`，
+`replace_once` 先查 `new` ⇒ 报 `already_present`、什么都没改，而组状态仍是 `applied`。
+`step_audit` 的 trap-1 检查抓住了它（`replacement block already exists in pristine mm/memory.c`）。
+修法：把上方的 kernel-doc 末两行（`" * The range must fit into one VMA.\n */\n"`）一起放进
+`old`/`new`，两个块就不再互为子串。这是 AGENTS.md trap 1 的一个新面孔——**不是「new 太常见」，
+而是「new 是 old 去掉一个存储类」**，正好落在「前缀」这一类里。
+
+**3b. 负向探针被自己的注释骗过（Batch 33 §3 的同族，第二次）。** `smoke.sh` 里
+`grep -q "invalidate_exceptional_entry"` 直接红，因为删掉那两个函数的**替换文本自己**
+在注释里写了它们的名字。与 Batch 33 的 `__free_zspage`/`free_zspage` 是同一族教训：
+**正向锚点要够宽才唯一，负向探针要够窄才有效**。改为 `"static int invalidate_exceptional_entry"`。
+同一族还出现两次：单测里数 `__clear_shadow_entry(` 时把注释里的名字也数了进去（改成带
+调用形状的 `"\t__clear_shadow_entry(mapping, index, page);"`）；`truncate_shadow_batch_sweep`
+的负向探针则换成带缩进的整行。
+
+**3c. 新函数插在别人 kernel-doc 与函数体之间。** 第一版把 `zap_page_range_single_batched()`
+与 `madvise_batch_tlb_flush()` 插在各自前一个函数的 `/** … */` 之后，于是那份 kerneldoc
+挂到了新函数上（名字对不上）。两处都改为**追加到前一个函数之后**（`memory.c` 把 batched
+半段放到 `zap_page_range_single()` 之后；`madvise.c` 把 `madvise_batch_tlb_flush()` 放到
+`madvise_walk_vmas()` 之后），这是 `apply_patch` 语义下的可见副作用，四道门禁都看不见。
+
+**3d. 参考树被自己写坏一次。** 用「非 dry-run」的调试脚本对 `build/abk-trees/167` 跑了全部
+组，把 35 个文件改成嫁接后的形态（`.abk-orig` 一起留下）。发现后删目录重拉。教训写在这里：
+**对着 `build/abk-trees/*` 跑组只能带 `--dry-run`**，其余入口（`smoke.sh`、
+`implementation_audit.py`）都在临时副本上工作，这也是它们安全的原因。顺带发现这批参考树里有
+43 个文件被 fetch 过程前置了 6 字节垃圾（`44 44 8e 51 10 84`），已删掉重拉并复验全树 UTF-8 可解。
+
+### 4. 验证
+
+- **五道门禁（本地可跑的四道 + 逐档全部基线）**：`py_compile`、`bash -n`（含 mksh 口径的
+  tools/ksu 脚本）、`stable_5_15_test.py`（新增 `test_batch35_pagecache_pt`：**191 项检查**，
+  含 trap-2 互斥、「两个调用点的替换文本必须逐字不同」、四个 trap-5 探针的**行为**断言
+  （载荷在 → `True`，不在 → `False`）、`zap_page_range_single` 那一步的锚点形状、以及一对
+  影子项组在合成树上的端到端与第二遍幂等）、`step_audit`（core **241 / 242 / 233 / 233** 步，
+  四档第二遍全部幂等）、`implementation_audit`（四档四组均 `applied`；新增 REQUIRED_CONTENT
+  四组、REQUIRED_ABSENT 三组、REQUIRED_IN_FUNCTION 三组——后者按函数切片钉「判定在
+  `zap_pte_range()` 尾部」「空判定在 `pmd_clear()` 之前」「`free_pte_page()` 带 SPECULATIVE
+  屏障」「gather 由调用方持有」）、`smoke.sh`（两遍 + 回滚；167/178 core pass1
+  `{'applied': 44}` → pass2 `{'already_present': 44}`，194 pass1
+  `{'applied': 41, 'already_present': 3}` → pass2 44，216 pass1
+  `{'applied': 37, 'already_present': 7}` → pass2 44；`mm/truncate.c` 与 `include/linux/mm.h`
+  的回滚逐字节比对已加入）。四组都不在任何基线的 `PRE_APPLIED` 里，`KNOWN_DEBT` 仍为空。
+- **`config_gate_audit.py` 未跑**：它要一份构建产物的 `.config`，本机没有构建树（与 Batch 32
+  同一处置）。本批**不引入任何 Kconfig 符号**，新增行也不引用任何配置门内符号：唯一的新
+  `#ifdef CONFIG_SPECULATIVE_PAGE_FAULT` 块内部的 `wait_for_smp_sync`/`smp_call_function`
+  本来就在同一个门内（`free_pte_range()` 的既有用法），`#if ALLOC_SPLIT_PTLOCKS` 同层。
+  真正的编译门是 ABK CI 的那次构建。
+- 参考树要补两个文件：`mm/truncate.c`、`include/linux/mm.h`（已进三处 fixture 列表：
+  `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES`）。
+- `GROUP_COUNTS` core 40 → **44**；`module.conf` 0.35.0 → **0.37.0**；registry 未新增 KMI 槽、
+  config 符号或导出符号（`zap_page_range_single()` 由 `static` 变外部链接，但它不是
+  `EXPORT_SYMBOL`，不进 KMI）。
+
+### 5. 已知边界
+
+- **不主张提速。** 第一对的上游数字（200GiB fuse 文件上 `fadvise(DONTNEED)` 5.12s → 4.19s）
+  与第二对的（50G mmap 循环里 VmPTE 102640KB → 240KB）都是上游合成负载，本机一次都没测；
+  本批交付的是「同样的活少走一遍树」与「空 PTE 页会还回去」，不是设备侧数字。
+- **`madvise_pt_reclaim` 是这批里最需要真机验证的一条。** 它动的是缺页/页表路径的
+  `pmd_clear()` + 释放页表，风险不在文本审计能覆盖的范围（本模块的既有先例是 MADV_COLLAPSE
+  与 arm64 `pte_mkwrite()`）。四条基线都不带上游那个 arch 门，接的是 arm64 的
+  `MMU_GATHER_RCU_TABLE_FREE`；真机上建议先跑 `MADV_DONTNEED` 密集的分配器负载（ART /
+  jemalloc 场景）再上。
+- 只批 `MADV_DONTNEED`。`MADV_FREE` 在 5.15 仍按 VMA 各自 flush，`MADV_DONTNEED_LOCKED`
+  在这个基线上不存在；两者都是「另一笔」而不是「漏了」。
+- 四条都没进 `mm/filemap.c` 与 `mm/readahead.c`：本批在这两个文件上**零改动**，Batch 30
+  的 `readahead_mmap_miss_race` 仍是该文件唯一的组。
 <a id="batch-34"></a>
 
 ## Batch 34(v0.36.0)

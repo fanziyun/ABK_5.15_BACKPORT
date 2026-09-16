@@ -67,6 +67,14 @@ GROUP_COUNTS = {
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
     #
+    # Batch 35 adds four groups, all landing on every baseline: the two
+    # page-cache shadow-entry sweeps (61c663e020d2, then d3db2c042591 which
+    # refactors its partner's helper) and the MADV_DONTNEED pair
+    # (6375e95f381e's empty-PTE-page reclaim, then 43c4cfde7e37's batched TLB
+    # flush).  None of the four has a Cc: stable, and android13-5.15 carries
+    # none of the substrate they touch.  The three readahead/filemap commits of
+    # the same area are *not* registered -- no baseline has a carrier for them
+    # (see the exclusion record in plan.md).
     # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
     # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
     # diverged), so the rolling lts row cannot arrive pre-applied either -- and
@@ -74,7 +82,9 @@ GROUP_COUNTS = {
     # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
     # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
     # non-LSE fallback path is untouched on cores without FEAT_LSE.
-    "stable_backport_core": 41,
+    # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
+    # from 40 to 41) + this batch's four page-cache/page-table groups.
+    "stable_backport_core": 45,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

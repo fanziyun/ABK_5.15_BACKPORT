@@ -4365,6 +4365,9 @@ import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 
+import batch35_core_pagecache_pt as _b35_pcpt  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b35_pcpt.build_groups(PatchGroup)
 # ============================================================================
 # Batch 34: the non-return per-CPU atomics become load LSE atomics.
 # Steps live in scripts/batch34_core_arm64_lse_percpu.py.
