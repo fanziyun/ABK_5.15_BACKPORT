@@ -156,6 +156,11 @@ AUDIT_FILES = [
     "kernel/time/tick-sched.c",
     "kernel/sched/idle.c",
     "kernel/bpf/helpers.c",
+    # Batch 30: readahead_mmap_miss_race guards the mmap_miss decrement in
+    # mm/filemap.c's do_async_mmap_readahead().  The file was already in
+    # FETCH_FILES for reference reads (the module touched no group there until
+    # now), so only the fixture list needed the entry.
+    "mm/filemap.c",
 ]
 
 CHILD_MODULES = [

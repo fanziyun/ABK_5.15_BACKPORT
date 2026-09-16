@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.31.1", "0.31.1"], _versions)
+          _versions == ["0.32.0", "0.32.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4340,6 +4340,96 @@ def test_batch27_launch_bench():
           "end of help" in r.stdout and "abk_launch_selftest" not in r.stdout)
 
 
+def test_batch30_readahead_mmap_miss_race():
+    """Batch 30: the mmap_miss decrement sits behind a page-lock test."""
+    print("Batch 30: readahead_mmap_miss_race (concurrent-fault mmap_miss guard)")
+    import abk_stable_core as core
+    import batch30_core_mmap_miss_races as b30
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "readahead_mmap_miss_race"), None)
+    check("readahead_mmap_miss_race group registered", group is not None)
+    if group is None:
+        return
+    check("the group touches only mm/filemap.c",
+          list(group.files) == ["mm/filemap.c"], group.files)
+
+    steps = b30.build_steps()
+    check("one required step",
+          len(steps) == 1 and steps[0][3] is True,
+          [(rel, req) for rel, _o, _n, req in steps])
+    rel, old, new, _req = steps[0]
+    check("step targets mm/filemap.c", rel == "mm/filemap.c", rel)
+
+    # Trap 1/2: replace_once tests `new` first, so `old` must not survive inside
+    # `new` (that would make a patched tree re-apply) and the block must not be
+    # present in the pristine file.
+    check("old is not a substring of new (the guard re-indents the decrement)",
+          old not in new)
+    check("new is not a prefix of old", not new.startswith(old))
+    check("the guard is the upstream page-lock test",
+          "if (likely(!PageLocked(page))) {" in new)
+    check("the decrement moved inside the guard",
+          "if (likely(!PageLocked(page))) {\n"
+          "\t\tmmap_miss = READ_ONCE(ra->mmap_miss);\n"
+          "\t\tif (mmap_miss)\n"
+          "\t\t\tWRITE_ONCE(ra->mmap_miss, --mmap_miss);\n"
+          "\t}\n" in new)
+    check("the PageReadahead test still follows the counter update",
+          "\t}\n\tif (PageReadahead(page)) {\n" in new)
+    check("no folio API leaks onto 5.15", "folio" not in new)
+    check("the pristine side keeps the unguarded decrement",
+          old.endswith("\tif (PageReadahead(page)) {\n")
+          and "mmap_miss);\n\tif (mmap_miss)\n" in old)
+
+    fixture = (
+        "static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)\n"
+        "{\n"
+        "\treturn NULL;\n"
+        "}\n"
+        "\n"
+        "static struct file *do_async_mmap_readahead(struct vm_fault *vmf,\n"
+        "\t\t\t\t\t    struct page *page)\n"
+        "{\n"
+        "\tstruct file *fpin = NULL;\n"
+        "\tunsigned int mmap_miss;\n"
+        "\n"
+        + old +
+        "\t\tfpin = maybe_unlock_mmap_for_io(vmf, fpin);\n"
+        "\t\tpage_cache_async_readahead(mapping, ra, file,\n"
+        "\t\t\t\t\t   page, offset, ra->ra_pages);\n"
+        "\t}\n"
+        "\treturn fpin;\n"
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {"mm/filemap.c": fixture})
+        status, detail = b30._mmap_miss_race_apply(ctx)
+        check("mmap_miss fixture applies", status == "applied", (status, detail))
+        patched = ctx.read("mm/filemap.c")
+        check("the patched function guards the decrement",
+              "if (likely(!PageLocked(page))) {" in patched)
+        check("the helper body around it is untouched",
+              "page_cache_async_readahead(mapping, ra, file,\n"
+              "\t\t\t\t\t   page, offset, ra->ra_pages);" in patched)
+        ctx2 = make_ctx(tmp, {"mm/filemap.c": patched})
+        status2, _d2 = b30._mmap_miss_race_apply(ctx2)
+        check("mmap_miss fixture is idempotent",
+              status2 == "already_present", status2)
+        check("the second pass writes nothing",
+              ctx2.read("mm/filemap.c") == patched)
+        # A tree without the anchor degrades instead of half-patching.
+        # apply_steps returns None for a missing *required* anchor and the child
+        # maps that to blocked_by_shape (house convention: the shape preflight
+        # is what reports the missing-anchor status).
+        ctx3 = make_ctx(tmp, {"mm/filemap.c": "static int other(void) { return 0; }\n"})
+        status3, _d3 = b30._mmap_miss_race_apply(ctx3)
+        check("a missing anchor degrades to blocked_by_shape",
+              status3 == "blocked_by_shape", status3)
+        check("a degraded group writes nothing",
+              ctx3.pending_writes() == [], ctx3.pending_writes())
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -4387,6 +4477,7 @@ def main():
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()
     test_batch27_launch_bench()
+    test_batch30_readahead_mmap_miss_race()
 
     print()
     if FAILURES:

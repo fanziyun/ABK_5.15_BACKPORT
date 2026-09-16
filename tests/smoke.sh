@@ -312,6 +312,14 @@ grep -q "register_trace_android_vh_tune_mmap_readaround" \
 grep -q "trace_android_vh_tune_mmap_readaround" \
   "$KERNEL_ROOT/common/mm/filemap.c" \
   || fail "mmap read-around vendor-hook call site missing in mm/filemap.c"
+# Batch 30: the mmap_miss decrement in do_async_mmap_readahead() is behind the
+# page-lock test (e338d8353154, v6.18).  This module writes it on every
+# baseline -- no Cc: stable, so no 5.15 tree can arrive with it -- and the
+# grep is on the guarded form, so a run that silently dropped the hunk (or
+# landed it unguarded) fails here instead of compiling a no-op.
+grep -q "if (likely(!PageLocked(page))) {" \
+  "$KERNEL_ROOT/common/mm/filemap.c" \
+  || fail "mmap_miss concurrent-fault guard missing in mm/filemap.c"
 grep -qE "^CONFIG_ABK_DYNAMIC_READAHEAD=y" \
   "$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig" \
   || fail "defconfig lane did not enable ABK_DYNAMIC_READAHEAD"
@@ -497,6 +505,13 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/drivers/gpu/drm/drm_atomic_helper.c" \
         "$KERNEL_ROOT/common/drivers/gpu/drm/drm_atomic_helper.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for drivers/gpu/drm/drm_atomic_helper.c"
+fi
+# Batch 30 is the first group to write mm/filemap.c; rollback has to restore it
+# like any other target (the file is otherwise pristine on every baseline).
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/filemap.c" \
+        "$KERNEL_ROOT/common/mm/filemap.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/filemap.c"
 fi
 
 echo "SMOKE OK"

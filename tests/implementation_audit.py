@@ -1058,6 +1058,20 @@ REQUIRED_IN_FUNCTION = {
           "num_recomp_pages--;\n\t\terr = abk_zram_recomp_enqueue("],
          ["zram_recompress(zram, index, page"]),
     ],
+    "core:readahead_mmap_miss_race": [
+        # The guard belongs in do_async_mmap_readahead(), the function whose
+        # counter it protects.  Whole-file matching cannot say which function
+        # got it: 5.15's FAULT_FLAG_SPECULATIVE branch in filemap_fault() holds
+        # the same decrement, and this graft deliberately leaves that one alone
+        # (upstream deleted the branch, so nothing upstream fixes it).  A hunk
+        # that landed in the wrong function, or on the wrong side of the
+        # RAND_READ return, is invisible to every other audit here.
+        ("mm/filemap.c", "do_async_mmap_readahead",
+         ["if (likely(!PageLocked(page))) {",
+          "mmap_miss = READ_ONCE(ra->mmap_miss);",
+          "if (PageReadahead(page)) {"],
+         ["return fpin;\n\tmmap_miss = READ_ONCE(ra->mmap_miss);\n"]),
+    ],
 }
 
 

@@ -4220,5 +4220,26 @@ import batch24_core_zram_max_pages as _b24_zmp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b24_zmp.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 30: concurrent faults no longer double-decrement mmap_miss.
+# Steps live in scripts/batch30_core_mmap_miss_races.py.
+#
+#   readahead_mmap_miss_race  mainline e338d8353154 (v6.18) puts the
+#                             do_async_mmap_readahead() mmap_miss decrement
+#                             behind a page-lock test, so several threads
+#                             faulting the same page cannot each decrement the
+#                             per-file counter for that one page (which used to
+#                             keep mmap read-around enabled under memory
+#                             pressure).  No Cc: stable, so 5.15.y never got it.
+#
+# Independent of every other group: mm/filemap.c is otherwise untouched by this
+# module, and the anchor is unique in the file.  Position carries no meaning
+# here, but keep this region append-only so the registration order in reports
+# stays chronological.
+# ============================================================================
+import batch30_core_mmap_miss_races as _b30_mmr  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b30_mmr.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

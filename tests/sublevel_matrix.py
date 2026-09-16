@@ -50,7 +50,11 @@ GROUP_COUNTS = {
     # The Batch-24 recompression cap (zram_recompress_max_pages) is a
     # second-pass group: it edits the text zram_recompression and
     # zram_async_recompress generate, both of which now probe their own payload.
-    "stable_backport_core": 36,
+    # The Batch-30 readahead_mmap_miss_race
+    # (e338d8353154, mm/filemap.c do_async_mmap_readahead) applies on every
+    # baseline: no Cc: stable, so no 5.15 tree carries it, and its anchor is
+    # byte-identical on all four.
+    "stable_backport_core": 37,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

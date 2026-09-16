@@ -240,7 +240,7 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 36 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 37 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
@@ -251,12 +251,14 @@ Batch 13's hook + policy pair (`customize_alloc_gfp_vh`,
 15's five fs/pid/MM hot-path groups, Batch 17's zram writeback trio
 (`zram_writeback_batching` -- several bios in flight, `ZRAM_UNDER_WB` as the
 in-flight marker, with the upstream `wb_ctl` UAF and blk_idx-leak fixes built
-in -- `zram_wb_batch_size`, and `zram_compressed_writeback`), and Batch 24's
+in -- `zram_wb_batch_size`, and `zram_compressed_writeback`), Batch 24's
 recompression pass cap (`zram_recompress_max_pages`: `max_pages` on both
-recompress nodes plus the guard that rejects an unrecognised `type=`); the
-perf child carries 22, including the five Batch 15 scheduler/block groups and
+recompress nodes plus the guard that rejects an unrecognised `type=`), and
+Batch 30's `readahead_mmap_miss_race` (the v6.18 mmap_miss concurrent-fault
+guard in `mm/filemap.c`, the module's only group in that file); the
+perf child carries 23, including the five Batch 15 scheduler/block groups and
 the PSI line (`psi_irq_tracking`, `psi_cgroup_pressure_switch`,
-`psi_oncpu_state_mask`); the display child carries 1, for 59 groups in total.
+`psi_oncpu_state_mask`); the display child carries 1, for 61 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 

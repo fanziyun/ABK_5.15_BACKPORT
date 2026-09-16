@@ -349,6 +349,108 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-30"></a>
+
+## Batch 30(v0.32.0)
+
+起因：用户点名「6.18 的 `e338d8353154` 要不要 backport」。逐条查证后落地**一组**：
+`readahead_mmap_miss_race`。`module.conf` 0.31.1 → **0.32.0**，`GROUP_COUNTS` core **36 → 37**。
+本批**不在**「九项优化」清单内（见 [交付日志总览](#overview-nine)）——它是 mm/readahead 启发式的
+一次上游对齐；政策上属「优化/行为修正」而非 security-only，故在范围内。
+
+### 1. 来源与判定：为什么搬
+
+上游 `e338d8353154`《mm: readahead: improve mmap_miss heuristic for concurrent faults》
+（Roman Gushchin，author 2025-08-15，akpm 2025-09-13 合入 ⇒ **v6.18**，12 小时合入窗口内无改动）。
+hunk 只有一处、11+/3−：`do_async_mmap_readahead()` 里那句 `--ra->mmap_miss` 加
+`likely(!folio_test_locked(folio))` 守卫。
+
+问题本身：多个线程同时 fault 同一个 page 时，**每一个**都会为**这一个** page 递减
+`ra->mmap_miss`（per-file 计数器），于是它相对 `do_sync_mmap_readahead()` 的递增侧**长期偏低**，
+而「这个文件是随机访问、别再预读」的判据（`mmap_miss > MMAP_LOTSAMISS`）就再也不触发 ——
+文件页正在被逐出/重新 fault 的内存压力下，mmap read-around 仍然开着。上游给的是 Google 生产
+（数十万台、数周）的观测：长期卡在 reclaim 循环里的容器数降 10–20×，全 fleet 直接回收的 CPU
+明显下降，无回归。
+
+三条「必须手动搬」的证据：
+
+| 判定 | 证据 |
+|---|---|
+| 四档基线全无 | 167/178/194/216 的 `do_async_mmap_readahead()` 都是裸的三行递减；`.216`（android13-5.15-lts）也没有 |
+| 不会随 sublevel 自己来 | 提交既无 `Fixes:` 也无 `Cc: stable` ⇒ 5.15.y 未回收，只有手动一条路 |
+| 本模块从未覆盖 | registry 里没有任何组碰过 `mm/filemap.c`，也不含 `mmap_miss` 字样；Batch 9-1 `dynamic_readahead_lowmem` 只改 `mm/readahead.c` + `mm/Kconfig`（它的 read-around 挂点在 `do_sync_mmap_readahead`，与本处不同函数），无锚点冲突、无陷阱 5 风险 |
+
+证据工件落盘在 `research/readahead_618/`：`e338d8353154.patch`（本次搬的）、
+`eb4c458a9803.patch` / `2f5e0477276b.patch`（§3 判掉的后续笔）、`filemap_master.c`（master 现状，
+用来确认上游后续形态）。
+
+### 2. 落地：一组一步（upstream-shape，无 marker）
+
+| 文件 | 改动 |
+|---|---|
+| `mm/filemap.c` | `do_async_mmap_readahead()`：`mmap_miss` 递减整块移进 `if (likely(!PageLocked(page))) { ... }`，注释逐字保留（`folio`→`page`），`if (PageReadahead(page))` 仍在其后 |
+
+- **5.15 形态差异只有 folio→page**：`folio_test_locked()` → `PageLocked()`；其余与上游逐 hunk 一致。
+  属**上游形态改写**，故**不加** ABK marker —— 将来哪条基线自带该 commit 时逐字节不动。
+- **锚点唯一且四档通用**：锚从函数自己的 `VM_RAND_READ` 早返回起、到 `if (PageReadahead(page)) {`
+  止，在 167/178/194/216 上 `count == 1`（实测）。lts 在同一函数里多一句 ACK 专有的
+  `trace_android_vh_do_async_mmap_readahead(vmf, page, &skip)` 前导，锚不碰它，递减点在其后。
+- **陷阱 1 检查**：`new` 不是 pristine 的子串（守卫把递减重新缩进了一级），`old` 也不是 `new` 的子串，
+  故 `replace_once` 的「先查 new」语义在第二趟正确返回 `already_present`（单测钉住）。
+
+### 3. 边界：刻意**不**搬的部分（写清楚，免得将来重议）
+
+5.15 上动这个计数器的位置共**三处**递减 + 一处递增，本批只碰一处：
+
+| 位置 | 本批处置 |
+|---|---|
+| `do_sync_mmap_readahead()`（**递增**侧） | 不动 —— 守卫正是为了恢复与它的平衡 |
+| `do_async_mmap_readahead()`（并发 fault 递减） | **本批搬** |
+| `filemap_map_pages()`（fault-around，把递减攒进局部变量最后写回一次） | 不碰：它是批量映射路径，不是本 commit 针对的并发 fault 路径 |
+| `filemap_fault()` 的 `FAULT_FLAG_SPECULATIVE` 分支 | 不碰：上游把整条投机 fault 路径**删掉了**（master 里 `FAULT_FLAG_SPECULATIVE` 出现 0 次），所以**没有任何上游提交修它** —— 这是 5.15 私有残余，要修属本地造型决策，不是 backport |
+
+后续上游对称系列按**决策**而非可移植性排除：`eb4c458a9803`（VM_SEQ_READ，v6.20）在 5.15 上
+其实有**三处**可改（5.15 的 `do_sync_mmap_readahead()` 在递增**之前**就对 VM_SEQ_READ 早返回，
+所以它要修的那种不对称在本树真实存在），`2f5e0477276b`（VM_EXEC，v6.20）则**完全无载体** ——
+它长在 `exec_folio_order()` 与 VM_EXEC readahead 路径上，两样在四档基线里都不存在（实测）。
+本批就是**单个** commit `e338d8353154`；对称系列会改变 VM_SEQ_READ/VM_EXEC 映射的行为，需要各自
+的证据，另外立项。
+
+### 4. 证据强度（先写明，别误读）
+
+上游依据是 fleet 级生产观测，**没有单机 A/B**。所以本批**不主张提速**（与 Batch 28 同款口径）：
+它主张的是「与上游对齐」+「消除了并发重复递减」，方向上是让计数器更忠实（该关 read-around 的文件
+更早关掉），代价是极端随机访问文件少一点预取。
+
+### 5. 门禁与 fixture 同步（三处清单这次是「两处已就位」）
+
+`mm/filemap.c` 早已在 `tests/fetch_sublevel_tree.sh` 的 `FETCH_FILES` 与 `tests/smoke.sh` 的
+`SMOKE_FILES` 里（Batch 9-1 读过它），只有 `tests/step_audit.py` 的 `AUDIT_FILES` 缺 —— 该审计第一条
+就报 `touches mm/filemap.c, which is not in AUDIT_FILES`，加上即可，无需重取参考树。
+
+本批新增的门禁：
+
+- `tests/stable_5_15_test.py`：`test_batch30_readahead_mmap_miss_race` —— 组注册、单必需步、
+  陷阱 1/2 的两条子串断言、「守卫里含递减、`PageReadahead` 在其后」、「无 folio API 漏到 5.15」、
+  以及 fixture 上的 applied / 幂等 / 缺锚点降级为 `blocked_by_shape`（且不写任何文件）；
+  版本钉子 `0.31.1` → `0.32.0`。
+- `tests/implementation_audit.py`：`core:readahead_mmap_miss_race` 用 **`REQUIRED_IN_FUNCTION`**
+  （不是整文件子串）钉 `do_async_mmap_readahead()` 本身 —— 因为 5.15 的 `filemap_fault()`
+  里还有同样两行递减，整文件匹配分不出「落进了哪个函数」，而这一批的边界恰恰是「只修前者」。
+- `tests/smoke.sh`：断言守卫文本存在（`if (likely(!PageLocked(page))) {`），并新增
+  `mm/filemap.c` 的**回滚字节一致**校验（本组是第一个写这个文件的组，四档实测都打印了这行）。
+
+### 6. 四档基线状态（本地审计）
+
+| child | 167 | 178 | 194 | 216 |
+|---|---|---|---|---|
+| stable_backport_core (37) | applied 37 | applied 37 | applied 34 / already 3 | applied 31 / already 6 |
+| stable_perf_backport (23) | applied 23 | applied 22 / already 1 | applied 20 / already 3 | applied 15 / already 8 |
+| stable_display_fix (1) | already 1 | already 1 | applied 1 | applied 1 |
+
+`step_audit` / `implementation_audit` / `smoke.sh`（两遍幂等 + 回滚字节一致）四档全部通过；
+本批不新增任何 CONFIG 门，故 `config_gate_audit` 不受影响（它需要构建产物，由 CI 运行覆盖编译面）。
+
 <a id="batch-29"></a>
 
 ## Batch 29(companion v0.12.0)
