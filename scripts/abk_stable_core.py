@@ -4316,5 +4316,32 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 32: a written-back slot keeps its metadata, and ->huge_pages is
+# decremented once.  Steps live in
+# scripts/batch32_core_zram_wb_slot_preserve.py.
+#
+#   zram_wb_slot_preserve  mainline b0377ee80429 (mm-hotfixes-stable 2026-03,
+#                          Fixes: d38fab605c667) / ACK android16-6.12
+#                          37b72d525502.  It rewrites the
+#                          zram_writeback_complete() that zram_writeback_batching
+#                          generates and the huge block of zram_free_page()
+#                          -- the second is a no-op on the *text*, but the
+#                          accounting it guards is the other half of the fix.
+#
+# Registered last, after the two groups whose replacement blocks it edits
+# (zram_writeback_batching) or which own the surrounding shape
+# (zram_recompression).  Both are safe for the reason trap 5 describes: each
+# probes its own payload, so a second pass reports already_present instead of
+# re-appending.  zram_writeback_batching learned that probe in this batch; keep
+# any further group that edits its text in the same dependency order.  (The
+# mm/ and arch/arm64 groups above -- Batch 30, Batch 31 -- are independent of
+# this one: different files, pristine anchors, so this dependency is only about
+# the zram groups.)
+# ============================================================================
+import batch32_core_zram_wb_slot_preserve as _b32_zwbsp  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b32_zwbsp.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()
