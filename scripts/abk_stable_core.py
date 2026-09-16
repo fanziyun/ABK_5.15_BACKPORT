@@ -1040,6 +1040,22 @@ def _cgroup_wq_split_apply(ctx):
 # ---------------------------------------------------------------------------
 
 def _memcg_reclaim_apply(ctx):
+    # docs/group_recipe.md trap 5, and a chain rather than a single later
+    # edit: Batch 34 rewrites the memory_reclaim() handler this group
+    # generates -- its call site three times over (the SWAP_CLUSTER_MAX cap,
+    # the decaying batch, the swappiness= argument) and its failure path
+    # (-ERESTARTSYS) -- so on a second pass the handler's `new` block no
+    # longer matches while its `old` anchor (the pristine
+    # `static struct cftype memory_files[] = {`) still does, and the whole
+    # function would be appended a second time.  The group stops on its own
+    # marker instead: text it alone writes, and which no later group touches.
+    try:
+        _probe = ctx.read("mm/memcontrol.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _b34_rp.MEMORY_RECLAIM_MARKER in _probe:
+        return "already_present", (
+            "memory.reclaim is already in memcontrol.c")
     steps = [
         # swap.h: reclaim option bits next to the try_to_free prototypes
         ("include/linux/swap.h",
@@ -1286,11 +1302,56 @@ def _memcg_reclaim_apply(ctx):
          "\t},\n"
          "\t{ }\t/* terminate */",
          T),
+        # cgroup-v2.rst: document the file itself.  5.15's manual predates
+        # memory.reclaim (94968384dde1 lands in v5.16), so without this the
+        # module would add a UAPI file that the kernel's own manual does not
+        # describe -- and the swappiness= group below amends this very section,
+        # so it has to exist for that hunk to be the upstream amendment rather
+        # than an invention.  Text is 94968384dde1's, at the same place in the
+        # list (after memory.max, before memory.oom.group).
+        ("Documentation/admin-guide/cgroup-v2.rst",
+         "\tutility is limited to providing the final safety net.\n"
+         "\n"
+         "  memory.oom.group\n",
+         "\tutility is limited to providing the final safety net.\n"
+         "\n"
+         "  memory.reclaim\n"
+         "\tA write-only nested-keyed file which exists for all cgroups.\n"
+         "\n"
+         "\tThis is a simple interface to trigger memory reclaim in the\n"
+         "\ttarget cgroup.\n"
+         "\n"
+         "\tThis file accepts a single key, the number of bytes to reclaim.\n"
+         "\tNo nested keys are currently supported.\n"
+         "\n"
+         "\tExample::\n"
+         "\n"
+         "\t  echo \"1G\" > memory.reclaim\n"
+         "\n"
+         "\tThe interface can be later extended with nested keys to\n"
+         "\tconfigure the reclaim behavior. For example, specify the\n"
+         "\ttype of memory to reclaim from (anon, file, ..).\n"
+         "\n"
+         "\tPlease note that the kernel can over or under reclaim from\n"
+         "\tthe target cgroup. If less bytes are reclaimed than the\n"
+         "\tspecified amount, -EAGAIN is returned.\n"
+         "\n"
+         "  memory.oom.group\n",
+         T),
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
         return "blocked_by_shape", detail
     return status, detail
+
+
+# ---------------------------------------------------------------------------
+# reclaim-path chain (Batch 34): the memory.reclaim batch fidelity, the
+# swappiness= argument, the suspend abort and the lru_add drain.
+# Steps live in scripts/batch34_core_reclaim_paths.py.  Registered on its own
+# below (after memcg_memory_reclaim / cached_freeze_reclaim / memcg_v1_reclaim,
+# whose generated text it edits) for the trap-5 reason spelled out there.
+# ---------------------------------------------------------------------------
 
 
 def _zram_recompression_apply(ctx):
@@ -2461,9 +2522,10 @@ PATCH_GROUPS = [
     ),
     PatchGroup(
         "memcg_memory_reclaim",
-        "per-memcg proactive reclaim via memory.reclaim, with reclaim options replacing may_swap (android14-6.1 / 6.1.y)",
+        "per-memcg proactive reclaim via memory.reclaim, with reclaim options replacing may_swap (android14-6.1 / 6.1.y), documented in the cgroup v2 manual",
         ["memory.reclaim series (android14-6.1; mainline proactive reclaim)"],
-        ["include/linux/swap.h", "mm/vmscan.c", "mm/memcontrol.c"],
+        ["include/linux/swap.h", "mm/vmscan.c", "mm/memcontrol.c",
+         "Documentation/admin-guide/cgroup-v2.rst"],
         _memcg_reclaim_apply,
     ),
 ]
@@ -4364,6 +4426,34 @@ PATCH_GROUPS = PATCH_GROUPS + _b32_zwbsp.build_groups(PatchGroup)
 import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 34: the memory-reclaim path -- proactive reclaim's batch fidelity, its
+# swappiness= argument, the suspend abort, and the lru_add drain.
+# Steps live in scripts/batch34_core_reclaim_paths.py.
+#
+#   proactive_reclaim_batch_fidelity  mainline 0388536ac291 (v6.6)
+#   proactive_reclaim_decaying_batches
+#                                     mainline 287d5fedb377 (v6.9,
+#                                     Fixes: 0388536ac291)
+#   reclaim_swappiness_defines        mainline 410abb20acae (v6.11 series p.2)
+#   proactive_reclaim_swappiness_arg  mainline 68cd9050d871 (v6.11 series p.3)
+#   proactive_reclaim_suspend_abort   mainline dc37771a43d4 (v7.2,
+#                                     Fixes: 287d5fedb377)
+#   lru_add_drain_dead_folios         mainline 9669b87065a6 (v7.2)
+#
+# Registered last, after memcg_memory_reclaim and cached_freeze_reclaim whose
+# generated text they rewrite, and in dependency order among themselves: the
+# first three rewrite the same memory_reclaim() call site in turn, and
+# reclaim_swappiness_defines must precede the group whose parser validates
+# against the constants it adds.  Each superseded group probes for content
+# that outlives its successor, which is what keeps the second pass a no-op --
+# docs/group_recipe.md trap 5, the Batch 21/24 remedy.  Keep any further group
+# that edits this chain in the same order.
+# ============================================================================
+import batch34_core_reclaim_paths as _b34_rp  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b34_rp.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()

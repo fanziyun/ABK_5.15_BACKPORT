@@ -163,6 +163,8 @@ AUDIT_FILES = [
     "mm/filemap.c",
     # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
     "arch/arm64/include/asm/pgtable.h",
+    # Batch 34: the lru_add drain filter is the module's first mm/swap.c group.
+    "mm/swap.c",
 ]
 
 CHILD_MODULES = [

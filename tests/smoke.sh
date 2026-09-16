@@ -110,6 +110,8 @@ SMOKE_FILES=(
   kernel/sched/idle.c
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
   arch/arm64/include/asm/pgtable.h
+  # Batch 34: the lru_add drain filter is the module's first mm/swap.c group.
+  mm/swap.c
 )
 
 WORK="$(mktemp -d)"
@@ -413,6 +415,45 @@ grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 memory.reclaim entry missing"
 
+# Batch 34: the memory-reclaim chain.  Three of its six groups rewrite the
+# memory_reclaim() handler this module generates and the rest of the chain
+# hangs off those, so what has to hold is the *end state*.  Group statuses
+# cannot show it: each superseded group stops on a probe of its successor, so a
+# run that silently lost the middle group would still report six applied
+# groups.  The negative below is the regression the 0388536ac291/287d5fedb377
+# pair exists to prevent -- the fixed 32-page cap without its follow-up.
+grep -q "unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;" \
+  "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "proactive reclaim does not use a decaying batch"
+if grep -q "min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX)" \
+     "$KERNEL_ROOT/common/mm/memcontrol.c"; then
+  fail "proactive reclaim kept the fixed SWAP_CLUSTER_MAX cap (287d5fedb377 missing)"
+fi
+grep -q '"swappiness=%d"' "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "memory.reclaim does not parse the swappiness= key"
+grep -q "swappiness == -1 ? NULL : &swappiness" \
+  "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "the swappiness= value never reaches try_to_free_mem_cgroup_pages()"
+grep -q "sc_swappiness(sc, memcg)" "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the scan balance does not read scan_control's swappiness"
+grep -q "if (unlikely(sc->proactive && signal_pending(current)))" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the MGLRU scan does not abort for a pending signal"
+grep -q "return -ERESTARTSYS;" "$KERNEL_ROOT/common/mm/memcontrol.c" \
+  || fail "memory.reclaim still turns the freezer's signal into -EINTR"
+# The lru_add filter and its consumer's NULL tolerance are one change: the
+# filter without the guard dereferences a vacated pagevec slot.
+grep -q "if (page_ref_freeze(page, 1)) {" "$KERNEL_ROOT/common/mm/swap.c" \
+  || fail "the lru_add drain does not filter a dead page"
+grep -q "A drained add batch may have freed this slot already." \
+  "$KERNEL_ROOT/common/mm/swap.c" \
+  || fail "release_pages() does not tolerate a filtered pagevec slot"
+# The new nested key has to be in the kernel's own manual, which is the half of
+# 68cd9050d871 that no status can show.
+grep -q "Swappiness value to reclaim with" \
+  "$KERNEL_ROOT/common/Documentation/admin-guide/cgroup-v2.rst" \
+  || fail "the memory.reclaim swappiness= key is undocumented"
+
 # Batch 13: the customize_alloc_gfp hook (declare/call/export) must be in the
 # tree and the ABK fast-fail policy must really register on it.  The hook
 # lines carry no ABK marker by design (upstream-shape), so assert the exact
@@ -543,6 +584,12 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/mm/filemap.c" \
         "$KERNEL_ROOT/common/mm/filemap.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/filemap.c"
+fi
+# Batch 34's lru_add filter is the module's first mm/swap.c write.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/swap.c" \
+        "$KERNEL_ROOT/common/mm/swap.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/swap.c"
 fi
 
 echo "SMOKE OK"

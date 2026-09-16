@@ -66,7 +66,19 @@ GROUP_COUNTS = {
     # any of them, so the mainline series patches 1-2 are inapplicable and only
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
-    "stable_backport_core": 40,
+    #
+    # Batch 34 adds the six-group memory-reclaim chain
+    # (proactive_reclaim_batch_fidelity, proactive_reclaim_decaying_batches,
+    # reclaim_swappiness_defines, proactive_reclaim_swappiness_arg,
+    # proactive_reclaim_suspend_abort, lru_add_drain_dead_folios).  All six
+    # apply on every baseline -- none of the commits has a Cc: stable, and
+    # 5.15 has neither memory_reclaim() nor user_proactive_reclaim() nor the
+    # post-5.17 folio_batch form of mm/swap.c -- but the first three rewrite
+    # text memcg_memory_reclaim generates, so the count moved for a *chain* of
+    # groups rather than for six independent ones.  The 194/lts swappiness
+    # vendor hook is handled by a probed step variant, not by a per-sublevel
+    # expectation, which is why PRE_APPLIED stays empty here.
+    "stable_backport_core": 46,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

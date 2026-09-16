@@ -113,6 +113,8 @@ FETCH_FILES=(
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).  The module's
   # first arch/arm64 C source -- the file is the whole group.
   arch/arm64/include/asm/pgtable.h
+  # Batch 34: the lru_add drain filter is the module's first mm/swap.c group.
+  mm/swap.c
 )
 
 decode() {
