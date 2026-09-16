@@ -117,6 +117,9 @@ FETCH_FILES=(
   # struct zap_details the MADV_DONTNEED page-table reclaim marks (mm.h).
   mm/truncate.c
   include/linux/mm.h
+  # Batch 34: the non-return per-CPU atomics become load LSE atomics
+  # (mainline 535fdfc5a228) -- the whole group is this header.
+  arch/arm64/include/asm/percpu.h
 )
 
 decode() {

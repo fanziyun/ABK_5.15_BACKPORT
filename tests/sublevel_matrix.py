@@ -75,7 +75,16 @@ GROUP_COUNTS = {
     # none of the substrate they touch.  The three readahead/filemap commits of
     # the same area are *not* registered -- no baseline has a carrier for them
     # (see the exclusion record in plan.md).
-    "stable_backport_core": 44,
+    # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
+    # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
+    # diverged), so the rolling lts row cannot arrive pre-applied either -- and
+    # its percpu.h anchors are byte-identical to the upstream old form on all
+    # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
+    # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
+    # non-LSE fallback path is untouched on cores without FEAT_LSE.
+    # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
+    # from 40 to 41) + this batch's four page-cache/page-table groups.
+    "stable_backport_core": 45,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

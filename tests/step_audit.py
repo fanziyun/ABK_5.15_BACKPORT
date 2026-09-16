@@ -168,6 +168,9 @@ AUDIT_FILES = [
     # reclaim marks before the zap path can hand an empty PTE page back.
     "mm/truncate.c",
     "include/linux/mm.h",
+    # Batch 34: the non-return per-CPU atomics become load LSE atomics
+    # (mainline 535fdfc5a228) -- the whole group is this header.
+    "arch/arm64/include/asm/percpu.h",
 ]
 
 CHILD_MODULES = [

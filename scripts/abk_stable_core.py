@@ -4365,9 +4365,30 @@ import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 
-import batch35_core_pagecache_pt as _b34_pcpt  # noqa: E402
+import batch35_core_pagecache_pt as _b35_pcpt  # noqa: E402
 
-PATCH_GROUPS = PATCH_GROUPS + _b34_pcpt.build_groups(PatchGroup)
+PATCH_GROUPS = PATCH_GROUPS + _b35_pcpt.build_groups(PatchGroup)
+# ============================================================================
+# Batch 34: the non-return per-CPU atomics become load LSE atomics.
+# Steps live in scripts/batch34_core_arm64_lse_percpu.py.
+#
+#   arm64_lse_percpu_load_atomics
+#                              mainline 535fdfc5a228 (v6.18, arm64-fixes).
+#                              The LSE branch of __PERCPU_OP_CASE() grows a
+#                              [tmp] destination and the three PERCPU_OP()
+#                              instantiations flip from stadd/stclr/stset to
+#                              ldadd/ldclr/ldset, so the instructions execute
+#                              "near" (L1) instead of "far".  No other group
+#                              writes arch/arm64/include/asm/percpu.h, so
+#                              there is nothing to order against.  The
+#                              upstream-measured BPF-fentry regression and why
+#                              it does not apply to a 5.15 arm64 build, plus
+#                              the no-speedup-claim rule, are in the child's
+#                              module docstring and CHANGELOG.md (Batch 34).
+# ============================================================================
+import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()
