@@ -201,12 +201,12 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 41 applied | 23 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 41 applied | 22 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 38 applied + 3 present | 20 applied + 3 present |
-| 216 | `android13-5.15-lts` | rolling | 34 applied + 7 present | 15 applied + 8 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 42 applied | 23 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 42 applied | 22 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 39 applied + 3 present | 20 applied + 3 present |
+| 216 | `android13-5.15-lts` | rolling | 35 applied + 7 present | 15 applied + 8 present |
 
-(Re-measured on the **v0.36.0** registry against the four fetched reference
+(Re-measured on the **v0.37.0** registry against the four fetched reference
 trees -- the numbers Batch 33 left here were two batches stale. The counts move
 with every batch, so they are a snapshot, not an invariant.)
 

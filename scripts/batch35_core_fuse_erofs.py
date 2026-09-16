@@ -1,4 +1,4 @@
-"""Batch 34: FUSE write-path prefaulting, and why the erofs half of this batch
+"""Batch 35: FUSE write-path prefaulting, and why the erofs half of this batch
 does not land.
 
 Batch theme was "filesystems -- FUSE and erofs": one FUSE commit plus the

@@ -67,12 +67,21 @@ GROUP_COUNTS = {
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
     #
-    # The Batch-34 FUSE write-path prefault (fuse_prefault_out_of_write_path)
+    # Batch 34 (arm64_lse_percpu_load_atomics, mainline 535fdfc5a228) applies
+    # on every baseline: the commit never reached linux-5.15.y (gregkh compare,
+    # diverged), so the rolling lts row cannot arrive pre-applied either -- and
+    # its percpu.h anchors are byte-identical to the upstream old form on all
+    # four trees.  Applies via arm64's own header, not a Kconfig: the LSE
+    # encoding is an ARM64_LSE_ATOMIC_INSN alternative patched at boot, so the
+    # non-LSE fallback path is untouched on cores without FEAT_LSE.
+    # The Batch-35 FUSE write-path prefault (fuse_prefault_out_of_write_path)
     # applies on every baseline too: faa794dd2e17 is a v6.16 performance change
     # with no Cc: stable, so no 5.15 tree carries it, and its two anchors are
     # byte-identical on all four.  It is also the module's first group in
-    # fs/fuse/, so nothing else writes the file.
-    "stable_backport_core": 41,
+    # fs/fuse/, so nothing else writes the file.  The count is Batch 33 + the
+    # two groups that landed in parallel as "Batch 34" (this one renamed to 35
+    # because the arm64 LSE one merged first).
+    "stable_backport_core": 42,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

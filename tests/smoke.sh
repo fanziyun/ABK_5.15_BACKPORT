@@ -110,7 +110,10 @@ SMOKE_FILES=(
   kernel/sched/idle.c
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
   arch/arm64/include/asm/pgtable.h
-  # Batch 34: the FUSE write-path prefault (faa794dd2e17).
+  # Batch 34: the non-return per-CPU atomics become load LSE atomics
+  # (mainline 535fdfc5a228) -- the whole group is this header.
+  arch/arm64/include/asm/percpu.h
+  # Batch 35: the FUSE write-path prefault (faa794dd2e17).
   fs/fuse/file.c
 )
 
@@ -290,6 +293,24 @@ grep -q "__free_zspage_lockless(struct zs_pool \*pool," "$KERNEL_ROOT/common/mm/
 if grep -q "[^_]free_zspage(pool, class, zspage);" "$KERNEL_ROOT/common/mm/zsmalloc.c"; then
   fail "zs_free() kept the class->lock-held free_zspage() call"
 fi
+# arm64_lse_percpu_load_atomics (535fdfc5a228): a markerless upstream-shape
+# rewrite, so the load-form instruction and the flipped instantiations are the
+# assertions -- and the store forms must be gone entirely, since a half-flip
+# compiles and quietly keeps one far-executing op.
+PERCPU_H="$KERNEL_ROOT/common/arch/arm64/include/asm/percpu.h"
+grep -qF '#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"' "$PERCPU_H" \
+  || fail "LSE per-CPU macro did not gain the load-form [tmp] destination"
+grep -q "PERCPU_OP(add, add, ldadd)" "$PERCPU_H" \
+  || fail "PERCPU_OP(add) was not flipped to ldadd"
+grep -q "PERCPU_OP(andnot, bic, ldclr)" "$PERCPU_H" \
+  || fail "PERCPU_OP(andnot) was not flipped to ldclr"
+grep -q "PERCPU_OP(or, orr, ldset)" "$PERCPU_H" \
+  || fail "PERCPU_OP(or) was not flipped to ldset"
+grep -q "PERCPU_RET_OP(add, add, ldadd)" "$PERCPU_H" \
+  || fail "PERCPU_RET_OP(add) lost its original ldadd"
+if grep -qE "PERCPU_OP\((add, add, stadd|andnot, bic, stclr|or, orr, stset)\)" "$PERCPU_H"; then
+  fail "a store-form PERCPU_OP instantiation survived the LSE load flip"
+fi
 grep -q "config RCU_NOCB_CPU_DEFAULT_ALL" \
   "$KERNEL_ROOT/common/kernel/rcu/Kconfig" \
   || fail "RCU default-all Kconfig option missing"
@@ -415,7 +436,7 @@ grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 memory.reclaim entry missing"
 
-# Batch 34: the write source buffer is prefaulted where the copy made no
+# Batch 35: the write source buffer is prefaulted where the copy made no
 # progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves
 # are load-bearing and neither is visible in a pass-1 status: without the first
 # the common path keeps its extra userspace touch (the whole point of the

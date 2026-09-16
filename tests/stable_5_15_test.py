@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.36.0", "0.36.0"], _versions)
+          _versions == ["0.37.0", "0.37.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4761,7 +4761,7 @@ def test_batch33_zsmalloc_free_out_of_lock():
 # The region the Batch-34 group owns, in the 5.15 page form (upstream's hunk is
 # the 6.x folio form and anchors nowhere here).  Synthetic on purpose: the real
 # anchors are proven against a fetched tree by step_audit.py.
-_BATCH34_FUSE_FILL_WRITE_PAGES = (
+_BATCH35_FUSE_FILL_WRITE_PAGES = (
     "static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,\n"
     "\t\t\t\t     struct address_space *mapping,\n"
     "\t\t\t\t     struct iov_iter *ii, loff_t pos,\n"
@@ -4809,8 +4809,8 @@ _BATCH34_FUSE_FILL_WRITE_PAGES = (
 )
 
 
-def test_batch34_fuse_prefault_out_of_write_path():
-    """Batch 34: the FUSE write path prefaults only on a no-progress retry.
+def test_batch35_fuse_prefault_out_of_write_path():
+    """Batch 35: the FUSE write path prefaults only on a no-progress retry.
 
     Three things this group gets wrong silently, so all three are pinned here
     rather than only on a real tree: the *pairing* (either half alone compiles
@@ -4821,11 +4821,11 @@ def test_batch34_fuse_prefault_out_of_write_path():
     batch (the erofs half is excluded, and an erofs or fs/super.c group
     reappearing unnoticed is exactly how that exclusion would regress).
     """
-    print("Batch 34 fuse_fill_write_pages() prefault move (upstream-shape rewrite)")
+    print("Batch 35 fuse_fill_write_pages() prefault move (upstream-shape rewrite)")
     import abk_stable_core as core
     import abk_stable_display as display
     import abk_stable_perf as perf
-    import batch34_core_fuse_erofs as b34
+    import batch35_core_fuse_erofs as b34
 
     group = next((g for g in core.PATCH_GROUPS
                   if g.key == "fuse_prefault_out_of_write_path"), None)
@@ -4859,7 +4859,7 @@ def test_batch34_fuse_prefault_out_of_write_path():
               "ABK stable_515_backport" not in new, new[:60])
 
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {b34.FUSE_FILE_C: _BATCH34_FUSE_FILL_WRITE_PAGES})
+        ctx = make_ctx(tmp, {b34.FUSE_FILE_C: _BATCH35_FUSE_FILL_WRITE_PAGES})
         status, detail = group.apply_fn(ctx)
         check("the move applies on the 5.15 page shape",
               status == "applied", (status, detail))
@@ -4979,7 +4979,7 @@ def main():
     test_batch30_readahead_mmap_miss_race()
     test_batch31_arm64_pte_mkwrite_clean()
     test_batch33_zsmalloc_free_out_of_lock()
-    test_batch34_fuse_prefault_out_of_write_path()
+    test_batch35_fuse_prefault_out_of_write_path()
 
     print()
     if FAILURES:

@@ -353,6 +353,107 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 
 ## Batch 34(v0.36.0)
 
+**未做设备 A/B,不主张提速。全部上游证据(SRCU 发现与 fentry 回归 alike)都来自 Neoverse V2 /
+ARM 服务器核,本模块目标是 Qualcomm Snapdragon,收益迁移性未经验证。上游该 commit 后来造成过
+实测回归(见 §3),本批把它连同「为何不适用于 5.15 arm64」一起归档。**
+
+mainline `535fdfc5a228`(v6.18,Catalin Marinas;Will Deacon 经 arm64-fixes 收,
+2025-11-11;Reported-by / Tested-by Paul E. McKenney,Reviewed-by Palmer Dabbelt)。提交本身
+**没有基准数字**:它修的是 Paul 在 SRCU 锁路径上发现的 per-CPU 原子行为问题,讨论串
+<https://lore.kernel.org/r/e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop>。
+原始 patch 存 `research/upstream-5.15.y/patches/`。
+
+### 1. 机制与改动本体
+
+FEAT_LSE 下,非返回型 `this_cpu_*()` 原子编译为 STADD/STCLR/STSET;在不少微架构上这类 store
+形态倾向**「远」执行**(互联/内存子系统,除非数据已在 L1),而背靠背的 STADD(如
+`srcu_read_{lock,unlock}*()`)还要额外付默认 posting 行为的开销。load 原子(LDADD/LDCLR/LDSET,
+目的寄存器**不用但不写 XZR**)倾向**「近」执行**(L1)。per-CPU 变量极少被并发访问同一地址,
+所以上游选择鼓励硬件「近」执行。
+
+改动只在 `arch/arm64/include/asm/percpu.h`,+11/−4,两个 hunk:
+
+| hunk | 改动 |
+|---|---|
+| `__PERCPU_OP_CASE()` 的 LSE 分支 | `#op_lse "\t%" #w "[val], %[ptr]\n"` → `#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n"`(store 形态 → load 形态;`[tmp]` 在输出操作数里本来就有,`"=&r"`,零新增寄存器压力) |
+| 三个 `PERCPU_OP()` 实例化 | `stadd`/`stclr`/`stset` → `ldadd`/`ldclr`/`ldset`,带上游自己的注释与 lore 链接。`PERCPU_RET_OP(add, add, ldadd)` **本来就是 ldadd,不动** |
+
+非 LSE 回退路径(stxr/ldxr 循环)逐字节不变;LSE 编码是 `ARM64_LSE_ATOMIC_INSN` 启动期
+alternative,无 FEAT_LSE 的核运行时仍走回退分支。**KMI 中性**:纯头文件 asm 宏,不动任何结构体、
+导出符号或 KABI 槽位。归 core(先例 Batch 31 的 `arm64_pte_mkwrite_clean`),组名
+`arm64_lse_percpu_load_atomics`,`scripts/batch34_core_arm64_lse_percpu.py`,2 步全 required,
+注册在 core 末尾。core **40 → 41** 组。
+
+**上游形态改写,不加 ABK 标记**(Batch 31 先例):两个 hunk 都是逐字上游原文,目标形态兼作
+幂等探针 —— 将来若某基线自带 `535fdfc5a228`,逐字节不动、报 `already_present`。
+**未进 linux-5.15.y**(gregkh/linux compare 确认:diverged),按 porting_policy 规则 2 取
+主线形态;四档基线(167/178/194/216)上 `old` 锚点与上游 old 形态**逐字节相同**(在
+android13-5.15-2025-12 的 percpu.h 上核对;8199 字节,与 kci515 参考树一致)。
+
+### 2. 落地前必须核的反面证据:上游曾因此回归
+
+bpf-next 系列「bpf: Optimize recursion detection on arm64」(merge `c2f2f005a1c2`,
+2025-12-21)在提交正文写明:Catalin 的 `535fdfc5a228` 「seems to have caused a regression on
+the fentry benchmark」,并给出 Neoverse-V2(KVM,8 CPU)上的 `bench trig-fentry`:
+
+| 形态 | 吞吐 |
+|---|---|
+| revert 掉该修复 | **51.770 M/s** |
+| bpf-next/master(含该修复) | **43.271 M/s** |
+
+同文另写明:该改动在 **x86-64 上启用会回归 30%**,所以那个 BPF 修复只在 arm64 启用;系列本身
+改用非原子方式做递归检测来补回吞吐。**这是本批最容易被漏掉的证据,归档于此。**
+
+**5.15 是否存在该回归面 —— 落地前已核,结论:不适用,但取舍照记:**
+
+- 5.15 的 `kernel/bpf/trampoline.c` **确实有**这条 per-CPU 原子递归检测路径:
+  `__bpf_prog_enter*()` 里的 `__this_cpu_inc_return(*(prog->active))` 是**返回型**
+  (`PERCPU_RET_OP`,本来就是 ldadd,不受影响);`__bpf_prog_exit*()` 里的
+  `__this_cpu_dec(*(prog->active))` 是**非返回型**,正是本批从 STADD 翻成 LDADD 的那条。
+- 但 **5.15 的 arm64 没有 BPF trampoline 支持**:`arch/arm64/net/bpf_jit_comp.c` 整文件无
+  trampoline 代码、arm64 Kconfig 无相应能力 select(两者都是更晚的上游产物),所以
+  `__bpf_prog_enter*/__bpf_prog_exit*` 在 arm64 5.15 构建里**编译了但不可达** ——
+  `bench trig-fentry` 的回归场景在这棵树上不存在。
+- 因此本组不需要写成「BPF fentry 吞吐换 SRCU 锁延迟」的取舍声明;若未来把 BPF trampoline
+  系列移植到 5.15,必须连同这条记录一起重估。SRCU 侧的收益动机(`srcu_read_{lock,unlock}` 的
+  背靠背 STADD)在 5.15 上原样成立。
+
+### 3. 证据强度(照 Batch 28 先例,如实标注)
+
+- Paul 的 SRCU 发现、上表的 fentry 回归,**全部测在 Neoverse V2 / ARM 服务器核**。
+  Snapdragon 上 store/load 形态的「远/近」执行分界是否同形,**未验证**;
+- 本批**不主张提速**(未做设备 A/B)。它记录的是:改了什么、上游证据从哪来、回归面为何
+  不适用、迁移性未知。真机 A/B(`tools/abk_fas_check.sh` 同族方法)留给后续;
+- 收益方向上对本模块有一个间接理由:本模块自己的批次大量使用 per-CPU 计数(PSI、zram 统计、
+  memcg 事件),SRCU 读锁也在调度/回收路径上 —— 但这些都不构成本批的数字依据。
+
+### 4. 审计与 trap
+
+- `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES` 三处 fixture 同步加
+  `arch/arm64/include/asm/percpu.h`(Batch 31 同款),四棵参考树**重新拉取**(旧树缺该文件,
+  审计会以 `reference tree is missing` 拒绝而不是静默);
+- `implementation_audit.py` 加 `REQUIRED_CONTENT`(load 形态指令串、三个 ld* 实例化、
+  RET_OP 的 ldadd 上下文、lore 链接 —— 后者是这条**无标记**改写留下的痕迹)与
+  `REQUIRED_ABSENT`(store 形态指令串只存在于 `__PERCPU_OP_CASE`,其缺席证明宏真的翻了;
+  三个 st* 实例化逐行钉死,半翻不能过);
+- `smoke.sh` 加同款正反断言(负向用 `grep -E` 一次挡三个 store 实例化);
+- **trap 6 全开**:该头文件被全树包含,改动落在 asm 内联里,四道纯文本审计一道也看不出宏展开
+  是否还能编译。本批的最终门槛是 **ABK CI 四档编译全绿**,文本审计绿灯不收工。
+
+### 5. 验证
+
+- 五道门禁:py_compile / bash -n / stable_5_15_test / step_audit × 4 档 /
+  implementation_audit × 4 档 / smoke × 4 档,全部在拉取的四棵参考树上跑;
+- `sublevel_matrix.py`:core `GROUP_COUNTS` 40 → 41;`PRE_APPLIED` **不变**(四档都不预装,
+  含 lts .216 —— 5.15.y 未收即滚动分支也未收);
+- `module.conf` 0.35.0 → 0.36.0。
+
+---
+
+<a id="batch-35"></a>
+
+## Batch 35(v0.37.0)
+
 主题「文件系统 —— FUSE 与 erofs」。候选三条，**只落一条**：FUSE 的预缺页搬移
 （`faa794dd2e17`）。erofs 那对（`fb176750266a` + `6422cde1b0d5`）与 lib/iov_iter 的
 `770c8d55c428` 都按「前提不存在」排除，FUSE passthrough 按决定不做 —— 四条的去留与证据见 §1/§3，
@@ -407,7 +508,7 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
 
 ### 2. 落地明细
 
-新组 `core:fuse_prefault_out_of_write_path`（`scripts/batch34_core_fuse_erofs.py`，
+新组 `core:fuse_prefault_out_of_write_path`（`scripts/batch35_core_fuse_erofs.py`，
 2 步全 required，注册在 core 末尾、`__main__` 守卫之前）。源是 mainline `faa794dd2e17`
 （「fuse: Move prefaulting out of hot write path」，Dave Hansen，Miklos Szeredi 收，v6.16）。
 
@@ -456,14 +557,17 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
   194/216 各 84695 字节）。用的是手写校验脚本而非 `research/hunks.py`：`.patch` 的上下文是
   6.x 的 folio 形态，转换器在这里用不上（同 Batch 33）。
 - **四档全绿**（167/178/194/216）：`py_compile`、`bash -n`（含 mksh 口径的 tools/ksu 脚本）、
-  `stable_5_15_test.py`（新增 `test_batch34_fuse_prefault_out_of_write_path`：27 项检查，含
+  `stable_5_15_test.py`（新增 `test_batch35_fuse_prefault_out_of_write_path`：27 项检查，含
   trap-2 互斥、「两半不许对调」、上游形态无标记、第二遍逐字节幂等、未知形状降级且不写树，
   以及那条排除守卫 —— 它同时把 `plan.md` 里的排除记录本身钉住，将来谁要移植 erofs 就得先删它
-  并证明前提）、`step_audit`（core **209 / 210 / 201 / 201** 步，四档第二遍全部幂等）、
+  并证明前提）、`step_audit`（core **211 / 212 / 203 / 203** 步，四档第二遍全部幂等）、
   `implementation_audit`（四档本组均 `applied`，并打出 upstream-shape 的
   `no module marker` 说明）、`smoke.sh`（两遍 + 回滚；core pass1 167/178 为
-  `{'applied': 41}`、194 为 `{'already_present': 3, 'applied': 38}`、216 为
-  `{'already_present': 7, 'applied': 34}`，四档 pass2 均 `{'already_present': 41}`）。
+  `{'applied': 42}`、194 为 `{'already_present': 3, 'applied': 39}`、216 为
+  `{'already_present': 7, 'applied': 35}`，四档 pass2 均 `{'already_present': 42}`）。
+  **这些数字是 merge `main` 之后重测的**：并行的 arm64 LSE 组先落地并占用了「Batch 34」
+  与 v0.36.0，故本批改名 **Batch 35 / v0.37.0**、core 计为 42，`step_audit` 的步数与
+  smoke 的 pass1 字典都随之各 +1（差值正是那一组）。
   本批的「两半」是标准审计看不出的那种失败（少一半都能编译、行为都错），所以专门做了
   **变异验证**：把「循环头预缺页加回来」与「重试预缺页删掉」两种错法分别打进已嫁接的树，
   `REQUIRED_IN_FUNCTION` 的函数切片断言两次都报错；`smoke.sh` 的那条否定探针在原始文件上
@@ -478,10 +582,11 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
   实测用那棵临时嫁接树的输出里，归到 `fs/fuse/` 或 `fs/erofs/` 的行数为 **0**。
   连带地，`DARK_GATES` 不需要新增条目：本批**没有**新增任何 `CONFIG_EROFS_FS_*`
   （erofs 整条排除），而 GKI 的 `gki_defconfig` 里本来只有 `CONFIG_EROFS_FS=y` 这一条与 erofs 有关。
-- `GROUP_COUNTS` core 40 → **41**；README 普查 core 40 → **41**、合计 64 → **65**；
-  `module.conf` 0.35.0 → **0.36.0**（单测里钉的那对版本号同步改），两个描述字段各补一句。
+- `GROUP_COUNTS` core 40 → **42**（本组 +1，并行落地并先合并的 arm64 LSE 组 +1）；
+  README 普查 core 40 → **41** 时只算了自己，改按合并后的 41 并补上两个新组；
+  `module.conf` 0.35.0 → **0.37.0**（单测里钉的那对版本号同步改），两个描述字段各补一句。
   顺带修掉两处陈旧数字：三份文档里的「~44 files」（`FETCH_FILES` 实际已是 77 条，本批 +1 后
-  78 条）统一改成 **~78**；`docs/porting_policy.md` 的基线表按 v0.36.0 重新实测
+  78 条）统一改成 **~78**；`docs/porting_policy.md` 的基线表按 v0.37.0 重新实测
   （core 41/41/38+3/34+7、perf 23/22+1/20+3/15+8）—— 那张表标着 v0.34.0，Batch 33 落了组
   却没更新，已经落后两批。
 
@@ -500,7 +605,7 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
 | Standards | 同一段说前提是「194 与 lts 两棵树的 grep」，而 `plan.md` / CHANGELOG 都写成「四条基线」—— 两边必有一处夸大 | 补测 167/178 的 `fs/erofs/`，把「四条基线」**做成事实**：四条 `internal.h` 同为 15955 字节，列出的 10 个符号在四条上各 0 处，`fileio.c` 不在任何一条的 `Makefile` 里 |
 | Standards | 「文件跨基线只差两处」与 CHANGELOG 的「三处」不一致 | 统一成三处（`fuse_dax_break_layouts()` 第三参数、`->len` 截断、`outarg.size` 检查） |
 | Standards | `tests/implementation_audit.py` 里留了一句起草期的死表达式 `"copy_page_from_iter_atomic" if False else "..."`，同时那条 `fault_in_iov_iter_readable(ii, bytes)` 钉的串在两种形态下都成立、没有判别力 | 死表达式删掉；只留两条真正能判别 5.15 page 形态的钉子，顺序与两半由 `REQUIRED_IN_FUNCTION` 负责 |
-| Standards | `docs/porting_policy.md` 的基线表标着 v0.34.0、core 39/39/36/32，落后两批（Batch 33 落了组没更新） | 按 v0.36.0 重新实测更新（见 §4） |
+| Standards | `docs/porting_policy.md` 的基线表标着 v0.34.0、core 39/39/36/32，落后两批（Batch 33 落了组没更新） | 按 v0.37.0 重新实测更新（见 §4） |
 
 表里的行是两轴各自的产出；**第二轮 Spec 审查另外揪出四处「记录不准」**，都不改结论、但都会让记录
 本身不可信，已逐条改掉：
