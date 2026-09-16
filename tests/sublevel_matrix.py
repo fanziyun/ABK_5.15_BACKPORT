@@ -84,7 +84,11 @@ GROUP_COUNTS = {
     # non-LSE fallback path is untouched on cores without FEAT_LSE.
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + this batch's four page-cache/page-table groups.
-    "stable_backport_core": 45,
+    # Batch 36 adds one memcg-stats group (mm/memcontrol.c +
+    # include/linux/memcontrol.h), applying on every baseline: the percpu
+    # stats compaction is 6.10 work no 5.15 tree carries, and the anchors
+    # are byte-identical on all four.
+    "stable_backport_core": 46,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed

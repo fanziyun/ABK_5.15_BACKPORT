@@ -46,6 +46,7 @@ FETCH_FILES=(
   include/linux/cgroup-defs.h
   include/linux/cpuset.h
   include/linux/mmzone.h
+  include/linux/memcontrol.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
   include/linux/psi_types.h

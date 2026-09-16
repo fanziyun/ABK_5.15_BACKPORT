@@ -351,6 +351,116 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 
 <a id="batch-35"></a>
 
+## Batch 36(v0.38.0)
+
+主题「memcg 统计结构的 per-cpu 瘦身」。来源 torvalds/linux v6.10 两条一组：
+`70a64b7919cb`（memcg: dynamically allocate lruvec_stats）+ `ff48c71c26aa`（memcg: reduce
+memory for the lruvec and memcg stats），Shakeel Butt，patch 存
+`research/upstream-5.15.y/patches/`。落地 **1 组**（core）：`memcg_stats_percpu_slim`
+（mm/memcontrol.c + include/linux/memcontrol.h，18 步全 required，单事务）。两条必须一起落：
+动态分配那条单独上是**纯开销**（每 node 多一次 kzalloc、零节省），节省只在数组砍短后出现。
+
+### 1. KMI 实测推翻原判，落地形态因此改写（本批的主线故事）
+
+任务下达时的调研判「只动 mm/memcontrol.c 内部、`struct lruvec_stats` 不是 KABI 可见」——
+**实测为错**：
+
+- `struct mem_cgroup` 被一批导出符号直接纳入 KMI（`mem_cgroup_from_task()`、
+  `get_mem_cgroup_from_mm()`、`mem_cgroup_from_id()`、`lock_page_memcg()` 等），而 5.15 把
+  `struct memcg_vmstats vmstats` **内嵌**在它里面；`struct mem_cgroup_per_node` 经
+  `mem_cgroup::nodeinfo[]` 指针进入 KMI 类型图，同样**内嵌** `struct lruvec_stats`。
+- 拉取 android13-5.15 的 `android/abi_gki_aarch64.xml`（libabigail 格式，14.6 MB）逐一核对，
+  四个结构全部带完整布局在案（`class-decl` + `size-in-bits`）：`lruvec_stats` /
+  `lruvec_stats_percpu` 各 5120 bit（640 B）、`memcg_vmstats` 17024 bit（2128 B）、
+  `memcg_vmstats_percpu` 17216 bit（2152 B）、`mem_cgroup` 32256 bit、
+  `mem_cgroup_per_node` 16448 bit。
+- 两个结构都**没有 `ANDROID_KABI_RESERVE` 槽**；而且本批的动作是「缩小/移除已存在的内嵌
+  数组成员」，reserve 本来就只保护新增 ⇒ **没有任何掩护手段**。
+
+用户拍板：**不接受 KMI break**。忠实移植两条因此不可落地——它们省内存的全部手段就是改这些
+内嵌布局（`ff48c71c26aa` 砍 `state[]`/`state_pending[]` 的宽度直接挪动 `mem_cgroup` 后续
+所有成员；`70a64b7919cb` 把内嵌 `lruvec_stats` 变成指针直接挪动 `mem_cgroup_per_node`）。
+改走 **KMI 中性的私有改写**（偏离上游形态的理由写进组 banner 注释与
+`scripts/abk_stable_core.py` 的注册块）：
+
+- **头文件的结构体定义逐字节不动**——ABI XML 看不出任何差别；唯一的 header 改动是把
+  `lruvec_page_state_local()` 从 inline 挪成 memcontrol.c 里的真函数（static inline 不进
+  ABI、无结构体成员移动、不加导出；它的 inline 体直接按原始下标索引 percpu 对象，对象压缩后
+  会读错槽，所以必须挪）。树内调用者只有 memcontrol.c 自己和 `workingset.c`（实证：整棵
+  mm/ 树 grep，出线后两者都是 built-in，无需导出）。
+- 真正压缩的是**两个 percpu 堆上对象**：它们躺在 `__percpu` 指针字段后面，指针字段的声明
+  类型不变，实体换成 memcontrol.c 私有的 `struct abk_vmstats_percpu` /
+  `struct abk_lruvec_stats_percpu`（字段布局镜像原结构、只缩数组宽度），用
+  `__alloc_percpu_gfp(自定义尺寸)` 在 `mem_cgroup_alloc()` /
+  `alloc_mem_cgroup_per_node_info()` 分配，`free_percpu()` 路径不变。
+- 聚合侧保持全宽、按**原始 enum 下标**（布局 KMI 冻结），于是 rstat flush
+  （`mem_cgroup_css_rstat_flush()`）把每个紧凑 percpu 槽位**映射回 item** 再写聚合数组
+  （state 用 node/memcg 两段表拼接定槽，events 直接查 `memcg_vm_event_items[]`）。这是本组
+  与上游形态最大的分叉点：上游连聚合数组一起缩、两侧同下标，flush 不需要映射。
+- `memcg_stats_index()` / `memcg_events_index()` 对无 memcg 记账的 item 返回 -1、percpu 写
+  丢弃——与 6.10 自己的索引表语义一致（上游同样丢弃表外 item）。`init_memcg_stats()` /
+  `init_memcg_events()` 挂在 root `css_alloc` 分支（上游同位），BUILD_BUG_ON 兜
+  `S8_MAX`。
+
+### 2. 两张 item 表为 5.15 重新推导（不是抄 6.10），并逐项钉死
+
+漏一项 = 该项统计**静默归零**，编译和四道树级审计都看不见（trap 7 的变体：索引查表是运行期
+行为）⇒ 表本身被 `implementation_audit.py` 逐项钉死，访问点被 REQUIRED_IN_FUNCTION 逐函数
+钉死（任何一处漏改都是编译全绿 + 读写错槽）：
+
+- **state 表 = 26 个 node item + 3 个 MEMCG item**。与 v2 `memory_stats[]`、v1
+  `memcg1_stats[]` 两张读出表交叉验证一致，且恰好等于 6.10 自己的
+  `memcg_node_stat_items[]` 去掉 5.15 没有的 `NR_SECONDARY_PAGETABLE`（5.15 的
+  `memcg_stat_item` 只有 MEMCG_SWAP/SOCK/PERCPU_B，没有 VMALLOC/KMEM/ZSWAP_*）。
+  `NR_SWAPCACHE` 与 enum 同门（CONFIG_SWAP）。
+- **events 表 = 15 项**（PGPGIN/PGPGOUT/PGFAULT/PGMAJFAULT/PGREFILL/PGSCAN_KSWAPD/
+  PGSCAN_DIRECT/PGSTEAL_KSWAPD/PGSTEAL_DIRECT/PGACTIVATE/PGDEACTIVATE/PGLAZYFREE/
+  PGLAZYFREED + THP 门内 THP_FAULT_ALLOC/THP_COLLAPSE_ALLOC）。枚举方法：gitiles 打包下载
+  ACK 基线整棵 mm/（114 个文件），`count_memcg_events*`/`count_memcg_page_event`/
+  `count_memcg_event_mm` 写者闭合于八个文件（filemap/huge_memory/khugepaged/memcontrol/
+  memory/shmem/swap/vmscan），并覆盖全部读者（`memory_stat_format()`、v1
+  `memcg1_events[]`、`memcg_events_local()`）。5.15 没有 PSWPIN/PSWPOUT 的 memcg 记账，
+  也没有 ZSWP*/PGSCAN|PGSTEAL_KHUGEPAGED（6.10 表里有，抄不得）。
+- 表内 `#ifdef` 与 enum 定义门严格同门 ⇒ **不新增任何 CONFIG 门**，config_gate 无新增归属。
+
+### 3. 收益（arm64 GKI，SCS=y，单 node 8 核，每 memcg 常驻）
+
+`NR_VM_NODE_STAT_ITEMS` 实测 40、`MEMCG_NR_STAT` 43、`NR_VM_EVENT_ITEMS` 90：
+
+| 结构 | 前 | 后 | 省 |
+|---|---|---|---|
+| `memcg_vmstats_percpu` | 2152 B | 736 B | 1416 B / cpu |
+| `lruvec_stats_percpu` | 640 B | 424 B | 216 B / cpu |
+
+合计 ≈ **13.2 KB/memcg**（8 核）；几百个 memcg 即 MB 级常驻。事件数组是大头：5.15 还是
+90 项全宽（上游在 6.10 之前已缩到 NR_MEMCG_EVENTS=27，`ff48c71c26aa` 不含这一步），所以
+**忠实移植两条在这棵树上反而只有 ~4 KB/memcg**——KMI 约束逼出的私有改写收益更大。代价是
+每次 percpu 访问多一次 int8_t 查表（写路径 O(1)，表在 `__read_mostly`）。上游提交原文的
+21 项/x86_64 数字不适用于本树：5.15 没有 `state_local` 一层，6.10 的 x86_64 配置枚举也更宽。
+
+### 4. 验证（六道门禁四档全绿；ABK CI 真编译与构建闸门未跑）
+
+参考树按新增 `FETCH_FILES`（+`include/linux/memcontrol.h`，同 Batch 31 的 fixture 三处
+先例）**全量重拉**（AGENTS 规则：树缺文件就重拉，不绕过）。
+
+- `python3 -m py_compile scripts/*.py tests/*.py` ✓、`bash -n` 全套 ✓、
+  `python3 tests/stable_5_15_test.py` ✓（matrix 与注册表一致，core 45 → 46）。
+- 四档干跑（167/178/194/216）：`memcg_stats_percpu_slim` **applied 全四档**；194/216 的
+  already_present 计数与 Batch 35 基线状态一致。
+- `step_audit` ×4 OK（每步 applied、注释/括号/#if 平衡、两遍幂等）；`implementation_audit`
+  ×4 OK；`smoke.sh` ×4 OK（端到端两遍 + 回滚逐字节）。
+- **未跑（合并前必须补）**：ABK CI 真编译——本组新增 C 符号多（两个私有结构、4 个 helper、
+  2 张表、1 个出线函数），trap 6/7 类风险只有真编译能兜底；`config_gate_audit` 需当期 tier
+  构建产出的 .config（本组不新增 CONFIG 门，无新增归属可报，陈旧 .config 反而会误报）。
+
+### 5. 并行工作隔离（存档）
+
+本批落地时，工作树里同存着另一份**未提交**的 Batch 37（MGLRU v4 系列，6 组）在制品；其
+`mglru_clean_workingset` / `mglru_rework_aging_feedback` 两组当时在 194/216 上
+`blocked_by_shape`（锚点未过），会连带共享工作树的 step_audit 报红。本批提交经临时 index
+**只包含 Batch 36 的文件集**（不含任何 mglru 改动），上述门禁全部在「HEAD + 仅本批」的隔离
+worktree 里验证；Batch 37 在制品原样留在工作树，由其后续批次自行收尾。
+
 ## Batch 35(v0.37.0)
 
 > **编号让位（已合并完成）**：本批起草时叫 Batch 34 / v0.36.0，撞上了当时并行开着的两条

@@ -647,6 +647,47 @@ REQUIRED_CONTENT = {
         # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
+    # Batch 36.  The tables themselves are pinned (a missing item reads as
+    # zero and neither the compile nor the structural audits can see it), the
+    # allocations must name the compact structs, and the index-table init must
+    # sit in the root css_alloc branch where upstream put its own init call.
+    "core:memcg_stats_percpu_slim": [
+        "ABK stable_515_backport: memcg_stats_percpu_slim",
+        "struct abk_vmstats_percpu",
+        "struct abk_lruvec_stats_percpu",
+        "__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+        "__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+        "static void init_memcg_stats(void)",
+        "static void init_memcg_events(void)",
+        "init_memcg_stats();\n\t\tinit_memcg_events();",
+        "static const unsigned int memcg_node_stat_items[] = {",
+        "static const unsigned int memcg_stat_items[] = {",
+        "static const unsigned int memcg_vm_event_items[] = {",
+
+        # The item tables, item by item: dropping any of these silently zeroes
+        # that stat.  State table = memory_stats[] + memcg1_stats[] readers
+        # (26 node items + 3 MEMCG items); events = every count_memcg_events*/
+        # writer on this baseline (13 + THP pair).
+        "NR_INACTIVE_ANON,\n\tNR_ACTIVE_ANON,\n\tNR_INACTIVE_FILE,\n\tNR_ACTIVE_FILE,\n\tNR_UNEVICTABLE,",
+        "NR_SLAB_RECLAIMABLE_B,\n\tNR_SLAB_UNRECLAIMABLE_B,",
+        "WORKINGSET_REFAULT_ANON,\n\tWORKINGSET_REFAULT_FILE,\n\tWORKINGSET_ACTIVATE_ANON,\n\tWORKINGSET_ACTIVATE_FILE,\n\tWORKINGSET_RESTORE_ANON,\n\tWORKINGSET_RESTORE_FILE,\n\tWORKINGSET_NODERECLAIM,",
+        "NR_ANON_MAPPED,\n\tNR_FILE_MAPPED,\n\tNR_FILE_PAGES,\n\tNR_FILE_DIRTY,\n\tNR_WRITEBACK,\n\tNR_SHMEM,\n\tNR_SHMEM_THPS,\n\tNR_FILE_THPS,\n\tNR_ANON_THPS,\n\tNR_KERNEL_STACK_KB,\n\tNR_PAGETABLE,",
+        "#ifdef CONFIG_SWAP\n\tNR_SWAPCACHE,\n#endif",
+        "MEMCG_SWAP,\n\tMEMCG_SOCK,\n\tMEMCG_PERCPU_B,",
+        "PGPGIN,\n\tPGPGOUT,\n\tPGFAULT,\n\tPGMAJFAULT,\n\tPGREFILL,\n\tPGSCAN_KSWAPD,\n\tPGSCAN_DIRECT,\n\tPGSTEAL_KSWAPD,\n\tPGSTEAL_DIRECT,\n\tPGACTIVATE,\n\tPGDEACTIVATE,\n\tPGLAZYFREE,\n\tPGLAZYFREED,",
+        "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n\tTHP_FAULT_ALLOC,\n\tTHP_COLLAPSE_ALLOC,\n#endif",
+
+        # The header keeps every struct member: nothing may shrink the
+        # KMI-visible aggregates (the group blob spans mm/memcontrol.c and
+        # include/linux/memcontrol.h, so plain strings pin both files).
+        # lruvec_page_state_local() moved out of line, not deleted: the
+        # prototype wrapping is the header's, the longer one the .c body's.
+        "struct lruvec_stats {\n\t/* Aggregated (CPU and subtree) state */\n\tlong state[NR_VM_NODE_STAT_ITEMS];",
+        "struct memcg_vmstats {",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
+        "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
+    ],
+
     # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
     # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
     # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
@@ -1265,6 +1306,128 @@ REQUIRED_IN_FUNCTION = {
           "__free_zspage_lockless(pool, zspage);",
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
+    ],
+    # Batch 36.  The whole change is the mapping: per-cpu slots are compact
+    # and item-indexed, the embedded aggregates stay raw-indexed, and any
+    # accessor still touching vmstats_percpu/lruvec_stats_percpu with a raw
+    # enum index compiles cleanly and reads/writes the wrong slot.  Function
+    # scoping is what pins every site; whole-file must-not-have cannot be used
+    # because the aggregates' own raw-indexed arrays are supposed to stay.
+    "core:memcg_stats_percpu_slim": [
+        ("mm/memcontrol.c", "__mod_memcg_state",
+         ["i = memcg_stats_index(idx);",
+          "if (i < 0)",
+          "abk_vmstats_percpu_of(memcg)->state[i], val"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "memcg_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], cpu"],
+         ["vmstats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__mod_memcg_lruvec_state",
+         ["i = memcg_stats_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->state[i], val",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], val"],
+         ["vmstats_percpu->state[idx]",
+          "lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "__count_memcg_events",
+         ["i = memcg_events_index(idx);",
+          "abk_vmstats_percpu_of(memcg)->events[i], count"],
+         ["vmstats_percpu->events[idx]"]),
+        ("mm/memcontrol.c", "memcg_events_local",
+         ["i = memcg_events_index(event);",
+          "abk_vmstats_percpu_of(memcg)->events[i], cpu"],
+         ["vmstats_percpu->events[event]"]),
+        ("mm/memcontrol.c", "lruvec_page_state_local",
+         ["i = memcg_stats_index(idx);",
+          "abk_lruvec_stats_percpu_of(pn)->state[i], cpu"],
+         ["lruvec_stats_percpu->state[idx]"]),
+        ("mm/memcontrol.c", "mem_cgroup_css_rstat_flush",
+         ["struct abk_vmstats_percpu *statc",
+          "per_cpu_ptr(abk_vmstats_percpu_of(memcg), cpu)",
+          "for (i = 0; i < NR_MEMCG_VMSTAT_SIZE; i++)",
+          "int item = i < NR_MEMCG_NODE_STAT_ITEMS ?",
+          "memcg->vmstats.state[item] += delta",
+          "for (i = 0; i < NR_MEMCG_VM_EVENTS; i++)",
+          "int event = memcg_vm_event_items[i];",
+          "memcg->vmstats.events[event] += delta",
+          "struct abk_lruvec_stats_percpu *lstatc",
+          "per_cpu_ptr(abk_lruvec_stats_percpu_of(pn), cpu)",
+          "for (i = 0; i < NR_MEMCG_NODE_STAT_ITEMS; i++)",
+          "int item = memcg_node_stat_items[i];",
+          "pn->lruvec_stats.state[item] += delta"],
+         ["for (i = 0; i < MEMCG_NR_STAT; i++)",
+          "for (i = 0; i < NR_VM_EVENT_ITEMS; i++)",
+          "for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)"]),
+        ("mm/memcontrol.c", "mem_cgroup_charge_statistics",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
+        ("mm/memcontrol.c", "mem_cgroup_event_ratelimit",
+         ["abk_vmstats_percpu_of(memcg)->nr_page_events",
+          "abk_vmstats_percpu_of(memcg)->targets[target]"],
+         ["vmstats_percpu->nr_page_events",
+          "vmstats_percpu->targets[target]"]),
+        ("mm/memcontrol.c", "alloc_mem_cgroup_per_node_info",
+         ["__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
+          "__alignof__(struct abk_lruvec_stats_percpu)"],
+         ["alloc_percpu_gfp(struct lruvec_stats_percpu"]),
+        ("mm/memcontrol.c", "mem_cgroup_alloc",
+         ["__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
+          "__alignof__(struct abk_vmstats_percpu)"],
+         ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
+    ],
+    # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
+    # change rather than a rewrite is *where* each half sits: the decision in
+    # zap_pte_range()'s tail (not in zap_pmd_range(), where a THP collapse could
+    # have replaced the pmd), the emptiness test before pmd_clear() (the reverse
+    # order frees a page table a skipped entry still points into), and the
+    # gather owned by the caller (a per-VMA gather is what the commit removes).
+    "core:madvise_pt_reclaim": [
+        ("mm/memory.c", "zap_pte_range",
+         ["unsigned long start = addr;",
+          "if (reclaim_pt_is_enabled(start, end, details))",
+          "try_to_free_pte(mm, pmd, start, tlb);"],
+         ["pmd_clear(pmd);"]),
+        ("mm/memory.c", "try_to_free_pte",
+         ["start_pte = pte_offset_map(pmd, addr);",
+          "if (!pte_none(*pte)) {",
+          "pmd_clear(pmd);",
+          "free_pte_page(tlb, pmd, pmdval, addr);"],
+         ["pte_free_tlb"]),
+        # The barrier this tree needs and upstream's helper has no counterpart
+        # for (CONFIG_SPECULATIVE_PAGE_FAULT): without it a reader that holds
+        # the ptl of the page table we are about to free races the free.
+        ("mm/memory.c", "free_pte_page",
+         ["#ifdef CONFIG_SPECULATIVE_PAGE_FAULT",
+          "smp_call_function(wait_for_smp_sync, NULL, 1);",
+          "pte_free_tlb(tlb, token, addr);",
+          "mm_dec_nr_ptes(tlb->mm);"],
+         []),
+    ],
+    "core:madvise_batch_tlb_flush": [
+        ("mm/madvise.c", "do_madvise",
+         ["if (madvise_batch_tlb_flush(behavior)) {",
+          "tlb_gather_mmu(&tlb, mm);",
+          "madvise_walk_vmas(mm, start, end, behavior, tlbp,",
+          "if (tlbp)\n\t\ttlb_finish_mmu(&tlb);"],
+         []),
+        # Batching means exactly that the per-VMA helper no longer gathers.
+        ("mm/madvise.c", "madvise_dontneed_single_vma",
+         ["zap_page_range_single_batched(tlb, vma, start, end - start, &details);"],
+         ["tlb_gather_mmu"]),
+    ],
+    # The pair has to reach both invalidate paths, and the loop bound has to be
+    # the batch size the call site indexes with -- a port that changed only the
+    # helper would pass a whole-file substring check on either half.
+    "core:truncate_shadow_batch_sweep": [
+        ("mm/truncate.c", "__invalidate_mapping_pages",
+         ["int nr = pagevec_count(&pvec);",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
+        ("mm/truncate.c", "invalidate_inode_pages2_range",
+         ["int nr = pagevec_count(&pvec);",
+          "xa_has_values = true;",
+          "clear_shadow_entries(mapping, indices[0], indices[nr-1]);"],
+         []),
     ],
     # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
     # change rather than a rewrite is *where* each half sits: the decision in

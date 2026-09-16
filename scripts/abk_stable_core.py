@@ -4390,5 +4390,39 @@ import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 36: the memcg per-cpu stats objects shrink to the accounted items.
+# Steps live in scripts/batch36_core_memcg_stats_slim.py.
+#
+#   memcg_stats_percpu_slim   mainline 70a64b7919cb + ff48c71c26aa (v6.10,
+#                             Shakeel Butt) -- index the memcg stats arrays
+#                             through item -> slot tables so the per-memcg,
+#                             per-cpu objects only carry items memcg actually
+#                             accounts.  Both commits land as one group: the
+#                             dynamic-allocation half alone buys nothing.
+#
+# KMI reshape, deliberately not the upstream shape: the ABI XML
+# (android/abi_gki_aarch64.xml) tracks struct mem_cgroup and struct
+# mem_cgroup_per_node with full layouts, and 5.15 embeds the memcg_vmstats /
+# lruvec_stats aggregates in them, so upstream's embedded-array shrink cannot
+# land (see plan.md and the batch docstring for the measured verdict).  What
+# lands instead keeps the header byte-identical and compacts only the two
+# per-cpu heap objects behind the unchanged __percpu pointer fields, via
+# private structs and __alloc_percpu_gfp().  The aggregates stay raw-indexed,
+# so the rstat flush maps compact slots back to items.  The item tables are
+# re-derived for 5.15 (memory_stats[]/memcg1_stats[] readers vs the full
+# count_memcg_events* writer set) -- a missing item reads as zero and no text
+# audit can see it, hence the implementation_audit pins.
+#
+# The header edit moves lruvec_page_state_local() out of line (its inline body
+# would index the compacted object with raw offsets); static inline, no
+# struct member moves, no export added.  No other group writes into the stats
+# accessors, the rstat flush or this header, so there is nothing to order
+# against.
+# ============================================================================
+import batch36_core_memcg_stats_slim as _b36_mss  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b36_mss.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()
