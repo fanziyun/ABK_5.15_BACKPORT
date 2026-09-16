@@ -36,8 +36,9 @@ Manual backport is therefore the only path.
   earlier in the same function; the anchor does not touch it, and the decrement
   this group guards sits after it either way.
 
-Deliberately NOT ported (recorded so this does not get re-litigated).  5.15 has
-three places that move this counter, and this batch touches one:
+Deliberately NOT ported (recorded so this does not get re-litigated).  5.15 moves
+this counter in four places -- one increment, three decrements -- and this batch
+touches the concurrent-fault decrement only, leaving the other three as they are:
 
 * the increment side: ``do_sync_mmap_readahead()`` (untouched -- it is what the
   guard restores the balance with).

@@ -461,7 +461,9 @@ KMI 无影响：inline helper 内部两行，不增删任何导出结构成员�
 ### 1. 来源与判定：为什么搬
 
 上游 `e338d8353154`《mm: readahead: improve mmap_miss heuristic for concurrent faults》
-（Roman Gushchin，author 2025-08-15，akpm 2025-09-13 合入 ⇒ **v6.18**，12 小时合入窗口内无改动）。
+（Roman Gushchin，author 2025-08-15；GitHub API 上 committer 是 akpm、committer date
+2025-09-13T23:55:04Z，即它进入 mm-stable 的时间点 ⇒ **v6.18** —— `.patch` 本身只带 author
+日期与 `Signed-off-by`，合入日期取自 API，记在这里免得日后被当成无来源的数字）。
 hunk 只有一处、11+/3−：`do_async_mmap_readahead()` 里那句 `--ra->mmap_miss` 加
 `likely(!folio_test_locked(folio))` 守卫。
 
@@ -550,6 +552,37 @@ hunk 只有一处、11+/3−：`do_async_mmap_readahead()` 里那句 `--ra->mmap
 
 `step_audit` / `implementation_audit` / `smoke.sh`（两遍幂等 + 回滚字节一致）四档全部通过；
 本批不新增任何 CONFIG 门，故 `config_gate_audit` 不受影响（它需要构建产物，由 CI 运行覆盖编译面）。
+
+### 7. 编译门禁（ABK CI run 35058941428，success）
+
+推送到 `origin/main`（`61fd88f`）后用 ABK CI 复跑完整构建（`kernel-custom.yml`，android13-5.15-lts，
+`custom_external_modules` 与参考 run 34891009037 逐字相同），结论 **success**，22 分钟。
+
+**先证「模块真的在跑」，再谈结果**：run 页面上不会出现外部模块（两次 run 的页面都一样），
+模块的唯一痕迹在 build job 日志里。本 run 的日志逐条对上：
+
+```
+克隆自定义外部模块 #5 (after_patch/module_set_child): https://github.com/fanziyun/ABK_5.15_BACKPORT
+克隆自定义外部模块 #6 (after_patch/module_set_child): https://github.com/fanziyun/ABK_5.15_BACKPORT
+克隆自定义外部模块 #7 (after_patch/module_set_child): https://github.com/fanziyun/ABK_5.15_BACKPORT
+  head_sha: 61fd88fa9787da614cca13f8d4fdc37098bf3eed      <- 本批提交
+  branch: main
+执行自定义外部模块 [after_patch] https://github.com/fanziyun/ABK_5.15_BACKPORT   ×3
+[ABK stable_515_backport] stable_backport_core/readahead_mmap_miss_race: applied
+[ABK stable_515_backport] stable_backport_core: {"already_present": 6, "applied": 31}
+[ABK stable_515_backport] stable_perf_backport: {"already_present": 8, "applied": 15}
+[ABK stable_515_backport] stable_display_fix: {"applied": 1}
+[ABK module] injected abk-ksu-modules/abk_runtime_tunables.zip and the installer block into .../AnyKernel3/anykernel.sh
+```
+
+- 三档状态与本地 `.216` 审计**逐条一致**（core 6/31、perf 8/15、display applied 1），共 64 行报告；
+- companion 也真的进了产物：`abk-ksu-modules/abk_runtime_tunables.zip` + 安装块被写进 AnyKernel3 的
+  `anykernel.sh`（产物 `None_kernel-android13-5.15-X`，80.7 MB）；
+- 全日志 ` error:` / `no member named` 命中 **0** 条 —— `PageLocked(page)` 这一笔在真实编译里过了。
+
+一次真机/CI 侧的经验也记在这里：workflow_dispatch 的 run 页面**不显示**输入与外部模块，日志在
+job 结束前也下载不到（`actions/jobs/<id>/logs` 一直 404），所以「绿了」本身**不能**当作「模块跑过」
+的证据 —— 要落到日志里的 `head_sha` 与 `[ABK stable_515_backport]` 那几行才算数。
 
 <a id="batch-29"></a>
 
