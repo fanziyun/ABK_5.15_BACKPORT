@@ -110,10 +110,11 @@ PRE_APPLIED = {
     # audited and drift surfaces before the baseline ships.
     # This is a rolling branch, so re-check these two sets -- and re-key this
     # row to the new Makefile SUBLEVEL -- when re-fetching it.
-    # Both .211 blockers from plan.md are closed on this row: the kstack KABI
-    # slot probe learned the slot-1-taken 2..8 RESERVE shape (so the group
-    # really applies here), and the blk-mq suspend path arrived upstream-first
-    # so it is recorded in PRE_APPLIED instead of KNOWN_DEBT.
+    # Both .211 blockers are closed on this row (CHANGELOG.md#batch-19, and the
+    # plan.md index line for Batch 5): the kstack KABI slot probe learned the
+    # slot-1-taken 2..8 RESERVE shape (so the group really applies here), and
+    # the blk-mq suspend path arrived upstream-first so it is recorded in
+    # PRE_APPLIED instead of KNOWN_DEBT.
     "216": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",

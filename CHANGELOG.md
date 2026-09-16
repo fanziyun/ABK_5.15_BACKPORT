@@ -14,9 +14,9 @@
 |---|---|---|---|---|
 | 1 | 优化内存分配 | Batch 13 | v0.18.0 | `android_vh_customize_alloc_gfp` 逐字移植 + ABK 消费者（第 4 条） |
 | 2 | 优化线程调度 | Batch 13（调研） | — | 四条基线逐字自带 → **不建组**；调度面见第 5 条 |
-| 3 | 空实现修复 | Batch 16 | v0.21.0 | `offload_all` **接上**，`se->slice` / nohz 死面**删掉** |
+| 3 | 空实现修复 | Batch 16 | v0.21.0 | `offload_all` **接上**，`se->slice` / nohz 死面**删掉**（其中 `se->slice` 槽 4 在 **Batch 28** 因重建后的 EEVDF 有了真实读取点而**重新认领**，见第 5 项） |
 | 4 | 低内存立刻触发碎片回收 | Batch 13 | v0.18.0 | `abk_gfp_fastfail`：order ≥ 9 的尝试加 `NORETRY\|NOWARN` |
-| 5 | 添加 EEVDF | Batch 15 → **Batch 28** | v0.20.0 → **v0.31.0** | Batch 15 选择器 14 步 + `sched_entity` 槽 1–4 认领；**Batch 28 按 `docs/survey_eevdf_gap.md` 的差异审计重建**：O(1) 累加器 + `RUN_TO_PARITY` + EEVDF 唤醒抢占 + `PREEMPT_SHORT` + EEVDF yield |
+| 5 | 添加 EEVDF | Batch 15 → **Batch 28** | v0.20.0 → **v0.31.1** | Batch 15 选择器 14 步 + `sched_entity` 槽 1–4 认领；**Batch 28 按 `docs/survey_eevdf_gap.md` 的差异审计重建**：O(1) 累加器 + `RUN_TO_PARITY` + EEVDF 唤醒抢占 + `PREEMPT_SHORT` + EEVDF yield |
 | 6 | 添加 async_depth | Batch 15 | v0.20.0 | 真正的 `q->async_depth` 策略（9 文件）+ `request_queue` 槽 1 |
 | 7 | back port zram writeback | Batch 14/17/18/23 | v0.19.0 → v0.28.0 | 正确性 → compressed writeback → sepolicy → 编译门 |
 | 8 | 优化 I/O 瓶颈（bio batching） | Batch 17 | v0.22.0 | 上游 v6.19 系列，用 5.15 自己的 `UNDER_WB`/`IDLE` 改写 |
@@ -58,7 +58,7 @@ Batch 16（v0.21.0）。方法不是读代码，而是拿**完整 GKI 树**（30
 
 | 空实现 | 事实 | 处置 |
 |---|---|---|
-| `se->slice`（KMI 级） | `include/linux/sched.h:582` 的槽 4 在全树只出现两次：声明，以及 `kernel/sched/fair.c:746` 的 `se->slice = slice;`；`abk_eevdf_slice()` 写它之后返回的是**局部变量**，0 个读取点 | 槽 4 退回 `ANDROID_KABI_RESERVE(4)`，删掉那次写入，并修正 fair.c 里「四个字段它都读」的错误注释（另三个 `deadline`/`vlag`/`min_vruntime` 逐个查过，都有真实读点，保留） |
+| `se->slice`（KMI 级） | `include/linux/sched.h:582` 的槽 4 在全树只出现两次：声明，以及 `kernel/sched/fair.c:746` 的 `se->slice = slice;`；`abk_eevdf_slice()` 写它之后返回的是**局部变量**，0 个读取点 | 槽 4 退回 `ANDROID_KABI_RESERVE(4)`，删掉那次写入，并修正 fair.c 里「四个字段它都读」的错误注释（另三个 `deadline`/`vlag`/`min_vruntime` 逐个查过，都有真实读点，保留）。**后续（Batch 28）**：重建后的 EEVDF 让 `se->slice` 有了真实读取点，槽 4 **重新认领**为 `ANDROID_KABI_USE(4, u64 slice)` |
 | `offload_all` 恒为 false | `kernel/rcu/tree_nocb.h` 的两处赋值分别落在 `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` 与 `CONFIG_NO_HZ_FULL` 门内，而**两个宏都没开** → Batch 8 的 rcu_nocb 嫁接编译得进去、永远不执行。根因很具体：该组往 `kernel/rcu/Kconfig` 加了 `config RCU_NOCB_CPU_DEFAULT_ALL`（`default n`），**没有任何 tier 启用它** | **接上**：加进 `_MODULE_CONFIGS`，让嫁接真正生效 |
 | nohz 四个谓词 + 两个 `EXPORT_SYMBOL_GPL` | `nohz_cpu_state_test()`/`nohz_cpu_inidle()`/`nohz_cpu_idle_active()`/`nohz_cpu_tick_stopped()` 在完整树里**文件外调用者为 0**，而 `nohz_cpu_state_test()` 的唯一调用者就是另外三个 | 判为**死 KMI 面**：删四个谓词与两个导出；`nohz_cpu_idle_calls()` 降为 file-local `static`（它确实还被两个 debugfs reader 用）。真正在干活的部分保留：`enum nohz_cpu_state` + `abk_tick_nohz_state_flags()` + tick-sched.c 的五个读取点 |
 | Batch 14 在出厂配置下等于调用一个空函数 | Batch 14 的 34 行新增代码全落在 `#ifdef CONFIG_ZRAM_WRITEBACK` 内，而实测 `.config` 是 `# CONFIG_ZRAM_WRITEBACK is not set`（原始 gki_defconfig 只有 `CONFIG_ZRAM=m`） | **保持 ROM tier opt-in，不改默认行为**：设备实测该 ROM 不启用 writeback（`vendor.zram.disable=1`、mmd 从不完成），默认打开只会在别的 ROM 上白送一个吃闪存寿命的能力 |
@@ -499,7 +499,7 @@ companion `abk_zram_writeback_sweep`（source 模块脚本后单独调用）：
 
 <a id="batch-28"></a>
 
-## Batch 28(v0.31.0)
+## Batch 28(v0.31.0 → v0.31.1)
 
 起因是一次 **EEVDF 现代版本差异审计**：不再问「EEVDF 有没有」，而问「5.15 上这套 EEVDF
 比 Linux 6.6 → 7.3 还缺什么」。审计原文 845 行，落在
@@ -859,6 +859,70 @@ state after on : EEVDF
 - **`sched_setattr(sched_runtime)` 现在对普通任务开放**（上游语义、上游钳位 100us..100ms），
   是否要在 SELinux 侧收紧不由本批次决定。
 
+<a id="batch-27"></a>
+
+## Batch 27(companion v0.11.0)
+
+起因：用户要求「查找优化 `launch_boost` 解决冷启动过慢」。本批**不引入任何 `PatchGroup`**
+—— registry 与 `GROUP_COUNTS` 未动，`module.conf` 本批不改（工作树里的 0.30.1 是并行的
+zram writeback 修复批次改的），只 bump companion 的 `module.prop`，沿用 Batch 25 先例。
+完整原文、脚本与原始输出：**`research/launch/vermeer_launch_20260915/FINDINGS.md`**。
+
+### 1. 点名：`launch_boost` 不是内核特性，而且当前完全没在运行
+
+真机逐条核实（vermeer）：
+
+- 它是**小米的用户态应用启动预取栈**：`xiaomi.launch_boost.readahead-ndk.so` 暴露 AIDL
+  `ILbReadahead`（`readahead_start` / `readahead_finish` / `readahead_abort` /
+  `readahead_clear` / `readahead_flush_all`），由 `init.launch_boost.rc` 拉起 `iorapd`；
+- **而且当前完全没在运行**：`iorapd=stopped`、`PrereadEnable=false`、AIDL 服务未注册、
+  无内核节点、无 `CONFIG_LAUNCH_BOOST`、`kallsyms` 无符号。
+
+内核侧没有这个东西可调，用户态那条链也没在跑 —— 所以按用户裁定「先测量归因再定」+
+「先只做判定观测」，本批只交付工装，**不指名任何杠杆**。
+
+### 2. 交付物
+
+- `tools/abk_launch_bench.sh` —— 每次启动记录 `TotalTime`、启动窗口内每簇
+  `cap_view`/`ceilings`、主线程落在最大簇的占比、应用 cpuset 是否含超大核、
+  `pswpin`/`pgpgin` 与 PSI io。
+- companion 接线（`embed.conf` / `action.sh launch` / README）+ 单测
+  `test_batch27_launch_bench`。
+
+工装的三条硬规则写进代码：**拒绝**把没测到的数报成数、拒绝从样本不足的窗口下结论、
+**拒绝在息屏或锁屏的机器上测量**。
+
+### 3. 工装自己在真机上暴露并修掉的四个缺陷
+
+`${v%%|*}` 在本机 mksh 不可靠；processor 字段剥离正则在本机 comm 下永不匹配、`$37` 读到
+恒 0 的 `cnswap`，**导致四十次启动报「0/714 在超大核」**；`echo "\t"` 不展开；中位数函数
+键前缀错。
+
+### 4. 一条已钉进工具的方法学结论
+
+丢 page cache 后读页数涨 5–340 倍而 `TotalTime` 只涨 11–29%，故「**读了很多页**」≠
+「**在等这些页**」：存储份额只能由 `--save`/`--compare` 的**两臂延迟差**给出，
+**单臂不再允许判 I/O 受限**。
+
+### 5. 为什么本批不引用任何数字
+
+唯一一次两臂完整的会话（`mt_on_big 28.9%`、`cap_inv 2.1%`）原始日志被后一轮覆盖，而后一轮
+同样「看似完整」却测的是一台**锁屏**手机 —— 两者在原始文件里**分不出来**，故不引用。
+这是本批「**归因待重测**」的全部含义，也是 §2 那条「拒绝在锁屏机器上测量」的由来。
+
+### 6. 版本号：为什么是 v0.11.0（而 v0.10.0 从未落盘）
+
+本批与 v0.30.1 的 zram writeback 修复落在**同一个提交**（`25d8f30`）。那个批次的 companion
+改动已声明 v0.10.0（见上方 v0.30.1 节 §4），而 companion 的 `module.prop` 全仓库只有一份，
+于是本批取 **v0.11.0** 避开它 —— 实际结果是 `module.prop` 从 `v0.9.3` 直接跳到 `v0.11.0`，
+**v0.10.0 从未写进文件**。
+
+### 7. 重测前提（两条命令与判据不在这里另立）
+
+设备必须**亮屏且已解锁**（`mDreamingLockscreen=false`）；`svc power stayon true` 在电池上
+无效。远程预热、两臂命令与三条判据（ceiling bound / placement bound / 存储份额）见
+`research/launch/vermeer_launch_20260915/FINDINGS.md` §5。
+
 <a id="batch-26"></a>
 
 ## Batch 26(v0.30.0)
@@ -1006,7 +1070,7 @@ A/B 的**符号**第一次是不确定的（§5.1 上表：一次负、两次正
 
 <a id="batch-25"></a>
 
-## Batch 25(companion v0.9.0，已落地；两态 A/B 待真机)
+## Batch 25(companion v0.9.0，已落地；两态 A/B 真机已做)
 
 Batch 21 把 per-cgroup PSI 开关（`cgroup.pressure`）graft 进内核，Batch 22 收了 PSI 家族的
 内部同步，**但那个开关从落地那天起没被按过一次**。这一批是它的设备侧策略：不加任何
@@ -1361,25 +1425,52 @@ Batch 17 加的三个块漏了。
 
 ### 5. PSI 家族结清后的下一步：per-VMA locks 实测结论
 
-backlog 上只剩 **per-VMA locks** 与 DAMON sysfs（§[~]§，价值已经评过）。本轮顺手给它做了
-实测探针（§tmp/ref515mm§ vs §tmp/ref61mm§，同一批文件两边取），三条结论见 §plan.md§ 那一节，
-要点：**KMI 不是阻塞点**（5.15 的 §struct vm_area_struct§ 末尾就有 4 个 §ANDROID_KABI_RESERVE§ 槽，
-而 6.1 只需 §int vm_lock_seq§ + 一个**指针**），**6.1 代码不能直接搬**（长在 maple tree 上），
-**真正的量在写侧**（11 个抽样文件里 §vma_start_write()§ 就 42 处、per-VMA API 83 处，5.15 侧为 0，
-漏一处是静默内存损坏）。给出的推进方式是**先做只读侧**（fault 路径解除 mmap_lock 读竞争，
-写者继续走 mmap_lock 写锁 → 无漏写者风险），写侧 retouch 与"枚举所有 VMA 变更点"的新审计
-放在后续批次。
+backlog 上只剩 **per-VMA locks** 与 DAMON sysfs（`[~]`，价值已经评过）。本轮顺手给它做了实测探针
+（`tmp/ref515mm` vs `tmp/ref61mm`，同一批文件两边取）。三条结论，**前两条与旧记载不同**：
+
+1. **KMI 不是阻塞点**：5.15 的 `struct vm_area_struct` 末尾就有 4 个 `ANDROID_KABI_RESERVE` 槽
+   （`include/linux/mm_types.h:431-434`，共 32 字节），而 6.1 的方案只需要 `int vm_lock_seq` +
+   `struct vma_lock *vm_lock`（锁体是**单独分配**的，不内联）—— 空间够，且用法正是模块已有的
+   `ANDROID_KABI_USE` 规则。
+2. **真正的工作量在写侧**：6.1 里 `vma_start_write()` 有 **42 处调用点**（仅在本次抽样的 11 个
+   文件里就有），per-VMA 锁 API 合计 **83 处**（`mm/mmap.c` 27、`mm/userfaultfd.c` 17、
+   `mm/memory.c` 14、`include/linux/mm.h` 15、`mmap_lock.h` 5、其余分散）。5.15 侧**一处都没有**
+   （零基础设施）。真实总数还要加上本次未抽样的 `fs/userfaultfd.c`、`mm/mlock.c`、
+   `mm/mempolicy.c`、`arch/arm64/mm/fault.c` 等 —— 也就是**上百处**需要正确插入写锁的 VMA
+   变更点，漏一处就是**静默的内存损坏**，不是"降级"。
+3. **6.1 的实现不能直接搬**：它长在 maple tree 上（`vma_lookup()`/`mas_walk()`，`mm.h` 里 4 处），
+   5.15 是 rbtree —— 必须按 rbtree 时代的 RFC 形态写：`find_vma()` 在 RCU 下读 VMA，
+   `vma->vm_lock_seq` 判定可读性，fault 入口仍走 `arch/arm64/mm/fault.c`。
+
+**结论**：不是"能不能"的问题，而是**验证策略**的问题。现有四道门禁里只有 `implementation_audit`
+能证明"内容在"，没有一道能证明"**没有漏掉写者**"。要动这个项目，得先加一类新审计：枚举树里所有
+VMA 变更点（`vm_start`/`vm_end`/`vm_flags`/`vm_pgoff`… 的写者）并与 `vma_start_write()` 调用点
+做集合比对，任何差集即失败。规模估计：`mm/` + `arch/arm64/mm/` + `fs/userfaultfd.c` 约 15-20 个
+文件、100+ 步，属于"多批次项目"，不是单批 bounded graft。
+
+**建议**：若要推进，先做**只读侧的核**（`lock_vma_under_rcu()` + `vma_start_read`/`vma_end_read` +
+`vm_lock` 分配）并让写侧仍走 mmap_lock 写锁（即"per-VMA lock 只用于读，写者暂不 retouch"）——
+这样可编译、可验证、fault 路径立刻受益，且**没有漏写者的静默风险**；写侧 retouch 作为后续批次，
+与新审计一起落地。
 
 <a id="batch-21"></a>
 
 ## Batch 21(v0.26.0)
 
 起因：Batch 20 结清上游 5.15.y 来源线后，backlog 上剩下的**全是架构级**候选。本批啃掉第一条
-—— android14-6.1 的 **per-cgroup PSI 开关（`cgroup.pressure`）**。Batch 20 留下的可行性探针
-已经把布局结论写进 `plan.md`：`struct psi_group` 是 `struct cgroup` 的**内嵌成员**（其后还有
-`bpf`/`congestion_count`/`freezer`/柔性数组 `ancestor_ids[]`），所以 ACK 6.1 的 `bool enabled`
-加不进任何一方；但 5.15 的 `iterate_groups()` 本来就走 cgroup 树，6.1 新加的 `parent` 指针也
-不需要。于是「cgroup KMI 红线」剩下的唯一约束就是**别动布局**：本批用 cgroup 自己的 `flags`
+—— android14-6.1 的 **per-cgroup PSI 开关（`cgroup.pressure`）**。
+
+**设计输入（Batch 20 之后记录的可行性探针）**：5.15 树上 `struct cgroup` / `struct psi_group` /
+`psi_group_cpu` **零 KABI 标记**（`cgroup-defs.h` / `psi_types.h` 里都没有 `ANDROID_KABI_*`），
+对照 `include/linux/sched.h` 的 17 处 —— 也就是说「cgroup KMI 红线」这条理由**没有被机械检查
+支撑**：它约束的是 out-of-tree 模块对 `struct cgroup` 布局的假设，不是本模块自己的 KABI 台账。
+真正的约束是**布局**：`struct psi_group` 是 `struct cgroup` 的**内嵌成员**（其后还有
+`struct cgroup_bpf bpf;`、`atomic_t congestion_count;`、`struct cgroup_freezer_state freezer;`
+和柔性数组 `u64 ancestor_ids[];`），所以 ACK 6.1 的 `bool enabled` 加不进任何一方，开关只能
+复用已有的位宽空间；而 5.15 的 `iterate_groups()` 本来就走 cgroup 树，6.1 新加的 `parent`
+指针也不需要。
+
+于是「cgroup KMI 红线」剩下的唯一约束就是**别动布局**：本批用 cgroup 自己的 `flags`
 （`unsigned long`）承载状态位 `CGRP_PSI_DISABLED`，两个结构体一个字节都不动。
 `module.conf` 0.25.0 → **0.26.0**，`GROUP_COUNTS` perf **20 → 21**。
 
@@ -1957,6 +2048,73 @@ Enforcing 下能拿到这个收益。
 早于本实验 200 秒以上）。写侧 `zram-policy.sh` 里「compressed writeback … halves the flash traffic」
 的注释与实测不符，已改成 CPU 口径（纯注释，不改行为、不动版本号）。
 
+### 9. 同日复测：直接测量并发深度（全程 Enforcing）
+
+§8 的性能数据是在 permissive 下测的。同日用 `research/zram/vermeer_batch17_check/b17_inflight.sh`
+在 **Enforcing** 下重测（Batch 18 的规则就位之后，原始输出 `raw/13-inflight-and-cwb-enforcing.txt`），
+仪器是 `block_rq_issue` / `block_rq_complete` tracepoint。
+
+**为什么不能靠数 bio / 数 I/O 来验证 batching**：移植后的路径**每页仍然只建一个请求**
+（`bio_init(&req->bio, &req->bio_vec, 1)` + `bio_add_page(&req->bio, req->page, PAGE_SIZE, 0)`），
+只是异步提交、最多 `wb_batch_size` 个同时在飞。所以请求数 / bio 数 / 总扇区数在 batch=1 与
+batch=256 下**逐字节相同** —— 实测 **7690 请求 / 61520 扇区 / `bd_stat` 相同**，6 次重复无一例外。
+**batching 买的是并发深度，不是更少的 I/O。** 这同时纠正了「打开 20 个应用看 `bd_stat`」这类
+测法：它连方向都指错了。
+
+| batch | 在飞峰值 | 时间加权平均 | issue 间隔 p50 | 请求数 | 扇区 | vcs | 任务 CPU |
+|---|---|---|---|---|---|---|---|
+| 1 | **1** | 0.60 | 90 µs | 7690 | 61520 | 7693 | 29 j |
+| 8 | **8** | 6.36 | 8 µs | 7690 | 61520 | 1897 | 6 j |
+| 32 | **32** | 28.69 | 10 µs | 7690 | 61520 | 1812 | 11 j |
+| 256 | **128** | 108.07 | 9 µs | 7690 | 61520 | 324 | 9 j |
+
+6 次重复下**在飞峰值恒等于 1 / 8 / 32**，无一次例外 —— batching 的机制到此不再依赖墙钟推断。
+三点必须一起读：
+
+1. **峰值 == batch，而请求数与扇区数完全不变**：这是「并发、未合并」的判据。
+2. **batch=256 的峰值只有 128**：loop 设备的 `queue/nr_requests` 实测为 **128**，所以
+   `wb_batch_size` 再往上加也压不进更深的队列。这是**设备属性，不是移植缺陷**；真实旋钮上限
+   应视作 `min(wb_batch_size, 128)`。
+3. **issue 间隔 p50 从 ~90–220 µs 掉到 4–13 µs**：batch=1 每页要等一个完整来回，batch≥8 是连续灌入。
+
+**墙钟不是这台设备上的可靠判据**（方法论，重要）：同一配置 batch=1 在 6 次运行里墙钟
+**430–1970 ms**（相差 4.6 倍），batch=32 为 140–420 ms —— 设备自身的负载波动远大于待测差异。
+稳定判据是**自愿上下文切换**（batch=1 中位 ~7590，约等于页数；batch=32 中位 ~2043，**3.7×**）
+与**任务 CPU jiffy**（中位 41 → 12 j，**3.6×**）。因此 §8 里那个「**17×**」不要当作可复现的
+规格 —— 那是 64MiB 数据集、当时较空闲的设备、且 permissive 下的数字；本轮既没有复现也没有
+推翻它（条件不同）。可复现的说法是「**上下文切换与任务 CPU 各降到约 1/3.7**」。
+
+**cwb 只复现了方向**：读侧系统级 CPU 中位 **+39%**（§8 是 +48%，方向一致、量级本轮无法分辨），
+写侧落在 jiffy 分辨率之内；`bd=[7690 7690 7690]` 两模式相同，**§8「cwb 不减少 4K 写次数」
+再次成立**。12 个单元格全部 `rc=0` / `md5=EQ` / `zram_avc=0` —— Batch 18 那条规则在 Enforcing
+下覆盖整个矩阵（§8 当时只验过 2 个单元格）。
+
+### 10. 运行期现实：这台设备上 writeback 根本不会被触发
+
+§8/§9 证明了代码路径正确，但同时暴露出一个更基础的事实 —— **当前配置下没有任何东西会去触发
+writeback**，所以这两个特性在本机是「**不可达**」，而不是「收益小」：
+
+| 证据 | 观察值 |
+|---|---|
+| `mmd` 进程 | **不存在**（`ps -A` 只有 `vendor.xiaomi.hardware.swap@1.0-service`） |
+| `init.svc.mmd_setup` | `stopped`（开机 33.8s 跑过一次 oneshot 后退出） |
+| `vendor.zram.disable` | **`1`** |
+| `losetup -a` 的 loop49（zram0 的后备设备） | `/dev/block/loop49: [64819]:313194 ()` —— **文件名是空的**，即后备文件已被 unlink，loop 设备还挂着那个孤立 inode |
+| `/data/per_boot/zram/` | 只剩本次实验的 `b17_probe.img`，**ROM 自己的后备文件不在** |
+| zram0 本次开机 615 秒后 `bd_stat` | `[1 0 1]` —— 那 1 块来自我们自己的实验 |
+| companion 侧 | `abk_zram_attach_writeback()` 只**挂/保**后备设备，**没有任何一处写 `writeback` 节点** |
+
+含义：**「连续打开 20 个应用」不可能测到这两个特性** —— 应用启动走的是 zram 压缩/换出热路径，
+而 batching 与 cwb 都在 `writeback_store()` 里；本机连一次 writeback 都不会发生，预期差异恒等于 0。
+这不是测法不够灵敏，而是**被测路径没有被进入**。因此 Batch 17/18 的代码在本机当前配置下是
+**未被执行过的代码**（除我们的实验）。它是否值得保留取决于是否要让 writeback 真的跑起来 ——
+这是产品决策，不是性能决策：要跑起来必须有人 (a) 让 ROM 的 mmd 回来（其后备文件现在已被 unlink），
+或 (b) 让 companion 自己按预算发 sweep（`echo <age> > idle` + `echo idle > writeback`，受
+`writeback_limit` 约束）。后者会给闪存写入量，且 cwb 的盈亏平衡点在 §8 的读回率 ~25–30% ——
+而**真实读回率目前无人测过**。下一个该测的不是启动 20 个应用，而是一次**计数研究**：在真实
+使用的一段时间里记录 `bd_stat` / `io_stat` / `/proc/swaps` 的增量，以及写回后被读回的页比例。
+本轮**没有改任何内核或模块代码**，版本号不动。
+
 <a id="batch-16"></a>
 
 ## Batch 16(v0.21.0)
@@ -2024,6 +2182,9 @@ GKI 树**当消费者语料做静态反查，再把结果与 **CI 复刻构建�
   （反向检查只覆盖 module tier：align tier 的符号来自 6.6 GKI defconfig，不是本模块引入的。）
 - [x] `tests/implementation_audit.py` 增加 `REQUIRED_ABSENT`：上述被删符号不得回归；
   `tests/smoke.sh` 的槽位断言由「必须占槽 4」改为「必须退回 `ANDROID_KABI_RESERVE(4)`」。
+  （**Batch 28 把这条槽位断言改了回去** —— `tests/smoke.sh` 现在断言
+  `ANDROID_KABI_USE(4, u64 slice);`，因为重建后的 EEVDF 有真实读取点。`REQUIRED_ABSENT`
+  里 nohz 那部分不受影响，仍钉着。）
 
 ### 验证
 
@@ -2285,6 +2446,15 @@ push，当前凭据不可用，远端仍在 `a016643`）。
   zsmalloc 映射 API（`zs_obj_read_begin/end`），并且与本模块
   `zram_recompression` 的 `zram_read_from_zspool()`、以及
   ABK_ABI_PATCH_SUITE 的 `compressed_writeback` 控制面**同名冲突**。
+
+  > **后续更正（Batch 17 落地后回填）**：上面这条「延后」的**两条理由已全部证伪**，
+  > 两者均已作为 **Batch 17(v0.22.0)** 落地。batching 不需要连 pp-slot 机制一起搬
+  > （in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE` 表达）；
+  > compressed writeback 也不卡在现代 zsmalloc 映射 API 上（5.15 `zs_map_object()`
+  > 已为跨页对象返回连续副本，`zstrm->buffer` 就是 5.15 版的 bounce buffer）。
+  > 那条「同名冲突」只在共注入 `ABK_ABI_PATCH_SUITE` 时成立，而该套件自 Batch 15 起
+  > 已禁止共注入 —— 也就是说它是**组合约束**，不是本特性自己的阻塞点。
+  > 「延后」这个判断本身没有错（当时的边界确实存在），错的是把它当成终局。
 - `be48c412f6eb`（拒绝零长度 backing device，5.15.168 才进）——**不补**：
   5.15.167 是唯一缺它的基线，而它**不是**本批的编辑输入（teardown 不依赖它），
   单独成组也做不干净（替换文本必然包含原始护栏块，在 178/194/216 上无法区分
