@@ -485,7 +485,7 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 `70a64b7919cb`（memcg: dynamically allocate lruvec_stats）+ `ff48c71c26aa`（memcg: reduce
 memory for the lruvec and memcg stats），Shakeel Butt，patch 存
 `research/upstream-5.15.y/patches/`。落地 **1 组**（core）：`memcg_stats_percpu_slim`
-（mm/memcontrol.c + include/linux/memcontrol.h，18 步全 required，单事务）。两条必须一起落：
+（mm/memcontrol.c + include/linux/memcontrol.h，19 步全 required，单事务）。两条必须一起落：
 动态分配那条单独上是**纯开销**（每 node 多一次 kzalloc、零节省），节省只在数组砍短后出现。
 
 ### 1. KMI 实测推翻原判，落地形态因此改写（本批的主线故事）
@@ -577,6 +577,11 @@ memory for the lruvec and memcg stats），Shakeel Butt，patch 存
   already_present 计数与 Batch 35 基线状态一致。
 - `step_audit` ×4 OK（每步 applied、注释/括号/#if 平衡、两遍幂等）；`implementation_audit`
   ×4 OK；`smoke.sh` ×4 OK（端到端两遍 + 回滚逐字节）。
+- **提交前复审抓到并修复一处漏网站点**：`uncharge_batch()` 对
+  `vmstats_percpu->nr_page_events` 的直接访问在首轮站点枚举中被截断输出漏掉——
+  编译照常通过、字段名相同，但紧凑结构里偏移已变，等于每次 uncharge 都在读写错位
+  内存。已补第 19 步，并把「整文件禁裸访问」（`vmstats_percpu->`/`lruvec_stats_percpu->`
+  的字段访问串）加进 REQUIRED_ABSENT，让这类半移植从今往后必被门禁拦下。
 - **未跑（合并前必须补）**：ABK CI 真编译——本组新增 C 符号多（两个私有结构、4 个 helper、
   2 张表、1 个出线函数），trap 6/7 类风险只有真编译能兜底；`config_gate_audit` 需当期 tier
   构建产出的 .config（本组不新增 CONFIG 门，无新增归属可报，陈旧 .config 反而会误报）。

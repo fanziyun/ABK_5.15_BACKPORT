@@ -533,6 +533,22 @@ _RATELIMIT_WRITE_NEW = (
 )
 
 # ---------------------------------------------------------------------------
+# Step 7b: the v1 uncharge path -- uncharge_batch() adds to nr_page_events
+# directly (found by re-enumerating every vmstats_percpu dereference on the
+# patched tree; the first enumeration pass stopped at the charge/ratelimit
+# sites and missed this one).
+# ---------------------------------------------------------------------------
+
+_UNCHARGE_OLD = (
+    "\t__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);\n"
+)
+
+_UNCHARGE_NEW = (
+    "\t__this_cpu_add(abk_vmstats_percpu_of(ug->memcg)->nr_page_events,\n"
+    "\t\t\t ug->nr_memory);\n"
+)
+
+# ---------------------------------------------------------------------------
 # Step 8: the two allocation sites.  The declared pointer types are unchanged;
 # the objects behind them shrink to the compact structs.
 # ---------------------------------------------------------------------------
@@ -830,8 +846,9 @@ INIT_PAIR = "init_memcg_stats();\n\t\tinit_memcg_events();"
 
 
 def build_steps():
-    """Eighteen required steps (tables+helpers insert, accessors, allocations,
-    the index-table init call site, the rstat flush, and the header move), all
+    """Nineteen required steps (tables+helpers insert, accessors -- charge,
+    ratelimit and the v1 uncharge_batch() page-event add -- allocations, the
+    index-table init call site, the rstat flush, and the header move), all
     on one transaction.
 
     All required: a tree that compacts the allocation but leaves one raw
@@ -848,6 +865,7 @@ def build_steps():
         (MEMCONTROL_C, _COUNT_EVENTS_OLD, _COUNT_EVENTS_NEW, T),
         (MEMCONTROL_C, _EVENTS_LOCAL_OLD, _EVENTS_LOCAL_NEW, T),
         (MEMCONTROL_C, _NR_PAGE_EVENTS_OLD, _NR_PAGE_EVENTS_NEW, T),
+        (MEMCONTROL_C, _UNCHARGE_OLD, _UNCHARGE_NEW, T),
         (MEMCONTROL_C, _RATELIMIT_READ_OLD, _RATELIMIT_READ_NEW, T),
         (MEMCONTROL_C, _RATELIMIT_WRITE_OLD, _RATELIMIT_WRITE_NEW, T),
         (MEMCONTROL_C, _PN_ALLOC_OLD, _PN_ALLOC_NEW, T),

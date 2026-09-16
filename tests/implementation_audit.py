@@ -837,6 +837,22 @@ REQUIRED_CONTENT = {
 # file only, for absence claims a *neighbouring* group's legitimate content
 # in a shared file would otherwise defeat).
 REQUIRED_ABSENT = {
+    # Batch 36.  Whole-file absence of the raw per-cpu dereferences: every
+    # access now goes through the abk_ helpers, so any surviving
+    # "vmstats_percpu->" / "lruvec_stats_percpu->" field access compiles
+    # cleanly and indexes the compacted object with the old offsets.  This
+    # is the check that catches a half-converted accessor the
+    # function-scoped pins do not cover.
+    "core:memcg_stats_percpu_slim": [
+        "vmstats_percpu->state[idx]",
+        "vmstats_percpu->events[idx]",
+        "vmstats_percpu->events[event]",
+        "vmstats_percpu->nr_page_events",
+        "vmstats_percpu->targets[target]",
+        "lruvec_stats_percpu->state[idx]",
+        "alloc_percpu_gfp(struct memcg_vmstats_percpu",
+        "alloc_percpu_gfp(struct lruvec_stats_percpu",
+    ],
     "perf:psi_oncpu_state_mask": [
         # The counter and the old "identical state makes the walk safe" trick
         # have to be gone, not merely bypassed: both were the failure mode.
@@ -1485,6 +1501,12 @@ REQUIRED_IN_FUNCTION = {
           "abk_vmstats_percpu_of(memcg)->targets[target]"],
          ["vmstats_percpu->nr_page_events",
           "vmstats_percpu->targets[target]"]),
+        # uncharge_batch() adds to nr_page_events outside the charge/ratelimit
+        # pair; missing it compiles cleanly and corrupts the v1 page-event
+        # counters on every uncharge (the first enumeration pass missed it).
+        ("mm/memcontrol.c", "uncharge_batch",
+         ["abk_vmstats_percpu_of(ug->memcg)->nr_page_events"],
+         ["vmstats_percpu->nr_page_events"]),
         ("mm/memcontrol.c", "alloc_mem_cgroup_per_node_info",
          ["__alloc_percpu_gfp(sizeof(struct abk_lruvec_stats_percpu)",
           "__alignof__(struct abk_lruvec_stats_percpu)"],
