@@ -2525,7 +2525,99 @@ echo 0 > "$T1/game/memory.usage_in_bytes"
 CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T1" --group game --list
 echo "v1_list_zero_rc=$?"
 
-rm -rf "$T" "$T1" "$T1E"
+# --frozen-only: a group is a target only while the platform keeps it frozen,
+# which is the judgement that makes a per-UID root safe to point at.  The v2
+# layout carries the answer itself.
+T2=$(mktemp -d)
+mkdir -p "$T2/apps/uid_2001" "$T2/apps/uid_2002"
+echo 536870912 > "$T2/apps/uid_2001/memory.current"
+echo 555 > "$T2/apps/uid_2001/memory.reclaim"
+echo 1 > "$T2/apps/uid_2001/cgroup.freeze"
+echo 536870912 > "$T2/apps/uid_2002/memory.current"
+echo 555 > "$T2/apps/uid_2002/memory.reclaim"
+echo 0 > "$T2/apps/uid_2002/cgroup.freeze"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T2" --frozen-only
+echo "FR_RC=$?"
+echo "FR_FROZEN=$(cat "$T2/apps/uid_2001/memory.reclaim")"
+echo "FR_THAWED=$(cat "$T2/apps/uid_2002/memory.reclaim")"
+sh "{tool_sh}" --cgroup-root "$T2" --frozen-only --list > "$T2/list.txt" 2>&1
+echo "FR_LIST_RC=$?"
+echo "FR_LIST_MARKS=$(grep -c 'not frozen' "$T2/list.txt")"
+echo "FR_LIST_FROZEN=$(grep -c 'uid_2001' "$T2/list.txt")"
+
+# A v1 tree whose groups carry no freezer node of their own: the question is
+# bridged to the tree that does the freezing, matched by the name both trees
+# give the group.
+T3=$(mktemp -d)
+T3F=$(mktemp -d)
+mkdir -p "$T3/uid_3001" "$T3/uid_3002" "$T3F/apps/uid_3001/pid_7" "$T3F/apps/uid_3002/pid_8"
+for g in 3001 3002; do
+  echo 268435456 > "$T3/uid_$g/memory.usage_in_bytes"
+  echo 555 > "$T3/uid_$g/memory.reclaim"
+done
+echo 1 > "$T3F/apps/uid_3001/pid_7/cgroup.freeze"
+echo 0 > "$T3F/apps/uid_3002/pid_8/cgroup.freeze"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T3" --frozen-only --freezer-root "$T3F"
+echo "BR_RC=$?"
+echo "BR_FROZEN=$(cat "$T3/uid_3001/memory.reclaim")"
+echo "BR_THAWED=$(cat "$T3/uid_3002/memory.reclaim")"
+
+# The bridge is keyed on uid_*: a vendor group named something else has no
+# counterpart to ask, so the filter must leave it alone rather than guess one.
+mkdir -p "$T3/mimd"
+echo 268435456 > "$T3/mimd/memory.usage_in_bytes"
+echo 555 > "$T3/mimd/memory.reclaim"
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T3" --group mimd --frozen-only --freezer-root "$T3F" >/dev/null 2>&1
+echo "BR_NAMED_RC=$?"
+echo "BR_NAMED=$(cat "$T3/mimd/memory.reclaim")"
+
+# Without --frozen-only the filter is off: the pair stays a deliberate choice
+# rather than a new default that silently narrows every existing sweep.
+CFR_ONE_SHOT=1 sh "{tool_sh}" --cgroup-root "$T3" --freezer-root "$T3F" >/dev/null 2>&1
+echo "NOFILTER_RC=$?"
+echo "NOFILTER_THAWED=$(cat "$T3/uid_3002/memory.reclaim")"
+
+# --cached-only: AOSP's rank for a cached app (oom_score_adj >= 900), which is
+# the signal that exists on a platform that does not freeze.  Every task, not
+# any -- the write reclaims the group as a whole, so one visible process in it
+# would be reclaimed with the cached ones.  The rank is read through
+# CFR_PROC_ROOT so the fixture is a fixture and not the host's own /proc.
+T4=$(mktemp -d)
+T4P=$(mktemp -d)
+T4F=$(mktemp -d)
+mkdir -p "$T4/uid_4001" "$T4/uid_4002" "$T4/uid_4003" "$T4/uid_4004"
+mkdir -p "$T4P/11" "$T4P/21" "$T4P/22" "$T4P/41"
+for g in 4001 4002 4003 4004; do
+  echo 268435456 > "$T4/uid_$g/memory.usage_in_bytes"
+  echo 555 > "$T4/uid_$g/memory.reclaim"
+done
+echo 11 > "$T4/uid_4001/tasks"; echo 900 > "$T4P/11/oom_score_adj"
+echo "21 22" > "$T4/uid_4002/tasks"
+echo 905 > "$T4P/21/oom_score_adj"; echo 100 > "$T4P/22/oom_score_adj"
+: > "$T4/uid_4003/tasks"
+echo 41 > "$T4/uid_4004/tasks"; echo 899 > "$T4P/41/oom_score_adj"
+CFR_ONE_SHOT=1 CFR_PROC_ROOT="$T4P" sh "{tool_sh}" --cgroup-root "$T4" --cached-only
+echo "CO_RC=$?"
+echo "CO_CACHED=$(cat "$T4/uid_4001/memory.reclaim")"
+echo "CO_MIXED=$(cat "$T4/uid_4002/memory.reclaim")"
+echo "CO_EMPTY=$(cat "$T4/uid_4003/memory.reclaim")"
+echo "CO_BELOW=$(cat "$T4/uid_4004/memory.reclaim")"
+CFR_PROC_ROOT="$T4P" sh "{tool_sh}" --cgroup-root "$T4" --cached-only --list > "$T4/list.txt" 2>&1
+echo "CO_LIST_RC=$?"
+echo "CO_LIST_MARKS=$(grep -c 'not fully cached' "$T4/list.txt")"
+echo "CO_LIST_KEPT=$(grep -c 'uid_4001' "$T4/list.txt")"
+
+# The two filters compose: a group must satisfy both when both are given.
+mkdir -p "$T4P/uid_4002/pid_5"
+mkdir -p "$T4F/apps/uid_4001/pid_9"
+echo 1 > "$T4F/apps/uid_4001/pid_9/cgroup.freeze"
+echo 555 > "$T4/uid_4001/memory.reclaim"
+CFR_ONE_SHOT=1 CFR_PROC_ROOT="$T4P" sh "{tool_sh}" --cgroup-root "$T4" \
+  --frozen-only --freezer-root "$T4F" --cached-only >/dev/null 2>&1
+echo "BOTH_RC=$?"
+echo "BOTH_KEPT=$(cat "$T4/uid_4001/memory.reclaim")"
+
+rm -rf "$T" "$T1" "$T1E" "$T2" "$T3" "$T3F" "$T4" "$T4P" "$T4F"
 '''
     r = run_shell(driver)
     got = {}
@@ -2568,6 +2660,39 @@ rm -rf "$T" "$T1" "$T1E"
           got.get("RC_GROUP_TRAVERSAL") == "2", r.stdout)
     check("cfr daemon --list still names a group that is currently empty",
           got.get("v1_list_zero_rc") == "0" and "/game" in r.stdout, r.stdout)
+    check("cfr daemon --frozen-only sweeps a frozen group and spares a thawed one",
+          got.get("FR_RC") == "0"
+          and got.get("FR_FROZEN") == "536870912"
+          and got.get("FR_THAWED") == "555", r.stdout)
+    check("cfr daemon --frozen-only --list names the group it left out",
+          got.get("FR_LIST_RC") == "0"
+          and got.get("FR_LIST_MARKS") == "1"
+          and got.get("FR_LIST_FROZEN") == "1", r.stdout)
+    check("cfr daemon --freezer-root bridges a v1 group to the tree that freezes it",
+          got.get("BR_RC") == "0"
+          and got.get("BR_FROZEN") == "268435456"
+          and got.get("BR_THAWED") == "555", r.stdout)
+    check("cfr daemon --frozen-only will not guess for a named group",
+          got.get("BR_NAMED_RC") == "1" and got.get("BR_NAMED") == "555", r.stdout)
+    check("cfr daemon sweeps an unfiltered root whole without --frozen-only",
+          got.get("NOFILTER_RC") == "0"
+          and got.get("NOFILTER_THAWED") == "268435456", r.stdout)
+    check("cfr daemon --cached-only sweeps a fully cached group (adj >= 900)",
+          got.get("CO_RC") == "0"
+          and got.get("CO_CACHED") == "268435456", r.stdout)
+    check("cfr daemon --cached-only spares a group that also holds a visible task",
+          got.get("CO_MIXED") == "555", r.stdout)
+    check("cfr daemon --cached-only spares a group with no readable task",
+          got.get("CO_EMPTY") == "555", r.stdout)
+    check("cfr daemon --cached-only spares a group just below the cached rank",
+          got.get("CO_BELOW") == "555", r.stdout)
+    check("cfr daemon --cached-only --list names each group it left out",
+          got.get("CO_LIST_RC") == "0"
+          and got.get("CO_LIST_MARKS") == "3"
+          and got.get("CO_LIST_KEPT") == "1", r.stdout)
+    check("cfr daemon composes --frozen-only with --cached-only",
+          got.get("BOTH_RC") == "0"
+          and got.get("BOTH_KEPT") == "268435456", r.stdout)
 
 
 def test_batch10_zram_trigger_script():
@@ -3005,6 +3130,42 @@ def test_runtime_tunables_module():
     check("cfr.group is a known tunables.conf key",
           "cfr.group" in common_sh
           and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
+    # A per-UID tree on this ROM is one level below the root the tool searches
+    # (/dev/memcg/mimd), and it holds the app on screen as well as the cached
+    # ones -- so reaching it and restricting it are one change, not two: an
+    # extra root without the frozen filter would reclaim the foreground app.
+    check("the cfr supervisor can reach a deeper per-UID tree",
+          "abk_cfg cfr.cgroup_root" in policy
+          and '--cgroup-root $_cf_r' in policy
+          and '$_cf_root_args' in policy)
+    check("the cfr supervisor can restrict a sweep to frozen (cached) groups",
+          "abk_cfg cfr.frozen_only" in policy
+          and '--frozen-only' in policy
+          and "abk_cfg cfr.freezer_root" in policy
+          and '--freezer-root $_cf_freezer' in policy)
+    check("a freezer root without the frozen filter is dropped, not passed inert",
+          '[ "$_cf_frozen" = 1 ] || _cf_freezer=""' in policy)
+    # The frozen filter needs a platform that freezes.  This one does not (the
+    # freezing had been an installed extension), so the rank-based filter is
+    # the one that decides anything here -- and it must be a separate knob, not
+    # a reinterpretation of the frozen one.
+    check("the cfr supervisor can restrict a sweep to the platform's cached rank",
+          "abk_cfg cfr.cached_only" in policy and '--cached-only' in policy
+          and "cached_only=$_cf_cached" in policy)
+    check("the cfr tool documents both filters it implements",
+          "--frozen-only" in cfr_tool and "--freezer-root" in cfr_tool
+          and "--cached-only" in cfr_tool and "oom_score_adj" in cfr_tool
+          and "uid_*" in cfr_tool)
+    check("the cached rank is AOSP's CACHED_APP_MIN_ADJ, not an invented one",
+          "ABK_CACHED_APP_MIN_ADJ=900" in cfr_tool
+          and 'if [ "$_gc_adj" -lt "$ABK_CACHED_APP_MIN_ADJ" ]' in cfr_tool)
+    check("a task that exits mid-walk cannot take the sweep down with it",
+          '2>/dev/null || true)"' in cfr_tool)
+    for key in ("cfr.cgroup_root", "cfr.frozen_only", "cfr.freezer_root",
+                "cfr.cached_only"):
+        check(f"{key} is a known tunables.conf key",
+              key in common_sh
+              and re.search(r"(?m)^\s*" + re.escape(key) + r"=", tunables) is not None)
 
     # "Never touches a read-only partition" is about the Android partitions
     # (/system, /vendor, /odm, /product).  /sys/devices/system/... is sysfs, which

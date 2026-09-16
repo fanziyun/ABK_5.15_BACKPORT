@@ -780,10 +780,20 @@ abk_cfr_supervisor_main() {
   _cf_freeze="$(abk_cfg cfr.freeze 0)"
   _cf_quota="$(abk_cfg cfr.quota_mb '')"
   _cf_group="$(abk_cfg cfr.group '')"
+  _cf_roots="$(abk_cfg cfr.cgroup_root '')"
+  _cf_frozen="$(abk_cfg cfr.frozen_only 0)"
+  _cf_freezer="$(abk_cfg cfr.freezer_root '')"
+  _cf_cached="$(abk_cfg cfr.cached_only 0)"
   abk_is_uint "$_cf_interval" || _cf_interval=300
   [ "$_cf_interval" -ge 30 ] || _cf_interval=30
   case "$_cf_freeze" in 0|1) ;; *) _cf_freeze=0 ;; esac
+  case "$_cf_frozen" in 0|1) ;; *) _cf_frozen=0 ;; esac
+  case "$_cf_cached" in 0|1) ;; *) _cf_cached=0 ;; esac
   abk_is_uint "$_cf_quota" || _cf_quota=0
+  # The freezer root is only ever read by the frozen filter, so carrying one
+  # with the filter off would put a flag in the argv that does nothing -- and
+  # the log line would then advertise a protection the sweep is not applying.
+  [ "$_cf_frozen" = 1 ] || _cf_freezer=""
 
   if [ ! -f "$_cf_tool" ]; then
     abk_warn "$_cf_tool is missing; proactive reclaim disabled"
@@ -794,19 +804,28 @@ abk_cfr_supervisor_main() {
   for _cf_g in $_cf_group; do
     _cf_group_args="$_cf_group_args --group $_cf_g"
   done
+  # Extra roots are appended to the two built-ins, never substituted for them:
+  # a ROM whose per-UID groups sit deeper still keeps the shallow ones swept.
+  _cf_root_args=""
+  for _cf_r in $_cf_roots; do
+    _cf_root_args="$_cf_root_args --cgroup-root $_cf_r"
+  done
 
-  abk_log "proactive reclaim supervisor up: interval=${_cf_interval}s freeze=$_cf_freeze quota=${_cf_quota}MiB groups=${_cf_group:-<uid_*>}"
+  abk_log "proactive reclaim supervisor up: interval=${_cf_interval}s freeze=$_cf_freeze quota=${_cf_quota}MiB groups=${_cf_group:-<uid_*>} roots=${_cf_roots:-<default>} frozen_only=$_cf_frozen cached_only=$_cf_cached freezer_root=${_cf_freezer:-<none>}"
   while :; do
-    _cf_args="--cgroup-root $ABK_SYS_ROOT/fs/cgroup --cgroup-root $ABK_MEMCG_ROOT"
+    _cf_args="--cgroup-root $ABK_SYS_ROOT/fs/cgroup --cgroup-root $ABK_MEMCG_ROOT$_cf_root_args"
     [ "$_cf_freeze" = "1" ] && _cf_args="$_cf_args --freeze"
     [ "$_cf_quota" -gt 0 ] && _cf_args="$_cf_args --quota-mb $_cf_quota"
+    [ "$_cf_frozen" = "1" ] && _cf_args="$_cf_args --frozen-only"
+    [ -n "$_cf_freezer" ] && _cf_args="$_cf_args --freezer-root $_cf_freezer"
+    [ "$_cf_cached" = "1" ] && _cf_args="$_cf_args --cached-only"
     _cf_args="$_cf_args$_cf_group_args"
 
     # shellcheck disable=SC2086 # _cf_args is a deliberately word-split flag list
     if CFR_ONE_SHOT=1 sh "$_cf_tool" $_cf_args >/dev/null 2>&1; then
-      abk_log "proactive reclaim sweep done (freeze=$_cf_freeze quota=${_cf_quota}MiB groups=${_cf_group:-<uid_*>})"
+      abk_log "proactive reclaim sweep done (freeze=$_cf_freeze quota=${_cf_quota}MiB groups=${_cf_group:-<uid_*>} frozen_only=$_cf_frozen cached_only=$_cf_cached)"
     else
-      abk_warn "proactive reclaim found no reclaimable group (groups=${_cf_group:-<uid_*>})"
+      abk_warn "proactive reclaim found no reclaimable group (groups=${_cf_group:-<uid_*>} frozen_only=$_cf_frozen cached_only=$_cf_cached)"
     fi
     sleep "$_cf_interval"
   done

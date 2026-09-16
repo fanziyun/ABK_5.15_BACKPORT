@@ -408,10 +408,38 @@ remove.
   module. On v1 a group also needs `memory.reclaim`, which only exists with that
   repository's `memcg_v1_reclaim` graft -- without it the tool says so instead of
   reporting a successful no-op. This ROM keeps the memory controller on v1 with
-  **named** groups (`freeze-app`, `game`, `mimd`, `protect_memcg_*`) and no
-  `uid_*` at all, so a per-UID sweep finds nothing here: select the groups to
-  sweep with `cfr.group` (or run the tool by hand with `--group NAME --list`
-  first).
+  **named** groups (`freeze-app`, `game`, `mimd`, `protect_memcg_*`), and its
+  per-UID groups sit one level below the roots the tool searches: all 87 of them
+  live under `mimd`, none at the top. A per-UID sweep of the default roots
+  therefore finds nothing here, and there are two ways to reach the real ones.
+  Name the groups directly with `cfr.group` (`freeze-app`, `game`) -- both read 0
+  except at the instant the ROM parks an app, so this route reclaims almost
+  nothing. Or name the deeper directory as an extra root with
+  `cfr.cgroup_root=/dev/memcg/mimd`, which reaches 1.5 GiB across 87 groups; but
+  a per-UID tree holds the app on screen as well as the cached ones, so that
+  route needs one of the two cached-app filters below.
+* **Which groups are cached apps, and why there are two filters.** Neither
+  filter is a guess about names: both ask the platform. `cfr.cached_only` asks
+  the rank -- AOSP puts every process of a cached app at or above
+  `CACHED_APP_MIN_ADJ` (900) and nothing a user can see reaches it -- and
+  `cfr.frozen_only` asks the freezer. The rank is the wider of the two and the
+  one that does not wait to be told: the freezer only parks a process after it
+  has been cached a while. Measured on this device 2026-09-16 (after an
+  installed extension that had been doing the freezing was switched off, which
+  is what makes the numbers the platform's own): **0** frozen in the first
+  minutes after boot, then exactly **1** -- a GMS unstable process at adj 945 --
+  stable there for the next seven minutes, while `--cached-only` selected **14**
+  groups in the same run. `cfr.frozen_only` stays for the device that freezes
+  more eagerly, and because it is the stronger promise of the two: a frozen app
+  cannot fault its pages back, a merely cached one can. Both filters require
+  **every** task in the group to qualify, not any of them, because the write
+  reclaims the group as a whole. They compose. A bounded sweep of the
+  `--cached-only` set moved `cfr_reclaim_reclaimed` from 0 to 29 448 pages, and
+  two control groups holding a visible process (`uid_10142` at adj 0, `uid_10205`
+  at 100) moved by 0.2% and 0.7% across it -- runtime noise, not reclaim, where a
+  reclaim would have taken up to the 16 MiB quota from each. Run the tool by hand
+  with `--list` first; it prints what it would touch and names each group it left
+  out.
 * Exactly **two** SELinux rules are shipped (`sepolicy.rule`, submitted at
   post-fs-data): `allow kernel zram_data_file file { read write }` and
   `allow kernel extm_data_file file { read write }` -- one per backing-file

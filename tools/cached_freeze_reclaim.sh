@@ -40,15 +40,55 @@
 # --group NAME, which is explicit on purpose so a sweep can never wander into a
 # vendor group nobody asked for.
 #
+# Discovery stops at the root and the root's apps/ -- it never descends.  Naming
+# the directory that holds them as an extra root is how a ROM that nests its
+# per-UID groups deeper gets reached (HyperOS keeps all of them under mimd/);
+# widening the walk instead would decide on the tool's behalf that every
+# directory it can reach is a target:
+#
+#   --cgroup-root /dev/memcg/mimd        # uid_* under mimd become the targets
+#
+# ...but a per-UID tree is not a cached-app tree.  Reclaiming the app the user
+# is looking at swaps its working set out and refaults it on the next touch, so
+# "this group holds memory" must not be read as "this group may be swept".
+# --frozen-only is what makes a deeper root safe: a group stays a target only
+# while the platform is keeping it frozen, which is the same judgement AOSP's
+# CachedAppOptimizer makes before it reclaims.  A group carrying its own freezer
+# node answers for itself; this ROM's v1 memcg groups carry neither
+# cgroup.freeze nor freezer.state, so --freezer-root bridges the question to the
+# tree that does the freezing, matching a group to the v2 group of the same
+# name:
+#
+#   --frozen-only --freezer-root /sys/fs/cgroup
+#
+# Without --frozen-only the pair changes nothing, and an unfiltered sweep of a
+# per-UID root reclaims from every app on the device, foreground included.
+#
+# --cached-only answers the same question from a signal that is always there:
+# AOSP ranks every process of a cached app at or above CACHED_APP_MIN_ADJ (900),
+# and nothing a user can see reaches it.  A group is a target only while EVERY
+# task in it is at or above that rank, because the write reclaims the group --
+# one visible process among them would be reclaimed with the rest.  This is the
+# wider of the two and the one that does not wait for the platform to act: the
+# freezer only parks a process after it has been cached a while (measured on
+# this ROM: none in the first minutes after boot, then one, where the rank was
+# already right on the first pass).  It needs no bridge and works anywhere /proc
+# does.  It is the weaker promise of the two, though: a cached app is still
+# runnable, so the pages can be faulted straight back, while a frozen one cannot
+# fault at all.  The two compose -- with both given, a group has to satisfy both.
+#
 # Usage:
 #   cached_freeze_reclaim.sh [--dry-run] [--freeze] [--list] [--interval SECS]
 #                            [--quota-mb N] [--cgroup-root PATH] [--uid UID] ...
-#                            [--group NAME] ...
+#                            [--group NAME] ... [--frozen-only]
+#                            [--freezer-root PATH] [--cached-only]
 # Defaults: interval 60s, no quota cap (0 = write memory.current whole),
-# no freezing, roots /sys/fs/cgroup then /dev/memcg, per-UID groups.
+# no freezing, no filter, roots /sys/fs/cgroup then /dev/memcg,
+# per-UID groups.
 # Environment: CFR_ONE_SHOT=1 runs a single sweep and exits (used by the
 # runtime companion module's supervisor); CFR_ALLOW_EMPTY=1 lets the daemon loop
-# start even when no cached group is visible.
+# start even when no cached group is visible; CFR_PROC_ROOT points the cached-app
+# rank lookup at a fixture tree instead of /proc, for the tests.
 # Exit codes: 0 ok, 2 bad usage, 1 runtime failure (including "no cached group
 # found", which is the condition that would otherwise hide a silent no-op).
 set -eu
@@ -56,15 +96,22 @@ set -eu
 DRY_RUN=0
 DO_FREEZE=0
 DO_LIST=0
+FROZEN_ONLY=0
+CACHED_ONLY=0
+FREEZER_ROOT=""
 INTERVAL=60
 QUOTA_MB=0
 ROOTS=""
 UIDS=""
 GROUP_NAMES=""
 DEFAULT_ROOTS="/sys/fs/cgroup /dev/memcg"
+PROC_ROOT="${CFR_PROC_ROOT:-/proc}"
 
 usage() {
-  sed -n '2,53p' "$0"
+  # The manual is everything between the shebang and the first line of code, so
+  # a line added to it cannot silently truncate the help the way a hardcoded
+  # range does.
+  sed -n '2,/^[^#]/p' "$0" | sed '$d'
   exit 2
 }
 
@@ -78,6 +125,9 @@ while [ $# -gt 0 ]; do
     --cgroup-root) ROOTS="$ROOTS $2"; shift 2 ;;
     --uid) UIDS="$UIDS $2"; shift 2 ;;
     --group) GROUP_NAMES="$GROUP_NAMES $2"; shift 2 ;;
+    --frozen-only) FROZEN_ONLY=1; shift ;;
+    --cached-only) CACHED_ONLY=1; shift ;;
+    --freezer-root) FREEZER_ROOT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "unknown arg: $1" >&2; usage ;;
   esac
@@ -188,6 +238,75 @@ set_frozen() {
   return 1
 }
 
+# Is the platform keeping this group frozen right now?  That, and not the
+# group's byte count, is what makes it a cached app rather than one the user is
+# looking at, and it is the only question --frozen-only asks.
+#
+# Two layouts answer it themselves.  A third carries neither node, which is the
+# case on a ROM that mounts memory on v1 and freezes on v2: there the question
+# is bridged to the tree that does the freezing, by the name both trees give the
+# group.  The bridge is deliberately keyed on uid_* -- a vendor group called
+# something else has no counterpart to ask, and guessing one would be the very
+# "wander into a group nobody asked for" this tool refuses to do.
+group_is_frozen() {
+  if [ -f "$1/cgroup.freeze" ]; then
+    if [ "$(cat "$1/cgroup.freeze" 2>/dev/null)" = "1" ]; then
+      return 0
+    fi
+    return 1
+  fi
+  if [ -f "$1/freezer.state" ]; then
+    if [ "$(cat "$1/freezer.state" 2>/dev/null)" = "FROZEN" ]; then
+      return 0
+    fi
+    return 1
+  fi
+  [ -n "$FREEZER_ROOT" ] || return 1
+  case "${1##*/}" in uid_*) ;; *) return 1 ;; esac
+  # Same two parents discovery searches, so --freezer-root takes a root of the
+  # same shape --cgroup-root does: the freezer's own cgroup root, not the apps/
+  # directory under it.
+  for _gf_parent in "$FREEZER_ROOT/apps" "$FREEZER_ROOT"; do
+    for _gf_node in "$_gf_parent/${1##*/}"/pid_*/cgroup.freeze; do
+      [ -f "$_gf_node" ] || continue
+      if [ "$(cat "$_gf_node" 2>/dev/null)" = "1" ]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# AOSP's rank for the least important cached process.  Every process of a cached
+# app sits at or above it, and nothing the user can see does.
+ABK_CACHED_APP_MIN_ADJ=900
+
+# Is every task in this group ranked as cached?  Every, not any: the write
+# reclaims the group as a whole, so a single visible process sharing the uid
+# would be reclaimed along with the cached ones -- which is exactly the harm
+# this filter exists to prevent.  A group whose tasks cannot be read is not a
+# target either; "unknown" must not decay into "safe".
+#
+# The /proc reads are the expensive half of the walk -- a busy uid can hold
+# hundreds of tasks -- so the caller runs this after the cheaper checks, and the
+# first non-cached task ends the question.
+group_is_cached() {
+  _gc_seen=0
+  for _gc_t in $(cat "$1/tasks" 2>/dev/null); do
+    # || true: a task that exited between the listing and the read is churn, but
+    # an assignment from a failing substitution carries that failure's status
+    # and `set -e` would take the whole sweep down with it.
+    _gc_adj="$(cat "$PROC_ROOT/$_gc_t/oom_score_adj" 2>/dev/null || true)"
+    [ -n "$_gc_adj" ] || continue
+    case "$_gc_adj" in ''|*[!0-9]*) return 1 ;; esac
+    _gc_seen=$(( _gc_seen + 1 ))
+    if [ "$_gc_adj" -lt "$ABK_CACHED_APP_MIN_ADJ" ]; then
+      return 1
+    fi
+  done
+  [ "$_gc_seen" -gt 0 ]
+}
+
 CFR_FOUND=0
 CFR_SWEPT=0
 
@@ -198,6 +317,25 @@ sweep_once() {
 
   while read -r dir; do
     [ -n "$dir" ] || continue
+
+    # A group the platform is not holding frozen, or does not rank as cached, is
+    # not an app this sweep may touch -- and on a per-UID root it is very likely
+    # the one on screen.  --list names what it left out rather than dropping it
+    # silently, so "would not touch this" stays distinguishable from "never saw
+    # it".  Frozen is the cheaper question, so it is asked first.
+    if [ "$FROZEN_ONLY" = 1 ] && ! group_is_frozen "$dir"; then
+      if [ "$DO_LIST" = 1 ]; then
+        printf '%s  (not frozen)\n' "$dir"
+      fi
+      continue
+    fi
+    if [ "$CACHED_ONLY" = 1 ] && ! group_is_cached "$dir"; then
+      if [ "$DO_LIST" = 1 ]; then
+        printf '%s  (not fully cached)\n' "$dir"
+      fi
+      continue
+    fi
+
     CFR_FOUND=$(( CFR_FOUND + 1 ))
 
     cur="$(group_bytes "$dir" | tr -d ' \r\n')"
@@ -281,6 +419,9 @@ if ! sweep_once && [ "${CFR_ALLOW_EMPTY:-0}" != 1 ]; then
   echo "cached_freeze_reclaim: no reclaimable group (uid_* or --group) under:$ROOTS" >&2
   echo "  (v1 devices expose memory.reclaim only with this module's memcg_v1_reclaim graft)" >&2
   echo "  (some ROMs name their groups instead of using uid_*: pass --group NAME)" >&2
+  echo "  (some ROMs nest the uid_* groups one level down, under a directory such as" >&2
+  echo "   mimd/: name that directory with --cgroup-root PATH -- and pair it with" >&2
+  echo "   --frozen-only, because a per-UID tree includes the app on screen)" >&2
   echo "  (set CFR_ALLOW_EMPTY=1 to run the loop anyway)" >&2
   exit 1
 fi

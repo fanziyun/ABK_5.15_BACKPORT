@@ -7,6 +7,7 @@
 
 ## 交付总览（九项优化，按功能清单顺序）→ 详见 CHANGELOG.md#overview-nine — 把九项功能重排成一份交付日志并往下续写第 10 项（`8a73e95` → HEAD 的四个提交）：逐项给出批次、组名与到手证据，不新增任何批次
 
+## Batch 29(companion v0.12.0,已落地；真机已验证)→ 详见 CHANGELOG.md#batch-29 — 修「主动回收在这台设备上**必然落空**」：v1 树的 per-UID 组一个也不在默认根下，87 个全在 `mimd/` 之下，而工具只扫根与根下 `apps/` 一层 ⇒ 默认配置下 sweep 永远 0 组（不是权限、不是挂死，是够不到）。新增 `cfr.cgroup_root`（额外根，追加而非替换）+ 两个「平台自己怎么判缓存」的过滤器：`cfr.frozen_only`/`cfr.freezer_root`（冻结档，v1 内存组自带 freezer 节点时自答，否则按组名桥接到 v2 冻结树、只认 `uid_*` 不猜厂商组）与 `cfr.cached_only`（rank 档，`oom_score_adj >= 900` = AOSP 的 `CACHED_APP_MIN_ADJ`，每个任务都要满档）；工具侧 `--frozen-only` / `--freezer-root` / `--cached-only`，`--list` 点名被排除的组。**用户随后证明那批冻结是他外装的 LSPosed 插件**（连 adj=201/410 的可感知档应用一起冻，平台不会这么做）；关掉后平台自己的冻结档**没有归零而是收窄**：开机 2–6 分钟 0 个，17 分钟后稳定 1 个（`id.gms.unstable`，adj 945，连续 7 分钟不变）⇒ frozen 是 cached 的**真子集**（同一次 1 组 vs 14 组），rank 档才是第一趟就正确、覆盖更宽的那个（75 组中选 12–14 排 61–63，`cfr_reclaim_reclaimed` 0 → 29 448 页，含可见进程的对照组只动 0.2%/0.7%）；registry 未动，只 bump companion
 
 ## v0.30.1(zram writeback 崩溃修复；已落地；真机已复测)→ 详见 CHANGELOG.md#v0-30-1 — 往 `page_index=1` 写 `writeback` 把内核打挂：Batch 14 的 `zram_writeback_bounds` **无条件**覆盖了 PAGE 模式的单次边界，而 sweep 循环把 `nr_pages` 当**次数**用（不是 `index` 上界）⇒ index 跑到 `N + nr_pages − 1` 越界；修复是在范围检查之后恢复 PAGE 模式 `nr_pages = 1`，同批带 companion v0.10.0 的 writeback 触发器与第二条 SELinux 规则
 

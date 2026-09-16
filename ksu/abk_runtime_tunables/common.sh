@@ -258,6 +258,10 @@ cfr.interval_sec
 cfr.freeze
 cfr.quota_mb
 cfr.group
+cfr.cgroup_root
+cfr.frozen_only
+cfr.freezer_root
+cfr.cached_only
 report.logcat
 EOF
 }

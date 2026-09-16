@@ -349,6 +349,125 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="batch-29"></a>
+
+## Batch 29(companion v0.12.0)
+
+起因是 2026-09-16 的一次真机检查：`action.sh status` 报 `proactive reclaim not running`，而
+2026-09-13 的检查已把它定性为「配置态、非故障」。本批把那个结论往下压了一层 —— **不只是配置态：
+即使把 `cfr.enable` 打开，这台设备上它也不会回收一个字节。**
+
+### 1. 「必然落空」是什么：工具的发现深度与这台 ROM 的组布局对不上
+
+`cached_freeze_reclaim.sh` 的 `discover_groups()` 只扫 `$root` 与 `$root/apps` 两层，从不下降。
+这台 ROM 的三层事实：
+
+- `/dev/memcg/apps/` **没有子组**（v1 的 `apps` 是叶子，246 MiB）；
+- `/sys/fs/cgroup/apps/uid_*` 存在，但 v2 这一层没有 `memory.reclaim`（内存控制器在 v1）；
+- 真正的 per-UID 组：**87 个，全在 `/dev/memcg/mimd/uid_*`** —— 比默认根深一层。
+
+于是默认根下可发现的组是 0 个：`CFR_ONE_SHOT` 每次都返回 1，监督器每分钟记一条
+`found no reclaimable group`。不是挂死，也不是权限问题（`refused=` 在复跑中为 3/8/0/0，是组在
+枚举与读取之间生灭的竞态，`dmesg` 里没有任何 `cgroup.pressure` 相关 avc）——**是发现路径够不到**。
+同一次检查还纠正了 README 里一句旧话：这台 ROM「没有 `uid_*`」只在一层深度上成立。
+
+### 2. 为什么不能只是「把 `mimd` 加进根里」
+
+`mimd/uid_*` 是 **per-UID 树，不是 cached-app 树**。实测 88 个组里有前台应用
+（`com.miui.home` uid_10154，以及当时的 pixiv uid_10321），而无差别 sweep 会对每个发现的组写
+`memory.reclaim` —— 对前台应用就是把它的工作集换出去、下次触碰再换回来。AOSP 的
+CachedAppOptimizer 正是为此只回收 cached 应用。
+
+所以「够得到」与「限得住」是**同一个改动**，拆开做没有意义。
+
+### 3. 改动
+
+工具（`tools/cached_freeze_reclaim.sh`，模块经 `embed.conf` 逐字打进 `bin/`）：
+
+| 新增 | 语义 |
+|---|---|
+| `--cgroup-root` ×N | 已存在；额外根**追加**到两个内置根之后，不是替换 |
+| `--frozen-only` | 只保留平台**当前冻结着**的组；组自带 `cgroup.freeze`/`freezer.state` 时自答 |
+| `--freezer-root PATH` | 组两个 freezer 节点都**没有**时（本机 v1 内存组即如此）按**组名**桥接到会冻结的那棵树：v1 的 `mimd/uid_N` 是否冻结 = v2 的 `apps/uid_N/pid_*/cgroup.freeze` 是否有 `1` |
+| `--cached-only` | 只保留**每个任务**都被平台判为缓存应用的组：`oom_score_adj >= 900`（AOSP 的 `CACHED_APP_MIN_ADJ`），任何用户看得见的进程都到不了这一档 |
+
+桥接的根与 `--cgroup-root` **同形**（给根，不给根下的 `apps/`），且**只认 `uid_*`**：命名组没有
+可问的对应物，猜一个正是这个工具一直拒绝做的「擅自走进没人要的厂商组」。`--list` 在
+`--frozen-only` 下把排除掉的组点名打成 `(not frozen)` —— 「不碰它」必须与「没看见它」可区分，
+这正是 `--list` 存在的理由。顺带把 `usage()` 的 `sed -n '2,53p'` 改成「从 shebang 到第一行代码」，
+往手册里加一行不会再静默截断 help。
+
+companion（`ksu/abk_runtime_tunables`）：新增 `cfr.cgroup_root` / `cfr.frozen_only` /
+`cfr.freezer_root` 三个键（`abk_known_keys` + 出厂 `tunables.conf` 注释），监督器拼进 argv；
+**`cfr.frozen_only=0` 时 `cfr.freezer_root` 被丢掉**而不是原样传下去 —— 否则日志行会宣称一个
+sweep 并没有施加的保护。出厂默认仍是 `cfr.enable=0`，态度不变。
+
+### 4. 真机验证（vermeer / 5.15.216 / 无线 adb / 模块 v0.10.0 状态下测工具本体）
+
+**第一段（frozen 方案，插件还开着时）**
+
+- `--list --cgroup-root /dev/memcg/mimd --frozen-only --freezer-root /sys/fs/cgroup`
+  → 选中 **7** 个组、排除 **81** 个（前台 `com.miui.home` uid_10154 在被排除之列）。
+- 有界真回收（`--quota-mb 16`）：`cfr_reclaim_attempts` 1 → 12，`cfr_reclaim_requested`
+  8 192 → 28 163，`cfr_reclaim_reclaimed` **8 349 → 35 480 页**。
+- 单组对照（改动前做的）：对已冻结的 `mimd/uid_10194` 回收 32 MiB，
+  `usage_in_bytes` 866 934 784 → 832 737 280，三个计数器同步增长 —— graft、工具、内核链路全通。
+
+**第二段（重启关掉插件后，本批真正的结论）**
+
+用户随后说明：先前那 9 个 v2 冻结 pid **不是平台行为，是他外装的一个 LSPosed 插件**。重启关掉后实测，
+冻结档并没有归零，而是**大大收窄**——这比「平台不冻结」更值得记：
+
+| 采样 | 冻结 pid 数 |
+|---|---|
+| 开机后 2–6 分钟（6 次采样） | **0** |
+| 开机后 17 分钟起，连续 7 分钟（每分钟一次） | **1**，且 7 次都是同一个 |
+
+唯一被冻结的是 `id.gms.unstable`（uid 10259，`oom_score_adj=945`）——**平台自己的
+CachedAppOptimizer 在正常工作**，只是它只park 真正进了缓存档的进程，而且要有延迟；那个插件则连
+`adj=201/410`（可感知档）的应用一起冻，那不是平台会做的事。`device_config get cached_apps_freezer`
+在本机返回 `device_default` / `Bad arguments` 两种结果，不足为凭，实测才是准的。
+
+同一时刻两个过滤器的选择面：
+
+| 过滤器 | 选中组数 |
+|---|---|
+| `--frozen-only --freezer-root /sys/fs/cgroup` | **1**（uid_10259，156 MiB） |
+| `--cached-only` | **14** |
+
+即 frozen 是 cached 的**真子集**，且要等平台先动手；cached 在第一趟就正确。两者都保留：frozen 是更强的
+承诺（冻结进程**不可能**把页换回来），cached 是更宽的覆盖。`--list` 在有 `--cached-only` 时对 75 个组
+选中 **12–14** 个、其余点名排除；有界回收（`--quota-mb 16`）把 `cfr_reclaim_reclaimed` 从 **0 推到
+29 448 页**。
+
+**安全对照（本批最关键的一次测量）**：两个含可见进程的组在一次 sweep 前后只变了 **0.2% / 0.7%**
+（`uid_10142`：107 438 080 → 107 192 320，组内最小 adj **0**；`uid_10205`：91 746 304 → 91 082 752，
+min adj 100）—— 是运行时噪声，不是回收；若被回收，每组最多会掉 16 MiB（当时的 quota）。
+两者在 `--list` 里都标为 `(not fully cached)`。
+
+「必然落空」到此不再成立：默认仍然关闭，但**打开的时候它真的会回收**，且只回收平台自己判定
+已缓存的应用。本机（无插件）用：
+
+```
+cfr.enable=1
+cfr.cgroup_root=/dev/memcg/mimd
+cfr.cached_only=1
+```
+
+### 5. 单测
+
+守护进程夹具新增 13 项。frozen 侧 5 项：v2 自答的冻结/非冻结分组、`--list` 点名被排除的组、
+v1→v2 的组名桥接、桥接对命名组拒绝猜测、以及「没有 `--frozen-only` 时同一棵树仍被整棵扫」这条
+反向断言（flag 是选择，不是新默认）。cached 侧 6 项：满档组被回收、含一个可见任务的组被放过、
+无任务组被放过、差 1 分（899）的组被放过、`--list` 三种排除原因各点一次名、以及两个 filter 的
+合取；另 2 项钉住「阈值就是 AOSP 的 900」与「中途退出的任务不能把整趟 sweep 带崩」
+（`cmd || true` 那处，`set -e` 下赋值会继承失败替换的状态）。夹具用 `CFR_PROC_ROOT` 把 rank
+查询指向假树 —— 否则测的是宿主自己的 `/proc`。
+
+模块侧新增 10 项：四个键的注册与出厂赋值、监督器三段拼装、`--cached-only` 的接线、
+「没有 filter 就丢掉 freezer root」、以及工具手册确实写了两个 filter 和 `oom_score_adj`。
+全套 `tests/stable_5_15_test.py` 通过。
+
 <a id="v0-30-1"></a>
 
 ## v0.30.1（zram writeback 崩溃修复）+ companion v0.10.0
