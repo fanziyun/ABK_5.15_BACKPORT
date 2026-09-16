@@ -621,6 +621,17 @@ REQUIRED_CONTENT = {
         # the macro further down the same file, which the pristine one has.
         "if (pte_sw_dirty(pte))\n"
         "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
+    ],    "core:zram_wb_slot_preserve": [
+        # b0377ee80429 / 37b72d525502.  The release has to be open-coded: the
+        # object and its compressed size go away *here* (not through the
+        # zram_free_page() that would take the slot's flags and attributes with
+        # them), the huge page is accounted here, and the guard on the other
+        # side is what keeps the slot's final release from decrementing that
+        # counter a second time.
+        "ABK stable_515_backport: b0377ee80429",
+        "atomic64_sub(zram_get_obj_size(zram, index),",
+        "zs_free(zram->mem_pool, zram_get_handle(zram, index));",
+        "if (!zram_test_flag(zram, index, ZRAM_WB))",
     ],
 }
 
@@ -812,6 +823,17 @@ REQUIRED_ABSENT = {
         # reclaim.  It must be gone, not merely bypassed.
         "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
         "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
+    ],    "core:zram_wb_slot_preserve": [
+        # The shape the fix removes.  The whole point is that the *absence* is
+        # load-bearing: a tree that kept the save/restore dance would still pass
+        # every "content survived" assertion while underflowing ->huge_pages and
+        # dropping ZRAM_INCOMPRESSIBLE/ac_time.  Scoped per file, and the locals
+        # carry their initialiser so a lookalike declaration elsewhere cannot
+        # false-positive.
+        ["drivers/block/zram/zram_drv.c", "\tu32 size = 0, prio = 0;"],
+        ["drivers/block/zram/zram_drv.c",
+         "\t\tsize = zram_get_obj_size(zram, index);"],
+        ["drivers/block/zram/zram_drv.c", "\t\tif (huge)"],
     ],
 }
 
@@ -1088,6 +1110,23 @@ REQUIRED_IN_FUNCTION = {
           "mmap_miss = READ_ONCE(ra->mmap_miss);",
           "if (PageReadahead(page)) {"],
          ["return fpin;\n\tmmap_miss = READ_ONCE(ra->mmap_miss);\n"]),
+    ],    "core:zram_wb_slot_preserve": [
+        # The completion helper is where the accounting happens, and the fix is
+        # one *removal* plus one open-coded release -- neither side is visible to
+        # whole-file matching, because zram_free_page() is called from many other
+        # places in this file and pages_stored is legitimately incremented
+        # elsewhere.  Slicing by function is what makes "the release no longer
+        # goes through zram_free_page() here" an assertion instead of a comment.
+        ("drivers/block/zram/zram_drv.c", "zram_writeback_complete",
+         ["if (zram_test_flag(zram, index, ZRAM_HUGE))\n"
+          "\t\tatomic64_dec(&zram->stats.huge_pages);",
+          "atomic64_sub(zram_get_obj_size(zram, index),\n"
+          "\t\t     &zram->stats.compr_data_size);",
+          "zs_free(zram->mem_pool, zram_get_handle(zram, index));",
+          "zram_set_element(zram, index, req->blk_idx);"],
+         ["zram_free_page(zram, index);",
+          "atomic64_inc(&zram->stats.pages_stored);",
+          "\t\tif (huge)"]),
     ],
 }
 

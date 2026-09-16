@@ -201,12 +201,12 @@ success, not a degradation. All three android13-5.15 combinations CI accepts
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 38 applied | 23 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 38 applied | 22 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 35 applied + 3 present | 20 applied + 3 present |
-| 216 | `android13-5.15-lts` | rolling | 31 applied + 7 present | 15 applied + 8 present |
+| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 39 applied | 23 applied |
+| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 39 applied | 22 applied + 1 present |
+| 194 | `android13-5.15-2025-12` | 2025-12 | 36 applied + 3 present | 20 applied + 3 present |
+| 216 | `android13-5.15-lts` | rolling | 32 applied + 7 present | 15 applied + 8 present |
 
-(Re-measured on the v0.33.0 registry against the four fetched reference trees;
+(Re-measured on the v0.34.0 registry against the four fetched reference trees;
 the counts move with every batch, so they are a snapshot, not an invariant.)
 
 The display child is the odd one out: its single revert group reports

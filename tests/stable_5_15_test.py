@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.33.0", "0.33.0"], _versions)
+          _versions == ["0.34.0", "0.34.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4151,6 +4151,11 @@ def test_batch17_zram_writeback():
           and "zs_obj_read_begin(zram->mem_pool" not in g1)
     check("trailing bytes are zeroed before writeback",
           "memzero_page(page, size, PAGE_SIZE - size)" in g1)
+    # This is the batching group's *generated* payload.  Batch 32
+    # (zram_wb_slot_preserve) later removes the save/restore dance from it --
+    # the pairs asserted there are what keeps the metadata without going through
+    # zram_free_page(), and the assertions below stay true of this group's own
+    # replacement block.
     check("compressed writeback preserves the slot metadata",
           "zram_set_obj_size(zram, index, size)" in g1
           and "zram_set_priority(zram, index, prio)" in g1)
@@ -4201,6 +4206,164 @@ def test_batch17_zram_writeback():
                 / "zram_drv.c").read_text()
         check("a degraded run writes nothing",
               body == "static int zram_bvec_read(void);\n", repr(body))
+
+
+def test_batch32_zram_wb_slot_preserve():
+    """Batch 32: a written-back slot keeps its metadata and is counted once.
+
+    The fixture's completion helper is *batch17's own generated text*
+    (``_A_HELPERS_NEW``), not a copy of this batch's anchors, so the steps are
+    checked against the shape the earlier group really produces.  The
+    zram_free_page() half is composed from this batch's pristine anchor, but
+    that block is byte-identical in pristine 5.15 and in the shape
+    zram_recompression rewrites it into -- which step_audit.py verifies for real
+    on all four baselines.
+    """
+    print("Batch 32: zram_wb_slot_preserve (no zram_free_page() on a WB slot)")
+    import inspect
+
+    import implementation_audit as ia
+    import abk_stable_core as core
+    import batch17_core_zram_writeback as b17
+    import batch32_core_zram_wb_slot_preserve as b32
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_wb_slot_preserve"), None)
+    check("zram_wb_slot_preserve group registered", group is not None)
+    if group is None:
+        return
+    keys = [g.key for g in core.PATCH_GROUPS]
+    for earlier in ("zram_writeback_batching", "zram_compressed_writeback",
+                    "zram_recompression"):
+        check(f"registered after {earlier}",
+              keys.index("zram_wb_slot_preserve") > keys.index(earlier))
+
+    # Trap 5: this group rewrites zram_writeback_complete(), which
+    # zram_writeback_batching generates.  That group must therefore recognise
+    # its own payload -- without the probe a second pass drops to
+    # blocked_by_shape (its replacement block no longer matches the file) and
+    # step_audit.py fails on the patched tree.
+    src = inspect.getsource(b17._batching_apply)
+    check("_batching_apply short-circuits on its own payload",
+          b32.BATCHING_PAYLOAD in src and "already_present" in src,
+          [ln for ln in src.split(chr(10)) if "payload" in ln or "probe" in ln])
+
+    steps = b32.build_steps()
+    check("three required steps",
+          len(steps) == 3 and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j in range(i + 1, len(steps)):
+            check("step %d new does not contain step %d new" % (i, j),
+                  steps[j][2] not in new_i)
+
+    free_page = (
+        "static void zram_free_page(struct zram *zram, size_t index)\n"
+        "{\n"
+        "\tunsigned long handle;\n"
+        "\n"
+        "\tif (zram_test_flag(zram, index, ZRAM_IDLE))\n"
+        "\t\tzram_clear_flag(zram, index, ZRAM_IDLE);\n"
+        "\n"
+        + b32._FREE_PAGE_HUGE_OLD +
+        "\n"
+        "\tif (zram_test_flag(zram, index, ZRAM_WB)) {\n"
+        "\t\tzram_clear_flag(zram, index, ZRAM_WB);\n"
+        "\t\tfree_block_bdev(zram, zram_get_element(zram, index));\n"
+        "\t\tgoto out;\n"
+        "\t}\n"
+        "\n"
+        "\thandle = zram_get_handle(zram, index);\n"
+        "\tif (!handle)\n"
+        "\t\treturn;\n"
+        "\n"
+        "\tzs_free(zram->mem_pool, handle);\n"
+        "\n"
+        "\tatomic64_sub(zram_get_obj_size(zram, index),\n"
+        "\t\t\t&zram->stats.compr_data_size);\n"
+        "out:\n"
+        "\tatomic64_dec(&zram->stats.pages_stored);\n"
+        "\tzram_set_handle(zram, index, 0);\n"
+        "\tzram_set_obj_size(zram, index, 0);\n"
+        "}\n"
+    )
+    # The real generated shape: the batching group's helper suite (it carries
+    # zram_writeback_complete() plus the pool/endio/drain helpers) followed by
+    # the free path it is counted against.
+    fixture = b17._A_HELPERS_NEW + "\n" + free_page
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b32.ZRAM_C: fixture})
+        status, detail = group.apply_fn(ctx)
+        check("all three steps land on the generated shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b32.ZRAM_C)
+        body = ia.function_body(text, "zram_writeback_complete")
+
+        check("the completion no longer frees the page",
+              "zram_free_page(zram, index);" not in body,
+              [ln for ln in body.split(chr(10)) if "zram_free_page" in ln])
+        check("the object, its size and the huge page are released in place",
+              "zs_free(zram->mem_pool, zram_get_handle(zram, index));" in body
+              and "atomic64_sub(zram_get_obj_size(zram, index)," in body
+              and "if (zram_test_flag(zram, index, ZRAM_HUGE))\n"
+                  "\t\tatomic64_dec(&zram->stats.huge_pages);" in body)
+        # pages_stored moved in both directions before (zram_free_page's out:
+        # label decremented, the path incremented); dropping only one side
+        # would make a written-back page start counting twice.
+        mentions = [ln for ln in body.split(chr(10)) if "pages_stored" in ln]
+        check("pages_stored is left untouched by completion",
+              all(ln.lstrip().startswith("*") for ln in mentions), mentions)
+        # The metadata readers this keeps: obj_size/priority for the compressed
+        # read, ZRAM_HUGE for the raw one.  The values must survive on the slot,
+        # i.e. nothing may write them back from a saved copy -- asserted on the
+        # function slice, because the recompression path legitimately writes
+        # obj_size and priority after its own zram_free_page().
+        check("the saved-copy restore dance is gone",
+              "\t\tsize = zram_get_obj_size(zram, index);" not in text
+              and "\tu32 size = 0, prio = 0;" not in text)
+        check("the flag the read path needs is no longer cleared then re-set",
+              "zram_set_flag(zram, index, ZRAM_HUGE)" not in body
+              and "zram_set_obj_size(zram, index, size)" not in body
+              and "zram_set_priority(zram, index, prio)" not in body
+              and "\t\tif (huge)" not in body,
+              [ln for ln in body.split(chr(10))
+               if "huge" in ln or "prio" in ln])
+        # The other half of the accounting: the final release of a written-back
+        # huge slot must not decrement the counter a second time.
+        check("zram_free_page() guards the huge-page decrement",
+              b32.HUGE_GUARD in text)
+        check("the huge-page decrement is written once per side",
+              text.count(chr(10) + "\t\tatomic64_dec(&zram->stats.huge_pages);\n") == 1
+              and text.count(chr(10) + "\t\t\tatomic64_dec(&zram->stats.huge_pages);\n") == 1,
+              [ln for ln in text.split(chr(10)) if "huge_pages" in ln])
+        check("the provenance marker is in both halves",
+              text.count(b32.SLOT_PRESERVE_MARKER) == 2)
+
+        snapshot = ctx.read(b32.ZRAM_C)
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass is a no-op", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical", ctx.read(b32.ZRAM_C) == snapshot)
+
+        # A tree that never gained the batching graft degrades; it must not
+        # rewrite the free path for a writeback path that does not exist.
+        ctx_bare = make_ctx(tmp + "/bare", {b32.ZRAM_C: free_page})
+        status3, detail3 = group.apply_fn(ctx_bare)
+        check("degrades without zram_writeback_batching",
+              status3 == "blocked_by_shape" and "zram_writeback_batching" in detail3,
+              (status3, detail3))
+
+        # Half a tree: the completion helper is there, the huge block is not.
+        # Transactional apply, so nothing at all may be written.
+        half = b17._A_HELPERS_NEW + "\nstatic void zram_free_page(void) {}\n"
+        ctx_half = make_ctx(tmp + "/half", {b32.ZRAM_C: half})
+        status4, detail4 = group.apply_fn(ctx_half)
+        check("degrades when the free path anchor is missing",
+              status4 == "blocked_by_shape", (status4, detail4))
+        check("a degraded run writes nothing",
+              ctx_half.read(b32.ZRAM_C) == half)
 
 
 def test_batch27_launch_bench():
@@ -4556,6 +4719,7 @@ def main():
     test_batch22_psi_oncpu_state_mask()
     test_batch23_zram_writeback_guard()
     test_batch24_zram_max_pages()
+    test_batch32_zram_wb_slot_preserve()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
     test_kstack_slot_shape_selection()

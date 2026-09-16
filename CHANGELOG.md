@@ -18,7 +18,7 @@
 | 4 | 低内存立刻触发碎片回收 | Batch 13 | v0.18.0 | `abk_gfp_fastfail`：order ≥ 9 的尝试加 `NORETRY\|NOWARN` |
 | 5 | 添加 EEVDF | Batch 15 → **Batch 28** | v0.20.0 → **v0.31.1** | Batch 15 选择器 14 步 + `sched_entity` 槽 1–4 认领；**Batch 28 按 `docs/survey_eevdf_gap.md` 的差异审计重建**：O(1) 累加器 + `RUN_TO_PARITY` + EEVDF 唤醒抢占 + `PREEMPT_SHORT` + EEVDF yield |
 | 6 | 添加 async_depth | Batch 15 | v0.20.0 | 真正的 `q->async_depth` 策略（9 文件）+ `request_queue` 槽 1 |
-| 7 | back port zram writeback | Batch 14/17/18/23 | v0.19.0 → v0.28.0 | 正确性 → compressed writeback → sepolicy → 编译门 |
+| 7 | back port zram writeback | Batch 14/17/18/23/**32** | v0.19.0 → **v0.34.0** | 正确性 → compressed writeback → sepolicy → 编译门 → **写回槽释放的账目与元数据** |
 | 8 | 优化 I/O 瓶颈（bio batching） | Batch 17 | v0.22.0 | 上游 v6.19 系列，用 5.15 自己的 `UNDER_WB`/`IDLE` 改写 |
 | 9 | 添加重压缩 | Batch 4/6/10-1/12/24 | v0.5.0 → v0.29.0 | 落地 → 补 config → 修空转 → 锁算法 → 每趟上限 |
 
@@ -348,6 +348,118 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 本节十项都是上面已归档内容的**顺序重排与续写**：1–9 按功能清单重排，第 10 项把「前九项在真机上
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
+
+<a id="batch-32"></a>
+
+## Batch 32(v0.34.0)
+
+起因是一次提交核对：ACK 6.12（`android16-6.12`）的 `37b72d525502`
+（`BACKPORT: FROMGIT: zram: do not slot_free() written-back slots`，richardycc）要不要回移。
+结论是**要，而且它就命中本模块自己移植的那段载荷**：它是 mainline `b0377ee80429`
+（mm-hotfixes-stable 2026-03，`Fixes: d38fab605c667`，Acked-by Minchan Kim）的回移，而
+`d38fab605c667` 正是 Batch 17 移植的 compressed writeback 系列（见 [Batch 17](#batch-17)）。
+
+**当时为什么没被覆盖（本批顺手修正的一条历史结论）**：不是「太新」。修复 2026-03-19 就落地了，
+而 Batch 17 是 2026-09-14 落的 —— 它**本来就在审计窗口之内**。Batch 17 那一段的三路核对各自都
+漏得开它（原文见 [Batch 17](#batch-17)）：
+
+- `Fixes:` 搜索的查询串是 **12 位**的 `d38fab605c66`，而这条修复写的是 **13 位**的
+  `Fixes: d38fab605c667`，短一位的 token 命不中；
+- 文件提交列表那一路取的窗口是 `since=2026-05-25`，**晚于**修复的 2026-03-19，结构上不可能
+  包含它；
+- 第三路拿的是 v7.3-rc3 期的 master 快照逐行核对，同样晚于该修复的合入点。
+
+**更能说明问题的是**：这条修复的补丁**早就在仓库里** ——
+`research/upstream-zram/patches/b0377ee80429.patch`，与 Batch 17 同一天作为研究工件提交
+（`2d4f117`，2026-09-14）。所以真正的教训是过程性的：`Fixes:` 搜索的结论必须与
+`research/upstream-zram/patches/` 里已有的补丁集**对账**（当时那里有 84 个补丁），否则
+「唯一后续修复就是 X」这类否定结论会掩盖已经下载、但没读到的补丁。本批是 ACK 6.12 的一次提交
+核对把这条补丁重新翻出来的。
+
+它也**不会**随 5.15 子级自己漂进来 —— 5.15 线根本没有这个特性（四条基线的
+`drivers/block/zram/zram_drv.c` 里 `wb_compressed` 命中 0）。
+
+### 1. 命中的是两处缺陷，触发条件是精确的
+
+Batch 17 的 `zram_writeback_complete()` 是**修复前形状**：先 `zram_free_page()`，再在
+`if (zram->wb_compressed)` 里回填 `huge` / `obj_size` / `priority`。由此：
+
+| 缺陷 | 机制 | 触发条件 |
+|---|---|---|
+| `->huge_pages` 下溢（**可观测的那个**） | 完成时 `zram_free_page()` 已经减过一次（当时 `ZRAM_HUGE` 是置着的），而回填只把**标志**放回去、计数没补回来 ⇒ 槽最终释放时 `zram_free_page()` 在 `ZRAM_WB` 提前返回**之前**又经过同一个 HUGE 块，每个写回过的 huge 页多减一次。`ZRAM_HUGE` 在 HUGE_WRITEBACK 模式下被 selector 选中，所以这条路径是常规路径而不是角落 | `compressed_writeback=1` **且** huge 槽被 `trigger=huge` 写回，**且**该槽之后被释放/改写。**本机就是这套配置**：companion 的 `zram-policy.sh` 把 `compressed_writeback` 写成 1 |
+| 槽元数据丢失（上游的另一半，**本机暂时是潜伏的**） | `zram_free_page()` 把 flags/attrs 整体重置，回填只覆盖了三个：`ZRAM_INCOMPRESSIBLE` 与 `ac_time` 在每个写回过的槽上直接丢掉。**如实说明影响**：读这两项的只有重压缩候选过滤与 `mark_idle` 的 `ac_time` 截止，而二者都**先跳过 `ZRAM_WB` 槽**；写在读路径上的 `zram_accessed()` 又会把 `ac_time` 刷新。所以本轮没有任何读者观察到这个丢失 —— 搬它是因为上游就是这么修的、而且删除它的同一处释放正是计数器缺陷的解，**不是**因为真机测到了它 | 任何 `ZRAM_WB` 槽（潜伏） |
+
+**这个缺陷为什么不在这台设备上现形**：v0.30.1 那次 `trigger=huge` 全量扫描（[v0.30.1](#v0-30-1)
+的表）结束时 `huge_pages` 本来就是 0，多出来的那一次递减落在槽**被释放**的时候，而那一轮只写回、
+没释放，所以修复前后那张表逐项相同 —— 这条修复**不可**由那次测量判别，也不要拿它当验证。
+本轮唯一必须**保持不变**的既有数字是 `pages_stored`（改动前它是什么、改后还得是什么）：它在两个方向上都动过（`zram_free_page()` 的 `out:` 标签
+减、路径末尾加），修复把两步一起去掉，**净值仍是 0**，与那张表的 896 MB → 896 MB 逐字一致。
+
+**范围依据（为什么一个纯 bug 修复算本模块的活）**：政策是「特性/优化/重构，纯安全修复排除」。
+本批修的是**本模块自己移植的那段载荷**的正确形式 —— 上游对 `d38fab605c667` 的后续修复是这个特性的组成部分，
+不搬就等于持续交付一个已知会下溢计数器、并在写回槽上丢掉元数据的版本。同类先例：Batch 23（就地修 Batch 17 的
+配置门缺陷）、v0.30.1（修 Batch 14 的边界覆盖）。它**不是** 5.15 子级的例行回移（5.15 线根本没有这个特性），
+也不动任何对外接口或 KMI。
+
+### 2. 落地明细（core 38 → 39 组，新建文件）
+
+| 组 | 文件 | 内容 |
+|---|---|---|
+| `zram_wb_slot_preserve` | `scripts/batch32_core_zram_wb_slot_preserve.py`（新）、`drivers/block/zram/zram_drv.c` | 3 步全 required：① 丢掉 save/restore 需要的三个局部量（`size`/`prio`/`huge`）② 完成路径改成 open-coded 释放（清 `ZRAM_IDLE`、`ZRAM_HUGE` 时减 `huge_pages`、`compr_data_size` 减 `obj_size`、`zs_free(mem_pool, zram_get_handle(...))`、清 `ZRAM_UNDER_WB`、置 `ZRAM_WB` + element=blk_idx），并删掉回填与 `pages_stored` 的加 ③ `zram_free_page()` 的 huge 块加 `ZRAM_WB` 守卫 |
+
+**为什么是独立小组而不是改 Batch 17 的文本**（`docs/group_recipe.md` trap 5）：本组改写的
+`zram_writeback_complete()` 是 `zram_writeback_batching` **生成**的，同批还要改
+`zram_free_page()` 的 huge 块（那段文本 pristine 与 `zram_recompression` 改写后逐字相同，所以
+两种形状都能落）。按 trap 5 的解法，前一个组必须对自己的载荷做探针短路
+（`zram_account_writeback_submit()`，无基线自带）—— 这一步是本批加的，没有它第二遍会因为
+自己的替换块已不在文件里而退化成 `blocked_by_shape`，而那是 `step_audit.py` 的**第二遍**断言才
+看得见的失败。本模块又一例「改写别的组生成文本」的组：Batch 21（`psi_cgroup_pressure_switch` 改 `psi_irq_tracking` 追加的走查）是这条陷阱的发现者，Batch 24（`zram_recompress_max_pages`）把探针做成机制，本批沿用。
+
+### 3. 为什么不是逐字 copy
+
+ACK 形态用的是 ACK 自己的 slot API（`req->pps->index`、`zram->compressed_wb`、
+`zram_set_handle`、`slot_free()`），本模块的写回是 v6.19 系列**重锚到 5.15 自己的
+`ZRAM_UNDER_WB`/`ZRAM_IDLE` 协议**上的，多一段「bio 期间槽是否被改过」的复检和一个
+`ZRAM_UNDER_WB` 清理，所以按自己的名字改写（`req->index`、`zram->wb_compressed`、
+`zram_set_element`），释放的是 5.15 的 `zram_free_page()` 而不是某个 `slot_free()`。
+
+上游把守卫插在 `clear_slot_flag(ZRAM_HUGE)` **之前**，本模块插在它**之后**（贴着 5.15 原行，
+`ZRAM_HUGE` 与 `ZRAM_WB` 是同一个 `flags` 字里相互独立的位，顺序无影响），改动面因此最小。
+
+### 4. 明确没做 / 不主张
+
+- **不做真机验证**：判别它需要在 `compressed_writeback=1` 下写回 huge 槽、再释放它们，并读
+  `huge_pages`（或看它下溢）。本轮没有跑这条序列，所以本批**不主张**任何设备侧结论；
+  连同下面的构建闸门一起，留作后续可选验证。
+- **不主张性能**：这是账目与元数据正确性修复，没有吞吐/延迟含义。
+- `config_gate_audit` **未跑**：它需要一次构建真实产出的 `.config`，按 AGENTS.md 属发布期闸门。
+  已静态核对：新增行中求值的部分全部落在既有 `#ifdef CONFIG_ZRAM_WRITEBACK` 内，`zram_free_page()`
+  那一半（无门）只用无门符号（`ZRAM_WB`、`stats.huge_pages`），且本组用到的每个符号在同文件内
+  都已有其它调用点（无新依赖）。
+
+### 5. 验证
+
+| 层级 | 检查 | 结果 |
+|---|---|---|
+| 语法 | `python3 -m py_compile scripts/*.py tests/*.py`、`bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh` | 通过 |
+| 单测 | `python3 tests/stable_5_15_test.py`（新增 `test_batch32_zram_wb_slot_preserve`，23 条断言） | 全过 |
+| 结构 | `tests/step_audit.py` × 5.15.167/.178/.194/.216 | 四棵树全过（core 202/203/194/194 步，第二遍逐字节一致） |
+| 内容 | `tests/implementation_audit.py` × 四棵树 | 全过（新增 REQUIRED_CONTENT / REQUIRED_ABSENT / REQUIRED_IN_FUNCTION 三处，`zram_writeback_complete` 按**函数切片**断言：释放不再走 `zram_free_page()`、回填与 `pages_stored` 增量为 0 处） |
+| 端到端 | `bash tests/smoke.sh` × 167/178/194/216 | 通过（pass1 core 39 applied，pass2 39 already_present），回滚逐字节一致 |
+| 配置门 | `config_gate_audit.py` | **未跑**（需构建产物，见 §4） |
+| 真机 | — | **未做**（见 §4） |
+
+单测的 fixture 用的是 **Batch 17 自己生成的文本**（`_A_HELPERS_NEW`，含真实的
+`zram_writeback_complete()`），不是本组 anchor 的副本，所以三步是对着「前一组真的会产出什么」
+验的；`zram_free_page()` 那一半由本组 anchor 拼出，这一步由 `step_audit.py` 在四棵真树上补足。
+
+### 6. 审计基线
+
+`GROUP_COUNTS` core **38 → 39**；`PRE_APPLIED`/`KNOWN_DEBT` 不变（本组在四档基线上都
+`applied`）。`module.conf` 0.33.0 → **0.34.0**。来源补丁：mainline 的
+`research/upstream-zram/patches/b0377ee80429.patch` **本批之前就已在仓库里**（本批只把它读进来，
+文件未改）；新增的是 ACK 形态 `research/upstream-zram/patches/37b72d525502.patch` 与两份提交
+元数据 `research/zram_cwb/c_b0377ee.json` / `research/zram_cwb/c_37b72d_ack.json`。
 
 <a id="batch-31"></a>
 
@@ -2209,6 +2321,8 @@ tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报
 
 复核方法与边界：`search/commits?q=repo:torvalds/linux+"Fixes: d38fab605c66"` 得 **total=2**
 （命中 d38fab605c66 自身与 `3bf1c285dc40`），即**唯一后续修复就是尾字节清零**；
+**[Batch 32](#batch-32) 修正**：这条否定结论漏了 `b0377ee80429`（`Fixes: d38fab605c667`，
+2026-03-19 合入，补丁当时就在 `research/upstream-zram/patches/` 里），见该批 §1 的三条原因；
 `commits?path=drivers/block/zram/zram_drv.c&since=2026-01-20&until=2026-01-23` 拉出合入窗口
 12 条提交，其中与本特性相关的只有 d38fab605c66 与 4c1d61389e8e（其余属别的系列）；系列另 5 个
 成员不改 `drivers/block/zram/*.c`，属 Documentation/清理，未逐条审计（诚实边界）。

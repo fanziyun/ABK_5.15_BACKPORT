@@ -1254,6 +1254,16 @@ def _batching_apply(ctx):
         text = ctx.read(ZRAM_C)
     except FileNotFoundError:
         return "blocked_by_shape", f"{ZRAM_C}: file absent"
+    # docs/group_recipe.md trap 5: Batch 32's zram_wb_slot_preserve rewrites
+    # zram_writeback_complete() -- text this group generates -- so per-step
+    # idempotency alone would leave this group's own anchors unmatched on a
+    # second pass (its replacement block is no longer in the file, and the
+    # pristine anchor it replaced is gone).  Probe one of this group's own
+    # symbols instead: no android13-5.15 baseline carries it, so a first pass
+    # always rewrites and only a second pass stops.
+    if "static void zram_account_writeback_submit(struct zram *zram)" in text:
+        return "already_present", ("the writeback batching graft is already in "
+                                   "zram_drv.c")
     for probe, why in (
         ("static ssize_t writeback_store(struct device *dev,",
          "writeback_store()"),

@@ -379,6 +379,25 @@ if grep -q "zs_obj_read_begin(zram->mem_pool" \
      "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c"; then
   fail "zram compressed writeback copied the 6.x zsmalloc mapping API"
 fi
+# Batch 32: the release of a written-back slot, on both sides of the
+# accounting.  The completion must free the object in place and keep the flags
+# and attributes the read path needs, and the final release must not decrement
+# ->huge_pages a second time -- so the save/restore dance the batching group
+# generated has to be *gone*, not merely bypassed.
+grep -q "ABK stable_515_backport: b0377ee80429" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram written-back slot release (b0377ee80429) missing"
+grep -q "if (!zram_test_flag(zram, index, ZRAM_WB))" \
+  "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c" \
+  || fail "zram_free_page() huge-page decrement is not guarded on ZRAM_WB"
+# The needle is the dance's restore of the saved object size: it exists only in
+# that block (the recompression path legitimately writes obj_size and priority
+# after its own zram_free_page(), so those two are ambiguous here -- the
+# function-scoped assertions in implementation_audit.py pin all three).
+if grep -q "zram_set_obj_size(zram, index, size);" \
+     "$KERNEL_ROOT/common/drivers/block/zram/zram_drv.c"; then
+  fail "zram writeback still saves slot metadata to restore it after a free"
+fi
 grep -q 'cfr_reclaim_attempts %ld' "$KERNEL_ROOT/common/mm/memcontrol.c" \
   || fail "cgroup-v1 cfr_reclaim counters missing"
 grep -q '.write = memory_reclaim,' "$KERNEL_ROOT/common/mm/memcontrol.c" \
