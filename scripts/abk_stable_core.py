@@ -4365,5 +4365,9 @@ import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 
+import batch35_core_pagecache_pt as _b34_pcpt  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b34_pcpt.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

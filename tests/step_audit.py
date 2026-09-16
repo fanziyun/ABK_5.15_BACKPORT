@@ -163,6 +163,11 @@ AUDIT_FILES = [
     "mm/filemap.c",
     # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
     "arch/arm64/include/asm/pgtable.h",
+    # Batch 35: the page-cache shadow-entry sweeps in mm/truncate.c, and the
+    # struct zap_details (include/linux/mm.h) the MADV_DONTNEED page-table
+    # reclaim marks before the zap path can hand an empty PTE page back.
+    "mm/truncate.c",
+    "include/linux/mm.h",
 ]
 
 CHILD_MODULES = [

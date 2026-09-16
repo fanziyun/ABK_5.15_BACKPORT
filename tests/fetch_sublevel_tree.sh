@@ -113,6 +113,10 @@ FETCH_FILES=(
   # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).  The module's
   # first arch/arm64 C source -- the file is the whole group.
   arch/arm64/include/asm/pgtable.h
+  # Batch 35: the page-cache shadow-entry sweeps (mm/truncate.c) and the
+  # struct zap_details the MADV_DONTNEED page-table reclaim marks (mm.h).
+  mm/truncate.c
+  include/linux/mm.h
 )
 
 decode() {

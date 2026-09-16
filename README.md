@@ -241,7 +241,7 @@ first anyway, this module's fd-table group recognizes the suite's fallback
 it (the suite's helpers and `expand_files()`/`alloc_fd()` prechecks stay in
 place), so every core group lands in either injection order.
 
-The core child carries 40 groups (the 11 pre-Batch-6 grafts plus
+The core child carries 44 groups (the 11 pre-Batch-6 grafts plus
 `config_enablement`, `zsmalloc_chain_size`, `madvise_collapse`,
 `pagealloc_fallback_reuse`, `rcu_nocb_cpu_default_all`, `dynamic_readahead_lowmem`,
 the Batch 10 line (`zram_async_recompress`, `cached_freeze_reclaim`,
@@ -263,10 +263,15 @@ module's first `arch/arm64` C source), Batch 32's written-back-slot release
 metadata the read and recompression paths need survives and `->huge_pages` is
 decremented exactly once), and Batch 33's zsmalloc free-path split
 (`zsmalloc_free_zspage_out_of_lock`: a dead zspage's pages go back to the buddy
-allocator after `class->lock` is dropped); the
+allocator after `class->lock` is dropped), and Batch 35's page-cache/page-table
+line (the shadow-entry pair `truncate_shadow_batch` + `truncate_shadow_batch_sweep`,
+which clears a pagevec's shadow entries under one `i_pages` acquisition and then
+in one tree traversal, and the MADV_DONTNEED pair `madvise_pt_reclaim` +
+`madvise_batch_tlb_flush`, which hands an emptied PTE page back and gathers the
+whole request's TLB flushes in one `mmu_gather`); the
 perf child carries 23, including the five Batch 15 scheduler/block groups and
 the PSI line (`psi_irq_tracking`, `psi_cgroup_pressure_switch`,
-`psi_oncpu_state_mask`); the display child carries 1, for 64 groups in total.
+`psi_oncpu_state_mask`); the display child carries 1, for 68 groups in total.
 `tests/sublevel_matrix.py` `GROUP_COUNTS` must match exactly — the unit tests
 assert it against the registry.
 

@@ -66,7 +66,16 @@ GROUP_COUNTS = {
     # any of them, so the mainline series patches 1-2 are inapplicable and only
     # the page-free-outside-class->lock hunk is ported.  Its anchors are
     # pristine text no other group writes.
-    "stable_backport_core": 40,
+    #
+    # Batch 35 adds four groups, all landing on every baseline: the two
+    # page-cache shadow-entry sweeps (61c663e020d2, then d3db2c042591 which
+    # refactors its partner's helper) and the MADV_DONTNEED pair
+    # (6375e95f381e's empty-PTE-page reclaim, then 43c4cfde7e37's batched TLB
+    # flush).  None of the four has a Cc: stable, and android13-5.15 carries
+    # none of the substrate they touch.  The three readahead/filemap commits of
+    # the same area are *not* registered -- no baseline has a carrier for them
+    # (see the exclusion record in plan.md).
+    "stable_backport_core": 44,
     # 13 Batch-1..13 groups + the three absorbed EEVDF groups
     # (sched_eevdf_pick_logic, sched_eevdf_core_fields,
     # sched_eevdf_modern_fields), the two absorbed
