@@ -657,21 +657,29 @@ jobs:
           fi
 
           marker='<!-- abk-compile-gate -->'
+          # ⚠️ 底下全是**双引号字符串**：反引号会被 shell 当命令替换去执行（`$STATUS_CONTEXT`
+          # 会当成一条叫 `ABK` 的命令，替换结果为空），评论里只剩空壳 —— PR #6 上实测出现过。
+          # 要输出字面反引号必须写 \`，本块内每一处都是转义的，改这段时别把它们省掉。
+          if [ -n "${GATE_REASON:-}" ]; then
+            no_dispatch="未派发构建：$GATE_REASON"
+          else
+            no_dispatch="未进入派发阶段（门禁未就绪或前置缺失，见本次 job 日志）"
+          fi
           {
             echo "$marker"
             echo "## ABK 编译门禁：$headline"
             echo ""
-            echo "- 状态检查: `$STATUS_CONTEXT`"
+            echo "- 状态检查: \`$STATUS_CONTEXT\`"
             echo "- 结论: **$desc**"
-            echo "- PR 的 commit: `$head_sha`"
+            echo "- PR 的 commit: \`$head_sha\`"
             if [ -n "$conclusion" ] && [ -n "${RUN_ID:-}" ]; then
-              echo "- ABK 构建: [run $RUN_ID]($run_url) —— `$conclusion`"
+              echo "- ABK 构建: [run $RUN_ID]($run_url) —— \`$conclusion\`"
             elif [ "$GATE_RUN" != "true" ]; then
-              echo "- 未派发构建：$GATE_REASON"
+              echo "- $no_dispatch"
             else
               echo "- 构建信息: 见 [本次门禁 job]($run_url)"
             fi
-            echo "- 重跑方式：再推一次，或给 PR 打/重打 `ci:compile` 标签，或手动 dispatch 本工作流"
+            echo "- 重跑方式：再推一次，或给 PR 打/重打 \`ci:compile\` 标签，或手动 dispatch 本工作流"
             echo ""
             if [ -f evidence.md ]; then cat evidence.md; fi
           } > comment.md
