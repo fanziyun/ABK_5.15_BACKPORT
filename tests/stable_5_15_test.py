@@ -2891,6 +2891,12 @@ def test_runtime_tunables_module():
         check(f"module.prop has {key}", bool(props.get(key)))
     check("module versionCode is a positive integer",
           props.get("versionCode", "").isdigit() and int(props["versionCode"]) > 0)
+    common_text = (module_dir / "common.sh").read_text(encoding="utf-8")
+    check("runtime banner matches module version",
+          f'ABK_VERSION="{props.get("version")}"' in common_text)
+    tunables_text = (module_dir / "tunables.conf").read_text(encoding="utf-8")
+    check("shipped configuration enables MGLRU",
+          re.findall(r"^lru_gen\.enable=(.*)$", tunables_text, re.M) == ["1"])
 
     # module.conf carries the companion through the module-set contract
     # (ABK's app reads parts[10] = name and parts[11] = download url).  On this

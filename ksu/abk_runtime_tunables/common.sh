@@ -5,10 +5,7 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-# Has to track module.prop, which carries v0.11.0: Batch 27 chose that over the
-# v0.10.0 this batch had declared, to avoid the collision.  So neither side of
-# the merge is right -- the banner is what the module manager shows.
-ABK_VERSION="v0.11.0"
+ABK_VERSION="v0.13.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device

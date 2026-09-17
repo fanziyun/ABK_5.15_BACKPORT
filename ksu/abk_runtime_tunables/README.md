@@ -207,7 +207,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `0` | `1` turns MGLRU on (kernel has the code, ships it off) |
+| `lru_gen.enable` | `1` | Enables MGLRU at module startup; `0` leaves the current kernel state unchanged (it does not disable MGLRU) |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
 | `sched.abk_sf_enable` | `0` | the smart-freq floor; leave at `0` whenever a vendor FAS/WALT governor owns DVFS (see below) |
@@ -225,8 +225,10 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `cfr.group` | *(empty)* | group names to sweep; empty = every `uid_*` group (this ROM names its groups: `cfr.group=freeze-app game`) |
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
-**Measure before you enable the opt-in knobs.** `lru_gen`, `thp` and
-`swappiness` change global reclaim behaviour.
+MGLRU is enabled by the shipped configuration; a missing configuration still
+uses the conservative built-in fallback and leaves it unchanged. This is an
+enablement policy, not a measured performance guarantee. MGLRU, THP and
+`swappiness` change global reclaim behaviour; measure them on the target workload.
 
 `abk_sf` (the Batch 10-4/10-5 schedutil smart-freq floor) ships disabled because
 of what was measured here, not because of a theory.  A FAS-style owner keeps

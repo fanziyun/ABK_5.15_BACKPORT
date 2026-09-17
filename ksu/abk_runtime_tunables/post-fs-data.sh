@@ -2,7 +2,7 @@
 # post-fs-data.sh - early stage of the ABK 5.15 runtime-tunables module.
 #
 # Only the knobs that want to be in place before the first real memory
-# pressure are applied here: vm sysctls, MGLRU (opt-in), THP (opt-in), the
+# pressure are applied here: vm sysctls, MGLRU (configured), THP (opt-in), the
 # schedutil smart-freq parameters (opt-in), the dynamic-readahead switch
 # (opt-in) and the kernel-domain SELinux rule the zram writeback path needs.
 # The rule has to be in place *before* something attaches a backing device,
