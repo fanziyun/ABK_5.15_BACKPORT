@@ -2227,7 +2227,7 @@ def _mglru_rework_type_selection_apply(ctx):
          "\tpos->gain = gain;\n"
          "\tpos->refaulted = pos->total = 0;\n"
          "\n"
-         "\tfor (i = tier % MAX_NR_TIERS; i <= min(tier, MAX_NR_TIERS - 1); i++) {\n"
+         "\tfor (i = tier % MAX_NR_TIERS; i <= min_t(typeof(tier), tier, MAX_NR_TIERS - 1); i++) {\n"
          "\t\tpos->refaulted += lrugen->avg_refaulted[type][i] +\n"
          "\t\t\t\t  atomic_long_read(&lrugen->refaulted[hist][type][i]);\n"
          "\t\tpos->total += lrugen->avg_total[type][i] +\n"

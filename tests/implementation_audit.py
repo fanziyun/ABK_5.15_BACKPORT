@@ -882,7 +882,7 @@ REQUIRED_CONTENT = {
         # isolate_pages() loop are the content; the per-tier gain array and
         # the shared tier_idx out-param must be gone.
         "pos->refaulted = pos->total = 0;",
-        "for (i = tier % MAX_NR_TIERS; i <= min(tier, MAX_NR_TIERS - 1); i++) {",
+        "for (i = tier % MAX_NR_TIERS; i <= min_t(typeof(tier), tier, MAX_NR_TIERS - 1); i++) {",
         "gain factor (2:3)",
         "read_ctrl_pos(lruvec, type, 0, 2, &sp);",
         "read_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);",
