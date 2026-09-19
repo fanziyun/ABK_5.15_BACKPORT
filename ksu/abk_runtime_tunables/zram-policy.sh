@@ -329,8 +329,8 @@ abk_zram_mount_swap() {
   abk_zram_set_mem_limit
 
   if [ "${ABK_DRY_RUN:-0}" = "1" ]; then
-    abk_log "[dry-run] $_ABK_MKSWAP $_ABK_ZRAM_NODE"
-    abk_log "[dry-run] $_ABK_SWAPON -p $_ms_prio $_ABK_ZRAM_NODE"
+    abk_log "[dry-run] $ABK_MKSWAP $ABK_ZRAM_NODE"
+    abk_log "[dry-run] $ABK_SWAPON -p $_ms_prio $ABK_ZRAM_NODE"
     return 0
   fi
 
@@ -714,12 +714,30 @@ abk_zram_supervisor_main() {
   _zs_per_wb=$(( _zs_wb_interval / _zs_reassert ))
   [ "$_zs_per_wb" -ge 1 ] || _zs_per_wb=1
 
+  # The mark is the one-shot half of the sweep and the pass is the repeatable
+  # half, so they run on different clocks -- and that is load bearing, not
+  # tidiness.  Re-marking before every pass would pin a capped sweep to the same
+  # first max_pages entries forever: mark_idle() *sets* ZRAM_IDLE on every page
+  # older than the cutoff, and a recompressed page never has its age refreshed
+  # (zram_recompress() reads through zram_read_from_zspool(), not
+  # zram_accessed()), so the pages a sweep just drained are handed straight back
+  # to the next one -- while the kernel's sweep always restarts at index 0 and
+  # spends its budget on attempts whether or not they can improve anything.  The
+  # drain advances only because a pass clears IDLE and nothing puts it back, so
+  # the mark runs on its own, much longer clock and every sweep in between
+  # passes --no-mark.
+  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 86400)"
+  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=86400
+  [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
+  _zs_per_mark=$(( _zs_mark_interval / _zs_reassert ))
+  [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
+
   if [ ! -f "$_zs_tool" ]; then
     abk_warn "$_zs_tool is missing; recompression sweeps disabled"
     return 1
   fi
 
-  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mode=$_zs_mode threshold=$_zs_threshold cap=${_zs_max_pages} reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
+  abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mark=${_zs_mark_interval}s mode=$_zs_mode threshold=$_zs_threshold cap=${_zs_max_pages} reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
 
   # Say so when writeback is armed, and stay quiet when it is not: the default
   # is off, and a line every boot for a feature nobody turned on is noise.
@@ -733,6 +751,11 @@ abk_zram_supervisor_main() {
   # and stay alive -- with a log line -- when a pass fails.
   _zs_tick=0
   _zs_wb_tick=0
+  # The first sweep marks -- the boot mark is what finds the initial cold set --
+  # and the --no-mark drain begins only after it.  Seeding the counter at
+  # _zs_per_mark makes that first tick fire without a special case.
+  _zs_mark_tick="$_zs_per_mark"
+  _zs_mark_arg=""
   while :; do
     abk_zram_reassert || true
 
@@ -745,13 +768,21 @@ abk_zram_supervisor_main() {
     _zs_tick=$(( _zs_tick + 1 ))
     if [ "$_zs_tick" -ge "$_zs_per_sweep" ]; then
       _zs_tick=0
+      _zs_mark_tick=$(( _zs_mark_tick + 1 ))
+      if [ "$_zs_mark_tick" -ge "$_zs_per_mark" ]; then
+        _zs_mark_tick=0
+        _zs_mark_arg=""
+      else
+        _zs_mark_arg="--no-mark"
+      fi
+      # shellcheck disable=SC2086 # _zs_mark_arg is a deliberate flag list
       sh "$_zs_tool" --sys-root "$ABK_SYS_ROOT" --device "$ABK_ZRAM_DEV" \
         --idle-age "$_zs_age" --mode "$_zs_mode" \
         --threshold "$_zs_threshold" --max-pages "$_zs_max_pages" \
-        >/dev/null 2>&1
+        $_zs_mark_arg >/dev/null 2>&1
       _zs_rc=$?
       case "$_zs_rc" in
-        0) abk_log "recompression sweep done (age=${_zs_age}s mode=$_zs_mode cap=$_zs_max_pages)" ;;
+        0) abk_log "recompression sweep done (age=${_zs_age}s mode=$_zs_mode cap=$_zs_max_pages${_zs_mark_arg:+ mark=skipped})" ;;
         3) abk_warn "recompression sweep refused: the secondary equals the primary" ;;
         *) abk_warn "recompression sweep failed (rc=$_zs_rc)" ;;
       esac

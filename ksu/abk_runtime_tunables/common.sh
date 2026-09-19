@@ -5,10 +5,12 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-# Has to track module.prop, which carries v0.11.0: Batch 27 chose that over the
-# v0.10.0 this batch had declared, to avoid the collision.  So neither side of
-# the merge is right -- the banner is what the module manager shows.
-ABK_VERSION="v0.11.0"
+# Has to track module.prop: this banner is what the module manager shows, so a
+# drift between the two makes action.sh report a version the manager never lists.
+# It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
+# -- because nothing tied the two files together; test_runtime_tunables_module
+# now does, so the next bump cannot leave one behind.
+ABK_VERSION="v0.13.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -225,6 +227,7 @@ abk_known_keys() {
 zram.recomp.enable
 zram.recomp.idle_age_sec
 zram.recomp.interval_sec
+zram.recomp.mark_interval_sec
 zram.recomp.threshold
 zram.recomp.max_pages
 zram.recomp.mode

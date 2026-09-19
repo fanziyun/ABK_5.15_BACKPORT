@@ -21,6 +21,19 @@
 # --mark-each-pass is given explicitly, because marking and recompressing in
 # the same instant recompresses everything every time.
 #
+# THE MARK IS ONE-SHOT FOR A HARDER REASON.  mark_idle() *sets* ZRAM_IDLE on
+# every page older than the cutoff, and a recompression clears the flag without
+# refreshing the page's age: zram_recompress() reads through
+# zram_read_from_zspool(), not zram_accessed(), so ac_time keeps its old value.
+# A page the last sweep just recompressed therefore still looks "older than the
+# cutoff" and the next mark hands it straight back.  Since the kernel's sweep
+# always restarts at index 0 and spends its max_pages budget on attempts -- even
+# on ones that cannot improve anything -- marking before every pass pins a
+# capped sweep to the same first max_pages entries forever and the rest of the
+# device is never reached.  A capped sweep makes progress only because a pass
+# clears IDLE and nothing puts it back: mark, then pass with --no-mark until
+# the caller decides to re-mark.
+#
 # An uncapped pass is an unbounded amount of work: it attempts every idle
 # entry on the device, in index order, and the CPU bill is paid on a phone
 # that is trying to stay quiet.  max_pages (mainline 34efe1c3b688, grafted by
@@ -41,6 +54,8 @@
 #   --interval SECS   seconds between passes with --daemon (default 1800)
 #   --daemon          keep sweeping (marks once unless --mark-each-pass)
 #   --mark-each-pass  with --daemon: re-run the mark step every pass
+#   --no-mark         skip the mark step: pass only (keeps a capped sweep
+#                     advancing instead of re-draining the same prefix)
 #   --allow-same-algo run even when the secondary equals the primary
 #   --status          print the device state and exit
 #   --dry-run         report what would be written, write nothing
@@ -60,13 +75,19 @@ MAX_PAGES=0
 INTERVAL=1800
 DAEMON=0
 MARK_EACH_PASS=0
+NO_MARK=0
 ALLOW_SAME_ALGO=0
 DRY_RUN=0
 STATUS=0
 SYS_ROOT=/sys
 
 usage() {
-  sed -n '2,51p' "$0"
+  # The manual is everything between the shebang and the first line of code, so
+  # a line added to it cannot silently truncate the help the way a hardcoded
+  # range does.  (This file carried `sed -n '2,51p'` until --no-mark pushed the
+  # first line of code past 51; cached_freeze_reclaim.sh already does it this
+  # way for the same reason.)
+  sed -n '2,/^[^#]/p' "$0" | sed '$d'
   exit 2
 }
 
@@ -98,6 +119,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="$2"; shift 2 ;;
     --daemon) DAEMON=1; shift ;;
     --mark-each-pass) MARK_EACH_PASS=1; shift ;;
+    --no-mark) NO_MARK=1; shift ;;
     --allow-same-algo) ALLOW_SAME_ALGO=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --status) STATUS=1; shift ;;
@@ -121,6 +143,12 @@ fi
 [ "$DAEMON" = 0 ] || [ "$MARK_EACH_PASS" = 0 ] || [ -n "$IDLE_AGE" ] \
   || [ "$MARK_IDLE" = 1 ] \
   || usage_fail "--mark-each-pass needs --mark-idle or --idle-age"
+# --no-mark says "do not mark"; --mark-idle says "mark every page".  Honouring
+# both would mean picking a winner, so refuse to guess.
+[ "$NO_MARK" = 0 ] || [ "$MARK_IDLE" = 0 ] \
+  || usage_fail "--no-mark and --mark-idle are mutually exclusive"
+[ "$NO_MARK" = 0 ] || [ "$MARK_EACH_PASS" = 0 ] \
+  || usage_fail "--no-mark and --mark-each-pass are mutually exclusive"
 
 DIR=$SYS_ROOT/block/zram$DEV
 [ -d "$DIR" ] || fail "$DIR does not exist"
@@ -205,6 +233,7 @@ compr_size() {
 
 mark() {
   local value
+  [ "$NO_MARK" = 0 ] || return 0
   if [ "$MARK_IDLE" = 1 ]; then
     value=all
   else
