@@ -94,8 +94,11 @@ GROUP_COUNTS = {
     # mglru_rework_aging_feedback generates.
     # 47 on the merged base (Batch 35's 45 + the two parallel Batch 36s:
     # memcg_stats_percpu_slim and the FUSE write-path prefault) + this batch's
-    # six MGLRU groups.
-    "stable_backport_core": 59,
+    # six MGLRU groups = 59, minus the two MADV_DONTNEED page-table groups
+    # removed in v0.42.0 (madvise_pt_reclaim + madvise_batch_tlb_flush: they
+    # freed empty PTE pages under mmap_read_lock and raced the smaps/reclaim
+    # page-table walkers on 5.15, which panicked in smaps_pte_range) = 57.
+    "stable_backport_core": 57,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
