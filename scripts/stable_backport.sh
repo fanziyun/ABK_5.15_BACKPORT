@@ -93,6 +93,50 @@ abk_stable_backport_preflight_display() {
   abk_require_file "$common_dir/drivers/gpu/drm/drm_atomic_helper.c"
 }
 
+# of/address.c ranges-parser revert (file overlay, not a Python graft).
+#
+# The upstream ranges flags-parsing rework (struct of_bus.has_flags ->
+# flag_cells, the new "default-flags" bus and of_bus_default_flags_* helpers,
+# the flag-preserving of_translate_one() memset) landed at 5.15.213.  On the
+# SM8550 (vermeer) it splits the Qualcomm PCIe root complex's single contiguous
+# MMIO ranges window in two, so the WCN (kiwi_v2) WLAN endpoint's 2 MB BAR0 --
+# which straddles the split -- can no longer be placed: cnss_pci probe fails
+# -EINVAL, msm_pcie tears the link down, and wlan0 never appears (BT unaffected,
+# it is on a separate transport).  files/drivers/of/address.c carries the
+# pre-rework 5.15.167 parser (with 5.15.216's unrelated __of_get_dma_parent
+# of_node_get refcount fix preserved); overlaying it restores the single-window
+# layout so BAR0 is assigned and WiFi comes up.  Verified on vermeer by flashing
+# a 5.15.216 build carrying only this overlay.
+#
+# Gated on the rework marker so it is a no-op on baselines that never carried it
+# (5.15.167/.178/.194): those trees are already in the target form, and their
+# unrelated of_node_get line must not be disturbed.  The original file is
+# snapshotted to <file>.abk-orig once, matching the Python grafts' rollback
+# convention (scripts/abk_rollback.sh restores it).
+abk_stable_backport_overlay_of_address() {
+  local common_dir target overlay
+  common_dir="$(abk_stable_backport_common_dir)"
+  target="$common_dir/drivers/of/address.c"
+  overlay="$MODULE_DIR/files/drivers/of/address.c"
+
+  abk_require_file "$target"
+  abk_require_file "$overlay"
+
+  if ! grep -q 'flag_cells' "$target" && ! grep -q '"default-flags"' "$target"; then
+    abk_log "of/address.c: pre-rework baseline, ranges parser already in target form (no overlay)"
+    return 0
+  fi
+
+  if cmp -s "$overlay" "$target"; then
+    abk_log "of/address.c: overlay already in place"
+    return 0
+  fi
+
+  [ -f "$target.abk-orig" ] || cp -a "$target" "$target.abk-orig"
+  cp -a "$overlay" "$target"
+  abk_log "of/address.c: overlaid pre-rework ranges parser (reverts the 5.15.213 rework; WLAN BAR0 fix)"
+}
+
 # The runtime companion (ksu/abk_runtime_tunables) is a distribution asset, not
 # a graft: it registers no PatchGroup and never writes into the kernel tree.  It
 # rides inside the AnyKernel3 zip so that flashing a kernel also installs the
@@ -172,6 +216,12 @@ abk_stable_backport_apply_selected() {
       stable_display_fix) abk_stable_backport_preflight_display ;;
     esac
     abk_stable_backport_apply_child "$child_id"
+    # The of/address.c overlay rides with the core child (both are mm/of core
+    # reverts).  Run it once, only when that child is selected, so a per-child
+    # invocation does not overlay three times.
+    if [ "$child_id" = "stable_backport_core" ]; then
+      abk_stable_backport_overlay_of_address
+    fi
     return 0
   fi
 
@@ -184,4 +234,6 @@ abk_stable_backport_apply_selected() {
     esac
     abk_stable_backport_apply_child "$child_id"
   done
+  # Overlay the pre-rework of/address.c once, after the Python children.
+  abk_stable_backport_overlay_of_address
 }
