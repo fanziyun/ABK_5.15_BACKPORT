@@ -2921,7 +2921,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.41.0", "0.41.0"], _versions)
+          _versions == ["0.42.0", "0.42.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4942,41 +4942,36 @@ def test_batch37_reclaim_paths():
 
 
 def test_batch35_pagecache_pt():
-    """Batch 35: shadow-entry sweeps + the MADV_DONTNEED page-table pair."""
-    print("Batch 35: shadow-entry sweeps + MADV_DONTNEED page tables")
+    """Batch 35: shadow-entry sweeps (the MADV_DONTNEED page-table pair removed)."""
+    print("Batch 35: shadow-entry sweeps")
     import abk_stable_core as core
     import batch35_core_pagecache_pt as b34
 
     keys = [g.key for g in core.PATCH_GROUPS]
     groups = {g.key: g for g in core.PATCH_GROUPS}
-    for key in ("truncate_shadow_batch", "truncate_shadow_batch_sweep",
-                "madvise_pt_reclaim", "madvise_batch_tlb_flush"):
+    for key in ("truncate_shadow_batch", "truncate_shadow_batch_sweep"):
         check(f"{key} group registered", key in groups)
 
-    # Each pair has to be registered in dependency order: the second group of
-    # the pair rewrites text the first one wrote, and both first groups probe
-    # their own payload so the second pass stops there (trap 5).
+    # The MADV_DONTNEED page-table pair (madvise_pt_reclaim +
+    # madvise_batch_tlb_flush) was removed: it freed empty PTE pages under
+    # mmap_read_lock and raced the smaps/reclaim page-table walkers on 5.15,
+    # which panicked in smaps_pte_range.  They must NOT be registered.
+    for key in ("madvise_pt_reclaim", "madvise_batch_tlb_flush"):
+        check(f"{key} group removed", key not in groups)
+
+    # The pair has to be registered in dependency order: the second group
+    # rewrites text the first one wrote, and the first group probes its own
+    # payload so the second pass stops there (trap 5).
     check("the sweep group follows the batch group",
           keys.index("truncate_shadow_batch")
           < keys.index("truncate_shadow_batch_sweep"))
-    check("the tlb group follows the reclaim group",
-          keys.index("madvise_pt_reclaim")
-          < keys.index("madvise_batch_tlb_flush"))
-    check("the reclaim group does not own mm/truncate.c",
-          "mm/truncate.c" not in groups["madvise_pt_reclaim"].files)
-    check("the tlb group owns the three files it rewrites",
-          groups["madvise_batch_tlb_flush"].files
-          == ["mm/internal.h", "mm/memory.c", "mm/madvise.c"],
-          groups["madvise_batch_tlb_flush"].files)
 
     # Trap 2 inside each group: no step may build its replacement out of a
     # later step's (the batch clear and the call-site rewrites are four
     # near-identical blocks, so this is exactly where it would happen).
     for key, builder in (
             ("truncate_shadow_batch", b34.build_shadow_batch_steps),
-            ("truncate_shadow_batch_sweep", b34.build_shadow_sweep_steps),
-            ("madvise_pt_reclaim", b34.build_pt_reclaim_steps),
-            ("madvise_batch_tlb_flush", b34.build_tlb_batch_steps)):
+            ("truncate_shadow_batch_sweep", b34.build_shadow_sweep_steps)):
         steps = builder()
         check(f"{key}: every step is required",
               all(req for _rel, _old, _new, req in steps),
@@ -4998,15 +4993,6 @@ def test_batch35_pagecache_pt():
     # ... and the same for the two clear steps of the first group.
     check("the two batch clear steps are textually distinct",
           b34._BIP_CLEAR_NEW != b34._IIP_CLEAR_NEW)
-    # The one-line signature steps: the new form of zap_page_range_single() is
-    # a substring of the pristine `static void ...` line, so the block has to
-    # carry the doc comment above it or replace_once reports already_present.
-    check("the zap_page_range_single step is anchored above the signature",
-          b34._ZPS_OLD.startswith(" * The range must fit into one VMA."),
-          b34._ZPS_OLD[:40])
-    check("... and its replacement is not a substring of the pristine line",
-          b34._ZPS_NEW not in b34._ZPS_OLD)
-
     # The trap-5 probes, asserted by behaviour rather than by source: a deleted
     # probe is invisible on the first pass (the pair still applies) and only the
     # second pass fails -- for the truncate pair with a blocked_by_shape, for the
@@ -5023,9 +5009,6 @@ def test_batch35_pagecache_pt():
          b34._BATCH_FN_OLD, b34._SWEEP_FN_NEW),
         (b34._shadow_sweep_probe, b34.TRUNCATE,
          b34._SWEEP_FN_OLD, b34._SWEEP_FN_NEW),
-        (b34._pt_reclaim_probe, b34.MM_H, b34._ZD_OLD, b34._ZD_NEW),
-        (b34._tlb_batch_probe, b34.MADVISE, "static int x;\n",
-         b34.MADVISE_TLB_GATHER),
     )
     for probe, rel, before, after in probe_cases:
         check(f"{probe.__name__}: false before its payload lands",

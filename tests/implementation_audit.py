@@ -747,31 +747,11 @@ REQUIRED_CONTENT = {
         "int nr = pagevec_count(&pvec);",
         "ABK stable_515_backport: d3db2c042591",
     ],
-    # The MADV_DONTNEED pair.  reclaim_pt_is_enabled() is the gate, and the
-    # emptiness decision under the pmd lock plus the pte_free_tlb() release are
-    # what make the page table actually go back: a port that only cleared the
-    # pmd would leak the page table instead of freeing it, and every structural
-    # audit would still pass.
-    "core:madvise_pt_reclaim": [
-        "bool reclaim_pt;",
-        "reclaim_pt_is_enabled",
-        "try_to_free_pte",
-        "pmd_clear(pmd);",
-        "pte_free_tlb(tlb, token, addr);",
-        "mm_dec_nr_ptes(tlb->mm);",
-        "\t\t.reclaim_pt = true,",
-        "ABK stable_515_backport: 6375e95f381e",
-    ],
-    "core:madvise_batch_tlb_flush": [
-        "madvise_batch_tlb_flush",
-        "void zap_page_range_single_batched(struct mmu_gather *tlb,",
-        # The gather has to be taken by the caller and handed *down*: the
-        # per-VMA call itself must no longer be the one that gathers.
-        "\t\ttlb_gather_mmu(&tlb, mm);",
-        "\tif (tlbp)\n\t\ttlb_finish_mmu(&tlb);",
-        "zap_page_range_single_batched(tlb, vma, start, end - start, &details);",
-        "ABK stable_515_backport: 43c4cfde7e37",
-    ],
+    # The MADV_DONTNEED page-table pair (madvise_pt_reclaim 6375e95f381e +
+    # madvise_batch_tlb_flush 43c4cfde7e37) was REMOVED: freeing an empty PTE
+    # page under mmap_read_lock races the smaps/reclaim page-table walkers on
+    # 5.15 (no pmdp_get_lockless()/RCU pte_offset_map*), which panicked in
+    # smaps_pte_range.  See CHANGELOG.md (Batch 35).
     "core:arm64_lse_percpu_load_atomics": [
         # 535fdfc5a228.  The whole graft is two verbatim upstream hunks in one
         # header: the LSE branch gains a [tmp] destination (store form -> load
@@ -1147,12 +1127,6 @@ REQUIRED_ABSENT = {
         # the invalidate paths run.
         ["mm/truncate.c", "clear_shadow_entries(mapping, &pvec, indices);"],
         ["mm/truncate.c", "\t\t\t__clear_shadow_entry(mapping, indices[i], page);"],
-    ],
-    "core:madvise_pt_reclaim": [
-        # MADV_DONTNEED must not still go through the multi-VMA zap with no
-        # details: that is the shape where the reclaim mark never reaches
-        # zap_pte_range() and the whole change is a no-op.
-        ["mm/madvise.c", "\tzap_page_range(vma, start, end - start);"],
     ],
 "core:fuse_prefault_out_of_write_path": [
         # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
@@ -1607,46 +1581,9 @@ REQUIRED_IN_FUNCTION = {
          ["if (!page)\n\t\t\tcontinue;"],
          []),
     ],
-    # Batch 35.  The MADV_DONTNEED pair spans two files, and what makes it a
-    # change rather than a rewrite is *where* each half sits: the decision in
-    # zap_pte_range()'s tail (not in zap_pmd_range(), where a THP collapse could
-    # have replaced the pmd), the emptiness test before pmd_clear() (the reverse
-    # order frees a page table a skipped entry still points into), and the
-    # gather owned by the caller (a per-VMA gather is what the commit removes).
-    "core:madvise_pt_reclaim": [
-        ("mm/memory.c", "zap_pte_range",
-         ["unsigned long start = addr;",
-          "if (reclaim_pt_is_enabled(start, end, details))",
-          "try_to_free_pte(mm, pmd, start, tlb);"],
-         ["pmd_clear(pmd);"]),
-        ("mm/memory.c", "try_to_free_pte",
-         ["start_pte = pte_offset_map(pmd, addr);",
-          "if (!pte_none(*pte)) {",
-          "pmd_clear(pmd);",
-          "free_pte_page(tlb, pmd, pmdval, addr);"],
-         ["pte_free_tlb"]),
-        # The barrier this tree needs and upstream's helper has no counterpart
-        # for (CONFIG_SPECULATIVE_PAGE_FAULT): without it a reader that holds
-        # the ptl of the page table we are about to free races the free.
-        ("mm/memory.c", "free_pte_page",
-         ["#ifdef CONFIG_SPECULATIVE_PAGE_FAULT",
-          "smp_call_function(wait_for_smp_sync, NULL, 1);",
-          "pte_free_tlb(tlb, token, addr);",
-          "mm_dec_nr_ptes(tlb->mm);"],
-         []),
-    ],
-    "core:madvise_batch_tlb_flush": [
-        ("mm/madvise.c", "do_madvise",
-         ["if (madvise_batch_tlb_flush(behavior)) {",
-          "tlb_gather_mmu(&tlb, mm);",
-          "madvise_walk_vmas(mm, start, end, behavior, tlbp,",
-          "if (tlbp)\n\t\ttlb_finish_mmu(&tlb);"],
-         []),
-        # Batching means exactly that the per-VMA helper no longer gathers.
-        ("mm/madvise.c", "madvise_dontneed_single_vma",
-         ["zap_page_range_single_batched(tlb, vma, start, end - start, &details);"],
-         ["tlb_gather_mmu"]),
-    ],
+    # Batch 35.  The MADV_DONTNEED page-table pair (madvise_pt_reclaim +
+    # madvise_batch_tlb_flush) was REMOVED; see the note in the payload table
+    # above and CHANGELOG.md (Batch 35).
     # The pair has to reach both invalidate paths, and the loop bound has to be
     # the batch size the call site indexes with -- a port that changed only the
     # helper would pass a whole-file substring check on either half.

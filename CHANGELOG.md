@@ -856,7 +856,36 @@ worktree 里验证；Batch 37 在制品原样留在工作树，由其后续批�
 
 <a id="batch-35"></a>
 
-## Batch 35(v0.37.0)
+## Batch 35(v0.37.0；MADV_DONTNEED 页表对已于 v0.42.0 移除）
+
+> **v0.42.0 移除 `madvise_pt_reclaim` + `madvise_batch_tlb_flush`（本节其余为历史原文，保留备查）**
+>
+> **真机现象**：vermeer（Redmi K70，SM8550）运行中 panic 黑屏重启。rawdump/`md_kmsg`
+> 抓到 `Kernel panic - not syncing: Oops: Fatal exception`，崩溃线程 CPU5 PID 631
+> `[GT]ColdPool#8`（GameTurbo 内存轮询）读 `/proc/pid/smaps`：
+> `sys_read → smaps_pte_range → _raw_spin_lock`，取页表页锁时踩野指针
+> （`pmd_page(*pmd)` 落在未映射 vmemmap，`FSC=0x06` level-2 translation fault，
+> pgtable dump `pmd=0`）。同一刻 CPU6 在 `zap_pte_range` 拆页表 —— smaps 遍历 vs
+> 页表拆除的竞态。
+>
+> **根因**：`madvise_pt_reclaim`（`6375e95f381e`）让 `MADV_DONTNEED` 在**只持
+> `mmap_read_lock`** 时经 `try_to_free_pte()` 把空 PTE 页还给 buddy。上游敢这么做，
+> 是因为同期带了 6.5 的 “free retracted page table by RCU” 全套（`pmdp_get_lockless()`
+> + RCU `pte_offset_map*`），让**所有**页表遍历者（含 `smaps_pte_range`）能重校验并安全
+> 失败退出。5.15 没有这套地基；本端口只搬了 `try_to_free_pte()` **函数内部**的 pmd-锁
+> 重校验，**保护不了别的遍历者**。移植时留的读者屏障 `smp_call_function(wait_for_smp_sync…)`
+> 又被圈在 `#if ALLOC_SPLIT_PTLOCKS` 里，而本机 config（无 `DEBUG_SPINLOCK`/`LOCKDEP`/
+> `PREEMPT_RT`，spinlock 是裸 qspinlock）恰好 `ALLOC_SPLIT_PTLOCKS = 0`，屏障被编译掉，
+> 形同虚设。
+>
+> **为何删而不修**：收益与进程 `VmPTE` 大小成正比，只在“超大稀疏映射 + 高频
+> `MADV_DONTNEED`”的服务器分配器场景显著（上游示例 `VmPTE 102640KB → 240KB`，VIRT 55TB），
+> 手机负载上可忽略。且上游把 `PT_RECLAIM` 挂在 `ARCH_SUPPORTS_PT_RECLAIM` 上，**arm64 在
+> v6.14 根本没选它** —— 上游自己就没在 arm64 打开这条路。为一个无实测收益的优化换一次随机
+> panic 不划算。`madvise_batch_tlb_flush`（`43c4cfde7e37`）的锚点是 `pt_reclaim` 改写后的
+> 产物（`madvise_dontneed_single_vma` 走单-VMA `zap_page_range_single` 带 `zap_details`），
+> 无法单独保留，一并移除。保留的是与本竞态无关的两组影子项清账
+> `truncate_shadow_batch` / `truncate_shadow_batch_sweep`。core 组数 59 → 57。
 
 > **编号让位（已合并完成）**：本批起草时叫 Batch 34 / v0.36.0，撞上了当时并行开着的两条
 > 都自称 Batch 34 的分支（PR #12「`fuse_fill_write_pages()`」与 PR #15「arm64 load LSE
