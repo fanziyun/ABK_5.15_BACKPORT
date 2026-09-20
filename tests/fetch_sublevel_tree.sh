@@ -40,6 +40,7 @@ FETCH_FILES=(
   kernel/rcu/tree_nocb.h
   mm/oom_kill.c
   mm/vmscan.c
+  mm/vmstat.c
   mm/memcontrol.c
   # Batch 37 (MGLRU v4 performance series): the workingset and deactivation
   # groups anchor in these.
@@ -89,6 +90,13 @@ FETCH_FILES=(
   include/linux/huge_mm.h
   include/uapi/asm-generic/mman-common.h
   drivers/gpu/drm/drm_atomic_helper.c
+  # The of/address.c ranges-parser overlay (scripts/stable_backport.sh
+  # abk_stable_backport_overlay_of_address) requires the target file to exist
+  # before it can read its rework gate, so smoke.sh aborted with "required file
+  # not found" on every freshly fetched tree.  It is a file overlay, not a
+  # Python graft, so no group declares it and step_audit's fixture-coverage
+  # check cannot see the gap.
+  drivers/of/address.c
   # Batch 15 (ABK_ABI_PATCH_SUITE absorption): the files the absorbed
   # optimization groups anchor in.  Note io_uring/io_uring.c is the 5.15
   # monolith (~11k lines) -- 6.1 split it into 56 files, so the suite's
@@ -128,8 +136,6 @@ FETCH_FILES=(
   # Batch 35: the FUSE write-path prefault (faa794dd2e17).  The module's first
   # group in fs/fuse/ -- the file is the whole group.
   fs/fuse/file.c
-  # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
-  mm/swap.c
 )
 
 decode() {

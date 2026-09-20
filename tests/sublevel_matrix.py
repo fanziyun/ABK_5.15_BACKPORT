@@ -98,7 +98,7 @@ GROUP_COUNTS = {
     # removed in v0.42.0 (madvise_pt_reclaim + madvise_batch_tlb_flush: they
     # freed empty PTE pages under mmap_read_lock and raced the smaps/reclaim
     # page-table walkers on 5.15, which panicked in smaps_pte_range) = 57.
-    "stable_backport_core": 57,
+    "stable_backport_core": 63,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
@@ -198,6 +198,13 @@ PRE_APPLIED = {
             # 5.15.196 pte_mkwrite() dirty guard: the rolling branch is past
             # that point, so the helper already has the guarded clear.
             "arm64_pte_mkwrite_clean",
+            # 5.15.220-era i_mmap-split UAF fix (mainline e923bd21058e, v7.2;
+            # linux-5.15.y backport f87c08060818, 2026-08-19).  Verified on the
+            # fetched lts tree: mm/huge_memory.c already carries the
+            # `pgoff_t end, struct address_space *mapping` signature, the
+            # early i_mmap_unlock_read() and the `mapping = NULL` call site,
+            # so the group writes nothing here and reports already_present.
+            "huge_memory_imap_split_uaf",
         },
         "stable_perf_backport": {
             "sched_nohz_idle_balance_series",

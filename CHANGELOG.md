@@ -550,6 +550,184 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+<a id="batch-38"></a>
+
+## Batch 38(v0.43.0)
+
+主题「Linux 7.2 MM/Reclaim 筛选后首批落地」。调研全文见 `docs/survey_7_2_mm_reclaim.md`，本批只落地其中
+按「真实性能收益 + 真能移植」口径筛出的 6 组，全部在 `scripts/batch38_core_mm_safety_perf.py`，
+core 组数 57 → **63**。
+
+### 0. 调研口径：为什么不能用 committer date 界定一个内核版本
+
+v7.2 触及 `mm/` 的 commit 共 **366** 条。这个数字是拿 tag 可达性比出来的：GitHub API 在
+`sha=v7.1` 与 `sha=v7.2` 下分别列 `path=mm`，取差集；再用 cgit 的 `log/mm/?id=v7.1..v7.2`
+全量翻页交叉核对，两者一致（差集的 245 条全部落在 cgit 的 366 条内，零遗漏）。
+
+我最初的窗口法（committer date 2026-06-13..08-16）只覆盖到 **121** 条、漏掉 **245** 条，
+而且混入了 **432** 条 v7.2 之后才进 master 的 commit——原因是子系统树在 Linus 拉取前几周
+就提交了补丁，committer date 落在 4/5 月。**教训记在这里，后续任何按版本筛选的调研都适用。**
+
+> kernel.org 现已不可访问（解析到假 IP，TLS 握手失败）。取补丁改走
+> `https://api.github.com/repos/torvalds/linux/commits/<sha>`（返回 `commit.message` +
+> `files[].patch`），未认证 60 次/小时（IP 级）。
+
+### 1. 六组明细
+
+| # | 组名 | 上游 | 落点 | 性质 |
+|---|---|---|---|---|
+| 1 | `huge_memory_imap_split_uaf` | `e923bd21058e`（v7.2）；**以 5.15.y 回移 `f87c08060818` 为移植文本** | `mm/huge_memory.c` | 稳定性/UAF |
+| 2 | `swap_readahead_lru_add_drain` | `a4519e5b648a`（v7.2） | `mm/swap_state.c` | 锁竞争 |
+| 3 | `vmscan_tasks_rcu_qs` | `25f52e812168`（v7.2）；以 5.15.y `4cdc1bdf4094` 为移植文本 | `mm/vmscan.c` | 停顿类 |
+| 4 | `filemap_mmap_miss_tried` | `9b0fcac3cfe7`（v7.2，1/2） | `mm/filemap.c` 的 `filemap_map_pages()` | 预读 I/O |
+| 5 | `memcg_dying_bailout` | `0beeaf14e7b9` + `e13f634f50d5` + `757dd8193f6c` + `10228e0a5123`（v7.2） | `include/linux/memcontrol.h` + `mm/memcontrol.c` | 尾部延迟 |
+| 6 | `buddyinfo_nolock` | `aaa98b100ea8`（v7.2） | `mm/vmstat.c` | 锁竞争 |
+
+### 2. 安全性逐条核对（移植前查，不是移植后补）
+
+**组 1（i_mmap split UAF）**：`split_huge_page_to_list()` 在 5.15 `mm/huge_memory.c:2680` 取
+`i_mmap_lock_read()`，原先是跨过 `__split_huge_page()` 一直持到 `out_unlock`（`:2758`）才释放；
+而 `__split_huge_page()` 内部会解锁并释放 after-split 子页，页面没了之后 `mapping` 及其 inode
+可能被并发 `evict()`/`iput()` 先释放，最后一次 `i_mmap_unlock_read(mapping)` 就成了解引用已释放内存。
+三条 required 步骤缺一不可：签名加 `mapping` 参数、在释放子页的循环**之前**提前解锁、调用点传参后
+立刻 `mapping = NULL`。安全性依据（逐条在 5.15.194 树上核实）：
+- `__split_huge_page()` 全文件**只有一个**调用点（`:2740`），签名改动不会遗漏第二处；
+- anon THP 走 `mapping = NULL` + `anon_vma_lock_write()`（`:2668`），新的 `if (mapping)` 天然跳过，
+  而外层 `out_unlock` 的解锁本来也跳过 ⇒ 既不会双解锁也不会漏解锁；
+- file THP 路径提前解锁后调用点把 `mapping` 置 NULL，`out_unlock` 的释放随之跳过；该分支此后只碰
+  `ret = 0`，`xa_unlock(&mapping->i_pages)` 在 `else`/`fail` 路径，到不了这里；
+- 提前解锁发生在 head page 仍持锁时，这正是钉住 inode 的前提，也是该修复「正确」而非仅仅「更早」的原因。
+
+**组 2（删 swap readahead 的 lru_add_drain）**：这里读进来的页面由调用方
+（`do_swap_page()` → `lru_cache_add()`）挂到 per-CPU pagevec，该批次由后续分配的
+`lru_add_drain()`/`lru_add_drain_all()` 自然排空，LRU 驻留本就是异步语义；两点之间没有任何代码
+读 LRU 驻留状态，所以不移除任何正确性依赖。5.15 有三处 `lru_add_drain()`，删的是
+`swap_cluster_readahead()`（`:659`）与 `swap_vma_readahead()`（`:831`）两处，
+`:317`（另一函数）保留。**trap 1 专项处理**：删行类改动的 `new` 是 `old` 的前缀，会让
+`replace_once` 直接短路成 `already_present` 而永不落地，所以两个锚点都把 `skip:` 标签和
+空行/注释上下文一并带进去，使 `new` 不再是 `old` 的子串。
+
+**组 3（Tasks-RCU QS）**：5.15 的 `cond_resched_tasks_rcu_qs()` 在 `include/linux/rcupdate.h`
+是**无条件宏** `do { rcu_tasks_qs(current, false); cond_resched(); } while (0)`，没有
+`CONFIG_TASKS_RCU` 门，所以永远编得过；`rcu_tasks_qs()` 在 Tasks-RCU 关闭时是 no-op 内联。
+本机 GKI 开的是 `CONFIG_TASKS_TRACE_RCU`（给 BPF 用）而非 `CONFIG_TASKS_RCU`，编译后与原先的
+`cond_resched()` **等价**。因此本组**不主张任何设备侧收益**，收益只在真开 Tasks-RCU 的宿主上。
+
+**组 4（mmap hit 不误计 TRIED）**：同一句
+`!(vmf->vma->vm_flags & VM_RAND_READ) && ra->ra_pages` 守卫在 5.15 的
+`do_async_mmap_readahead()`（`:3037`）也出现，但那边是 `||` 且是提前返回，语义相反；锚点带上
+紧随其后的 `unsigned int mmap_miss = READ_ONCE(...)` **声明行**（只有 `filemap_map_pages()`
+有声明），保证是单点编辑。与 Batch 30 的 `readahead_mmap_miss_race` 不冲突：那一组改的是
+`do_async_mmap_readahead()` 里的递减，本组改 `filemap_map_pages()` 里的递减。
+
+**组 5（memcg dying bailout）**：只在 css 已标记 dying 时触发，也就是 `cgroup_rmdir()` 已经决定拆它、
+页面反正要被 reparent 的时候，提前停手不损失任何东西。5.15 的 `kill_css()`
+（`kernel/cgroup/cgroup.c:5720`）先 `css->flags |= CSS_DYING` **再** `css_clear_dir()`，
+正是该修复依赖的顺序，已在 2025-12 基线上核实。5.15 既无 `memcg_is_dying()` 也无
+`css_is_dying()`，只有 `include/linux/cgroup-defs.h` 里的 `CSS_DYING` 标志；按上游位置把
+`memcg_is_dying()` 补进 `include/linux/memcontrol.h`（`CONFIG_MEMCG` 块 + `#else` 存根），
+直接测标志。memcg-v1 两处按 5.15 布局重锚到 `mm/memcontrol.c`（`:3433`/`:3575`）——5.15
+**没有** `mm/memcontrol-v1.c`。
+
+### 3. 本批踩到并修掉的一个真陷阱（trap 5）
+
+`memcg_dying_bailout` 的主动回收那条，上游把它紧贴在 `signal_pending()` 判断之后。但 5.15 上那个
+循环是 Batch 37 `memcg_memory_reclaim` **生成**的 `memory_reclaim()`（在 `mm/memcontrol.c`，
+不是 vmscan.c），而 Batch 37 的 `proactive_reclaim_suspend_abort` 组正好重写那一段并把
+`/* This is the final attempt...` 注释作为自己 `new` 块的结尾。**我的插入落在它中间，就把那个
+`new` 块劈成两半**：第二遍时它的 `old`（`-EINTR`）匹配不上、`new` 也匹配不上，于是在已打补丁的树上
+降级成 `blocked_by_shape`。这是 `step_audit.py` 的第二遍断言抓到的，第一遍全绿。
+
+修法：把检查挪到那条注释**之后**——仍在同一个 `while` 循环里、仍在
+`try_to_free_mem_cgroup_pages()` 之前，行为完全一致，而锚点是 Batch 37 从不改写的文本；
+附带好处是本组从此只依赖 `memcg_memory_reclaim` 落地，不再依赖 suspend-abort 组。
+
+### 4. 顺带修掉的两个既有缺口（不是本批引入，是挡门禁的）
+
+1. `drivers/of/address.c` 不在 `tests/fetch_sublevel_tree.sh` 的 `FETCH_FILES`、也不在
+   `tests/smoke.sh` 的 `SMOKE_FILES` 里，而 `scripts/stable_backport.sh` 的
+   `abk_stable_backport_overlay_of_address()` **无条件** `abk_require_file` 它 ⇒ 任何新取的参考树
+   跑 `smoke.sh` 必炸 `required file not found`。这是文件 overlay、不是 Python graft，所以没有组声明它，
+   `step_audit` 的 fixture 覆盖检查看不见这个缺口。已在两处补齐。
+2. `tests/smoke.sh` 还留着 v0.42.0 移除 `madvise_pt_reclaim`/`madvise_batch_tlb_flush` 之后的
+   六条陈旧断言（4 个 `grep -q` 符号断言 + `zap_page_range_single_batched` 调用点断言 +
+   `madvise_dontneed_single_vma()` 的 `tlb_gather_mmu` awk 断言）——那两个组已从
+   `build_groups()` 删掉，`scripts/` 里 `reclaim_pt_is_enabled` 零命中，断言只可能失败。
+   已删除并留注释说明原因。
+
+两个缺口都用 `git stash` 在 HEAD 上复现过（同样失败、同样错误），确认非本批引入。
+
+### 5. 验证
+
+五道树级门禁全绿（`build/abk-trees/194`，5.15.194）：
+
+```bash
+python3 -m py_compile scripts/*.py tests/*.py     # OK
+bash -n tests/smoke.sh tests/fetch_sublevel_tree.sh  # OK
+python3 tests/stable_5_15_test.py                 # all checks passed
+python3 tests/step_audit.py build/abk-trees/194   # STEP AUDIT OK, second pass idempotent
+python3 tests/implementation_audit.py build/abk-trees/194  # IMPLEMENTATION AUDIT OK
+bash tests/smoke.sh build/abk-trees/194           # SMOKE OK (exit 0)
+```
+
+本批按 `docs/group_recipe.md` §3 补齐了 `tests/implementation_audit.py` 的行为门禁
+（Batch 37 有、本批原先漏了）：六组全部进 `REQUIRED_IN_FUNCTION`，`memcg_dying_bailout`
+另在 `REQUIRED_CONTENT` 里钉住 `memcg_is_dying()` 的 `CONFIG_MEMCG` 体与 `#else` 存根。
+已做反向验证：把 `filemap_mmap_miss_tried` 的锚点改回**错误的那个 decrement**
+（`filemap_fault()` 的那处），审计报
+`filemap_map_pages missing required text … has forbidden text …` 并退出 1——
+也就是说门禁真的能抓住「 guard 落错站点」这类回归，不是摆设。
+
+**已知局限：只跑了 194 一档。** recipe §3 要求「在每个受支持基线上重复 dry-run」，
+本批没有做，167/178/216 三档未取树、`mm/vmstat.c` 在本地仅有 194 一份。
+`mm/vmstat.c`、`drivers/of/address.c` 已同时加进 `FETCH_FILES` / `AUDIT_FILES` /
+`SMOKE_FILES`，新取的树会自动带上；但 `buddyinfo_nolock` 与 `memcg_dying_bailout`
+在另三档上的落点尚未实测。
+
+另外单独做了一次真实施加后目视核对生成代码（`memory_reclaim()` 中 `memcg` 在作用域内、检查在循环内
+且在回收调用之前、Batch 37 的 `-ERESTARTSYS` 块保持完整连续），并跑了第二遍幂等：63 组全部
+`already_present`，`memcg_is_dying()` 恰好出现两次（`CONFIG_MEMCG` 块 + `#else` 存根），无重复施加。
+
+`tests/sublevel_matrix.py`：`GROUP_COUNTS` core 57 → 63；`huge_memory_imap_split_uaf` 加入
+`PRE_APPLIED["216"]`（lts 已含 `f87c08060818`，已取该树核对三处 hunk 均在）。另三组在 lts 上
+确认**不**是 already_present（`mm/swap_state.c` 仍是 3 处 `lru_add_drain()`；`mm/vmscan.c` 无
+`cond_resched_tasks_rcu_qs`；`mm/filemap.c` 里那处 `FAULT_FLAG_TRIED` 是既有的
+`filemap_fault()` 门，不是本组落点）。
+
+### 6. 未做设备 A/B，不主张提速
+
+上游数字全部来自服务器负载：组 4 的 20 GiB 大于内存随机访问（预读 I/O 降约 21×）、
+组 5 的 `cgdelete` 159 s / 无关读者 182 s。**没有任何 Snapdragon 数据**，故本批每个收益数字
+都标注来源，不写成设备侧结论。组 3 更明确：在本机配置下编译后与原先等价。
+
+> **更正**：本节省览初版把「吞吐 +29%／延迟 −23%／
+> `workingset_refault_file` −43%」记在组 1 名下。那组数字属于 survey §1 的
+> MGLRU 回收循环系列（`f37d3708b676`），**本批没有落地**；组 1 是
+> `huge_memory_imap_split_uaf`，它自己的 docstring 写的是「no performance
+> benefit」。已删去这组错记的数字。
+
+### 7. 组 4 的落点更正（本地 code review 抓到的真问题）
+
+5.15 的 `mm/filemap.c` 里有**两处** `mmap_miss` 递减，形状相近、都在预读路径上：
+
+| 5.15 站点 | 形状 | mainline 对应物 | `9b0fcac3cfe7` 是否改它 |
+|---|---|---|---|
+| `filemap_fault()` ~`:3121` | `if (!(vmf->vma->vm_flags & VM_RAND_READ) && ra->ra_pages) { … WRITE_ONCE(ra->mmap_miss, --mmap_miss); }` | `do_async_mmap_readahead()`（今天 `mm/filemap.c:3477`） | **否** |
+| `filemap_map_pages()` ~`:3421` | `if (mmap_miss > 0) mmap_miss--;`（函数局部计数，函数尾一次性写回） | 上游改的那块（`mm/filemap.c:3984`） | **是** |
+
+survey 初版写成「递减在 `mm/filemap.c:3119-3125`，`filemap_map_pages()` 的逐 PTE
+循环内」——行号属于 `filemap_fault()`、函数名也错，于是第一版 graft 把 guard 加到了
+错误的那个 decrement 上（锚点是 `!(VM_RAND_READ) && ra->ra_pages` + `unsigned int
+mmap_miss = READ_ONCE(ra->mmap_miss);`，行号对、函数错，`replace_once` 照样 applied）。
+已改成 `filemap_map_pages()` 的 per-PTE 递减，并在 `implementation_audit.py` 里用
+`must_not_have` 钉住旧文本（见 §5 的反向验证）。
+
+范围限制：mainline 那个块还带 `(map_ret & VM_FAULT_NOPAGE)` 与
+`!folio_test_workingset(folio)` 两个条件，5.15 的无条件 per-PTE 递减两者都没有
+（`do`-`while` 里每个页都减，包括 PTE 本就存在的那些）。不重构循环就无法移植这两项，
+所以只加新的 `FAULT_FLAG_TRIED` 一项，既有的多减行为保持上游所见。该改动只可能
+**跳过**一次递减（`mmap_miss > 0` 边界检查保留），不会引入下溢。
+
 <a id="batch-37"></a>
 
 ## Batch 37(v0.39.0)

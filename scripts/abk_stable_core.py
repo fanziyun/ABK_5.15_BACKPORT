@@ -5747,5 +5747,16 @@ import batch37_core_reclaim_paths as _b37_rp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b37_rp.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 38: Linux 7.2 MM/Reclaim grafts, selected by docs/survey_7_2_mm_reclaim.md.
+#
+# Registered after the Batch-37 reclaim-path chain because nothing here edits
+# that chain's generated text; the groups are independent of each other and of
+# every earlier group except where noted in the batch file's own docstring.
+# ============================================================================
+import batch38_core_mm_safety_perf as _b38  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b38.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

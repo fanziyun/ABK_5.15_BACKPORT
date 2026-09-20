@@ -208,10 +208,15 @@ required strings.
 - `docs/group_recipe.md` — the add-a-group recipe and the traps above.
 - `plan.md` — living backlog (written in Chinese; status markers `[ ]`/`[~]`/`[x]`/
   `[-]`). Each landed batch bumps `module.conf`'s version.
-- `docs/survey_5_15_168_218.md`, `docs/survey_6_1_ack.md`, `docs/survey_6_6_ack.md` —
+- `docs/survey_5_15_168_218.md`, `docs/survey_6_1_ack.md`, `docs/survey_6_6_ack.md`,
+  `docs/survey_7_2_mm_reclaim.md` —
   candidate inventories. Since Batch 15 absorbed the ABK_ABI_PATCH_SUITE
   optimization inventory, those surveys' "suite-covered, rely on the suite"
   rows are provenance for what was absorbed, not an exclusion list to honour.
+  `docs/survey_7_2_mm_reclaim.md` also records the release-delimiting method
+  (compare tag reachability, never committer dates — subsystem trees commit
+  weeks before Linus pulls) and, in its §4, a provenance correction: 5.15 has
+  two `mmap_miss` decrements and the survey's first pass named the wrong one.
 
 ## How ABK runs this module (the external-module contract)
 

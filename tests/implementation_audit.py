@@ -893,6 +893,19 @@ REQUIRED_CONTENT = {
         "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);",
     ],
+    # --- Batch 38 -------------------------------------------------------
+    # 0beeaf14e7b9 + e13f634f50d5 + 757dd8193f6c + 10228e0a5123.  The five
+    # call sites are pinned per-function in REQUIRED_IN_FUNCTION; these two
+    # are the helper they all call.  The CONFIG_MEMCG body alone is satisfied
+    # by a tree that forgot the #else stub, which breaks every
+    # !CONFIG_MEMCG build -- the stub is the whole reason the helper is
+    # worth an inline rather than a plain call.
+    "core:memcg_dying_bailout": [
+        "static inline bool memcg_is_dying(struct mem_cgroup *memcg)\n{\n"
+        "\treturn memcg ? !!(memcg->css.flags & CSS_DYING) : false;\n}",
+        "static inline bool memcg_is_dying(struct mem_cgroup *memcg) "
+        "{ return false; }",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1706,6 +1719,73 @@ REQUIRED_IN_FUNCTION = {
          ["__alloc_percpu_gfp(sizeof(struct abk_vmstats_percpu)",
           "__alignof__(struct abk_vmstats_percpu)"],
          ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
+    ],
+    # --- Batch 38 -------------------------------------------------------
+    # e923bd21058e, carried as the 5.15.y backport f87c08060818.  Both halves
+    # have to be pinned inside their own function: the signature alone is
+    # satisfied by a call site that still passes three arguments (which
+    # compiles only because the 5.15 prototype is visible), and the
+    # `mapping = NULL` alone is satisfied by a tree that nulled it without
+    # ever unlocking early.  The must_not_have on the callee catches the
+    # unpatched signature, and the one on the caller catches a half-applied
+    # group that added the parameter but left the old three-arg call.
+    "core:huge_memory_imap_split_uaf": [
+        ("mm/huge_memory.c", "__split_huge_page",
+         ["pgoff_t end, struct address_space *mapping)",
+          "\tif (mapping)\n\t\ti_mmap_unlock_read(mapping);"],
+         []),
+        ("mm/huge_memory.c", "split_huge_page_to_list",
+         ["__split_huge_page(page, list, end, mapping);",
+          "\t\tmapping = NULL;"],
+         ["__split_huge_page(page, list, end);"]),
+    ],
+    # a4519e5b648a.  Both call sites must lose the drain; a third one in
+    # free_pages_and_swap_cache() must keep it, so the claim is per-function
+    # and cannot be a file-wide absence.
+    "core:swap_readahead_lru_add_drain": [
+        ("mm/swap_state.c", "swap_cluster_readahead", [], ["lru_add_drain"]),
+        ("mm/swap_state.c", "swap_vma_readahead", [], ["lru_add_drain"]),
+    ],
+    # 25f52e812168, carried as the 5.15.y backport 4cdc1bdf4094.  The
+    # must_not_have pins the replacement: leaving the bare cond_resched()
+    # behind compiles identically and silently drops the fix.
+    "core:vmscan_tasks_rcu_qs": [
+        ("mm/vmscan.c", "shrink_lruvec",
+         ["cond_resched_tasks_rcu_qs();"],
+         ["\t\tcond_resched();"]),
+    ],
+    # 9b0fcac3cfe7.  Pinned to filemap_map_pages() because 5.15 carries a
+    # second mmap_miss decrement in filemap_fault() with a similar-looking
+    # guard, and the filemap_fault() one is *not* the site this commit
+    # patches (upstream's analogue of it lives in do_async_mmap_readahead()).
+    # A file-wide needle would be satisfied by the wrong one.
+    "core:filemap_mmap_miss_tried": [
+        ("mm/filemap.c", "filemap_map_pages",
+         ["if (mmap_miss > 0 && !(vmf->flags & FAULT_FLAG_TRIED))"],
+         ["if (mmap_miss > 0)\n\t\t\tmmap_miss--;"]),
+    ],
+    # 0beeaf14e7b9 + e13f634f50d5 + 757dd8193f6c + 10228e0a5123.  All five
+    # loops, each in its own function: a helper that is defined but called
+    # from nowhere, or called from only four of the five, still compiles.
+    "core:memcg_dying_bailout": [
+        ("mm/memcontrol.c", "memory_high_write",
+         ["if (memcg_is_dying(memcg))"], []),
+        ("mm/memcontrol.c", "memory_max_write",
+         ["if (memcg_is_dying(memcg))"], []),
+        ("mm/memcontrol.c", "mem_cgroup_resize_max",
+         ["if (memcg_is_dying(memcg))"], []),
+        ("mm/memcontrol.c", "mem_cgroup_force_empty",
+         ["if (memcg_is_dying(memcg))"], []),
+        ("mm/memcontrol.c", "memory_reclaim",
+         ["if (memcg && memcg_is_dying(memcg))"], []),
+    ],
+    # aaa98b100ea8.  Only frag_show() may flip; pagetypeinfo_showfree() in the
+    # same file legitimately keeps false (it reads more than nr_free), so the
+    # forbidden needle is what stops a well-meaning "flip them all".
+    "core:buddyinfo_nolock": [
+        ("mm/vmstat.c", "frag_show",
+         ["walk_zones_in_node(m, pgdat, true, true, frag_show_print);"],
+         ["walk_zones_in_node(m, pgdat, true, false, frag_show_print);"]),
     ],
 }
 
