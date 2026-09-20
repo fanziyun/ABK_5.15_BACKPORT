@@ -349,6 +349,72 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-13-0"></a>
+
+## companion v0.13.0（重压缩扫描的饥饿：被清掉的前缀每趟又被标回去）
+
+### 1. 起因：`max_pages` 之后，扫描只覆盖设备最前面的一小段
+
+`zram.recomp.max_pages`（Batch 24，默认 16384 = 64 MiB）本意是给每趟重压缩扫描封顶。但
+kernel 的扫描（`recompress_store()`）**每趟都从 index 0 起重走**，而 `max_pages` 的递减落在
+调用点、**对每一次 attempt 都扣**（上游 `34efe1c3b688` 的理由是「attempt 失败也花了资源」）。
+「一趟排掉一个前缀、后趟继续」这个说法因此只在**不再重新 mark** 时成立。
+
+### 2. 根因：`mark_idle()` 会把刚重压缩过的页重新标成 IDLE
+
+- `mark_idle(zram, cutoff)`（随 Batch 4 落地）不是「跳过」，而是对每个已分配、非 `ZRAM_WB`、
+  非 `ZRAM_SAME` 的槽**显式 set/clear**：`is_idle = ktime_after(cutoff, ac_time)`，旧 → set
+  `ZRAM_IDLE`，否则 → clear。
+- `zram_recompress()` 只做 `zram_clear_flag(zram, index, ZRAM_IDLE)`（上游
+  `recompress_slot()` 同，逐字核对 `research/upstream-zram/zram_drv_master.c`），它走的是
+  `zram_read_from_zspool()`，**不是** `zram_accessed()` —— `ac_time` 保持旧值。
+- `zram_accessed()` 是唯一写 `ac_time` 的地方，挂在**读**路径上。被重压缩的冷页通常不会
+  被读回去，所以它的 `ac_time` 始终「很旧」。
+- `CONFIG_ZRAM_TRACK_ENTRY_ACTIME=y`（Batch 6 的 `config_enablement` 默认打开）⇒ 这条 cutoff
+  路径是活的，不是死代码。
+
+绕开设计的地方在 supervisor：它每趟 sweep **都全新调用一次工具**，而工具的非 `--daemon` 路径
+**先 mark 再 pass**。工具自己的文档写的是「mark 是一次性动作，daemon 循环不会重复 mark」，但
+supervisor 用不了 `--daemon`（它要在自己的 tick 里做 reassert / writeback / compaction），那条
+「只 mark 一次」的设计就被绕过了。
+
+合起来：每 30 min 一趟，每趟先 mark → 上一趟刚排掉的前 16384 个 IDLE 槽被重新标回 IDLE →
+扫描从 0 重走 → 整个 budget 又被同一批槽吃掉。**index 超出这个前缀的槽永远不被重压缩**，
+`zstd` 二级算法实际只作用于设备最前面约 64 MiB 的冷页。
+
+### 3. 修复：mark 与 pass 拆到两个时钟
+
+- `tools/zram_recompress_trigger.sh` 新增 `--no-mark`（只 pass 不 mark），与 `--mark-idle`、
+  `--mark-each-pass` 互斥（usage error 2）。顺带把 `usage()` 的硬编码行范围
+  `sed -n '2,51p'` 换成 `sed -n '2,/^[^#]/p' | sed '$d'`（`cached_freeze_reclaim.sh` 早已如此）
+  —— 正是这次加行把首行代码推过了 51 行。
+- `zram-policy.sh` 的 supervisor 新增 `zram.recomp.mark_interval_sec`（默认 86400）：mark 走自己
+  的 tick 计数（首 tick 触发，让开机那次 mark 找到初始冷集），其余每趟带 `--no-mark`；up 行记
+  `mark=…s`，sweep 行记 `mark=skipped`。
+- 于是「一趟排一个前缀」恢复成立：pass 清 IDLE、没有东西把它写回去，扫描单调推进。
+
+**残留（如实说明）**：一个 mark 周期能排的量是 `mark_interval_sec / interval_sec × max_pages`，
+默认 48 × 16384 = 3 GiB 冷页；冷集大于此数时尾巴仍到不了，且下一次 mark 会把已排过的前缀重新
+标脏。`tunables.conf` 与 companion README 都写明了这一点及「加大 `mark_interval_sec`/`max_pages`」
+的取舍。**未做真机验证**：本轮只动 userspace（kernel 一个字节未改），冷集 >3 GiB 的推进形态需要
+按 `mm_stat` 的 `compr_data_size` 长窗口观察才能确认。
+
+### 4. 顺带修掉的两处
+
+- `abk_zram_mount_swap()` 的 dry-run 分支里 `$_ABK_MKSWAP`/`$_ABK_ZRAM_NODE`/`$_ABK_SWAPON`
+  多了一个前导下划线。两个 entry point（`service.sh`/`action.sh`）都带 `set -u`，所以它**不是**
+  打印空串，而是直接把这次运行 abort 掉（实测 `unbound variable`、exit 127）。改成真变量名。
+- `common.sh` 的 `ABK_VERSION` 漂移：`module.prop` 在 Batch 29 已到 v0.12.0，`common.sh` 仍写
+  v0.11.0，于是 `action.sh status` 的 banner 报的是 module manager 根本不显示的版本。注释里那句
+  「Has to track module.prop」此前没有任何东西在保证 —— 本次补上单测把两边互钉。
+
+### 5. 验证
+
+`python tests/stable_5_15_test.py` 全绿（**0 FAIL**）。新增/更新的断言：`--no-mark` 跳过 mark 且
+仍驱动 async 节点；`--no-mark` 与两个 mark 选项互斥均为 usage error；supervisor 首个 sweep 不带
+`--no-mark` 而后续带；up 行携带 `mark=86400s`；`common.sh ABK_VERSION` 与 `module.prop` 一致；
+dry-run 分支不得出现 `$_ABK_` 形状的笔误。
+
 <a id="batch-37-mglru"></a>
 
 ## Batch 37(v0.39.0)

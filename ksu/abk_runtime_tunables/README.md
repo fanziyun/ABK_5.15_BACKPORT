@@ -190,6 +190,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `zram.recomp.enable` | `1` | drive age-marked recompression sweeps (on by default, together with the compaction gate below -- both ride this clock) |
 | `zram.recomp.idle_age_sec` | `3600` | mark only pages untouched this long |
 | `zram.recomp.interval_sec` | `1800` | seconds between sweeps |
+| `zram.recomp.mark_interval_sec` | `86400` | seconds between **mark** steps. Only a mark makes new cold pages eligible; the sweeps in between pass `--no-mark`, because a mark sets `ZRAM_IDLE` on every page older than the age cutoff and a recompressed page never has its age refreshed (`zram_recompress()` reads through `zram_read_from_zspool()`, not `zram_accessed()`), so marking before every pass would hand a capped sweep the same prefix forever. This is the knob that bounds what a capped sweep can reach: one cycle drains `mark_interval_sec / interval_sec` sweeps × `max_pages` entries -- 3 GiB of cold pages at the defaults. |
 | `zram.recomp.threshold` | `0` | only recompress entries at least this large |
 | `zram.recomp.max_pages` | `16384` | how many entries **one** sweep may attempt (0 = no cap). An uncapped pass walks every idle entry in index order -- tens of seconds of one core on a full device; 16384 attempted entries is 64 MiB of pages. Requires the kernel's `max_pages` parameter (module Batch 24): on a kernel without it the parameter is ignored and the sweep stays unbounded, exactly as before that batch. |
 | `zram.recomp.mode` | `async` | `async` (kernel worker) or `sync` |

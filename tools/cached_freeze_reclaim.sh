@@ -67,7 +67,7 @@
 # --cached-only answers the same question from a signal that is always there:
 # AOSP ranks every process of a cached app at or above CACHED_APP_MIN_ADJ (900),
 # and nothing a user can see reaches it.  A group is a target only while EVERY
-# task in it is at or above that rank, because the write reclaims the group --
+# process in it is at or above that rank, because the write reclaims the group --
 # one visible process among them would be reclaimed with the rest.  This is the
 # wider of the two and the one that does not wait for the platform to act: the
 # freezer only parks a process after it has been cached a while (measured on
@@ -281,29 +281,45 @@ group_is_frozen() {
 # app sits at or above it, and nothing the user can see does.
 ABK_CACHED_APP_MIN_ADJ=900
 
-# Is every task in this group ranked as cached?  Every, not any: the write
+# Is every process in this group ranked as cached?  Every, not any: the write
 # reclaims the group as a whole, so a single visible process sharing the uid
 # would be reclaimed along with the cached ones -- which is exactly the harm
-# this filter exists to prevent.  A group whose tasks cannot be read is not a
-# target either; "unknown" must not decay into "safe".
+# this filter exists to prevent.  A group whose processes cannot be read is not
+# a target either; "unknown" must not decay into "safe".
 #
-# The /proc reads are the expensive half of the walk -- a busy uid can hold
-# hundreds of tasks -- so the caller runs this after the cheaper checks, and the
-# first non-cached task ends the question.
+# The list walked is cgroup.procs, not tasks.  oom_score_adj belongs to the
+# thread group, so every thread of a process answers with the same value:
+# walking tasks would re-read one number once per thread (a busy uid holds
+# hundreds) and buy nothing, while cgroup.procs names each process once.  It is
+# also the only one of the two that v2 has, so this one traversal serves both
+# layouts.  The /proc reads are still the expensive half of the walk, so the
+# caller runs this after the cheaper checks, and the first non-cached process
+# ends the question.
 group_is_cached() {
+  # A list that cannot be read is not a target, and the guard also keeps the
+  # loop's redirection from failing under `set -e` below (a failed redirection
+  # on a compound command aborts the whole sweep).
+  [ -r "$1/cgroup.procs" ] || return 1
+
   _gc_seen=0
-  for _gc_t in $(cat "$1/tasks" 2>/dev/null); do
-    # || true: a task that exited between the listing and the read is churn, but
-    # an assignment from a failing substitution carries that failure's status
-    # and `set -e` would take the whole sweep down with it.
-    _gc_adj="$(cat "$PROC_ROOT/$_gc_t/oom_score_adj" 2>/dev/null || true)"
-    [ -n "$_gc_adj" ] || continue
+  while read -r _gc_p; do
+    # A pid is digits; anything else never becomes part of a path.
+    case "$_gc_p" in ''|*[!0-9]*) continue ;; esac
+    # `read < file` is a builtin redirection: no fork, no exec, unlike the
+    # $(cat ...) it replaced.  A process that exited between the listing and
+    # this read fails the redirection, read returns non-zero, and || continue
+    # absorbs both that churn and set -e's interest in it.
+    read -r _gc_adj < "$PROC_ROOT/$_gc_p/oom_score_adj" 2>/dev/null || continue
+    # A negative or non-numeric rank (-1000 and friends) is not cached.
     case "$_gc_adj" in ''|*[!0-9]*) return 1 ;; esac
     _gc_seen=$(( _gc_seen + 1 ))
     if [ "$_gc_adj" -lt "$ABK_CACHED_APP_MIN_ADJ" ]; then
       return 1
     fi
-  done
+  # || true covers the race the guard above cannot: the group's last process
+  # exits between the -r and this open.  Then _gc_seen stays 0 and the answer
+  # below is "not cached", which is the conservative one.
+  done < "$1/cgroup.procs" || true
   [ "$_gc_seen" -gt 0 ]
 }
 

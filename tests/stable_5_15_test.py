@@ -2578,10 +2578,13 @@ echo "NOFILTER_RC=$?"
 echo "NOFILTER_THAWED=$(cat "$T3/uid_3002/memory.reclaim")"
 
 # --cached-only: AOSP's rank for a cached app (oom_score_adj >= 900), which is
-# the signal that exists on a platform that does not freeze.  Every task, not
+# the signal that exists on a platform that does not freeze.  Every process, not
 # any -- the write reclaims the group as a whole, so one visible process in it
 # would be reclaimed with the cached ones.  The rank is read through
-# CFR_PROC_ROOT so the fixture is a fixture and not the host's own /proc.
+# CFR_PROC_ROOT so the fixture is a fixture and not the host's own /proc.  The
+# list walked is cgroup.procs, one pid per line: oom_score_adj belongs to the
+# thread group, so the tool walks processes rather than re-reading one value per
+# thread, and cgroup.procs is the only one of the two that v2 has.
 T4=$(mktemp -d)
 T4P=$(mktemp -d)
 T4F=$(mktemp -d)
@@ -2591,11 +2594,13 @@ for g in 4001 4002 4003 4004; do
   echo 268435456 > "$T4/uid_$g/memory.usage_in_bytes"
   echo 555 > "$T4/uid_$g/memory.reclaim"
 done
-echo 11 > "$T4/uid_4001/tasks"; echo 900 > "$T4P/11/oom_score_adj"
-echo "21 22" > "$T4/uid_4002/tasks"
+echo 11 > "$T4/uid_4001/cgroup.procs"; echo 900 > "$T4P/11/oom_score_adj"
+# Two lines, not "21 22": the tool reads the list line by line.
+echo 21 > "$T4/uid_4002/cgroup.procs"
+echo 22 >> "$T4/uid_4002/cgroup.procs"
 echo 905 > "$T4P/21/oom_score_adj"; echo 100 > "$T4P/22/oom_score_adj"
-: > "$T4/uid_4003/tasks"
-echo 41 > "$T4/uid_4004/tasks"; echo 899 > "$T4P/41/oom_score_adj"
+: > "$T4/uid_4003/cgroup.procs"
+echo 41 > "$T4/uid_4004/cgroup.procs"; echo 899 > "$T4P/41/oom_score_adj"
 CFR_ONE_SHOT=1 CFR_PROC_ROOT="$T4P" sh "{tool_sh}" --cgroup-root "$T4" --cached-only
 echo "CO_RC=$?"
 echo "CO_CACHED=$(cat "$T4/uid_4001/memory.reclaim")"
@@ -2793,6 +2798,18 @@ echo "lzo [lz4kd]" > "$T/block/zram0/comp_algorithm"
 sh "{tool_sh}" --sys-root "$T" --idle-age 3600
 echo "idle_age=$(cat "$T/block/zram0/idle")"
 
+# --no-mark is the other half of that pair: the pass still runs, the mark does
+# not.  A capped sweep only advances because of this -- marking re-sets ZRAM_IDLE
+# on every page older than the cutoff, and a recompressed page keeps its old age
+# (zram_recompress() reads through zram_read_from_zspool(), never
+# zram_accessed()), so the prefix the last pass cleared would come straight back
+# and the sweep would re-drain that same prefix forever.
+echo "sentinel-not-marked" > "$T/block/zram0/idle"
+: > "$T/block/zram0/recompress_async"
+sh "{tool_sh}" --sys-root "$T" --idle-age 3600 --no-mark
+echo "nomark_idle=$(cat "$T/block/zram0/idle")"
+echo "nomark_async=$(cat "$T/block/zram0/recompress_async")"
+
 # Usage errors must be rejected before anything is written.
 set +e
 sh "{tool_sh}" --sys-root "$T" --idle-age 0 >/dev/null 2>&1
@@ -2804,6 +2821,10 @@ sh "{tool_sh}" --sys-root "$T" --mark-idle --idle-age 60 >/dev/null 2>&1
 echo "RC_IDLE_AGE_CONFLICT=$?"
 sh "{tool_sh}" --sys-root "$T" --daemon --mark-each-pass >/dev/null 2>&1
 echo "RC_MARK_EACH_BAD=$?"
+sh "{tool_sh}" --sys-root "$T" --no-mark --mark-idle >/dev/null 2>&1
+echo "RC_NOMARK_MARKIDLE=$?"
+sh "{tool_sh}" --sys-root "$T" --no-mark --daemon --mark-each-pass --idle-age 60 >/dev/null 2>&1
+echo "RC_NOMARK_MARKEACH=$?"
 set -e
 
 rm -rf "$T"
@@ -2839,6 +2860,16 @@ rm -rf "$T"
           r.stdout)
     check("--idle-age passes the age to the kernel, not 'all'",
           got.get("idle_age") == "3600", r.stdout)
+    # A capped sweep can only advance if the mark is not repeated: the kernel
+    # re-sets ZRAM_IDLE on everything older than the cutoff at every mark, and a
+    # recompressed page keeps its old age, so a mark per sweep would re-drain the
+    # same first max_pages entries forever.
+    check("--no-mark skips the mark and still runs the pass",
+          got.get("nomark_idle") == "sentinel-not-marked"
+          and got.get("nomark_async") == "type=idle threshold=0", r.stdout)
+    check("--no-mark is refused against --mark-idle and --mark-each-pass",
+          got.get("RC_NOMARK_MARKIDLE") == "2"
+          and got.get("RC_NOMARK_MARKEACH") == "2", r.stdout)
     check("--max-pages extends the pass string in mainline parameter order",
           got.get("capped_async") == "type=idle threshold=64 max_pages=4096",
           r.stdout)
@@ -2990,6 +3021,13 @@ def test_runtime_tunables_module():
 
     policy = (module_dir / "zram-policy.sh").read_text(encoding="utf-8")
     common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
+    # The banner action.sh prints has to be the version the module manager
+    # lists, and nothing used to tie the two files together -- so they drifted:
+    # common.sh sat at v0.11.0 while module.prop moved on to v0.12.0, and
+    # `action.sh status` reported a version that had not existed for a release.
+    check("common.sh ABK_VERSION tracks module.prop's version",
+          f'ABK_VERSION="{props.get("version")}"' in common_sh,
+          re.findall(r"(?m)^ABK_VERSION=.*", common_sh))
     check("policy hardcodes the measured primary",
           'ABK_ZRAM_PRIMARY="lz4kd"' in common_sh)
     check("policy hardcodes the measured secondary",
@@ -3035,6 +3073,16 @@ def test_runtime_tunables_module():
                    ("disksize", "abk_zram_set_mem_limit", "ABK_MKSWAP", "ABK_SWAPON")]
     check("remount order is disksize -> mem_limit -> mkswap -> swapon",
           mount_order == sorted(mount_order), mount_order)
+    # A dry-run has to describe the command it is deliberately NOT running, so
+    # the names in it must be the real ones.  `$_ABK_MKSWAP` and friends are one
+    # leading underscore away from the truth: they expand to nothing, and under
+    # the `set -u` both entry points carry they abort the run rather than
+    # printing it -- which is the opposite of what a dry-run is for.
+    mount_code = "\n".join(l for l in mount.splitlines()
+                           if not l.lstrip().startswith("#"))
+    check("the dry-run branch names the real swap commands, not $_ABK_ typos",
+          not re.search(r'\$_ABK_', mount_code),
+          re.findall(r'\$_\w+', mount_code))
 
     check("the safety gate precedes the swapoff",
           "abk_zram_swap_idle_enough" in takeover
@@ -3159,8 +3207,14 @@ def test_runtime_tunables_module():
     check("the cached rank is AOSP's CACHED_APP_MIN_ADJ, not an invented one",
           "ABK_CACHED_APP_MIN_ADJ=900" in cfr_tool
           and 'if [ "$_gc_adj" -lt "$ABK_CACHED_APP_MIN_ADJ" ]' in cfr_tool)
-    check("a task that exits mid-walk cannot take the sweep down with it",
-          '2>/dev/null || true)"' in cfr_tool)
+    # A process that exited between the listing and the rank read must not take
+    # the whole sweep down.  There are two ways that race lands, and `set -e`
+    # turns either into an abort unless it is absorbed: the per-read redirection
+    # fails when that process is gone, and the loop's own redirection fails when
+    # the group's last process leaves between the -r guard and the open.
+    check("a process that exits mid-walk cannot take the sweep down with it",
+          '2>/dev/null || continue' in cfr_tool
+          and 'done < "$1/cgroup.procs" || true' in cfr_tool)
     for key in ("cfr.cgroup_root", "cfr.frozen_only", "cfr.freezer_root",
                 "cfr.cached_only"):
         check(f"{key} is a known tunables.conf key",
@@ -3630,6 +3684,8 @@ sleep() { _n=$((_n+1)); [ "$_n" -ge 4 ] && exit 0; return 0; }
 ( abk_zram_supervisor_main > "$T/out7" 2>&1 )
 echo "supervisor_runs=$(wc -l < "$T/runs" | tr -d ' ')"
 echo "supervisor_args=$(head -n 1 "$T/runs")"
+echo "supervisor_args2=$(sed -n '2p' "$T/runs")"
+echo "supervisor_mark=$(grep 'recompression supervisor up' "$T/state/abk_runtime_tunables.log" | grep -o 'mark=[^ ]*' | tail -1)"
 echo "supervisor_compact=$(cat "$T/sys/block/zram0/compact" 2>/dev/null)"
 echo "supervisor_gate_line=$(grep -o 'compact=[^ ]*' "$T/state/abk_runtime_tunables.log" | tail -1)"
 echo "supervisor_pid=$([ -s "$T/state/zram.pid" ] && echo set || echo unset)"
@@ -3813,6 +3869,16 @@ rm -rf "$T"
           got.get("supervisor_compact") == "100", r.stdout)
     check("the supervisor up line carries the gate config, so the defaults are pinned",
           got.get("supervisor_gate_line") == "compact=1>50MB+15%", r.stdout)
+    # The mark runs once and the sweeps in between must not repeat it: a mark
+    # re-sets ZRAM_IDLE on every page older than the cutoff, and a recompressed
+    # page never has its age refreshed, so marking each sweep would pin the
+    # capped pass to the same first max_pages entries forever.
+    check("the first sweep marks and the ones after it pass --no-mark",
+          "--no-mark" not in got.get("supervisor_args", "")
+          and "--no-mark" in got.get("supervisor_args2", ""),
+          (got.get("supervisor_args"), got.get("supervisor_args2")))
+    check("the supervisor up line carries the mark cadence",
+          got.get("supervisor_mark") == "mark=86400s", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
 
