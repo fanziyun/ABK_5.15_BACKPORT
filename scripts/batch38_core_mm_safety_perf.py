@@ -265,12 +265,24 @@ def _swap_readahead_lru_add_drain_apply(ctx):
 # Safety.  In 5.15 the macro is defined unconditionally in
 # include/linux/rcupdate.h as
 #     do { rcu_tasks_qs(current, false); cond_resched(); } while (0)
-# -- there is no CONFIG_TASKS_RCU gate, so it always compiles, and
-# rcu_tasks_qs() is a static inline no-op when Tasks-RCU is off.  On this
-# target the GKI config enables CONFIG_TASKS_TRACE_RCU (for BPF), not
-# CONFIG_TASKS_RCU, so the graft compiles to the same cond_resched() as
-# before: no behaviour change here, and the win applies to hosts that do
-# build Tasks-RCU.  This group therefore claims no device-side benefit.
+# -- there is no CONFIG_TASKS_RCU gate, so it always compiles.  rcu_tasks_qs()
+# itself is
+#     do { rcu_tasks_classic_qs(t, preempt); rcu_tasks_trace_qs(t); } while (0)
+# under CONFIG_TASKS_RCU_GENERIC and a no-op outside it, and
+# rcu_tasks_classic_qs() clears t->rcu_tasks_holdout only under
+# CONFIG_TASKS_RCU.
+#
+# The first draft of this group claimed the graft was a no-op on this target
+# ("GKI enables CONFIG_TASKS_TRACE_RCU, not CONFIG_TASKS_RCU").  **That was
+# wrong and the device check refuted it**: the running vermeer kernel reports
+#     CONFIG_TASKS_RCU_GENERIC=y  CONFIG_TASKS_RCU=y  CONFIG_TASKS_TRACE_RCU=y
+# and exports real call_rcu_tasks/synchronize_rcu_tasks symbols (the #else
+# branch would alias them to call_rcu/synchronize_rcu), so the classic
+# holdout clear IS compiled in.  A reclaim task that becomes a holdout now
+# reports its quiescent state on every scan iteration, which is the fix
+# working as upstream intended -- not a no-op.  No speedup is *claimed* for
+# the device because none was measured, but "compiles back to cond_resched()"
+# is not true here and must not be repeated.
 # ---------------------------------------------------------------------------
 
 _TASKS_QS_OLD = (

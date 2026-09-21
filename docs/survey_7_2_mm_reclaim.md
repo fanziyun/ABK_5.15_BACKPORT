@@ -31,20 +31,38 @@ for). 50 commits were individually re-verified as "in v7.2, not in v7.1".
 > requests/hour per IP, so the deepest analysis went to the highest-value
 > candidates and the rest are classified by subject + file list only.
 
-## Target-machine facts (measured on the reference trees, not inferred)
+## Target-machine facts
+
+Rows marked **[D]** were re-measured on the running device over wireless adb
+(vermeer / Xiaomi 14, kernel `5.15.216-202609202-FanZiyun-pr22-4152336`, i.e. the
+build this PR produces) via `zcat /proc/config.gz`, `/sys/kernel/mm/…` and
+`/proc/kallsyms`. Rows without the tag came from the reference trees only.
 
 | Fact | Value | Consequence |
 |---|---|---|
-| `CONFIG_LRU_GEN` | **y** | MGLRU is **live** on the device — MGLRU work is not theoretical |
-| `CONFIG_KSM` | **not set** | every `ksm/*` commit is inapplicable |
-| `CONFIG_DAMON` / `DAMON_PADDR` / `DAMON_RECLAIM` | **all y** | `mm/damon/reclaim` is reachable (but see caveat below) |
-| `CONFIG_TRANSPARENT_HUGEPAGE` + `_MADVISE` | y / y | THP exists but is madvise-only, not always |
-| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON` + `CONFIG_KASAN_HW_TAGS` | y / y | the per-page clear loop in `post_alloc_hook()` really runs on every allocation |
-| `CONFIG_ZSMALLOC` / `CONFIG_ZRAM` | m / m | zram/zsmalloc paths are hot |
-| `CONFIG_TASKS_TRACE_RCU` (not `CONFIG_TASKS_RCU`) | y / not set | Tasks-RCU quiescent-state reporting compiles to a no-op here |
+| `CONFIG_LRU_GEN` | **y** **[D]** | MGLRU is compiled in — **but not live** |
+| `CONFIG_LRU_GEN_ENABLED` / `/sys/kernel/mm/lru_gen/enabled` | **not set** / **`0x0000`** **[D]** | MGLRU is **off at runtime**. The first draft of this table said "MGLRU is live, so MGLRU work is not theoretical" — that was wrong, and it is the single most consequential error the device check caught. MGLRU commits still compile, but none of them executes on this device without a runtime switch |
+| `CONFIG_KSM` | **not set** **[D]** | every `ksm/*` commit is inapplicable |
+| `CONFIG_DAMON` / `DAMON_PADDR` / `DAMON_RECLAIM` | **all y** **[D]** | `mm/damon/reclaim` is reachable (but see caveat below) |
+| `CONFIG_TRANSPARENT_HUGEPAGE` + `_MADVISE` | y / y **[D]** | THP exists but is madvise-only, not always |
+| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON` + `CONFIG_KASAN_HW_TAGS` | y / y **[D]** | the per-page clear loop in `post_alloc_hook()` really runs on every allocation |
+| `CONFIG_ZSMALLOC` / `CONFIG_ZRAM` | y / y (built-in, not `m`) **[D]** | zram/zsmalloc paths are hot |
+| `CONFIG_TASKS_RCU` **and** `CONFIG_TASKS_TRACE_RCU` | **both y** **[D]** | `cond_resched_tasks_rcu_qs()` is **not** a no-op here. The first draft said Tasks-RCU was off; `/proc/kallsyms` exports real `call_rcu_tasks`/`synchronize_rcu_tasks`, so `rcu_tasks_classic_qs()`'s holdout clear is compiled in |
+| `CONFIG_PREEMPT` | **y** **[D]** | confirms the premise of the Tasks-RCU fix: `cond_resched()` is a no-op on a PREEMPTION kernel |
+| cgroup v2 controllers | **none delegated** **[D]** (`/sys/fs/cgroup/cgroup.controllers` is empty) | memory is cgroup **v1** only (`/dev/memcg`). Of Batch 38's four memcg bail-outs, `memory_high_write` and `memory_max_write` have **no carrier on this device**; the three v1 sites (`memory.limit_in_bytes`, `memory.force_empty`, and the `memory.reclaim` this module itself adds) are the live ones |
+| swap device | `/dev/block/zram0`, 16 GiB, zram-backed **[D]** | swap-in/swap-out paths are genuinely exercised, so `swap_readahead_lru_add_drain` is not dead code here |
 | `mm/swap.c` | **does not exist** | 5.15's swap-offset machinery is in `swap_slots.c` / `swapfile.c` / `internal.h` |
 | `i_mmap_lock` | the 5.15 name | 7.x's `i_mmap_rwsem` is a rename and must be mapped |
 | `do_swap_page()` calls `lru_add_drain()` | yes (`mm/memory.c:1741`, `:1768`) | lru-drain removal has a target here |
+
+**How the device check was run** (reproducible):
+
+```bash
+adb connect <phone>:<wireless-debug-port>      # mDNS: adb mdns services
+adb -s <transport> shell su -c 'zcat /proc/config.gz | grep <SYMBOL>'
+adb -s <transport> shell su -c 'cat /sys/kernel/mm/lru_gen/enabled'
+adb -s <transport> shell su -c 'grep " T call_rcu_tasks$" /proc/kallsyms'
+```
 
 The reference trees carry only 76 files. **`mm/rmap.c`, `mm/workingset.c`,
 `mm/percpu.c`, `mm/page-writeback.c`, `mm/zswap.c`, `mm/shmem.c`, `mm/slab.h`,
@@ -114,9 +132,15 @@ plus `mm/workingset.c` and `include/linux/mm_inline.h`).
    (`PageReclaim() && (PageDirty(page) || PageWriteback(page))`), and
    `6e9be217a3ce` has a counterpart in `isolate_pages()`'s `scanned` return
    chain.
-5. **Verdict**: **strongly recommended** — the only systematic, quantified,
-   genuinely-live (`CONFIG_LRU_GEN=y`) MM performance series in v7.2. Risk: the
-   numbers are server-side and need a device A/B to confirm direction.
+5. **Verdict**: **strongly recommended** — the only systematic, quantified MM
+   performance series in v7.2 that targets MGLRU, which is compiled in here.
+   Risk: the numbers are server-side, and the device check showed MGLRU is
+   **off at runtime** on this target (`/sys/kernel/mm/lru_gen/enabled` is
+   `0x0000`), so the whole series is inert until something turns it on — see
+   the target-machine facts table. That does not change the verdict (the
+   series is still the right code to have if MGLRU is ever enabled, and the
+   lts baseline is the same shape), but it does mean no device-side benefit is
+   reachable from it today.
 
 ### 2. `aaa98b100ea8` — mm/vmstat: don't take the zone lock reading /proc/buddyinfo
 
@@ -266,11 +290,23 @@ state, so a task in long reclaim becomes an `rcu_tasks` holdout and stalls
 grace periods for minutes. `cond_resched_tasks_rcu_qs()` exists in 5.15
 (`include/linux/rcupdate.h`) and is an **unconditional** macro
 (`do { rcu_tasks_qs(current, false); cond_resched(); } while (0)`), so it
-always compiles and `rcu_tasks_qs()` no-ops when Tasks-RCU is off. Upstream
-backported it to 5.15.y as `4cdc1bdf4094` (2026-09-14). On this target the GKI
-config enables `CONFIG_TASKS_TRACE_RCU` (for BPF) rather than
-`CONFIG_TASKS_RCU`, so the graft compiles to the same `cond_resched()` as
-before: **no device-side benefit is claimed.**
+always compiles; `rcu_tasks_qs()` expands under `CONFIG_TASKS_RCU_GENERIC` to
+`rcu_tasks_classic_qs()` + `rcu_tasks_trace_qs()`, and the classic half clears
+`current->rcu_tasks_holdout` only under `CONFIG_TASKS_RCU`. Upstream backported
+it to 5.15.y as `4cdc1bdf4094` (2026-09-14).
+
+> **Device check correction.** The first draft said this target enables
+> `CONFIG_TASKS_TRACE_RCU` rather than `CONFIG_TASKS_RCU`, so the graft
+> "compiles to the same `cond_resched()` as before" and no device-side benefit
+> could be claimed. **That is wrong.** On the running vermeer kernel
+> `CONFIG_TASKS_RCU_GENERIC=y`, `CONFIG_TASKS_RCU=y` and
+> `CONFIG_TASKS_TRACE_RCU=y`, and `/proc/kallsyms` exports real
+> `call_rcu_tasks`/`synchronize_rcu_tasks` (the `#else` branch would alias
+> them to `call_rcu`/`synchronize_rcu`), so the classic holdout clear **is**
+> compiled in. Batch 38's group therefore does change behaviour on this
+> device — reclaim tasks report their quiescent state every scan iteration.
+> The error under-claimed rather than over-claimed, but it was still wrong.
+> No speedup figure is claimed because none was measured.
 
 ---
 

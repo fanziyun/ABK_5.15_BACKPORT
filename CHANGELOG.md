@@ -609,15 +609,24 @@ v7.2 触及 `mm/` 的 commit 共 **366** 条。这个数字是拿 tag 可达性�
 
 **组 3（Tasks-RCU QS）**：5.15 的 `cond_resched_tasks_rcu_qs()` 在 `include/linux/rcupdate.h`
 是**无条件宏** `do { rcu_tasks_qs(current, false); cond_resched(); } while (0)`，没有
-`CONFIG_TASKS_RCU` 门，所以永远编得过；`rcu_tasks_qs()` 在 Tasks-RCU 关闭时是 no-op 内联。
-本机 GKI 开的是 `CONFIG_TASKS_TRACE_RCU`（给 BPF 用）而非 `CONFIG_TASKS_RCU`，编译后与原先的
-`cond_resched()` **等价**。因此本组**不主张任何设备侧收益**，收益只在真开 Tasks-RCU 的宿主上。
+`CONFIG_TASKS_RCU` 门，所以永远编得过。`rcu_tasks_qs()` 在 `CONFIG_TASKS_RCU_GENERIC` 下展开为
+`rcu_tasks_classic_qs()` + `rcu_tasks_trace_qs()`，其中 classic 那个清
+`current->rcu_tasks_holdout` 需要 `CONFIG_TASKS_RCU`。
 
-**组 4（mmap hit 不误计 TRIED）**：同一句
-`!(vmf->vma->vm_flags & VM_RAND_READ) && ra->ra_pages` 守卫在 5.15 的
-`do_async_mmap_readahead()`（`:3037`）也出现，但那边是 `||` 且是提前返回，语义相反；锚点带上
-紧随其后的 `unsigned int mmap_miss = READ_ONCE(...)` **声明行**（只有 `filemap_map_pages()`
-有声明），保证是单点编辑。与 Batch 30 的 `readahead_mmap_miss_race` 不冲突：那一组改的是
+> **设备核查后更正**：初版这里写「本机 GKI 开 `TASKS_TRACE_RCU` 而非 `TASKS_RCU`，编译后与原先
+> 等价」——**错**。真机（vermeer，`5.15.216-...-pr22-4152336`）上 `zcat /proc/config.gz` 给出
+> `CONFIG_TASKS_RCU_GENERIC=y`、`CONFIG_TASKS_RCU=y`、`CONFIG_TASKS_TRACE_RCU=y`，
+> `/proc/kallsyms` 里 `call_rcu_tasks`/`synchronize_rcu_tasks` 是真实全局符号（`#else` 分支会
+> 把它们别名成 `call_rcu`/`synchronize_rcu`）。所以 classic holdout 清除**确实编进去了**，
+> 本组在这台设备上有真实作用：回收任务成为 holdout 时每轮扫描都上报静止状态。方向是「少报了
+> 收益」而非「多报」，但陈述已改正。仍未测速，不主张具体提速数字。
+
+**组 4（mmap hit 不误计 TRIED）**：锚点是 `filemap_map_pages()` 逐 PTE 循环里的
+`if (mmap_miss > 0) mmap_miss--;`，全文件唯一（另一处递减是 `filemap_fault()` 的
+`WRITE_ONCE(ra->mmap_miss, --mmap_miss)`，递增侧是 `++mmap_miss`）。
+范围限制：mainline 那个块还带 `(map_ret & VM_FAULT_NOPAGE)` 与
+`!folio_test_workingset(folio)` 两项，5.15 的无条件递减两者都没有，不重构循环无法移植，
+故只加 `FAULT_FLAG_TRIED` 一项。与 Batch 30 的 `readahead_mmap_miss_race` 不冲突：那一组改的是
 `do_async_mmap_readahead()` 里的递减，本组改 `filemap_map_pages()` 里的递减。
 
 **组 5（memcg dying bailout）**：只在 css 已标记 dying 时触发，也就是 `cgroup_rmdir()` 已经决定拆它、
@@ -706,6 +715,16 @@ bash tests/smoke.sh build/abk-trees/194           # SMOKE OK (exit 0)
 > `huge_memory_imap_split_uaf`，它自己的 docstring 写的是「no performance
 > benefit」。已删去这组错记的数字。
 
+> **更正（设备核查后）**：本节省览初版写「组 3 在本机配置下编译后与原先
+> `cond_resched()` 等价」——**错，真机推翻了它**。在 vermeer 上
+> `zcat /proc/config.gz` 给出 `CONFIG_TASKS_RCU_GENERIC=y`、
+> `CONFIG_TASKS_RCU=y`、`CONFIG_TASKS_TRACE_RCU=y`，且 `/proc/kallsyms` 里
+> `call_rcu_tasks`/`synchronize_rcu_tasks` 是真实全局符号（`#else` 分支会把
+> 它们别名成 `call_rcu`/`synchronize_rcu`），所以 5.15 的
+> `rcu_tasks_classic_qs()`（清 `current->rcu_tasks_holdout`）**确实编进去了**。
+> 组 3 在这台设备上有真实作用：回收任务成为 holdout 时每轮扫描都会上报静止状态。
+> 方向是「少报了收益」而不是「多报」，但事实陈述已改正。仍未测速，不主张提速数字。
+
 ### 7. 组 4 的落点更正（本地 code review 抓到的真问题）
 
 5.15 的 `mm/filemap.c` 里有**两处** `mmap_miss` 递减，形状相近、都在预读路径上：
@@ -727,6 +746,69 @@ mmap_miss = READ_ONCE(ra->mmap_miss);`，行号对、函数错，`replace_once` 
 （`do`-`while` 里每个页都减，包括 PTE 本就存在的那些）。不重构循环就无法移植这两项，
 所以只加新的 `FAULT_FLAG_TRIED` 一项，既有的多减行为保持上游所见。该改动只可能
 **跳过**一次递减（`mmap_miss > 0` 边界检查保留），不会引入下溢。
+
+### 8. 真机核查（无线 adb，vermeer / Xiaomi 14）
+
+内核正是本 PR 的构建：`uname -r` = `5.15.216-202609202-FanZiyun-pr22-4152336`。
+先确认 graft 确实进了这颗内核：`/proc/kallsyms` 里有 `abk_sf_tick`、
+`abk_eevdf_pick_eevdf`、`abk_zram_read_endio`、`abk_dra_adjust_readahead` 等
+其它批次的 `abk_*` 符号 ⇒ module_set 的 after_patch 阶段真的跑了。
+
+**组 6（buddyinfo_nolock）——最直接的验证。** `/proc/pagetypeinfo` 仍取 zone 锁，
+它逐阶打印的就是 `buddyinfo` 无锁读的同一个 `zone->free_area[order].nr_free`
+（5.15 按 migrate type 分行，需跨 type 求和）。200 组成对采样（设备侧连读、宿主机解析）：
+
+| 指标 | 值 |
+|---|---|
+| 格式错误的读 | **0 / 200** |
+| 均值 buddyinfo 总计 | 73620 页（287.6 MiB） |
+| 均值 pagetypeinfo 总计 | 73605 页（287.5 MiB） |
+| 两者均值比 | **0.9998** |
+| 总计比范围 | 0.98988 – 1.05396（成对读相隔毫秒，系统同时在分配/释放，±5% 属正常漂移） |
+| 逐阶最大相对偏差 | 0.53，落在 order 0（单页最易变） |
+
+结论：无锁读回读的数据是对的，且同文件里带锁的那个读法（`pagetypeinfo_showfree`）
+没有被误改——它仍返回正确数据。
+
+> 过程中我自己造过一个伪指标并弃用：曾用「`nr_free[o+1] <= nr_free[o]` 是结构不变量」
+> 判定撕裂读，报出 buddyinfo 200/2000 违反、pagetypeinfo 0/2000。**该不变量本身是错的**——
+>  buddy 分配器的高阶空闲块不拆成低阶计数，`nr_free[1]` 完全合法地远大于 `nr_free[0]`；
+> 修好 pagetypeinfo 解析后两个读法违反次数完全相同（各 200），证实是伪指标。
+
+**组 2 / 3 / 4（swap 与回收路径）**：有界压力测试（shell 持有 20 MB + 260 MB 匿名内存造
+zram 换出，再触摸已换出的页强制换入）后的 vmstat 增量：
+
+```
+pswpout                +10074     pgmajfault            +48
+pswpin                    +30     pgscan_kswapd      +145992
+swap_ra                   122     pgsteal_kswapd     +107012
+pgactivate             +24676     pgdeactivate        +25045
+workingset_refault_file +1598     oom_kill                 +0
+```
+
+`pgscan_kswapd`/`pgsteal_kswapd` 大幅为正说明页面**确实到达 LRU 并被回收**——这正是删掉
+`lru_add_drain()` 后最该看的（若页面被搁在 LRU 之外，kswapd 扫不到、MemFree 会单调下滑）。
+测试后 MemFree 回到 550 MB、MemAvailable 6.8 GB，无泄漏迹象；`oom_kill +0`。
+
+**组 5（memcg_dying_bailout）**：这台设备的 cgroup v2 **没有委派任何控制器**
+（`/sys/fs/cgroup/cgroup.controllers` 为空），memory 走 v1（`/dev/memcg`）。因此四个
+bail-out 里只有三个有载体，实测均正常返回、无挂住：
+
+| 写入 | 站点 | 耗时 |
+|---|---|---|
+| `echo 268435456 > /dev/memcg/abk_t/memory.reclaim` | `memory_reclaim()`（本模块自带） | 26 ms |
+| `echo 33554432 > …/memory.limit_in_bytes` | `mem_c_group_resize_max()` | 15 ms |
+| `echo 1 > …/memory.force_empty` | `mem_c_group_force_empty()` | 225 ms |
+| `rmdir /dev/memcg/abk_t` | `cgroup_rmdir()` 路径 | 28 ms（快速失败，非挂住） |
+
+`memory.high` / `memory.max` 两个 v2 站点在这台设备上不可达。
+
+**组 1（huge_memory_imap_split_uaf）**：lts(216) 基线本身已含 `f87c08060818`，本组在该档
+报 `already_present`、不写任何字节 ⇒ **本组无法在真机上与上游区分**。能做的是确认内核没有
+因 THP 分裂路径出问题：全程 `dmesg` 无 `BUG:` / `WARNING:` / `soft lockup` / `rcu.*stall`。
+
+**未做**：设备侧 A/B 提速测量（上游数字全是服务器负载）；MGLRU 系列本身未落地，且设备上
+`/sys/kernel/mm/lru_gen/enabled` = `0x0000`（编译进去了但运行时关着）。
 
 <a id="batch-37"></a>
 
