@@ -5779,5 +5779,17 @@ import batch38_core_mm_safety_perf as _b38  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b38.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 39: the v7.2 mm/page_alloc batch clear, from the same survey.
+#
+# Registered last and independent of everything: kernel_init_free_pages() is
+# static and no other group writes it, so there is no ordering constraint and
+# no trap-5 exposure.  See the batch file's docstring for why the per-page
+# KASAN tag pair can be dropped here.
+# ============================================================================
+import batch39_core_pagealloc_batch_clear as _b39  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b39.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

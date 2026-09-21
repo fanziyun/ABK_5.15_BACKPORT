@@ -1787,6 +1787,22 @@ REQUIRED_IN_FUNCTION = {
          ["walk_zones_in_node(m, pgdat, true, true, frag_show_print);"],
          ["walk_zones_in_node(m, pgdat, true, false, frag_show_print);"]),
     ],
+    # b001cf7d16dd.  The kasan_disable_current()/kasan_enable_current() pair is
+    # pinned as a must-have, not decoration: the memset is what makes the
+    # s390 comment ("memset() could override KASAN redzones") load-bearing, so a
+    # later "cleanup" that drops the pair would silently reintroduce that
+    # hazard.  The per-page loop stays in the HIGHMEM branch, so the pristine
+    # loop is deliberately NOT a forbidden needle here.
+    "core:pagealloc_batch_clear": [
+        ("mm/page_alloc.c", "kernel_init_free_pages",
+         ["kasan_disable_current();",
+          "if (!IS_ENABLED(CONFIG_HIGHMEM)) {",
+          "memset(kasan_reset_tag(page_address(page)), 0,",
+          "(unsigned long)numpages * PAGE_SIZE);",
+          "clear_highpage(page + i);",
+          "kasan_enable_current();"],
+         []),
+    ],
 }
 
 
