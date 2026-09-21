@@ -3506,14 +3506,29 @@ _MODULE_CONFIGS = [
     # With the symbol unset the whole graft reduced to an always-false branch
     # (found by Batch 16's emptiness audit), so the tier has to enable it.
     ("RCU_NOCB_CPU_DEFAULT_ALL", "y"),
+    # LRU_GEN_ENABLED (MGLRU).  CONFIG_LRU_GEN is already =y in every
+    # android13-5.15 baseline, so the whole MGLRU implementation compiles --
+    # but this symbol is what DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects
+    # for ``lru_gen_caps`` (mm/vmscan.c), and without it every MGLRU branch
+    # starts false, /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the
+    # classic-LRU path runs.  Verified on the device that shipped the first
+    # cut of this batch: LRU_GEN=y, LRU_GEN_ENABLED unset, enabled == 0x0000.
+    #
+    # Turning it on is what makes this module's MGLRU work live at all:
+    # Batch 37's six v6.14 groups are compiled in but were runtime-inert for
+    # exactly the reason Batch 8's RCU graft was -- the same class of bug the
+    # emptiness audit was written to catch, one config layer further down.
+    ("LRU_GEN_ENABLED", "y"),
 ]
 
 _ALIGN_CONFIGS = [
     # Enabled in the android15-6.6 GKI defconfig, absent from every
     # android13-5.15 baseline, and the code already exists in 5.15 for all of
-    
     # them -- config-only deltas, so they change runtime behaviour.
-    ("LRU_GEN_ENABLED", "y"),        # MGLRU on by default
+    # LRU_GEN_ENABLED used to live here; it moved to _MODULE_CONFIGS above
+    # because it is the one symbol in this list that a *landed* group of this
+    # module (Batch 37-mglru) is inert without.  The rest stay opt-in: they are
+    # 6.6-GKI alignments, not optimizations this module ships.
     ("TCP_CONG_ADVANCED", "y"),      # prerequisite for BBR
     ("TCP_CONG_BBR", "y"),
     ("BLK_WBT", "y"),                # writeback throttling
@@ -3549,6 +3564,12 @@ _INTRODUCED_KCONFIG = {
     "ZRAM_MULTI_COMP": "module",
     "ABK_DYNAMIC_READAHEAD": "module",
     "RCU_NOCB_CPU_DEFAULT_ALL": "module",
+    # Pre-existing baseline symbol (mm/Kconfig), like ZRAM_WRITEBACK below --
+    # this table records what the module turns on, not only what it declares.
+    # It moved here from the align tier because a landed group (Batch 37's six
+    # MGLRU groups) is runtime-inert without it, and an inert optimization is
+    # not an optimization.
+    "LRU_GEN_ENABLED": "module",
     "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
     "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
 }
@@ -5746,6 +5767,17 @@ PATCH_GROUPS = PATCH_GROUPS + _b35_fuse.build_groups(PatchGroup)
 import batch37_core_reclaim_paths as _b37_rp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b37_rp.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 38: Linux 7.2 MM/Reclaim grafts, selected by docs/survey_7_2_mm_reclaim.md.
+#
+# Registered after the Batch-37 reclaim-path chain because nothing here edits
+# that chain's generated text; the groups are independent of each other and of
+# every earlier group except where noted in the batch file's own docstring.
+# ============================================================================
+import batch38_core_mm_safety_perf as _b38  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b38.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()

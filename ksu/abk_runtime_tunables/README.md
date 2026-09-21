@@ -208,7 +208,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `0` | `1` turns MGLRU on (kernel has the code, ships it off) |
+| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
 | `sched.abk_sf_enable` | `0` | the smart-freq floor; leave at `0` whenever a vendor FAS/WALT governor owns DVFS (see below) |
@@ -226,8 +226,12 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `cfr.group` | *(empty)* | group names to sweep; empty = every `uid_*` group (this ROM names its groups: `cfr.group=freeze-app game`) |
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
-**Measure before you enable the opt-in knobs.** `lru_gen`, `thp` and
-`swappiness` change global reclaim behaviour.
+**Measure before you enable the opt-in knobs.** `thp` and `swappiness` change
+global reclaim behaviour. `lru_gen` is no longer opt-in: since Batch 38 the
+kernel ships MGLRU enabled (`CONFIG_LRU_GEN_ENABLED=y` in the module tier) and
+this companion re-asserts it, so `lru_gen.enable` is a consistency knob, not a
+switch. That also means Batch 37's six MGLRU performance groups run for the
+first time on a build from this module — no device-side A/B exists yet.
 
 `abk_sf` (the Batch 10-4/10-5 schedutil smart-freq floor) ships disabled because
 of what was measured here, not because of a theory.  A FAS-style owner keeps

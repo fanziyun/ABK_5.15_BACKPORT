@@ -38,6 +38,8 @@ SMOKE_FILES=(
   kernel/rcu/tree_nocb.h
   mm/oom_kill.c
   mm/vmscan.c
+  # Batch 38: buddyinfo_nolock is the module's first mm/vmstat.c group.
+  mm/vmstat.c
   mm/memcontrol.c
   # Batch 37 (MGLRU v4): the workingset and deactivation groups anchor here.
   mm/workingset.c
@@ -96,6 +98,9 @@ SMOKE_FILES=(
   mm/slub.c
   mm/huge_memory.c
   mm/memory.c
+  # The of/address.c ranges-parser overlay runs for every baseline and
+  # requires the target file to exist before it reads its gate.
+  drivers/of/address.c
   include/linux/blkdev.h
   block/blk-core.c
   block/blk-mq-sched.c
@@ -124,7 +129,10 @@ SMOKE_FILES=(
   # Batch 35: the FUSE write-path prefault (faa794dd2e17).
   fs/fuse/file.c
   # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
-  mm/swap.c
+  # mm/swap.c is already listed once above, so it is not repeated here.
+  # Batch 38: swap_readahead_lru_add_drain is the first group to write
+  # mm/swap_state.c, so the file has to be in the smoke fixture too.
+  mm/swap_state.c
 )
 
 WORK="$(mktemp -d)"
@@ -629,23 +637,15 @@ if grep -q "static int invalidate_exceptional_entry" \
      "$KERNEL_ROOT/common/mm/truncate.c"; then
   fail "per-entry shadow helpers survived in mm/truncate.c"
 fi
-grep -q "reclaim_pt_is_enabled" "$KERNEL_ROOT/common/mm/memory.c" \
-  || fail "MADV_DONTNEED page-table reclaim gate missing in mm/memory.c"
-grep -q "try_to_free_pte" "$KERNEL_ROOT/common/mm/memory.c" \
-  || fail "page-table emptiness re-check missing in mm/memory.c"
-grep -q "bool reclaim_pt;" "$KERNEL_ROOT/common/include/linux/mm.h" \
-  || fail "zap_details.reclaim_pt does not exist"
-grep -q "madvise_batch_tlb_flush" "$KERNEL_ROOT/common/mm/madvise.c" \
-  || fail "MADV_DONTNEED tlb batching missing in mm/madvise.c"
-grep -qF "zap_page_range_single_batched(tlb, vma, start, end - start, &details);" \
-  "$KERNEL_ROOT/common/mm/madvise.c" \
-  || fail "MADV_DONTNEED still gathers its own tlb per VMA"
-# The per-VMA helper must not gather for itself any more: that is the whole
-# difference between a batched flush and the 5.15 shape.
-if awk '/^static long madvise_dontneed_single_vma\(/,/^}/' \
-     "$KERNEL_ROOT/common/mm/madvise.c" | grep -q "tlb_gather_mmu"; then
-  fail "madvise_dontneed_single_vma() still owns its mmu_gather"
-fi
+# The four MADV_DONTNEED page-table assertions that used to live here
+# (reclaim_pt_is_enabled / try_to_free_pte / zap_details.reclaim_pt /
+# madvise_batch_tlb_flush) were removed with their groups in v0.42.0:
+# madvise_pt_reclaim (6375e95f381e) and madvise_batch_tlb_flush (43c4cfde7e37)
+# freed empty PTE pages under mmap_read_lock and raced the smaps/reclaim
+# page-table walkers on 5.15, panicking in smaps_pte_range on vermeer.  Only
+# truncate_shadow_batch and truncate_shadow_batch_sweep survive from that batch
+# (asserted above), so nothing in this module writes any of those four symbols
+# any more and the assertions could only ever fail.
 
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null

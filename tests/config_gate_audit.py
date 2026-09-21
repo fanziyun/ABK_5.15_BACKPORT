@@ -16,6 +16,22 @@ enables it now).  ``scripts/abk_stable_core.py`` grew ``_INTRODUCED_KCONFIG``
 from that finding, but that table only covers symbols this module *introduces*
 -- symbols it merely *depends on* were invisible to it.
 
+**What this audit cannot see, by construction.**  It looks for added lines
+*inside* a gate.  A symbol that only picks a static-branch initialiser has no
+added line to find, so a whole class of "compiles in but never runs" survives
+it.  ``CONFIG_LRU_GEN_ENABLED`` is that class: ``mm/vmscan.c`` selects
+``DEFINE_STATIC_KEY_ARRAY_TRUE`` vs ``_FALSE`` for ``lru_gen_caps`` on it, and
+with it unset every MGLRU branch starts false and
+``/sys/kernel/mm/lru_gen/enabled`` reads ``0x0000`` while ``CONFIG_LRU_GEN=y``
+still compiles the whole implementation.  Verified on the device that shipped
+the first cut of Batch 38: the audit reports OK against that config *and*
+against a fixed one, because the gate never appears in the diff.  Batch 37's
+six MGLRU groups were runtime-inert for exactly this reason.  Do not read
+"CONFIG GATE AUDIT OK" as "every feature this module touches is running" --
+for runtime-default symbols, the guard is
+``test_mglru_is_enabled_by_the_default_tier`` in
+``tests/stable_5_15_test.py``.
+
 Attribution is exact rather than heuristic.  Every file this module writes has
 a pristine ``<file>.abk-orig`` snapshot next to it (the same snapshots
 ``scripts/abk_rollback.sh`` restores from), so "did we add this line?" is a diff

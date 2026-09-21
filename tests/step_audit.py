@@ -75,6 +75,7 @@ AUDIT_FILES = [
     "mm/internal.h",
     "mm/oom_kill.c",
     "mm/vmscan.c",
+    "mm/vmstat.c",
     "mm/memcontrol.c",
     # Batch 37 (MGLRU v4 series): the workingset and deactivation groups
     # anchor in these.
@@ -180,8 +181,6 @@ AUDIT_FILES = [
     # Batch 35: the FUSE write-path prefault (faa794dd2e17), the module's first
     # group in fs/fuse/.
     "fs/fuse/file.c",
-    # Batch 37: the lru_add drain filter is the module's first mm/swap.c group.
-    "mm/swap.c",
 ]
 
 CHILD_MODULES = [

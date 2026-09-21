@@ -173,10 +173,23 @@ suite-preference cross-check.
   absent), snapshots through `.abk-orig`, and refuses to write a defconfig
   outside `KERNEL_ROOT` (`report_only` with the reason). `config_enablement`
   turns on the module's own symbols (`ZRAM_TRACK_ENTRY_ACTIME`,
-  `ZRAM_MULTI_COMP`) by default; `ABK_515_DEFCONFIG_ALIGN=1` additionally
-  aligns six 6.6-GKI defaults whose 5.15 code exists. CI's
+  `ZRAM_MULTI_COMP`, `ABK_DYNAMIC_READAHEAD`, `RCU_NOCB_CPU_DEFAULT_ALL`,
+  `LRU_GEN_ENABLED`) by default; `ABK_515_DEFCONFIG_ALIGN=1` additionally
+  aligns the remaining five 6.6-GKI defaults whose 5.15 code exists. CI's
   `custom_kernel_options` still owns one-off config input; the module only
   owns its own feature gates.
+
+  `LRU_GEN_ENABLED` is in the **default** tier, not the align tier, and that
+  placement is a correctness requirement rather than a preference: every
+  android13-5.15 baseline already ships `CONFIG_LRU_GEN=y`, so MGLRU compiles,
+  but this symbol is what selects `DEFINE_STATIC_KEY_ARRAY_TRUE` vs `_FALSE`
+  for `lru_gen_caps` in `mm/vmscan.c`. Without it every MGLRU branch starts
+  false, `/sys/kernel/mm/lru_gen/enabled` reads `0x0000`, and the classic-LRU
+  path runs — measured on the device that shipped the first cut of Batch 38.
+  Batch 37's six MGLRU performance groups were runtime-inert for exactly this
+  reason, which is the same failure class as Batch 8's RCU graft one config
+  layer further down. `tests/stable_5_15_test.py` pins the placement
+  (`test_mglru_is_enabled_by_the_default_tier`).
 - **Family gate.** A non-`android13-5.15` family now produces `report_only`
   for every group without reading files; `--allow-unsupported` (shell:
   `ABK_515_ALLOW_UNSUPPORTED=1`) is the explicit escape hatch. The old
