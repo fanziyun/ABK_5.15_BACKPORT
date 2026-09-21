@@ -2127,13 +2127,17 @@ def test_config_tiers():
 
     check("module-owned tier enables the module's own symbols",
           dict(plain).get("ZRAM_MULTI_COMP") == "y"
+          and dict(plain).get("LRU_GEN_ENABLED") == "y"
           and "ZRAM_WRITEBACK" not in dict(plain), sorted(dict(plain)))
+    # LRU_GEN_ENABLED used to be the align tier's marker symbol; it moved to
+    # the module tier because Batch 37's six MGLRU groups are runtime-inert
+    # without it.  TCP_CONG_BBR is now the align-only marker.
     check("align tier adds the 6.6 GKI config deltas",
-          dict(align).get("LRU_GEN_ENABLED") == "y"
+          dict(align).get("TCP_CONG_BBR") == "y"
           and "ZRAM_WRITEBACK" not in dict(align), sorted(dict(align)))
     check("ROM tier adds CONFIG_ZRAM_WRITEBACK",
           dict(rom).get("ZRAM_WRITEBACK") == "y"
-          and "LRU_GEN_ENABLED" not in dict(rom), sorted(dict(rom)))
+          and "TCP_CONG_BBR" not in dict(rom), sorted(dict(rom)))
     check("ROM tier is reported in the detail string",
           status == "applied" and "ROM integration" in detail, (status, detail))
     # The PSI tier is the only one that touches the kernel command line, and it
@@ -2152,8 +2156,9 @@ def test_config_tiers():
           psi_status == "applied" and "per-cgroup PSI accounting" in psi_detail,
           (psi_status, psi_detail))
     check("the PSI tier keeps the module symbols and pulls in no other tier",
-          psi.get("ZRAM_MULTI_COMP") == "y" and "ZRAM_WRITEBACK" not in psi
-          and "LRU_GEN_ENABLED" not in psi, sorted(psi))
+          psi.get("ZRAM_MULTI_COMP") == "y" and psi.get("LRU_GEN_ENABLED") == "y"
+          and "ZRAM_WRITEBACK" not in psi
+          and "TCP_CONG_BBR" not in psi, sorted(psi))
     blocked_status, blocked_detail, _c, _t = enabled(
         "ABK_515_DEFCONFIG_PSI", psi_status="blocked_by_missing_anchor",
         psi_detail="no CONFIG_CMDLINE line in arch/arm64/configs/gki_defconfig")
@@ -2290,6 +2295,45 @@ def test_introduced_kconfig_tiers():
         check(f"module-tier symbol {symbol} is recorded in _INTRODUCED_KCONFIG",
               symbol in core._INTRODUCED_KCONFIG,
               "add it to _INTRODUCED_KCONFIG in scripts/abk_stable_core.py")
+
+
+def test_mglru_is_enabled_by_the_default_tier():
+    """MGLRU must be on by default, or Batch 37's six groups are inert.
+
+    This is the Batch 8 RCU lesson one config layer further down.  Every
+    android13-5.15 baseline already ships ``CONFIG_LRU_GEN=y``, so the whole
+    MGLRU implementation compiles -- but ``CONFIG_LRU_GEN_ENABLED`` is what
+    selects ``DEFINE_STATIC_KEY_ARRAY_TRUE`` vs ``_FALSE`` for ``lru_gen_caps``
+    in mm/vmscan.c.  With it unset every MGLRU branch starts false,
+    ``/sys/kernel/mm/lru_gen/enabled`` reads ``0x0000``, and the classic-LRU
+    path runs -- verified on the device that shipped the first cut of Batch 38.
+
+    The consequence is not cosmetic: Batch 37 landed six MGLRU performance
+    groups (``mglru_clean_workingset``, ``mglru_optimize_deactivation``,
+    ``mglru_rework_aging_feedback``, ``mglru_rework_type_selection``,
+    ``mglru_rework_refault_detection``, ``mglru_wake_flushers``) that were
+    runtime-inert for exactly this reason.  An optimization that never runs is
+    not an optimization, so the default tier has to turn the symbol on.
+    """
+    print("MGLRU is enabled by the default (module) tier")
+    import abk_stable_core as core
+
+    module = dict(core._MODULE_CONFIGS)
+    check("LRU_GEN_ENABLED is in the default tier",
+          module.get("LRU_GEN_ENABLED") == "y", sorted(module))
+    check("LRU_GEN_ENABLED is recorded in _INTRODUCED_KCONFIG",
+          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "module",
+          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED"))
+    check("LRU_GEN_ENABLED is no longer only in the opt-in align tier",
+          "LRU_GEN_ENABLED" not in dict(core._ALIGN_CONFIGS),
+          sorted(dict(core._ALIGN_CONFIGS)))
+
+    # Every MGLRU group the module ships must still be registered -- the point
+    # of enabling the symbol is to make them live, so a silently-dropped
+    # registration would defeat it.
+    mglru = sorted(g.key for g in core.PATCH_GROUPS if g.key.startswith("mglru_"))
+    check("the MGLRU groups the symbol makes live are still registered",
+          len(mglru) >= 6, mglru)
 
 
 def test_batch10_memcg_v1_reclaim():
@@ -5230,6 +5274,7 @@ def main():
     test_config_tiers()
     test_psi_cmdline_tier()
     test_introduced_kconfig_tiers()
+    test_mglru_is_enabled_by_the_default_tier()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()
     test_batch10_daemon_script()

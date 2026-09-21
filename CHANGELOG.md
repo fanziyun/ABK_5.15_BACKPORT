@@ -747,6 +747,52 @@ mmap_miss = READ_ONCE(ra->mmap_miss);`，行号对、函数错，`replace_once` 
 所以只加新的 `FAULT_FLAG_TRIED` 一项，既有的多减行为保持上游所见。该改动只可能
 **跳过**一次递减（`mmap_miss > 0` 边界检查保留），不会引入下溢。
 
+### 9. MGLRU 改为默认开启（用户要求「该 PR 的优化全部默认开启」）
+
+`LRU_GEN_ENABLED` 从 `_ALIGN_CONFIGS`（opt-in）挪进 `_MODULE_CONFIGS`（默认层），
+`/sys/kernel/mm/lru_gen/enabled` 开机即非零。
+
+**为什么这是正确性要求而不是偏好。** 基线本来就 `CONFIG_LRU_GEN=y`，MGLRU 整套实现都编得进去；
+但这个符号决定 `mm/vmscan.c` 里 `lru_gen_caps` 取 `DEFINE_STATIC_KEY_ARRAY_TRUE` 还是
+`_FALSE`：
+
+```c
+#ifdef CONFIG_LRU_GEN_ENABLED
+DEFINE_STATIC_KEY_ARRAY_TRUE (lru_gen_caps, NR_LRU_GEN_CAPS);
+#define get_cap(cap)	static_branch_likely (&lru_gen_caps[cap])
+#else
+DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
+#define get_cap(cap)	static_branch_unlikely(&lru_gen_caps[cap])
+#endif
+```
+
+不设它 ⇒ 每条 MGLRU 分支初始为假 ⇒ 跑经典 LRU。真机实测（vermeer，本 PR 自己的构建）：
+`CONFIG_LRU_GEN=y`、`CONFIG_LRU_GEN_ENABLED` 未设、`/sys/kernel/mm/lru_gen/enabled` = `0x0000`
+——**编译进去了，运行时空转**。
+
+**后果：Batch 37 落地的 6 个 MGLRU 组（v6.14 系列）此前一直没生效，现在才第一次真正运行。**
+这与 Batch 8 的 RCU graft「编出去了但组仍报 applied」是同一类失败，只是发生在低一层的 config
+上——Batch 16 的 emptiness audit 抓的是 Kconfig 层，这次是运行时 static-branch 层。
+
+**仍未落地：v7.2 的 12 条 MGLRU 回收循环重写。** 所以打开后设备跑的是 6.1「最小实现」回移 +
+Batch 37 的 v6.14 六组，不是 survey §1 那版。若要 survey 里那组收益（吞吐 +29%／延迟 −23%／
+refault −43%，服务器数字），得先把 12 条落地。
+
+**按用户划定的范围，其余 opt-in 层不动**：`TCP_CONG_ADVANCED`/`TCP_CONG_BBR`/`BLK_WBT`/
+`BLK_DEV_THROTTLING`/`TASK_DELAY_ACCT`（align 层，6.6-GKI 对齐而非本模块优化）、
+per-cgroup PSI（psi 层，删 `cgroup_disable=pressure` 的设备级开销）、`abk_sf_enable`
+（vendor FAS/WALT 拥有 DVFS 时频率地板会变天花板锁）、伴生 `zram.writeback.trigger`（闪存磨损）。
+
+**测试**：新增 `tests/stable_5_15_test.py::test_mglru_is_enabled_by_the_default_tier`，
+四个断言分别钉住「在默认层」「`_INTRODUCED_KCONFIG` 已登记」「不再只在 opt-in 层」
+「6 个 MGLRU 组仍注册」。反向验证：把符号挪回 align 层 → 6 个检查失败（含新测试 3 条），恢复后全绿。
+`test_config_tiers()` 里原先拿 `LRU_GEN_ENABLED` 当「align 层标记」的三个断言改用
+`TCP_CONG_BBR`（该符号现在是唯一还在 align 层的语义标记）。
+
+defconfig 改写实测：`enable_configs` 在 `arch/arm64/configs/gki_defconfig` 里追加
+`CONFIG_LRU_GEN_ENABLED=y`（带 `ABK stable_515_backport: config_enablement` 标记），
+原有 `CONFIG_LRU_GEN=y` 不动，无行被删。
+
 ### 8. 真机核查（无线 adb，vermeer / Xiaomi 14）
 
 内核正是本 PR 的构建：`uname -r` = `5.15.216-202609202-FanZiyun-pr22-4152336`。
