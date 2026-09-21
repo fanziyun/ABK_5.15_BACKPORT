@@ -2335,6 +2335,43 @@ def test_mglru_is_enabled_by_the_default_tier():
     check("the MGLRU groups the symbol makes live are still registered",
           len(mglru) >= 6, mglru)
 
+    # The companion and the kernel tier must agree.  Before Batch 38 they did,
+    # in the wrong direction: the kernel shipped MGLRU off and the companion
+    # stated 0, and abk_apply_lru_gen() only ever *writes* on ==1, so the knob
+    # was a no-op that documented the kernel default rather than deciding it.
+    # Now the kernel defaults it on, so a companion still saying 0 is a stale
+    # comment waiting to mislead someone into thinking MGLRU is off.
+    ksu = (Path(__file__).resolve().parent.parent / "ksu"
+           / "abk_runtime_tunables")
+    tunables = (ksu / "tunables.conf").read_text(encoding="utf-8")
+    readme = (ksu / "README.md").read_text(encoding="utf-8")
+    check("the companion asserts lru_gen.enable=1",
+          re.search(r"(?m)^lru_gen\.enable=1$", tunables) is not None,
+          [l for l in tunables.splitlines() if l.startswith("lru_gen.enable")])
+    check("the companion README no longer claims the kernel ships MGLRU off",
+          "ships it off" not in readme, "stale README row")
+    check("the companion README lists lru_gen as not opt-in",
+          "`lru_gen` is no longer opt-in" in readme, "README opt-in paragraph")
+    # The knob must stay a write-only assertion: if abk_apply_lru_gen() ever
+    # grows an else-branch that writes n, a future 0 would silently disable
+    # MGLRU again and the two layers would fight.
+    common_sh = (ksu / "common.sh").read_text(encoding="utf-8")
+    lines = common_sh.split("\n")
+    start = next((i for i, l in enumerate(lines)
+                  if l.startswith("abk_apply_lru_gen()")), None)
+    check("abk_apply_lru_gen() is present in common.sh", start is not None)
+    if start is not None:
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i] == "}"), None)
+        check("abk_apply_lru_gen() is closed by a line-initial }", end is not None)
+        if end is not None:
+            body = "\n".join(lines[start:end + 1])
+            check("abk_apply_lru_gen() has no branch that turns MGLRU off",
+                  '"n"' not in body and "write \"n\"" not in body,
+                  [l for l in body.split("\n") if '"n"' in l])
+            check("abk_apply_lru_gen() writes y, never a bare 1",
+                  'abk_write "$_lg_node" y' in body, "the write target changed")
+
 
 def test_batch10_memcg_v1_reclaim():
     print("Batch 10-4 memcg_v1_reclaim")
