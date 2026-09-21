@@ -98,7 +98,14 @@ GROUP_COUNTS = {
     # removed in v0.42.0 (madvise_pt_reclaim + madvise_batch_tlb_flush: they
     # freed empty PTE pages under mmap_read_lock and raced the smaps/reclaim
     # page-table walkers on 5.15, which panicked in smaps_pte_range) = 57.
-    "stable_backport_core": 63,
+    # Batch 38 added six (huge_memory_imap_split_uaf,
+    # swap_readahead_lru_add_drain, vmscan_tasks_rcu_qs,
+    # filemap_mmap_miss_tried, memcg_dying_bailout, buddyinfo_nolock) = 63.
+    # Batch 39 adds one: pagealloc_batch_clear (v7.2 b001cf7d16dd).  It lands
+    # on every baseline -- the anchor is pristine 5.15 text on all four, and
+    # unlike the i_mmap split UAF no baseline carries the commit, because it
+    # is a v7.2 performance change with no Cc: stable and no 5.15.y backport.
+    "stable_backport_core": 64,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

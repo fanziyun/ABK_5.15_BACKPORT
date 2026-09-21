@@ -8,7 +8,11 @@ scope by policy (`porting_policy.md`), and a fix rides along only when its
 5.15.y backport text is already available verbatim.
 
 Landed as **Batch 38** (`CHANGELOG.md#batch-38`, v0.43.0): six groups in
-`scripts/batch38_core_mm_safety_perf.py`.
+`scripts/batch38_core_mm_safety_perf.py`. Landed as **Batch 39**
+(`CHANGELOG.md#batch-39`, v0.44.0): `pagealloc_batch_clear`, i.e. item 3
+below. **Item 1 (the MGLRU series) is recorded here as *not portable*** — the
+first pass rated it strongly recommended on a wrong premise about how closely
+5.15's MGLRU matches 7.2's; §1 now carries the revision and its evidence.
 
 ## Method — and why a committer-date window does not work
 
@@ -40,12 +44,12 @@ build this PR produces) via `zcat /proc/config.gz`, `/sys/kernel/mm/…` and
 
 | Fact | Value | Consequence |
 |---|---|---|
-| `CONFIG_LRU_GEN` | **y** **[D]** | MGLRU is compiled in — **but not live** |
-| `CONFIG_LRU_GEN_ENABLED` / `/sys/kernel/mm/lru_gen/enabled` | **not set** / **`0x0000`** **[D]** | MGLRU is **off at runtime**. The first draft of this table said "MGLRU is live, so MGLRU work is not theoretical" — that was wrong, and it is the single most consequential error the device check caught. MGLRU commits still compile, but none of them executes on this device without a runtime switch |
+| `CONFIG_LRU_GEN` | **y** **[D]** | MGLRU is compiled in; **not live on a stock build** (next row) |
+| `CONFIG_LRU_GEN_ENABLED` / `/sys/kernel/mm/lru_gen/enabled` | **not set** / **`0x0000`** **[D]** | MGLRU is **off at runtime** on a stock baseline. The first draft of this table said "MGLRU is live, so MGLRU work is not theoretical" — that was wrong, and it is the single most consequential error the device check caught: the symbol selects `lru_gen_caps`' `DEFINE_STATIC_KEY_ARRAY_TRUE` vs `_FALSE` (`mm/vmscan.c:2972`), so unset means every MGLRU branch starts false and the classic LRU runs. **Since `717c046` the module puts this symbol in its default tier**, so a module build does run MGLRU; the measurement above is the stock-baseline fact and is what made Batch 37's six MGLRU groups inert until then |
 | `CONFIG_KSM` | **not set** **[D]** | every `ksm/*` commit is inapplicable |
 | `CONFIG_DAMON` / `DAMON_PADDR` / `DAMON_RECLAIM` | **all y** **[D]** | `mm/damon/reclaim` is reachable (but see caveat below) |
 | `CONFIG_TRANSPARENT_HUGEPAGE` + `_MADVISE` | y / y **[D]** | THP exists but is madvise-only, not always |
-| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON` + `CONFIG_KASAN_HW_TAGS` | y / y **[D]** | the per-page clear loop in `post_alloc_hook()` really runs on every allocation |
+| `CONFIG_INIT_ON_ALLOC_DEFAULT_ON` + `CONFIG_KASAN_HW_TAGS` | y / y **[D]** | **Corrected in Batch 39.** The first draft of this row said "the per-page clear loop in `post_alloc_hook()` really runs on every allocation" — that is wrong, and it is the premise `b001cf7d16dd` was rated on. 5.15's `kasan_has_integrated_init()` **is** `kasan_hw_tags_enabled()` (`include/linux/kasan.h:86`), so with HW-tags KASAN active `post_alloc_hook()` lets `kasan_unpoison_pages()` zero the pages and clears `init`, and `kernel_init_free_pages()` is never reached. The loop is live only when HW-tags KASAN is off at runtime — full analysis in §3 |
 | `CONFIG_ZSMALLOC` / `CONFIG_ZRAM` | y / y (built-in, not `m`) **[D]** | zram/zsmalloc paths are hot |
 | `CONFIG_TASKS_RCU` **and** `CONFIG_TASKS_TRACE_RCU` | **both y** **[D]** | `cond_resched_tasks_rcu_qs()` is **not** a no-op here. The first draft said Tasks-RCU was off; `/proc/kallsyms` exports real `call_rcu_tasks`/`synchronize_rcu_tasks`, so `rcu_tasks_classic_qs()`'s holdout clear is compiled in |
 | `CONFIG_PREEMPT` | **y** **[D]** | confirms the premise of the Tasks-RCU fix: `cond_resched()` is a no-op on a PREEMPTION kernel |
@@ -75,38 +79,37 @@ unverified — all damon/reclaim conclusions are blocked on fetching it.
 
 ---
 
-## Strongly recommended (6 of the 8 landed as Batch 38)
+## Strongly recommended (7 of the 8 landed: 6 in Batch 38, item 3 in Batch 39; item 1 revised to not-portable)
 
-### 1. MGLRU reclaim-loop restructure + dirty writeback series
+### 1. MGLRU reclaim-loop restructure + dirty writeback series — **not portable, verdict revised**
 
 Kairui Song (Tencent), "mm/mglru: improve reclaim loop and dirty folio" v7,
 cover `0491e9f75c15`, 12 commits, **all touching only `mm/vmscan.c`** (sole
 exception `6cbdd9726fb5`, which also touches `mm/swap.c` — absent on 5.15 —
 plus `mm/workingset.c` and `include/linux/mm_inline.h`).
 
-| sha | subject | lines |
-|---|---|---|
-| `790d3abeca09` | rename variables related to aging and rotation (rename only) | +7/-7 |
-| `aa6ef5b159dc` | relocate the LRU scan batch limit to callers (no behaviour change) | +9/-7 |
-| `163bc3d68c9f` | **restructure the reclaim loop** (compute the scan number once, decouple aging/rotation) | +36/-36 |
-| `6e9be217a3ce` | **use a smaller batch for reclaim** (less lock contention, no over-reclaim) | +1/-1 |
-| `3a72e078b4a3` | scan and count the exact number of folios | +29/-29 |
-| `12316f7902f8` | **don't abort scan immediately right after aging** | +9/-3 |
-| `16b475d2ac3c` | avoid reclaim type fall back when isolation makes no progress (holds swappiness) | +7/-2 |
-| `acd22fbb9f47` | remove redundant swap constrained check upon isolation (also unblocks lazyfree) | +0/-6 |
-| `75d4c3f5fb98` | **use the common routine for dirty/writeback reactivation** | +0/-19 |
-| `f37d3708b676` | **simplify and improve dirty writeback handling** (move the dirty flush into the loop) | +16/-25 |
-| `32d87083ee97` | remove no longer used reclaim argument for folio protection | +4/-7 |
-| `6cbdd9726fb5` | use folio_mark_accessed to replace folio_set_active | +25/-9 ⚠ touches `mm/swap.c` |
+| sha | subject | lines | 5.15 verdict |
+|---|---|---|---|
+| `790d3abeca09` | rename variables related to aging and rotation | +7/-7 | **no-op** — 5.15's names (`lru_gen_shrink_lruvec`, `need_aging`, `can_swap`) are not the ones renamed |
+| `aa6ef5b159dc` | relocate the LRU scan batch limit to callers | +9/-7 | **blocked** — 5.15's `scan_pages()` hardcodes `int remaining = MAX_LRU_BATCH` and takes no `nr_to_scan` |
+| `163bc3d68c9f` | **restructure the reclaim loop** | +36/-36 | **blocked** — needs 4-arg `should_run_aging()` and 3-arg `get_nr_to_scan()`; 5.15's are 6- and 4-arg with a different algorithm |
+| `6e9be217a3ce` | **use a smaller batch for reclaim** | +1/-1 | **blocked** — depends on `aa6ef5b159dc` |
+| `3a72e078b4a3` | scan and count the exact number of folios | +29/-29 | **blocked** — needs `scan_folios(..., int *isolatedp)` and the 6-arg `isolate_folios()` |
+| `12316f7902f8` | **don't abort scan immediately right after aging** | +9/-3 | **largely already present** — see below |
+| `16b475d2ac3c` | avoid reclaim type fall back on no progress | +7/-2 | **already present** — 5.15's `isolate_pages()` breaks on `scanned != 0`, so the fallback is only reached when `scanned == 0` |
+| `acd22fbb9f47` | remove redundant swap constrained check | +0/-6 | **already present** — 5.15's `isolate_page()` has no such check; its `sc->may_writepage` guard is the later refinement |
+| `75d4c3f5fb98` | **use the common routine for dirty/writeback reactivation** | +0/-19 | **blocked** — see below |
+| `f37d3708b676` | **simplify and improve dirty writeback handling** | +16/-25 | **blocked by idempotency collision** — see below |
+| `32d87083ee97` | remove no longer used reclaim argument | +4/-7 | **blocked** — 5.15's `page_inc_gen()` still sets `PG_reclaim` when reclaiming and `isolate_page()` clears it |
+| `6cbdd9726fb5` | use folio_mark_accessed to replace folio_set_active | +25/-9 | **blocked** — touches `mm/swap.c`, which does not exist on 5.15 |
 
-1. **Problem**: the loop recomputes the scan number every iteration and couples
-   that calculation to aging and rotation; dirty-writeback handling differs
-   from classical LRU (dirty pages are moved to the second-oldest generation
-   instead of being reactivated, so they keep reappearing at the LRU tail);
-   the dirty flush only runs after the whole reclaim loop, so it rarely
-   triggers. Production saw OOM caused by a passive flusher. `12316f7902f8`
-   matters most for a phone: once aging fires the reclaimer aborts, so under
-   concurrent reclaim **every** reclaimer can fail, worst case an early OOM.
+1. **Problem** (unchanged from the first pass): the loop recomputes the scan
+   number every iteration and couples that calculation to aging and rotation;
+   dirty-writeback handling differs from classical LRU (dirty pages are moved to
+   the second-oldest generation instead of being reactivated, so they keep
+   reappearing at the LRU tail); the dirty flush only runs after the whole
+   reclaim loop, so it rarely triggers. Production saw OOM caused by a passive
+   flusher.
 2. **Benefit** (upstream, YCSB/MongoDB — server load): the series reports "up
    to ~30% increase in some workloads like MongoDB with YCSB and a huge
    decrease in file refault, **no swap involved**. Other common benchmarks have
@@ -119,28 +122,70 @@ plus `mm/workingset.c` and `include/linux/mm_inline.h`).
    claimed.**
 3. **Already in 5.15?** No. 5.15's MGLRU is the 6.1 minimal implementation plus
    Batch 37-mglru's port of the v6.14 series (`9cbfd1c3c83b` cover, 6 groups).
-4. **Difficulty**: hard, but less than it first looks. I initially assumed
-   5.15 had only a single `isolate_pages()` and needed the 6.x scan/evict split
-   introduced first — **measurement disproved that**: 5.15 already has
-   `isolate_pages()` (`mm/vmscan.c:4800`, which calls `scan_pages()`) and
-   `evict_pages()` (`:4841`, which calls `shrink_page_list()`), a one-to-one
-   match for 7.2's `scan_folios()`/`evict_folios()`. The difference is only
-   page-vs-folio form and the scan-budget arithmetic, i.e. exactly the shape
-   rewrite Batch 37-mglru already performed for the v6.14 series. Two members
-   were additionally confirmed directly portable: `75d4c3f5fb98` deletes a
-   branch that exists verbatim in 5.15's `evict_pages()`
-   (`PageReclaim() && (PageDirty(page) || PageWriteback(page))`), and
-   `6e9be217a3ce` has a counterpart in `isolate_pages()`'s `scanned` return
-   chain.
-5. **Verdict**: **strongly recommended** — the only systematic, quantified MM
-   performance series in v7.2 that targets MGLRU, which is compiled in here.
-   Risk: the numbers are server-side, and the device check showed MGLRU is
-   **off at runtime** on this target (`/sys/kernel/mm/lru_gen/enabled` is
-   `0x0000`), so the whole series is inert until something turns it on — see
-   the target-machine facts table. That does not change the verdict (the
-   series is still the right code to have if MGLRU is ever enabled, and the
-   lts baseline is the same shape), but it does mean no device-side benefit is
-   reachable from it today.
+4. **Difficulty — revised upward after reading all 12 patches against the
+   baseline.** My first pass claimed 5.15's `isolate_pages()`/`evict_pages()`
+   are "a one-to-one match" for 7.2's `scan_folios()`/`evict_folios()` and that
+   the port is therefore the same shape rewrite Batch 37-mglru already did.
+   **That was wrong: the names correspond, the decomposition does not.** The
+   series sits on five intervening refactors that 5.15 does not have:
+
+   * `should_run_aging()` — 7.2: 4 args, a pure predicate. 5.15: **6 args**
+     (`lruvec, max_seq, min_seq, sc, can_swap, &nr_to_scan`) and it *computes*
+     `nr_to_scan` by walking every generation (`mm/vmscan.c:4282`).
+   * `get_nr_to_scan()` — 7.2: 3 args returning `>0`. 5.15: 4 args
+     (`..., bool can_swap, bool *need_aging`) returning 0 to signal aging
+     (`:4949`).
+   * the top loop — 7.2: `try_to_shrink_lruvec()`. 5.15:
+     `lru_gen_shrink_lruvec()`, with `can_swap` (not `swappiness`) threaded
+     through the helpers (`:5033`).
+   * `scan_folios()` returning `scanned` plus an `isolatedp` out-param, and
+     `isolate_folios()` accumulating `total_scanned` across types — 5.15's
+     `isolate_pages()` breaks on the first non-zero `scanned` and returns it
+     (`:4800`).
+   * `for_each_evictable_type()` and `root_reclaim()` — **zero occurrences**
+     each in 5.15's `mm/vmscan.c`.
+
+   Three members deserve individual notes:
+
+   * `12316f7902f8` (the phone-relevant one) is **largely already the 5.15
+     behaviour**. 5.15 puts the abort inside `get_nr_to_scan()`, and after
+     aging it *returns `nr_to_scan`* — i.e. it ages and then scans — except at
+     `DEF_PRIORITY` (where it deliberately gets away without aging) or for
+     kswapd. So there is no unconditional `break` after aging to remove.
+   * `75d4c3f5fb98` cannot be taken alone. In 5.15 `sort_page()`'s
+     "waiting for writeback" branch (`mm/vmscan.c:4625`) already diverts
+     `PageLocked || PageWriteback || (file && dirty)` pages before they are
+     isolated, so `evict_pages()`'s `PageReclaim() && (dirty || writeback)`
+     case only fires for pages that *became* dirty during `shrink_page_list()`.
+     Deleting it without the rest of the series changes putback behaviour for
+     that race.
+   * `f37d3708b676` is the one whose mechanism this module already owns: the
+     flusher wakeup it relocates is the block this module's own
+     `mglru_wake_flushers` (v6.13 `1bc542c6a0d1`) generates at the end of
+     `lru_gen_shrink_lruvec()`. A *later* group cannot move text an earlier
+     group rewrites — doing so breaks that group's idempotency probe, which is
+     `docs/group_recipe.md` trap 5 and the Batch 21/24 remedy — and its
+     per-batch `isolated` count comes from the blocked `3a72e078b4a3` anyway.
+     Its `reclaim_throttle()` payload needs `VMSCAN_THROTTLE_WRITEBACK`, absent
+     on 5.15.
+
+5. **Verdict — revised from "strongly recommended" to "not portable as a
+   graft".** A faithful port is not a graft but a ~500-line restructure of the
+   device's primary reclaim path, carrying six intervening refactors, for
+   server-measured numbers. Given the explicit requirement to trade no
+   stability for performance, that is not worth the panic risk. If a later
+   batch wants this, the honest route is to port the intervening refactors
+   first (as their own groups, each independently auditable) and only then the
+   reclaim-loop change — not to graft the series on top.
+
+   The device check first reported this series as *inert* (MGLRU off at runtime,
+   see the facts table), which would have made the verdict easy. `717c046`
+   then put `LRU_GEN_ENABLED` in the module's default tier, so **a module build
+   does run MGLRU** — and that raises the risk rather than lowering it: the
+   reclaim path being live is exactly why a ~500-line restructure of it is not
+   something to land on a shape-mismatch premise. Batch 37's six v6.14 groups
+   run there too, and they are the code this series was measured against only on
+   7.x, not on this 6.1-shape implementation.
 
 ### 2. `aaa98b100ea8` — mm/vmstat: don't take the zone lock reading /proc/buddyinfo
 
@@ -160,18 +205,51 @@ With `init_on_alloc` on, `kernel_init_pages()` clears pages one at a time via
 pair per page and preventing the arch primitive from working on a contiguous
 range. Upstream: allocating 8192 x 2MB HugeTLB (16 GB) with `init_on_alloc=1`
 went 0.445s → 0.166s (**−62.7%, 2.68x**); Graph500 kernel time −50.3% (64C128T)
-and −39.0% (16C32T).
+and −39.0% (16C32T). Those are server numbers; nothing here is a device claim.
 
-On 5.15 the target exists verbatim and **really runs**: `mm/page_alloc.c:1398-1412`
-is the per-page loop (named `kernel_init_free_pages()` there, called from
-`post_alloc_hook()`), and `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` +
-`CONFIG_KASAN_HW_TAGS=y` makes `kasan_has_integrated_init()` false, so `init`
-stays true and **every allocation walks the loop**. Naming caveat: 5.15's
-contiguous-clear primitive is `clear_huge_page()` in `include/linux/highmem.h`
-(7.2's `clear_pages()` is the later rename), and that header is not in the
-reference trees, so the helper name must be confirmed on a real checkout
-before anchoring. Difficulty: moderate (+11/-7, but a highmem helper is
-involved and the call site is inlined in `post_alloc_hook()`).
+**Two corrections to this entry, both found while implementing it (Batch 39).**
+
+*Correction 1 — the helper name.* 5.15's contiguous-clear primitive is **not**
+`clear_huge_page()` in `include/linux/highmem.h`. `clear_huge_page()` is
+declared in `include/linux/mm.h:3266`, defined in `mm/memory.c:5899`, and is
+**not** a contiguous clear: it funnels into `process_huge_page()` →
+`clear_subpage()` and still issues one `clear_user_highpage()` per subpage.
+5.15 has no `clear_pages()` at all, so the batch primitive has to be spelled
+inline (which is what upstream's own author note "move
+clear_highpages_kasan_tagged() to page_alloc.c" does too).
+
+*Correction 2 — my earlier claim that the loop runs on every allocation was
+wrong for the HW-KASAN case.* 5.15's `kasan_has_integrated_init()` is
+`kasan_hw_tags_enabled()` (`include/linux/kasan.h:86`), and
+`kasan_hw_tags_enabled()` is `static_branch_likely(&kasan_flag_enabled)` — a
+static key that defaults **false** (`include/linux/kasan-enabled.h`). So:
+
+| runtime state | `should_skip_kasan_unpoison()` | `post_alloc_hook()` | loop live? |
+|---|---|---|---|
+| HW-tags KASAN **on** | false (normal flags) | `kasan_unpoison_pages()` zeroes the memory, `kasan_has_integrated_init()` clears `init` | **no** — KASAN's own per-page path does the init |
+| HW-tags KASAN **off** | true (`!kasan_hw_tags_enabled()`) | block skipped, `init` stays true | **yes** |
+
+`free_pages_prepare()` additionally needs `CONFIG_INIT_ON_FREE_DEFAULT_ON`,
+which `gki_defconfig` does not set, so the free path never reaches it either.
+
+**Why the port is nevertheless safe in every regime.** The only semantic
+difference is dropping the per-page KASAN tag pair, and that pair is provably
+a no-op: `page_kasan_tag_reset()` is `page_kasan_tag_set(page, 0xff)`
+(`include/linux/mm.h:1587`) and `page_kasan_tag_set()` writes the saved value
+back through `try_cmpxchg` (`:1571`), so `page->flags` ends where it started;
+and the reset cannot affect the address handed to `clear_highpage()` because on
+arm64 `page_address()` is `lowmem_page_address()` (`:1702` → `__va()`), which
+carries no tag. The one regime where the pair would have been live — KASAN on
+and `kernel_init_free_pages()` still reached — is unreachable: the only escape
+from `kasan_has_integrated_init()` is `should_skip_kasan_unpoison()`'s last
+line, `init_tags || (flags & __GFP_SKIP_KASAN_UNPOISON)`
+(`mm/page_alloc.c:2537`), where `__GFP_ZEROTAGS` is consumed by the
+`init_tags` branch above (which sets `init = false` itself) and
+`__GFP_SKIP_KASAN_UNPOISON` has no user anywhere in the tree (grepped).
+
+**Landed as Batch 39** (`pagealloc_batch_clear`), keeping the 5.15 function
+name (upstream's rename buys nothing and costs two more anchors on the hottest
+allocator path) and keeping the HIGHMEM branch byte-for-byte.
 
 ### 4. `9b0fcac3cfe7` — mm/filemap: don't count FAULT_FLAG_TRIED retries as mmap hits
 

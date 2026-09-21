@@ -550,6 +550,140 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+<a id="batch-39"></a>
+
+## Batch 39(v0.44.0)
+
+主题「v7.2 分配器批量清页」+「MGLRU 系列的不可移植结论」。前者落地 1 组（`scripts/batch39_core_pagealloc_batch_clear.py`，
+core 63 → **64**）；后者不落地，但把 survey §1 从「强烈推荐」改判为「不可移植」，证据一并记入
+`docs/survey_7_2_mm_reclaim.md`。
+
+### 1. 落地：`pagealloc_batch_clear`（`b001cf7d16dd`，v7.2）
+
+`kernel_init_free_pages()` 在 `!CONFIG_HIGHMEM` 下把 numpages 次
+`kmap_atomic()`/`clear_page()`/`kunmap_atomic()` 换成对整个连续区间的一次 `memset()`，
+HIGHMEM 分支逐字节保留 5.15 原循环（那些页面确实需要 kmap）。
+
+上游数字：8192×2MB HugeTLB（16 GB）+ `init_on_alloc=1`，0.445 s → 0.166 s（**−62.7%**）；
+Graph500 内核态时间 −50.3%（64C128T）/−39.0%（16C32T）。**全是服务器负载，本批不主张设备侧提速。**
+
+### 2. 实现时推翻了 survey 初版的两个结论
+
+**（a）5.15 的连续清页原语不是 `clear_huge_page()`。** survey 写它在
+`include/linux/highmem.h`；实测它在 `include/linux/mm.h:3266` 声明、`mm/memory.c:5899` 定义，
+而且**不是**连续清页——它经 `process_huge_page()`/`clear_subpage()` 仍然逐 subpage 调
+`clear_user_highpage()`。5.15 根本没有 7.2 的 `clear_pages()`，所以批量原语只能内联书写
+（上游自己的 author note "move clear_highpages_kasan_tagged() to page_alloc.c" 也是这个路子）。
+**影响**：`include/linux/highmem.h` 不必进三处 fixture，改动收缩到 `mm/page_alloc.c` 一个文件。
+
+**（b）「`CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` + `CONFIG_KASAN_HW_TAGS=y` ⇒ 每次分配都走这个逐页循环」
+是错的。** 5.15 的 `kasan_has_integrated_init()` 就是 `kasan_hw_tags_enabled()`
+（`include/linux/kasan.h:86`），而后者是 `static_branch_likely(&kasan_flag_enabled)`——
+一个**默认 false** 的 static key（`include/linux/kasan-enabled.h`）。于是：
+
+| 运行时状态 | `should_skip_kasan_unpoison()` | `post_alloc_hook()` | 循环是否活 |
+|---|---|---|---|
+| HW-tags KASAN **开** | false（普通 flag） | `kasan_unpoison_pages()` 自己清零，`kasan_has_integrated_init()` 清掉 `init` | **否** |
+| HW-tags KASAN **关** | true（`!kasan_hw_tags_enabled()` 分支） | 整块跳过，`init` 保持 true | **是** |
+
+free 路径两条都不通：`CONFIG_INIT_ON_FREE_DEFAULT_ON` 在 `gki_defconfig` 未设。
+
+### 3. 为什么移植仍然安全（可证明，不是假定）
+
+唯一语义差异是去掉逐页 KASAN tag 对，逐条 discharge：
+
+- `page_kasan_tag_reset()` 就是 `page_kasan_tag_set(page, 0xff)`（`include/linux/mm.h:1587`），
+  而 `page_kasan_tag_set()` 用 `try_cmpxchg` 把存下的值写回去（`:1571`）。所以这一对是
+  「读-改-写回到原点」，`page->flags` 的可观测状态不变，删掉它不可能改变任何已记录 tag。
+- reset 的另一个可能影响是改变传给 `clear_highpage()` 的地址——**没有**：arm64 的
+  `page_address()` 是 `lowmem_page_address()`（`include/linux/mm.h:1702` → `__va()`），
+  不带 KASAN tag。`kasan_reset_tag()` 仍按上游写法带上，在本基线上可证明是恒等操作。
+- 「KASAN 开着且本函数仍被调用」这一唯一危险 regime **不可达**：绕过
+  `kasan_has_integrated_init()` 只有 `should_skip_kasan_unpoison()` 末行
+  `init_tags || (flags & __GFP_SKIP_KASAN_UNPOISON)`（`mm/page_alloc.c:2537`）一条路，
+  而 `__GFP_ZEROTAGS` 被上面的 `init_tags` 分支自己消费（该分支已置 `init = false`），
+  `__GFP_SKIP_KASAN_UNPOISON` 在**全树没有任何用户**（已 grep）。
+- `free_pages_prepare()` 断言 `!PageTail(page)`，两个调用点都从 head page 传 `1 << order`，
+  区间确实连续——这正是单次 `memset` 的前提。`!IS_ENABLED(CONFIG_HIGHMEM)` 即 arm64 的配置，
+  所有可达页面都在线性映射内，`page_address()` 有效。
+
+**不改函数名**：上游把 `kernel_init_pages()` 改名 `clear_highpages_kasan_tagged()`（改完后它不只服务
+free 路径），5.15 的 `kernel_init_free_pages()` 同样服务 `post_alloc_hook()`，但改名零收益、
+却要在整棵树最热的分配路径上多两个锚点，故不携带。
+
+### 4. 不落地：MGLRU 回收循环系列（12 commit，封面 `0491e9f75c15`）
+
+survey 初版把它评为「强烈推荐」，理由是「5.15 已有 `isolate_pages()`/`evict_pages()` 这对拆分，
+与 7.2 的 `scan_folios()`/`evict_folios()` 一一对应，移植性质与 Batch 37-mglru 同族」。
+**逐条取回 12 个补丁对照基线后，这个理由是错的：名字对应，分解方式不对应。** 系列踩在五项
+5.15 没有的中间重构之上：
+
+- `should_run_aging()`：7.2 是 4 参纯谓词；5.15 是 **6 参**且**自己算** `nr_to_scan`
+  （遍历所有 generation，`mm/vmscan.c:4282`）。
+- `get_nr_to_scan()`：7.2 3 参返回 `>0`；5.15 4 参，用返回 0 表达「该 aging 了」（`:4949`）。
+- 顶层循环：7.2 叫 `try_to_shrink_lruvec()`；5.15 叫 `lru_gen_shrink_lruvec()`，
+  且贯穿辅助函数的是 `can_swap` 而不是 `swappiness`（`:5033`）。
+- `scan_folios()` 返回 `scanned` + `isolatedp` 出参、`isolate_folios()` 跨 type 累加
+  `total_scanned`；5.15 的 `isolate_pages()` 遇到第一个非零 `scanned` 就 break 并返回它（`:4800`）。
+- `for_each_evictable_type()` 与 `root_reclaim()`：5.15 的 `mm/vmscan.c` 里各 **0 次**出现。
+
+逐条结论（详见 survey §1 表格）：`790d3abeca09`（改名，5.15 名字不同，无事可做）、
+`16b475d2ac3c`（5.15 的 `isolate_pages()` 只在 `scanned == 0` 时才回退 type，**已是修复后形状**）、
+`acd22fbb9f47`（5.15 的 `isolate_page()` 没有那条 swap-constrained 检查，且它的
+`sc->may_writepage` 守卫是更晚的细化，**已是修复后形状**）三条是 no-op；
+`12316f7902f8`（survey 里最被看好的手机向那条）**大部分已是 5.15 行为**——5.15 把中止放在
+`get_nr_to_scan()` 里，aging 之后它*返回 `nr_to_scan`*（即先 age 再扫），
+只有 `DEF_PRIORITY`（刻意不 age）和 kswapd 两条例外，没有那个无条件 `break` 可删；
+`6cbdd9726fb5` 碰 `mm/swap.c`，5.15 无此文件；其余七条都被上述中间重构挡住。
+
+`f37d3708b676`（系列里唯一有实测数字的，+29%/−23%/−43%）另有一层障碍：它要搬移的那段
+flusher 唤醒，正是**本模块自己**的 `mglru_wake_flushers`（Batch 37，v6.13 `1bc542c6a0d1`）
+在 `lru_gen_shrink_lruvec()` 尾部生成的文本。后注册的组不能改先注册组重写过的文本——
+那会破坏该组的幂等探针（`docs/group_recipe.md` trap 5，Batch 21/24 的补救办法是排序而非改写），
+而它需要的逐批 `isolated` 计数又来自被挡住的 `3a72e078b4a3`；其 `reclaim_throttle()` 载荷
+还需要 5.15 没有的 `VMSCAN_THROTTLE_WRITEBACK`。
+
+**结论**：忠实移植不是 graft 而是对设备主回收路径约 500 行的重构，要连带搬六项中间重构，
+换来的还是服务器数字。按「性能移植不能以稳定性为代价」的口径，不值得这个 panic 风险。
+若将来要做，正路是先把中间重构成独立的、各自可审计的组，再动回收循环本身。
+
+### 5. 验证
+
+```
+1. py_compile scripts/*.py tests/*.py                     OK
+2. bash -n tests/smoke.sh                                 OK
+3. python3 tests/stable_5_15_test.py                      all checks passed
+4. python3 tests/step_audit.py <194>                      STEP AUDIT OK (5.15.194)
+5. python3 tests/implementation_audit.py <194>            IMPLEMENTATION AUDIT OK
+6. ABK_TEST_SUB_LEVEL=194 bash tests/smoke.sh <194>       SMOKE OK (exit 0)
+   core: pass1={'applied': 61, 'already_present': 3}  pass2={'already_present': 64}
+   .abk-orig leftovers: 0
+```
+
+另外单独驱动新组做了施前/施后目视核对（不依赖门禁结论）：`applied` → 1 hunk，
+第二遍 `already_present` 且字节相同；生成的函数体与上文 §1 描述逐字一致，两个调用点
+（`mm/page_alloc.c:1500`、`:2600`）未改动。
+
+`tests/implementation_audit.py` 补了本组的行为门禁（recipe §3）：`kernel_init_free_pages`
+内 must-have 钉住 `kasan_disable_current()`/`kasan_enable_current()` 这对、`!IS_ENABLED(CONFIG_HIGHMEM)`
+守卫、`memset(kasan_reset_tag(page_address(page)), 0,` 与 `(unsigned long)numpages * PAGE_SIZE);`，
+并保留 `clear_highpage(page + i);` 证明 HIGHMEM 分支没被顺手删掉。**已做反向验证**：把
+`kasan_reset_tag()` 从 graft 里去掉，审计报
+`AUDIT FAIL: core/pagealloc_batch_clear: kernel_init_free_pages missing required text: 'memset(kasan_reset_tag(page_address(page)), 0,'`
+并以 1 退出。
+
+**rebase 后复跑**：本批最初在 Batch 38 的父提交上开发，开 PR 前 rebase 到已合入的
+main（含 `717c046` 把 `LRU_GEN_ENABLED` 搬进默认层、`243ac34` 的真机核查更正）。
+`module.conf` / `plan.md` / `docs/survey_7_2_mm_reclaim.md` 三处有冲突，按「主线侧保留、
+本批只叠加」解掉：主线侧的两处 description 与 Batch 38 索引行原样保留，只把版本号抬到
+0.44.0；survey 的设备实测表与 §6 的 Tasks-RCU 更正保留，本批改写的 §1/§3 覆盖旧结论。
+解冲突后**六道门禁全部重跑一遍**，结果与上表一致（core 64，pass2 全 already_present，
+0 个 `.abk-orig` 残留）——`717c046` 动过 `scripts/abk_stable_core.py` 的 config 分层和
+`tests/stable_5_15_test.py` 的 runner，不复跑无法确认两者兼容。
+
+**已知局限**：只跑了 194 一档；`config_gate_audit.py` 需要真实构建的 `.config`，本地没有，
+未跑。**未做设备 A/B，不主张提速。**
+
 <a id="batch-38"></a>
 
 ## Batch 38(v0.43.0)
