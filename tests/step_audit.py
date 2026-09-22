@@ -181,6 +181,13 @@ AUDIT_FILES = [
     # Batch 35: the FUSE write-path prefault (faa794dd2e17), the module's first
     # group in fs/fuse/.
     "fs/fuse/file.c",
+    # Batch 40: the erofs readahead temporary-buffer relaxation (d9281660ff3f),
+    # the module's first group in fs/erofs/.
+    "fs/erofs/compress.h",
+    "fs/erofs/decompressor.c",
+    "fs/erofs/decompressor_lzma.c",
+    "fs/erofs/zdata.c",
+    "fs/erofs/zdata.h",
 ]
 
 CHILD_MODULES = [

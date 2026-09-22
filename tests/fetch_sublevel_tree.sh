@@ -136,6 +136,18 @@ FETCH_FILES=(
   # Batch 35: the FUSE write-path prefault (faa794dd2e17).  The module's first
   # group in fs/fuse/ -- the file is the whole group.
   fs/fuse/file.c
+  # Batch 40: the erofs readahead temporary-buffer relaxation (d9281660ff3f).
+  # The module's first group in fs/erofs/.  Five files carry anchors: the
+  # request struct (compress.h), the two decompressors that allocate the
+  # temporary bounce pages, the pcluster the state bit rides on (zdata.h --
+  # note the struct is in the header on 5.15, not in zdata.c as upstream has
+  # it), and zdata.c, which decides on the readahead path that those
+  # allocations are allowed to fail.
+  fs/erofs/compress.h
+  fs/erofs/decompressor.c
+  fs/erofs/decompressor_lzma.c
+  fs/erofs/zdata.c
+  fs/erofs/zdata.h
 )
 
 decode() {

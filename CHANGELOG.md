@@ -550,6 +550,224 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+<a id="batch-40"></a>
+
+## Batch 40(v0.45.0)
+
+主题：**erofs 预读解压的临时缓冲放开**，外加对「上游有没有 erofs 优化补丁能提升 zram 压缩性能」
+这个问题的完整调查与裁决。落地 **1 组**（`scripts/batch40_core_erofs_readahead.py`，
+core 64 → **65**，模块 `0.44.0` → `0.45.0`）；这是本模块第一个 `fs/erofs/` 组。
+
+### 1. 调查结论（本批的起点）：erofs 补丁**无法**提升 zram 压缩性能
+
+用户的原始请求是「查看上游是否有 erofs 相关的优化补丁，移植下来以此优化 zram 等的压缩性能」。
+调查结论是**这条桥不存在**，五条证据（已写进 `plan.md` 的「排除记录（不再重议）」）：
+
+1. **代码上不共享压缩路径。** erofs 的解压实现全在 `fs/erofs/` 内——LZ4 走
+   `decompressor.c` 的 `z_erofs_lz4_decompress()` → `LZ4_decompress_safe_partial()`，
+   LZMA 走 `decompressor_lzma.c`；而 zram 经 crypto 层：`drivers/block/zram/zcomp.c` 的
+   `zcomp_strm_init()` 调 `crypto_alloc_comp()`，落到 `crypto/lz4.c`（它 `#include <linux/lz4.h>`）、
+   `crypto/zstd.c` 等。**唯一真正共用的是 `lib/lz4`。**
+2. **上游 `lib/lz4` 在 `v5.15..v7.2` 只有 6 个提交，其中零个是性能优化：**
+
+   | sha | 主题 | 性质 |
+   |---|---|---|
+   | `f0ef073e213a` | `include/linux/lz4.h: add some missing macros` | 宏搬移，提交信息明写 "No logic changes" |
+   | `5f60d5f6bbc1` | `move asm/unaligned.h to linux/unaligned.h` | treewide 头文件改名 |
+   | `751884743025` | `lib: lz4hc: export LZ4_resetStreamHC symbol` | 符号导出 |
+   | `2d8867f3e083` | `lib: make LZ4_decompress_safe_forceExtDict() static` | 消 build warning |
+   | `eafc0a02391b` | `lz4: fix LZ4_decompress_safe_partial read out of bound` | 安全修复（5.15.y 已带；按政策安全修复出局） |
+   | `22c033989c3e` | `include/linux/unaligned: replace kernel.h …` | 头文件清理 |
+
+   方法：`git.kernel.org` cgit 按 **tag 可达性**逐页走完（`log/lib/lz4/?id=v5.15..v7.2`），
+   不是 committer-date 窗口——后者会把子系统树的提交日期误当发布边界（`docs/survey_7_2_mm_reclaim.md`
+   的方法论，本批沿用）。
+3. **跨越方向是反的。** `751884743025`（导出 `LZ4_resetStreamHC`，提交信息写着 "needed to enable
+   lz4hc dictionary support"）是 Sergey Senozhatsky 的 **zram 字典系列**，同一系列的
+   `eb826a01909a`「zram: recalculate zstd compression params once」是第 15 篇；而
+   `f0ef073e213a` 那次宏搬移才是 Gao Xiang 的 erofs 侧清理。**是 zram 动了 `lib/lz4`，不是 erofs。**
+4. **erofs 自身的「压缩优化」全是读路径解压**：LZ4 预留页池、per-CPU 解压 kthread、
+   compressed large folio、Zstd/DEFLATE 解压器支持（`7c35de4df105` / `ffa09b3bd024`）——
+   都不碰 zram 的压缩/解压。而且 `EROFS_FS_PCPU_KTHREAD` / `_HIPRI` **ACK 5.15 早已自带**
+   （`fs/erofs/Kconfig` 里两个 config 都在，真机 `/proc/config.gz` 亦均为 `y`）。
+5. **设备侧的致命一击。** 真机 `CONFIG_ZRAM_DEF_COMP="lz4kd"`（厂商编解码器，
+   `CONFIG_CRYPTO_LZ4KD=y`）、二级 `zstd`。即便 `lib/lz4` 将来有了优化，也落在
+   「既不是主算法、也不是 lz4 二级」的位置。
+
+顺带说明 **`lib/zstd`**：上游 v5.16（1.4.10）、v6.4（1.5.2）、v6.15（1.5.7）三次整库导入确实会惠及
+二级 zstd，但那是 ~40 文件的库替换 + `crypto/zstd.c` API 改写，属子系统重写、且与 erofs 无关，
+记为**另立项目**，不并入本批。
+
+### 2. 落地：`erofs_readahead_relaxed_gfp`（`d9281660ff3f`，v6.9）
+
+调查同时找出**上游唯一在 ARM64 Android 5.15 真机上实测过的 erofs 解压优化**，即本组。
+
+**机制。** erofs 用**原地解压**：压缩数据所在的页直接当输出缓冲复用。LZ4 是 LZ77 家族、需要滑动
+窗口，当窗口跨出已映射的输出页时，内核只能分配临时「短生命周期」bounce 页
+（`Z_EROFS_SHORTLIVED_PAGE`）。5.15 的两个解压器都无条件用
+
+```c
+victim = erofs_allocpage(pagepool, GFP_KERNEL | __GFP_NOFAIL);
+```
+
+**无论前台同步读还是后台预读，一律死等**——预读本来可以失败（下一次同步访问会重读），却仍会进
+直接回收。上游给 `struct z_erofs_decompress_req` 加了 `gfp_t gfp`，按 pcluster 设值，预读路径用
+`GFP_NOWAIT | __GFP_NORETRY`，同步读保持 `GFP_KERNEL | __GFP_NOFAIL`。
+
+**上游数字**（ARM64 Android、8 核 8 GB、5.15 LTS、EROFS 4k pcluster，多应用启动平均）：
+3364 → 2684 ms（**−20.21%**，64k 滑窗）/ 2079 → 1610 ms（**−22.56%**，16k 滑窗），
+镜像体积几乎不变。**这是上游口径、上游负载；本批不主张设备侧提速。**
+
+### 3. 真机前提核查：按 inode 逐条核，不看 superblock
+
+`d9281660ff3f` 只在挂载的 erofs **确实带压缩**时才是活代码，所以先核前提（本仓先例：Batch 38 的
+真机核查纠正过两处错误前提）。**但 superblock 的 `feature_incompat` 位单独不够**：`LZ4_0PADDING`
+（0x1）与 `u1.lz4_max_distance` 的默认值会让未压缩镜像看起来一样——本机读到的正是
+`feature_incompat = 0x1`（**无** `COMPR_CFGS` 0x2、**无** `BIG_PCLUSTER`）。
+
+于是改成**逐 inode 判定**：从挂载的 `/dev/block/dm-N` 拉 16 MB 头部，按 5.15 的 on-disk 格式走目录树，
+读真正被目录项引用到的普通文件 inode 的 `i_format` datalayout：
+
+| 镜像 | 文件 | nid | `i_size` | datalayout |
+|---|---|---|---|---|
+| `dm-1` = `/` | `init.environ.rc` | 135 | 621 | `FLAT_INLINE`（2，未压缩） |
+| `dm-1` = `/` | （子目录内） | 640 | 12880 | **`FLAT_COMPRESSION`（3）**，`compressed_blocks=2` |
+| `dm-3` = `/vendor` | `build.prop` | 110 | 16314 | **`FLAT_COMPRESSION`（3）**，`compressed_blocks=2` |
+
+`/vendor/build.prop` 16314 B 压进 2 个块（8192 B）≈ 2:1，正是 LZ4 在 prop 类文本上的典型比值。
+**前提成立 ⇒ 解压路径在真机上确实是活的。** 目录走查的正确性自证：`/` 的目录项还原出 Android
+真实根目录（`adb_keys apex bin bootstrap-apex config cust data … opconfig opcust postinstall proc
+product sdcard second_stage_resources storage sys system system_dlkm system_ext tmp vendor`），
+`/vendor` 还原出 `app bin bt_firmware build.prop dsp etc firmware firmware_mnt framework gpu lib
+lib64 odm odm_dlkm overlay rfs` ⇒ 取到的 nid 不是误报。
+
+**滑窗与 pcluster 尺寸**：`u1.lz4_max_distance = 0xFFFF = 65535` ⇒ **64 KiB 滑窗**；
+无 `BIG_PCLUSTER` ⇒ **4 KiB pcluster**。正落在上游表的 64k 窗那一列（−20.2%），不是 16k 窗那列。
+
+**顺带核实的 5.15 on-disk 格式要点**（后续 erofs 工作复用，两个坑）：
+
+- `struct erofs_dirent` 在 5.15 是 **12 字节**（`__le64 nid; __le16 nameoff; __u8 file_type;
+  __u8 reserved;`），不是上游后来的 16 字节（上游把 `reserved` 扩成 `reserved[5]`）。按 16 字节走
+  会得到一堆看似「垃圾 nid」的错位。
+- `struct erofs_xattr_ibody_header` 是 **12 字节**，`erofs_xattr_ibody_size() = 12 + 4*(icount-1)`
+  （`icount` 为 0 时整体 0）。inline 目录数据起点 = inode 偏移 + 32 + 该值；算成 `4*(icount-1)`
+  会整体错位 4 字节。
+- `nameoff` 相对**目录数据块起点**（不是相对目录项自身）；每块 `maxsize` = 第一个目录项的
+  `nameoff`，目录项数组占 `[0, maxsize)`、名字区占 `[maxsize, blocksize)`，各名字正序连续、无 NUL 终止。
+- `EROFS_INODE_FLAT_COMPRESSION = 3` / `_LEGACY = 1` / `FLAT_INLINE = 2` / `FLAT_PLAIN = 0`，
+  位域在 `i_format` 的 `[1,4)`（`EROFS_I_DATALAYOUT_BIT 1`、`_BITS 3`）。
+
+复现方法、四档 config 抄录与可执行探针见 `research/erofs_readahead/vermeer_check_20260922.md`
+与 `research/erofs_readahead/erofs_probe_inode.py`。
+
+### 4. 5.15 形态六处差异，以及一个会静默把行为写反的极性陷阱
+
+全部是**上游形态改写**（同 Batch 35 的 FUSE 前缀缺页），所以**不加 `ABK stable_515_backport:` marker**：
+将来某个基线自己带上 `d9281660ff3f` 时必须逐字节不动并报 `already_present`。
+
+1. **`struct z_erofs_pcluster` 在 5.15 位于 `fs/erofs/zdata.h`**（上游 v6.6 才搬进 `zdata.c`），
+   上游锚点 `bool multibases;` 在本基线不存在。新位放在 `algorithmformat` 之后、`compressed_pages[]`
+   柔性数组之前；槽位由 `struct_size(a, compressed_pages, maxpages)` 自动增长，`kmem_cache_zalloc()`
+   保证初值 `false`（这正是「复位为假」的前提）。
+2. **不需要上游新加的 `bool ra` 参数。** 5.15 的 `struct z_erofs_decompress_frontend` 本来就有
+   `bool readahead`——`DECOMPRESS_FRONTEND_INIT()` 不初始化它（即 false），只有
+   `z_erofs_readahead()` 置 `true`，且 `z_erofs_pcluster_readmore()` 已在读 `f->readahead`。
+   所以 `z_erofs_do_read_page()` **直接读 `fe->readahead`**，签名与三个调用点一个不动——
+   比上游形态更小、更安全。另外 `fe->pcl` 在 5.15 也不存在，pcluster 是 `clt->pcl`
+   （`clt = &fe->clt`）；`z_erofs_collector_begin()` 在返回 0 前的 `out:` 块自己就解引用
+   `clt->pcl`，故**非空可证**，新加的解引用不会触空。
+3. `z_erofs_decompress_pcluster()` 里的 rq 字面量末项是无逗号的 `.partial_decoding = partial`，
+   加 `.gfp` 要补一个逗号（上游末项是 5.15 没有的 `.fillgaps = pcl->multibases,`）。
+4. **复位点**跟 `cl->nr_pages = 0; cl->vcnt = 0;` 走（5.15 没有上游那个 pcluster 状态块），
+   位置相对消费者（`z_erofs_decompress_pcluster()` 尾部）与上游一致。顺序保证了过期位是**安全**的：
+   只有「某个 pcluster 的收集者全是预读」才可能带着 `false` 进解压，而过期的 `true` 只是退化回
+   打补丁前的 NOFAIL，绝不会让同步读失败。
+5. 两个上游 hunk **无 5.15 载体、不落**：`decompressor_deflate.c`（5.15 没有 DEFLATE 解压器），
+   以及 LZMA 里 `rq->fillgaps` 去重分支那一处（5.15 的 LZMA 解压器不用 `fillgaps`）。
+   LZMA 的 bounce 页 hunk 与它新加的 `failed:` 标号**都落**——5.15 的该函数只有两处 `again:`、
+   没有 `failed:`，标号是空的。
+6. LZMA 的参数改名（`pagepool` → `pgpl`）是化妆品，**不落**。
+
+**极性陷阱（本批最容易写反的一处）。** 上游把字段命名为 `besteffort`、注释写「whether extra buffer
+allocations are best-effort」，却用 `besteffort |= !ra` 置位、用
+`besteffort ? GFP_KERNEL | __GFP_NOFAIL : GFP_NOWAIT | __GFP_NORETRY` 读取——
+**true 表示「必须成功」，名字与语义相反**。极性由上游自己的调用点确证：`z_erofs_read_folio()`
+传 `false`（同步 ⇒ NOFAIL）、`z_erofs_readahead()` 传 `true`（⇒ NOWAIT）、
+`z_erofs_pcluster_readmore()` 传 `!!rac`。照名字抄就会把两侧对调。
+故 `tests/stable_5_15_test.py` 与 `tests/implementation_audit.py` **都按标志串钉**而不是按字段名：
+`REQUIRED_IN_FUNCTION` 里 `z_erofs_decompress_pcluster` 必须同时含
+`GFP_KERNEL | __GFP_NOFAIL :` 与 `GFP_NOWAIT | __GFP_NORETRY`，`z_erofs_do_read_page` 必须含
+`clt->pcl->besteffort |= !fe->readahead;`。
+
+**安全性按调用图追过（不是假定）。** 预读时 `z_erofs_lz4_prepare_dstpages()` 返回 `-ENOMEM`
+⇒ 页保持 not-uptodate（`SetPageError()`），下一次同步访问走 `z_erofs_readpage()`——
+它既不检查 error 位也不看 `readahead`，以 `GFP_KERNEL | __GFP_NOFAIL` 重读。**不能失败的那条路
+仍然不能失败。** 这是上游的设计，本模块不主张独立测量。
+
+### 5. 另一条裁决：`0f6273ab4637` 不可移植
+
+`0f6273ab4637`（「erofs: add a reserved buffer pool for lz4 decompression」，v6.10，同作者）
+看起来是本组的天然后续（默认 `reserved_pages=0` 即关闭，上游报相机冷启动平均省 150 ms），
+但**全部上下文是上游 v6.8 才有的全局 `z_erofs_gbufpool`**（`zutil.c` 的 `z_erofs_gbuf_init()`、
+`module_param_named(global_buffers, ...)`）。android13-5.15 的 `fs/erofs/` 里 `gbuf` /
+`global_buffers` / `z_erofs_gbuf_init` / `z_erofs_gbufpool` **grep 全为 0**
+（`internal.h`/`zdata.c`/`compress.h`/`pcpubuf.c` 逐文件核对）——5.15 是 **per-call 局部 pagepool**
+（`z_erofs_readpage()`/`z_erofs_readahead()` 各自 `struct page *pagepool = NULL;`，
+`erofs_allocpage()` 定义在 `fs/erofs/utils.c`）。硬移植要先补那层基底 ⇒ **前置链，不是单批
+bounded graft**，同 `fb176750266a`（erofs file-backed mount）与 `9909b088b1f0`（zsmalloc `pool->lock`）
+的裁决形态。已记入排除记录。
+
+非性能项一并记录、不落：`cf7f2732b4b8`（per-CPU kthread 打开时默认开 HIPRI）只是 1 行 Kconfig
+且真机 config 早已显式选 `EROFS_FS_PCPU_KTHREAD_HIPRI=y`，属 config 层；
+`1001042e54ef`（短生命周期页不再用 refcount 记账）是 memdescs 铺垫重构、无收益主张。
+
+### 6. 验证
+
+六道门禁，四档参考树（167/178/194/216）实测：
+
+| 门禁 | 结果 |
+|---|---|
+| `python3 -m py_compile scripts/*.py tests/*.py` | 通过 |
+| `bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh` | 通过 |
+| `python3 tests/stable_5_15_test.py` | 全绿（新增 `test_batch40_erofs_readahead`，含双遍幂等、`already_present`、post-v6.9 形态降级与未知形态降级四条行为断言） |
+| `python3 tests/step_audit.py <tree>` | **194/216 全绿**；167/178 红一处（见下） |
+| `python3 tests/implementation_audit.py <tree>` | **四档全绿** |
+| `bash tests/smoke.sh <tree>` | **194/216 `SMOKE OK`**；167/178 红一处（见下） |
+
+单 child 干跑（四档一致）：`erofs_readahead_relaxed_gfp | applied | d9281660ff3f | 8 hunk(s)
+applied, 0 already present`。
+
+**已知局限（一处既有红项，非本批引入）。** 167/178 档 `step_audit.py` 与 `smoke.sh` 各红一处，
+都是 **Batch 38 的 `memcg_dying_bailout`**：它的 `include/linux/memcontrol.h` 锚点
+（`extern int mem_cgroup_init(void);
+#else /* CONFIG_MEMCG */` 与其 `#else` 存根）在 167/178
+计数为 **0**、在 194/216 为 1，即该组在 167/178 上本就 `blocked_by_shape`。已用 **pristine HEAD**
+在同一批参考树上复现同一失败以排除本批嫌疑：167 档 pristine 为 `applied 63 + blocked 1`（期望 64），
+本批后为 `applied 64 + blocked 1`（期望 65）——**本批恰好 +1 个 applied，那处红项原样不动**。
+（本批新引入的 `erofs` fixture 缺口一度让 194/216 也红，原因是漏了 `tests/smoke.sh` 的
+`SMOKE_FILES`——smoke 有自己的一份最小 fixture 列表，与 `FETCH_FILES`/`AUDIT_FILES` 是三处独立清单；
+补上后 194/216 即 `SMOKE OK`。）
+
+产物侧：`module.conf` 的 `ABK_MODULE_VERSION` 与 `ABK_MODULE_SET_VERSION` 均 `0.44.0` → `0.45.0`，
+两个 description 各追加一段；`tests/sublevel_matrix.py` 的 `GROUP_COUNTS["stable_backport_core"]`
+64 → **65**（不进 `PRE_APPLIED`：`d9281660ff3f` 是 v6.9 性能提交、无 `Cc: stable`，
+四档基线均不带）；fixture 三处同步
+（`tests/fetch_sublevel_tree.sh` FETCH_FILES、`tests/step_audit.py` AUDIT_FILES、
+`tests/smoke.sh` SMOKE_FILES，各加五个 erofs 文件）；上游补丁存
+`research/upstream-5.15.y/patches/d9281660ff3f.patch`。
+
+### 7. 未做 / 明确不做
+
+- **未做设备 A/B，不主张提速。** 上游的 −20% 是上游负载与上游口径；本批只证前提成立（真机 erofs
+  确实带 LZ4 压缩）与移植忠实（极性、复位、重读路径逐条核对）。
+- 不落 `0f6273ab4637`（前置链，见 §5）；不落 `cf7f2732b4b8` / `1001042e54ef`（见 §5）。
+- 不动 `lib/lz4`（上游无性能提交可搬）、不动 `lib/zstd`（子系统重写，另立项目）。
+- 不碰 `fs/f2fs`、`drivers/scsi/ufs`（sibling suite 红线）。
+- 本模块的 C 只有编译能真证伪（AGENTS.md trap 6/7）：本组不新增 `module_param`、也不引用任何
+  `CONFIG_*` 门内符号（`gfp_t` 是基础类型），两条陷阱均不适用；发布时仍以 ABK CI 编译门禁为准。
+
+---
+
 <a id="batch-39"></a>
 
 ## Batch 39(v0.44.0)
