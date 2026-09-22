@@ -98,12 +98,12 @@ combinations and put the module into `custom_external_modules`:
 | 194 | 2025-12 | `android13-5.15-2025-12` |
 
 ```
-set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch
+set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_backport_core;after_patch|set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_perf_backport;after_patch|set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_patch
 ```
 
 The display fix child is independently injectable: a build that only needs
 the black-screen fix can carry just
-`set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch`.
+`set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_patch`.
 
 One injection string covers all three: the engine gates on text anchors, never
 on the sublevel, so a group whose upstream commit the baseline already carries
@@ -386,3 +386,15 @@ launch, Binder, power, image size).
 `$KERNEL_ROOT/abk_5_15_backport_reports/<child>/<child>_report.{json,md}`
 per run: shapes, per-group status, applied commits. Extend the module via
 `docs/group_recipe.md`.
+
+**Author: FanZiyun** ([@fanziyun](https://github.com/fanziyun))
+
+- Repository: <https://github.com/fanziyun/ABK_5.15_BACKPORT>
+
+An independent, unofficial backport of upstream Linux commits, unaffiliated
+with any vendor's or distribution's official kernel release.
+
+## AI-Assisted Development
+
+This project makes use of AI-assisted development.
+
