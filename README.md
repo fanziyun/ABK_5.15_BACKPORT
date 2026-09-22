@@ -98,12 +98,12 @@ combinations and put the module into `custom_external_modules`:
 | 194 | 2025-12 | `android13-5.15-2025-12` |
 
 ```
-set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_backport_core;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_perf_backport;after_patch|set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch
+set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_backport_core;after_patch|set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_perf_backport;after_patch|set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_patch
 ```
 
 The display fix child is independently injectable: a build that only needs
 the black-screen fix can carry just
-`set:https://github.com/xingguangcuican6666/ABK_5.15_backport.git#stable_display_fix;after_patch`.
+`set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_patch`.
 
 One injection string covers all three: the engine gates on text anchors, never
 on the sublevel, so a group whose upstream commit the baseline already carries
@@ -386,3 +386,60 @@ launch, Binder, power, image size).
 `$KERNEL_ROOT/abk_5_15_backport_reports/<child>/<child>_report.{json,md}`
 per run: shapes, per-group status, applied commits. Extend the module via
 `docs/group_recipe.md`.
+
+## License
+
+**GPL-2.0-only.** The full text is [`LICENSE`](LICENSE) at the repository root;
+a file copied out of this repository should carry
+`SPDX-License-Identifier: GPL-2.0-only`.
+
+The licence is constrained by what this module *produces*, not chosen freely.
+Everything the graft registry writes lands in the `android13-5.15` kernel tree,
+which is itself GPL-2.0, and GPLv2 §6 forbids imposing any further restriction
+on the recipient's exercise of the rights it grants — so neither a
+non-commercial rider nor a re-licence to CC BY-NC could hold on the code side.
+It is the wrong tool for the graft registry too: every `scripts/batchNN_*.py`
+carries verbatim upstream `5.15.y` / ACK / vendor source as its replacement
+strings, which makes those Python files GPL-2.0 derivative text in their own
+right. Anything weaker declared anywhere in this repository would contradict
+the code it emits, so the whole repository — graft registry, anchor/step
+engine, tests, device tooling and the KernelSU companion — is GPL-2.0-only.
+
+Upstream copyright is not transferred and none is claimed. The grafted code is
+Linux kernel code, **© Linus Torvalds and the kernel's contributors**; the
+`5.15.y`, ACK and mainline commits are © their individual authors (or their
+employers, under work-for-hire), and Google engineers authored 25 of the 91
+commits this module grafts with an archived patch — MGLRU, the zram writeback
+reworks, the proactive-reclaim batching among them. All 91 are listed by author
+and subject in [`docs/attribution.md`](docs/attribution.md), and the `.patch`
+files under `research/` stay in-tree as the evidence.
+
+The grafts that originate with a vendor keep that vendor's own copyright:
+
+| holder | what |
+|---|---|
+| Qualcomm Technologies, Inc. and/or its subsidiaries; The Linux Foundation; Qualcomm Innovation Center, Inc. | the WALT smart-freq / pipeline / voter line (`research/popsicle_w_oss/walt_extract/`) |
+| OPLUS — "Copyright 2020-2022 Oplus, as shipped in Xiaomi_Kernel_OpenSource" | `mi_dynamic_readahead` (Batch 9-1) |
+| OPPO — `wei li <liwei1234@oppo.com>`, Bug 337192903 | the `android_vh_customize_alloc_gfp` vendor hook (Batch 13) |
+
+`docs/survey_popsicle_w_611.md`, `docs/survey_6_1_ack.md`,
+`docs/survey_6_6_ack.md` and `docs/survey_7_2_mm_reclaim.md` hold the per-item
+provenance. `LICENSE` covers what this repository itself authors.
+
+## Author and project
+
+**ABK 5.15 LTS Backport** — a standalone feature, optimization,
+structural-refactor backport and display-bringup fix line for the
+`android13-5.15` GKI baselines (5.15.167 / 5.15.178 / 5.15.194), currently
+v0.44.0.
+
+**Author: FanZiyun** ([@fanziyun](https://github.com/fanziyun))
+
+- Repository: <https://github.com/fanziyun/ABK_5.15_BACKPORT>
+
+Copyright (C) 2026 FanZiyun
+
+This is an independent, unofficial backport of upstream Linux commits. It is
+not affiliated with, endorsed by or derived from any vendor's or distribution's
+official kernel release, and it carries no warranty — see sections 11 and 12
+of `LICENSE`.
