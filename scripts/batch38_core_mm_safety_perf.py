@@ -426,13 +426,43 @@ def _filemap_mmap_miss_tried_apply(ctx):
 # two v1 hunks are re-anchored there rather than dropped.
 # ---------------------------------------------------------------------------
 
+# The anchor pair is the mem_cgroup_soft_limit_reclaim() declaration/stub, not
+# the mem_cgroup_init() one upstream's patch context shows.  5.15.167 and
+# 5.15.178 declare mem_cgroup_init() `static` in mm/memcontrol.c, so neither
+# `extern int mem_cgroup_init(void);` nor its inline stub exists in their
+# include/linux/memcontrol.h at all; the declaration split that introduces both
+# arrived somewhere in 5.15.179..5.15.194 (absent on the 178 tree, present on the
+# 194 tree), which is why only 194/216 have them.
+#
+# The soft-limit pair is what anchors that boundary on every baseline: it is the
+# *last* declaration of the CONFIG_MEMCG block and the *last* stub of the
+# !CONFIG_MEMCG block, so the helper still lands immediately before the
+# #else/#endif /* CONFIG_MEMCG */ line -- the same placement upstream gives it,
+# with the boundary line itself left out of the anchor on purpose.  Including
+# `#else`/`#endif` would re-introduce the baseline dependency: on 194/216 the
+# mem_cgroup_init() declaration/stub sits *between* the soft-limit pair and that
+# line, so the anchor would only match on the two baselines whose header never
+# mentions mem_cgroup_init() at all -- i.e. exactly the 167/178 shape, blocking
+# the group on 194/216 instead of fixing it.
+#
+# One anchor for all four baselines rather than an either/or pair of steps:
+# both constants are byte-identical on 167/178/194/216 (counts verified 1/1 each
+# on all four fetched trees), so no step ever needs to degrade.  The alternative
+# -- a second step pair anchored on the mem_cgroup_init() shape -- could not work
+# anyway, because apply_steps treats a *required* miss as a group abort, so the
+# unused variant would report missing_anchor and take the whole group to
+# blocked_by_shape whichever shape it was not written for.
 _DYING_HELPER_OLD = (
-    "extern int mem_cgroup_init(void);\n"
-    "#else /* CONFIG_MEMCG */\n"
+    "unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,\n"
+    "\t\t\t\t\t\tgfp_t gfp_mask,\n"
+    "\t\t\t\t\t\tunsigned long *total_scanned);\n"
+    "\n"
 )
 
 _DYING_HELPER_NEW = (
-    "extern int mem_cgroup_init(void);\n"
+    "unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,\n"
+    "\t\t\t\t\t\tgfp_t gfp_mask,\n"
+    "\t\t\t\t\t\tunsigned long *total_scanned);\n"
     "\n"
     "/*\n"
     " * ABK stable_515_backport: memcg_is_dying (v7.2 memcg dying-bailout\n"
@@ -447,19 +477,30 @@ _DYING_HELPER_NEW = (
     "{\n"
     "\treturn memcg ? !!(memcg->css.flags & CSS_DYING) : false;\n"
     "}\n"
-    "#else /* CONFIG_MEMCG */\n"
+    "\n"
 )
 
 _DYING_STUB_OLD = (
-    "static inline int mem_cgroup_init(void) { return 0; }\n"
-    "#endif /* CONFIG_MEMCG */\n"
+    "static inline\n"
+    "unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,\n"
+    "\t\t\t\t\t    gfp_t gfp_mask,\n"
+    "\t\t\t\t\t    unsigned long *total_scanned)\n"
+    "{\n"
+    "\treturn 0;\n"
+    "}\n"
 )
 
 _DYING_STUB_NEW = (
-    "static inline int mem_cgroup_init(void) { return 0; }\n"
+    "static inline\n"
+    "unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,\n"
+    "\t\t\t\t\t    gfp_t gfp_mask,\n"
+    "\t\t\t\t\t    unsigned long *total_scanned)\n"
+    "{\n"
+    "\treturn 0;\n"
+    "}\n"
     "\n"
     "static inline bool memcg_is_dying(struct mem_cgroup *memcg) { return false; }\n"
-    "#endif /* CONFIG_MEMCG */\n"
+    "\n"
 )
 
 # The two v2 handlers' guards are byte-identical in 5.15, so each anchor
