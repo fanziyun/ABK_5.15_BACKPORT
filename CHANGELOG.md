@@ -930,9 +930,13 @@ fixture 三处同步：`tests/fetch_sublevel_tree.sh` 的 `FETCH_FILES`、`tests
   并发 bring-up 覆盖 `kcd->task` 的竞态论证（判为保险而非活竞态）。
 - **完全没做**：**`CONFIG_MEMORY_HOTPLUG_SPARSE=n` 的构建没有实测**；**真机热插拔没有跑过**
   （本地没有可热插拔的内核树）；编译未验证；设备侧收益未测。
-- **没有**：**编译未验证**（ABK CI「编译内核」闸门本轮未跑，见 §9.2）；**设备侧收益未测**
-  （无 A/B，不主张数字）；`kcompressd` 线程在真机上的实际排队深度与 CPU 占用**未观测**；
-  真机热插拔（含节点增删）**从未跑过**。
+- **编译：第一轮 CI 已跑并抓到两个真缺陷**（见 §14 —— `mm/page_io.o` 四个 error 同源成
+  两个：`abk_kcompressd_store` 缺前向声明、数组与线程函数同名不同类符号）。§14.3 的编译级
+  自查（去注释后的定义/声明/使用顺序、同名异类符号、goto/label 配对、comment/brace 平衡）
+  是**静态自查，不等于编译通过** —— 它只证明这两类不再存在，不证明没有第三类。
+  修复后尚未重新过 CI。
+- **设备侧收益未测**（无 A/B，不主张数字）；`kcompressd` 线程在真机上的实际排队深度与 CPU
+  占用**未观测**；真机热插拔（含节点增删）**从未跑过**。
 
 ### 12. 安全加固一轮：移除自找的 panic 面、关闭自入队活锁、knob 改为失败即关
 
@@ -1144,6 +1148,98 @@ include 块与 append 块，以及 import 步骤新加的一个 include 行。
 形状（stop-aware 谓词、先唤醒后 stop、锁内置空）；`REQUIRED_ABSENT` 继续禁止 WARN 家族；
 `tests/smoke.sh` 加 9 条 grep（其中"谓词必须含 stop"与"必须唤醒后 stop"两条是上面
 ①/② 的回归防线）；单测里另逐条断言 `wake_up_interruptible` 的偏移小于 `kthread_stop`。
+
+
+### 14. CI 编译门禁抓到的两个 C 级错误（文本审计看不见）
+
+PR #27 推送后 ABK CI 的「内核编译」job（android13-5.15-lts）失败，
+`fan221153-blip/ABK` run 35852802085，`mm/page_io.o` 四个 error
+（`mm/page_io.c:217 / 689 / 802 / 950`）。四个 error 同源，实际是**两个**缺陷：
+
+```
+error: implicit declaration of function 'abk_kcompressd_store'
+       [-Werror,-Wimplicit-function-declaration]
+error: static declaration of 'abk_kcompressd_store' follows non-static declaration
+error: redefinition of 'abk_kcompressd' as different kind of symbol
+error: incompatible pointer types passing 'struct abk_kcompressd_node[1]'
+       to parameter of type 'int (*)(void *)'
+```
+
+**这正是 AGENTS.md 陷阱 6 的原样复现**：C 级错误，四道文本审计（`step_audit.py` 查
+comment/brace/`#ifdef` 平衡与幂等，`implementation_audit.py` 查内容）一个都看不见，
+编译器是唯一的门。上一轮的结论分类里写的是「编译未验证」，现在它验证了，而且一下就
+抓到两条。
+
+#### 14.1 缺陷一：调用点在定义点之前，缺前向声明
+
+`swap_writepage()` 在文件第 217 行调 `abk_kcompressd_store(page)`，而引擎整个 append 在
+文件尾部（第 689 行起）。我在设计注释里写的理由是"引擎 append 在最后一个函数之后，
+所以它调用的东西都已声明，不需要发明前向声明"——**这个理由只涵盖了引擎调用的东西，
+漏了引擎自己也是被调用方**：`swap_writepage()` 在 append 点之前。
+
+上游 0.5 永远不会撞上这个：它的 patch 把 `do_swapout()`/`kcompressd_store()` 插在
+`@@ -234,6 +236,101 @@` 那个 hunk，**位置在 `swap_writepage()` 的 hunk
+（`@@ -276,6 +373,15 @@`）之前**。本树选择 append 到文件尾，于是顺序反了。
+
+**修法**：新增第 3 个 step（第 2b 步），在 `swap_writepage()` 之前插一行
+`static bool abk_kcompressd_store(struct page *page);`。
+锚点是 **pristine 的 doc comment + 函数签名整块**，声明 emit 在 comment **上方**
+而不是 `*/` 与函数之间 —— 插在中间会让那段 pristine 注释读起来像在描述
+`abk_kcompressd_store()` 而不是 `swap_writepage()`，而这种回归同样没有审计能看见。
+锚点在四个基线上各出现一次（已逐个 grep 验证）。步骤数 3 → 4。
+
+#### 14.2 缺陷二：数组与线程函数同名，不同类符号重定义
+
+上游的载体是 `pgdat->kcompressd`（结构体**成员**）对 `int kcompressd(void *p)`
+（**函数**）—— 两个名字空间，永不相撞。本树把 pglist_data 成员换成文件内静态数组，
+数组和线程函数就都成了同一 TU 的普通标识符，且都叫 `abk_kcompressd`：
+
+```c
+static struct abk_kcompressd_node abk_kcompressd[MAX_NUMNODES];   /* 502 行 */
+...
+static int abk_kcompressd(void *p)                                 /* 802 行 */
+```
+
+第三个 error（`incompatible pointer types passing 'struct abk_kcompressd_node[1]' to
+'int (*)(void *)'`）是同一个根因的连带：名字先解析到数组，于是函数指针类型不对。
+
+任务简报里写的是"命名前扫一遍 `docs/porting_policy.md` 与既有组名，避免撞名或撞
+suite-detection marker"——我扫了**跨组**撞名（`abk_kcompressd_*` 与 `abk_zram_*` /
+`abk_sf_*` / `abk_gfp_*` / `abk_dra_*` 零撞），**漏了本 TU 内部自己两个符号相撞**。
+
+**修法**：数组改名 `abk_kcompressd_nodes`（复数），线程函数保持 `abk_kcompressd`。
+5 处引用同步改。数组不是任何必需 marker（`REQUIRED_CONTENT` 钉的是
+`abk_kcompressd_store` / `abk_kcompressd_do_swapout`，smoke 钉的是
+`'kcompressd%d', nid;`），所以改名没有门禁代价。
+
+#### 14.3 之后做的编译级自查（本地无内核树，只能静态）
+
+不能本地编译，所以把这两类错误系统性地自查了一遍，写进一次性脚本
+（跑完即弃，非仓库文件）：
+
+1. **去注释后逐标识符核对「定义点 / 前向声明点 / 第一个使用点」**，含**取函数地址**
+   的用法（`kthread_create_on_node(abk_kcompressd, ...)`、`.notifier_call =
+   abk_kcompressd_memory_notifier` —— 这两处不产生 `name(`，只查 `name(` 会漏）。
+   结果：8 个符号全部"先定义后使用"，唯一需要前向声明的就是 `abk_kcompressd_store`。
+2. **同一 TU 内同名不同类符号**：清零。
+3. **goto / label 配对**：`out` / `sync` / `reprobe` / `bad_bmap` 四个，无悬空。
+4. **comment / brace 平衡**：`/* : */ ` 54:54，`{ : }` 65:65。
+
+**这些是静态自查，不等于编译通过** —— 它只能证明"这两类已发现的错误不再存在"，
+不能证明没有第三类。
+
+#### 14.4 门禁同步
+
+- `tests/stable_5_15_test.py`：步骤数断言 3 → 4，并加两条 shape 断言
+  （原型步保持 pristine 注释与函数相邻；`_C_DECL_OLD` 与新的
+  `b41.DECL_ANCHOR` 常量逐字节相等 —— 常量单独存在就是为了让"锚点不再是
+  comment+签名"这种改动失败在测试上，而不是静默产出拆注释的形状）。
+- 夹具 `pristine_text()` 补上那段 doc comment，否则新锚点匹配不上、整组退化成
+  `blocked_by_shape`。
+- 数组名断言改为 `abk_kcompressd_nodes[`，并把"为什么是复数"写进注释。
+- `tests/implementation_audit.py` 的 `REQUIRED_CONTENT` 增加
+  `static bool abk_kcompressd_store(struct page *page);`。
+- 引擎步索引 2 → 3。
 
 
 ---

@@ -79,7 +79,7 @@ vendor-hook contract the tree does honour is worse than no offload.
 
 import re
 
-__all__ = ["build_steps", "HOOK_PROBE", "PLAIN_PROBE", "HOOK_BODY",
+__all__ = ["build_steps", "DECL_ANCHOR", "HOOK_PROBE", "PLAIN_PROBE", "HOOK_BODY",
            "PLAIN_BODY", "probe_swapout_shape", "swapout_body", "T"]
 
 T = True
@@ -165,6 +165,58 @@ _C_OFFLOAD_NEW = (
     "\t\treturn 0;\n"
     "\n"
 ) + _C_OFFLOAD_OLD
+
+# ---------------------------------------------------------------------------
+# 2b) mm/page_io.c: the forward declaration swap_writepage() needs.
+#
+# The engine is appended at the end of the file, i.e. *after* swap_writepage(),
+# so the call above precedes the definition by roughly 500 lines.  Upstream never
+# hits this -- its patch inserts do_swapout()/kcompressd_store() in a hunk
+# *above* the swap_writepage() hunk -- but appending means C requires a
+# prototype.  Without it: "implicit declaration of function
+# 'abk_kcompressd_store'" and then "static declaration follows non-static
+# declaration", both -Werror.  That is what the ABK CI compile gate found on the
+# first run of this batch, and no text audit can see it: step_audit checks
+# comment/brace/#ifdef balance and idempotency, implementation_audit checks
+# content -- neither runs a compiler (AGENTS.md trap 6).
+#
+# Anchored on the function's signature, which is unique in the file.  `struct
+# page` is only forward-declared this early, which is fine for a prototype, and
+# bool comes from <linux/types.h> via mm.h.
+# ---------------------------------------------------------------------------
+
+# The same anchor spelled out on its own so the unit test can compare against it:
+# an edit to _C_DECL_OLD that stops being "the doc comment + the signature"
+# would otherwise silently produce the comment-splitting shape.
+DECL_ANCHOR = (
+    "/*\n"
+    " * We may have stale swap cache pages in memory: notice\n"
+    " * them here and get rid of the unnecessary final write.\n"
+    " */\n"
+    "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+    "{\n"
+)
+
+_C_DECL_OLD = (
+    "/*\n"
+    " * We may have stale swap cache pages in memory: notice\n"
+    " * them here and get rid of the unnecessary final write.\n"
+    " */\n"
+    "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+    "{\n"
+)
+
+_C_DECL_NEW = (
+    "/* ABK stable_515_backport: Batch 41 -- defined below, with the engine. */\n"
+    "static bool abk_kcompressd_store(struct page *page);\n"
+    "\n"
+    "/*\n"
+    " * We may have stale swap cache pages in memory: notice\n"
+    " * them here and get rid of the unnecessary final write.\n"
+    " */\n"
+    "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+    "{\n"
+)
 
 # ---------------------------------------------------------------------------
 # 3) mm/page_io.c: the engine, appended after the file's last function.
@@ -337,7 +389,7 @@ struct abk_kcompressd_node {
 	spinlock_t		lock;
 };
 
-static struct abk_kcompressd_node abk_kcompressd[MAX_NUMNODES];
+static struct abk_kcompressd_node abk_kcompressd_nodes[MAX_NUMNODES];
 
 /*
  * abk_kcompressd_do_swapout() - write one page out to swap.
@@ -513,7 +565,7 @@ static bool abk_kcompressd_enqueue(struct abk_kcompressd_node *kcd,
  */
 static bool abk_kcompressd_store(struct page *page)
 {
-	struct abk_kcompressd_node *kcd = &abk_kcompressd[page_to_nid(page)];
+	struct abk_kcompressd_node *kcd = &abk_kcompressd_nodes[page_to_nid(page)];
 	bool offloaded;
 
 	/*
@@ -627,7 +679,7 @@ sync:
 static int abk_kcompressd(void *p)
 {
     int nid = (int)(long)p;
-    struct abk_kcompressd_node *kcd = &abk_kcompressd[nid];
+    struct abk_kcompressd_node *kcd = &abk_kcompressd_nodes[nid];
     struct page *page;
 
     current->flags |= PF_MEMALLOC | PF_KSWAPD;
@@ -723,7 +775,7 @@ static struct ctl_table abk_kcompressd_sysctl_table[] = {
  */
 static void abk_kcompressd_add_node(int nid)
 {
-    struct abk_kcompressd_node *kcd = &abk_kcompressd[nid];
+    struct abk_kcompressd_node *kcd = &abk_kcompressd_nodes[nid];
     struct task_struct *task;
     int ret;
 
@@ -810,7 +862,7 @@ static void abk_kcompressd_add_node(int nid)
  */
 static void abk_kcompressd_del_node(int nid)
 {
-	struct abk_kcompressd_node *kcd = &abk_kcompressd[nid];
+	struct abk_kcompressd_node *kcd = &abk_kcompressd_nodes[nid];
 	struct task_struct *task;
 	struct page *page;
 	unsigned long flags;
@@ -1002,5 +1054,6 @@ def build_steps(swapout_body=None):
     return [
         (PAGE_IO, _C_INC_OLD, _C_INC_NEW, T),
         (PAGE_IO, _C_OFFLOAD_OLD, _C_OFFLOAD_NEW, T),
+        (PAGE_IO, _C_DECL_OLD, _C_DECL_NEW, T),
         (PAGE_IO, _ENGINE_ANCHOR_OLD, _ENGINE_ANCHOR_OLD + engine, T),
     ]

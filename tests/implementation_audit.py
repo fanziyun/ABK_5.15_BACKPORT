@@ -968,6 +968,7 @@ REQUIRED_CONTENT = {
         "if (arg->status_change_nid < 0)",
         "!kfifo_is_empty(&kcd->fifo) ||",
         "kthread_should_stop());",
+        "static bool abk_kcompressd_store(struct page *page);",
         "wake_up_interruptible(&kcd->wait);",
         "kthread_stop(task);",
         "if (unlikely(!kcd->task)) {",

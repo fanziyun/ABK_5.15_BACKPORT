@@ -5298,10 +5298,23 @@ def test_batch41_kcompressd_offload():
           group.files == [b41.PAGE_IO], group.files)
 
     steps = b41.build_steps()
-    check("three required steps, all in mm/page_io.c",
-          [rel for rel, _o, _n, req in steps] == [b41.PAGE_IO] * 3
+    # Four, not three: the CI compile gate failed the first push because
+    # swap_writepage() calls abk_kcompressd_store() while the engine is appended
+    # *after* it, so a prototype is required (upstream's patch inserts the engine
+    # above swap_writepage() and never hits this).
+    check("four required steps, all in mm/page_io.c",
+          [rel for rel, _o, _n, req in steps] == [b41.PAGE_IO] * 4
           and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
+    decl_step = next(s for s in steps if s[0] == b41.PAGE_IO
+                     and "static bool abk_kcompressd_store(struct page *page);"
+                     in s[2])
+    check("the prototype step keeps the pristine doc comment with its function",
+          b41._C_DECL_NEW.index(" * We may have stale swap cache pages")
+          > b41._C_DECL_NEW.index("static bool abk_kcompressd_store"),
+          b41._C_DECL_NEW)
+    check("the prototype's anchor is the doc comment plus the signature",
+          b41._C_DECL_OLD == b41.DECL_ANCHOR, b41._C_DECL_OLD)
     # Trap 1: a replacement block that already exists in the pristine file is
     # short-circuited by replace_once's idempotency pre-check and the real edit
     # never lands, while the group still reports applied.  Asserted against the
@@ -5310,6 +5323,10 @@ def test_batch41_kcompressd_offload():
         return (
             "#include <linux/sched/task.h>\n"
             "\n"
+            "/*\n"
+            " * We may have stale swap cache pages in memory: notice\n"
+            " * them here and get rid of the unnecessary final write.\n"
+            " */\n"
             "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
             "{\n"
             "\tint ret = 0;\n"
@@ -5339,7 +5356,7 @@ def test_batch41_kcompressd_offload():
     check("the offload step keeps the pristine tail verbatim",
           steps[1][2].endswith(b41._C_OFFLOAD_OLD), steps[1][2])
     check("the engine step keeps the file's last function verbatim",
-          steps[2][2].startswith(b41._ENGINE_ANCHOR_OLD))
+          steps[3][2].startswith(b41._ENGINE_ANCHOR_OLD))
 
     # Two fixture shapes: the 167/178/194 form and the android13-5.15-lts form
     # carrying AOSP's android_vh_shrink_page_lock_owner_clear().  The probe is
@@ -5369,7 +5386,13 @@ def test_batch41_kcompressd_offload():
                   '"kcompressd%d", nid);' in text)
             check(f"{label} shape: per-node state is private",
                   "static struct abk_kcompressd_node "
-                  "abk_kcompressd[MAX_NUMNODES];" in text)
+                  "abk_kcompressd_nodes[MAX_NUMNODES];" in text,
+                  # the array is plural because the singular name was
+                  # already taken by the thread function below -- a
+                  # redefinition as different kinds of symbol that no
+                  # text audit could see (the CI compile gate found it).
+                  [ln.strip() for ln in text.splitlines()
+                   if "abk_kcompressd_nodes[" in ln])
             check(f"{label} shape: the knob and its counters are registered",
                   'register_sysctl("vm", abk_kcompressd_sysctl_table);' in text
                   and ".procname	= \"kcompressd\"," in text
