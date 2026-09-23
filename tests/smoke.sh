@@ -133,6 +133,16 @@ SMOKE_FILES=(
   # Batch 38: swap_readahead_lru_add_drain is the first group to write
   # mm/swap_state.c, so the file has to be in the smoke fixture too.
   mm/swap_state.c
+  # Batch 40: erofs_readahead_relaxed_gfp is the module's first fs/erofs/
+  # group and spans five files -- the request struct, the two decompressors
+  # that allocate the bounce pages, the pcluster header the mode bit rides on,
+  # and zdata.c.  Missing any one of them degrades the whole group to
+  # blocked_by_shape in smoke only (the reference trees do carry all five).
+  fs/erofs/compress.h
+  fs/erofs/decompressor.c
+  fs/erofs/decompressor_lzma.c
+  fs/erofs/zdata.c
+  fs/erofs/zdata.h
 )
 
 WORK="$(mktemp -d)"

@@ -105,7 +105,12 @@ GROUP_COUNTS = {
     # on every baseline -- the anchor is pristine 5.15 text on all four, and
     # unlike the i_mmap split UAF no baseline carries the commit, because it
     # is a v7.2 performance change with no Cc: stable and no 5.15.y backport.
-    "stable_backport_core": 64,
+    # Batch 40 adds one: erofs_readahead_relaxed_gfp (v6.9 d9281660ff3f), the
+    # module's first fs/erofs/ group.  It lands on every baseline for the same
+    # reason -- a v6.9 performance change with no Cc: stable -- and its eight
+    # anchors are byte-identical on all four (the pcluster struct it edits is
+    # in fs/erofs/zdata.h on 5.15, which is why that file joined the fixture).
+    "stable_backport_core": 65,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

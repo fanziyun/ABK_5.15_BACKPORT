@@ -5791,5 +5791,21 @@ import batch39_core_pagealloc_batch_clear as _b39  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b39.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 40: the erofs readahead temporary-buffer relaxation (d9281660ff3f).
+#
+# The module's first fs/erofs/ group.  Registered last and independent of
+# everything: no other group writes any of its five files and it edits no
+# generated text, so there is no ordering constraint.  It probes its own
+# payload instead, so a baseline that already carries the commit reports
+# already_present rather than half-applying.  See the batch file's docstring
+# for the 5.15 shape differences (the pcluster lives in zdata.h here; 5.15
+# needs no new ``ra`` parameter because the frontend already carries
+# ``readahead``) and for the ``besteffort`` polarity trap.
+# ============================================================================
+import batch40_core_erofs_readahead as _b40_erofs  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b40_erofs.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

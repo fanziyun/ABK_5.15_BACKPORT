@@ -906,6 +906,24 @@ REQUIRED_CONTENT = {
         "static inline bool memcg_is_dying(struct mem_cgroup *memcg) "
         "{ return false; }",
     ],
+    "core:erofs_readahead_relaxed_gfp": [
+        # d9281660ff3f, the module's first fs/erofs/ group.  Pinned per file
+        # because the claim spans five: the request carries the flags, the two
+        # decompressors take them, the pcluster carries the mode, and zdata.c
+        # sets, reads and clears it.  The polarity of `besteffort` is pinned by
+        # the *flags*, not by the field name -- upstream's name reads inverted
+        # against its own comment (true means must-succeed), so a port that
+        # trusted the name would ship the two sides swapped and still find every
+        # symbol present.
+        ["fs/erofs/compress.h", "\tgfp_t gfp;"],
+        ["fs/erofs/decompressor.c", "erofs_allocpage(pagepool, rq->gfp);"],
+        ["fs/erofs/decompressor_lzma.c", "erofs_allocpage(pagepool, rq->gfp);"],
+        ["fs/erofs/zdata.h", "\tbool besteffort;"],
+        ["fs/erofs/zdata.c", "\tclt->pcl->besteffort |= !fe->readahead;"],
+        ["fs/erofs/zdata.c", "\t\t\t\t\t.gfp = pcl->besteffort ?"],
+        ["fs/erofs/zdata.c", "\t\t\t\t\t\tGFP_NOWAIT | __GFP_NORETRY"],
+        ["fs/erofs/zdata.c", "\tpcl->besteffort = false;"],
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1150,6 +1168,26 @@ REQUIRED_ABSENT = {
         # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
         # is this module's only group there.
         ["fs/fuse/file.c", "ABK stable_515_backport:"],
+    ],
+    "core:erofs_readahead_relaxed_gfp": [
+        # The two NOFAIL allocations are the *whole* thing this group replaces;
+        # leaving one behind would leave that decompressor exactly as it was.
+        # Counted in the pristine trees: one occurrence per file.
+        ["fs/erofs/decompressor.c", "GFP_KERNEL | __GFP_NOFAIL"],
+        ["fs/erofs/decompressor_lzma.c", "GFP_KERNEL | __GFP_NOFAIL"],
+        # Upstream-shape graft, so the rewritten lines must stay marker-free --
+        # same reason as fuse_prefault_out_of_write_path: a marker would sit
+        # inside the block the already_present short-circuit compares against.
+        ["fs/erofs/compress.h", "ABK stable_515_backport:"],
+        ["fs/erofs/decompressor.c", "ABK stable_515_backport:"],
+        ["fs/erofs/decompressor_lzma.c", "ABK stable_515_backport:"],
+        ["fs/erofs/zdata.c", "ABK stable_515_backport:"],
+        ["fs/erofs/zdata.h", "ABK stable_515_backport:"],
+        # Upstream threaded a new `bool ra` parameter because v6.9 had moved the
+        # fact off the frontend; 5.15 still has frontend->readahead, and copying
+        # the parameter would mean the group had edited a signature it need not
+        # have touched.
+        ["fs/erofs/zdata.c", "bool ra)"],
     ],
     "core:memcg_stats_percpu_slim": [
         "vmstats_percpu->state[idx]",
@@ -1640,6 +1678,37 @@ REQUIRED_IN_FUNCTION = {
           "\t\tpage = grab_cache_page_write_begin(mapping, index, 0);"],
          [" again:\n"
           "\t\terr = -EFAULT;\n"]),
+    ],
+    "core:erofs_readahead_relaxed_gfp": [
+        # d9281660ff3f.  The claim is per call site, and a whole-file check
+        # cannot express it: `GFP_NOWAIT | __GFP_NORETRY` in the request
+        # initialiser is satisfied by a tree that also left a NOFAIL somewhere
+        # in the same function, and `rq->gfp` in the decompressor is satisfied
+        # by one that never wired the mode up.  Both sides live in the same
+        # function body, so pin them there.
+        ("fs/erofs/decompressor.c", "z_erofs_lz4_prepare_dstpages",
+         ["erofs_allocpage(pagepool, rq->gfp);",
+          "if (!victim)",
+          "return -ENOMEM;"],
+         ["GFP_KERNEL | __GFP_NOFAIL"]),
+        ("fs/erofs/decompressor_lzma.c", "z_erofs_lzma_decompress",
+         ["erofs_allocpage(pagepool, rq->gfp);",
+          "goto failed;",
+          "\nfailed:\n"],
+         ["GFP_KERNEL | __GFP_NOFAIL"]),
+        # The mode has to be set where the pcluster is collected, read where it
+        # is decompressed, and cleared so a recycled pcluster starts pristine --
+        # all three in this one function pair, and the polarity in the set line
+        # is the part a name-trusting port would invert.
+        ("fs/erofs/zdata.c", "z_erofs_do_read_page",
+         ["clt->pcl->besteffort |= !fe->readahead;"],
+         ["bool ra"]),
+        ("fs/erofs/zdata.c", "z_erofs_decompress_pcluster",
+         [".gfp = pcl->besteffort ?",
+          "GFP_KERNEL | __GFP_NOFAIL :",
+          "GFP_NOWAIT | __GFP_NORETRY",
+          "pcl->besteffort = false;"],
+         []),
     ],
     "core:mglru_rework_refault_detection": [
         # The windowed recency test must land in lru_gen_refault() itself;

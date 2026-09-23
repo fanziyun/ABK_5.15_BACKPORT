@@ -3033,7 +3033,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.44.0", "0.44.0"], _versions)
+          _versions == ["0.45.0", "0.45.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -5283,6 +5283,186 @@ def test_batch35_pagecache_pt():
               bare.read(b34.TRUNCATE) == "static int x;\n")
 
 
+def test_batch40_erofs_readahead():
+    """Batch 40: the erofs readahead temporary-buffer relaxation."""
+    print("Batch 40: erofs_readahead_relaxed_gfp (readahead allocs may fail)")
+    import abk_stable_core as core
+    import batch40_core_erofs_readahead as b40
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "erofs_readahead_relaxed_gfp"), None)
+    check("erofs_readahead_relaxed_gfp group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly the five erofs files",
+          group.files == [b40.COMPRESS_H, b40.DECOMPRESSOR_C,
+                          b40.DECOMPRESSOR_LZMA_C, b40.ZDATA_C, b40.ZDATA_H],
+          group.files)
+    check("the pcluster header is fs/erofs/zdata.h",
+          b40.ZDATA_H == "fs/erofs/zdata.h", b40.ZDATA_H)
+
+    steps = b40.build_steps()
+    # The declaration is in the header (5.15 keeps the struct in zdata.h);
+    # the three zdata.c steps only read or clear the field.
+    check("the besteffort declaration lands in zdata.h, not zdata.c",
+          [rel for rel, _o, new, _r in steps
+           if b40.PCLUSTER_BESTEFFORT in new] == [b40.ZDATA_H],
+          [rel for rel, _o, new, _r in steps if b40.PCLUSTER_BESTEFFORT in new])
+    check("eight required steps",
+          len(steps) == 8 and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j in range(i + 1, len(steps)):
+            check("step %d new does not contain step %d new" % (i, j),
+                  steps[j][2] not in new_i)
+    # Trap 1: every `new` must be absent from the pristine shape it anchors on.
+    for rel, old, new, _req in steps:
+        check(f"the {rel} new block is not already in its old block",
+              new not in old)
+
+    # The anchor policy: d9281660ff3f is reproduced as an upstream-shape
+    # rewrite, so a baseline that carries the commit must stay byte-identical
+    # and report already_present -- no marker on any of these lines.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        check("step %d adds no ABK marker" % i,
+              "ABK stable_515_backport" not in new_i)
+
+    # The polarity trap.  Upstream's field is named `besteffort` but comments
+    # and reads inverted: TRUE means the allocation must succeed.  Assert both
+    # sides by their flags, so a later edit cannot quietly swap the ternary.
+    init = steps[6][2]
+    check("the mode is read as pcl->besteffort ? NOFAIL : NOWAIT",
+          b40.REQ_GFP_INIT in init
+          and "GFP_KERNEL | __GFP_NOFAIL :" in init
+          and "GFP_NOWAIT | __GFP_NORETRY" in init
+          and init.index("GFP_KERNEL | __GFP_NOFAIL")
+          < init.index("GFP_NOWAIT | __GFP_NORETRY"),
+          init)
+    # ... and the set side must be `|= !readahead`: a synchronous read
+    # (fe->readahead == false) marks the pcluster must-succeed.
+    check("the set side is `besteffort |= !fe->readahead`",
+          b40.SET_MODE_LINE == "\tclt->pcl->besteffort |= !fe->readahead;",
+          b40.SET_MODE_LINE)
+    check("both decompressors take the flags from rq->gfp",
+          "erofs_allocpage(pagepool, rq->gfp);" in steps[1][2]
+          and "erofs_allocpage(pagepool, rq->gfp);" in steps[2][2])
+    # Upstream threads a new `bool ra` parameter because v6.9 moved the fact;
+    # 5.15 already carries it on the frontend, so copying the signature is the
+    # one form that would be wrong here.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        check("step %d does not copy upstream's `bool ra` parameter" % i,
+              "bool ra" not in new_i and "!ra" not in new_i)
+
+    # Synthetic 5.15-shaped tree: only the anchors, which are what the group
+    # owns.  The real text is proven against a fetched tree by step_audit.py.
+    fixture = {
+        b40.COMPRESS_H: (
+            "struct z_erofs_decompress_req {\n"
+            "\tstruct super_block *sb;\n"
+            + b40._REQ_STRUCT_OLD +
+            "\nstruct z_erofs_decompressor {\n\tint x;\n};\n"),
+        b40.DECOMPRESSOR_C: (
+            "static int z_erofs_lz4_prepare_dstpages(void)\n{\n"
+            "\t\tif (top) {\n"
+            "\t\t\tvictim = availables[--top];\n"
+            "\t\t\tget_page(victim);\n"
+            "\t\t} else {\n"
+            + b40._LZ4_ALLOC_OLD +
+            "\t\t}\n"
+            "\t\trq->out[i] = victim;\n"
+            "\t}\n\treturn 0;\n}\n"),
+        b40.DECOMPRESSOR_LZMA_C: (
+            "int z_erofs_lzma_decompress(struct z_erofs_decompress_req *rq,\n"
+            "\t\t\t    struct page **pagepool)\n{\n"
+            "\tfor (ni = 0, no = -1;;) {\n"
+            "\t\tfor (j = ni + 1; j < nrpages_in; ++j) {\n"
+            "\t\t\tstruct page *tmppage;\n"
+            "\n\t\t\tif (rq->out[no] != rq->in[j])\n"
+            "\t\t\t\tcontinue;\n"
+            + b40._LZMA_ALLOC_OLD +
+            "\t\t}\n\t}\n"
+            + b40._LZMA_LABEL_OLD +
+            "\t\tkunmap(rq->in[ni]);\n"
+            "\treturn err;\n}\n"),
+        b40.ZDATA_H: (
+            "struct z_erofs_pcluster {\n"
+            "\tunsigned int length;\n"
+            "\tunsigned short pclusterpages;\n"
+            + b40._PCLUSTER_OLD +
+            "\tstruct page *compressed_pages[];\n};\n"),
+        b40.ZDATA_C: (
+            "static int z_erofs_do_read_page(void)\n{\nrestart_now:\n"
+            + b40._SET_MODE_OLD +
+            "\tif (should_alloc_managed_pages())\n"
+            "\t\tcache_strategy = TRYALLOC;\n"
+            "\treturn 0;\n}\n\n"
+            "static int z_erofs_decompress_pcluster(void)\n{\n"
+            "\terr = z_erofs_decompress(&(struct z_erofs_decompress_req) {\n"
+            "\t\t\t\t\t.sb = sb,\n"
+            "\t\t\t\t\t.inplace_io = overlapped,\n"
+            + b40._REQ_INIT_OLD +
+            "\tcl->nr_pages = 0;\n"
+            "\tcl->vcnt = 0;\n"
+            "\tWRITE_ONCE(pcl->next, Z_EROFS_PCLUSTER_NIL);\n"
+            "\treturn err;\n}\n"),
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, fixture)
+        status, detail = group.apply_fn(ctx)
+        check("all eight steps land", status == "applied", (status, detail))
+        cc = ctx.read(b40.COMPRESS_H)
+        check("the request struct gained gfp_t gfp",
+              b40.REQ_GFP_FIELD in cc and cc.count("gfp_t gfp;") == 1)
+        lz4 = ctx.read(b40.DECOMPRESSOR_C)
+        lzma = ctx.read(b40.DECOMPRESSOR_LZMA_C)
+        check("LZ4 allocates with rq->gfp and may fail",
+              "erofs_allocpage(pagepool, rq->gfp);" in lz4
+              and "return -ENOMEM;" in lz4)
+        check("LZMA allocates with rq->gfp and may fail",
+              "erofs_allocpage(pagepool, rq->gfp);" in lzma
+              and "goto failed;" in lzma and "\nfailed:\n" in lzma)
+        check("neither decompressor still demands a NOFAIL page",
+              "GFP_KERNEL | __GFP_NOFAIL" not in lz4
+              and "GFP_KERNEL | __GFP_NOFAIL" not in lzma)
+        check("the pcluster carries the mode",
+              b40.PCLUSTER_BESTEFFORT in ctx.read(b40.ZDATA_H))
+        zd = ctx.read(b40.ZDATA_C)
+        check("the collector records the mode", b40.SET_MODE_LINE in zd)
+        check("the decompressor selects the flags per mode",
+              b40.REQ_GFP_INIT in zd
+              and "GFP_NOWAIT | __GFP_NORETRY" in zd
+              and zd.count("GFP_NOWAIT | __GFP_NORETRY") == 1)
+        check("the pcluster is put back to pristine",
+              b40.RESET_LINE in zd)
+
+        # Two-pass idempotency: the group probes its own payload.
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass: already_present",
+              status2 == "already_present", (status2, detail2))
+        check("second pass: the tree is byte-identical",
+              ctx.read(b40.ZDATA_C) == zd)
+
+        # A post-v6.9 erofs (upstream's own layout) is not this group's shape.
+        post = make_ctx(tmp + "/post", {
+            b40.COMPRESS_H: ("\tunsigned int alg;\n"
+                             "\tbool inplace_io, partial_decoding, fillgaps;\n"
+                             "};\n")})
+        status3, _d3 = group.apply_fn(post)
+        check("degrades on a post-v6.9 request struct",
+              status3 == "blocked_by_shape", status3)
+        check("the degraded tree is not written",
+              "gfp_t gfp;" not in post.read(b40.COMPRESS_H))
+
+        # A tree that never gained the anchors degrades too.
+        bare = make_ctx(tmp + "/bare40", {b40.COMPRESS_H: "static int x;\n"})
+        status4, _d4 = group.apply_fn(bare)
+        check("degrades on an unknown shape", status4 == "blocked_by_shape")
+        check("the unknown-shape tree is not written",
+              bare.read(b40.COMPRESS_H) == "static int x;\n")
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -5337,6 +5517,7 @@ def main():
     test_batch33_zsmalloc_free_out_of_lock()
     test_batch37_reclaim_paths()
     test_batch35_pagecache_pt()
+    test_batch40_erofs_readahead()
 
     print()
     if FAILURES:
