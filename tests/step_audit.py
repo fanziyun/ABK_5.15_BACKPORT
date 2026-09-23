@@ -188,6 +188,10 @@ AUDIT_FILES = [
     "fs/erofs/decompressor_lzma.c",
     "fs/erofs/zdata.c",
     "fs/erofs/zdata.h",
+    # Batch 41: vm_kcompressd_swapout -- the whole payload is appended to this
+    # file, so its comment/brace/#ifdef balance has to be auditable and its
+    # anchors have to be checkable for the already_present traps.
+    "mm/page_io.c",
 ]
 
 CHILD_MODULES = [

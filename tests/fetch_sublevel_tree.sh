@@ -148,6 +148,13 @@ FETCH_FILES=(
   fs/erofs/decompressor_lzma.c
   fs/erofs/zdata.c
   fs/erofs/zdata.h
+  # Batch 41: vm_kcompressd_swapout -- the module's first mm/page_io.c group,
+  # and the file the whole payload lives in (upstream's carrier, a struct
+  # pglist_data field run, is KMI-frozen on this baseline, so nothing else is
+  # touched).  Every anchor is pristine text no other group writes, and the
+  # frontswap_store() block the shape probe discriminates sits in the same
+  # translation unit as the engine.
+  mm/page_io.c
 )
 
 decode() {

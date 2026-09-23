@@ -5807,5 +5807,71 @@ import batch40_core_erofs_readahead as _b40_erofs  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b40_erofs.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 41: kcompressd -- kswapd's swap-out compression moves to its own thread.
+# Steps live in scripts/batch41_core_vm_kcompressd.py.
+#
+#   vm_kcompressd_swapout   Kcompressd-Unofficial 0.5 (Masahito Suzuki, forked
+#                           from MediaTek's Kcompressd by Qun-Wei Lin), whose
+#                           upstream carrier cannot be used here: it adds four
+#                           fields to struct pglist_data, which
+#                           android/abi_gki_aarch64.xml pins at 56320 bits
+#                           across 22 members with no KABI reserve run and no
+#                           usable ANDROID_OEM_DATA slot.  So the payload is
+#                           re-carried entirely inside mm/page_io.c -- private
+#                           per-node state indexed by page_to_nid(), a
+#                           late_initcall instead of kswapd_run()/kswapd_stop(),
+#                           and a file-static knob registered with
+#                           register_sysctl() instead of a vm_table[] entry.
+#                           mm/vmscan.c is not touched at all, which also
+#                           removes upstream's kswapd_run() trap.
+#
+# Registered last and independent of everything: mm/page_io.c is in zero other
+# groups' file lists, so nothing can edit these blocks and no trap-5 ordering
+# applies.  The one ordering constraint is a *read* dependency on Batch 38's
+# memcg_dying_bailout, whose memcg_is_dying() the store path calls; it is
+# registered above and reports applied on all four baselines (the header's
+# mem_cgroup_init() or stub anchor is not part of that group's step set on any
+# of them).  If it ever degrades, the failure is a compile error naming
+# memcg_is_dying, not a half-applied group.
+#
+# The only per-baseline variance is a *text* variant, not a CONFIG gate: 216
+# carries AOSP's android_vh_shrink_page_lock_owner_clear() vendor hook at
+# swap_writepage()'s unlock points (added along with the DECLARE_HOOK in
+# include/trace/hooks/vmscan.h), and 167/178/194 have neither.  The shape is
+# probed against the frontswap branch and the engine text follows; a tree
+# matching neither shape reports blocked_by_shape and writes nothing rather
+# than dropping a vendor-hook contract the tree does honour.
+# ============================================================================
+import batch41_core_vm_kcompressd as _b41_kc  # noqa: E402
+
+
+def _vm_kcompressd_swapout_apply(ctx):
+    """Off-load kswapd's swap-out compression to a per-node kcompressd thread."""
+    body = _b41_kc.swapout_body(ctx)
+    if body is None:
+        return ("blocked_by_shape",
+                "mm/page_io.c matches neither the 167/178/194 nor the lts "
+                "shape of swap_writepage()'s frontswap_store() branch")
+    status, _results, detail = apply_steps(ctx, _b41_kc.build_steps(body))
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "vm_kcompressd_swapout",
+        "kswapd's anonymous swap-out compression and writeback move to a "
+        "per-node kcompressd thread, so reclaim latency no longer includes "
+        "waiting for zram on every page; a full queue drains head-first so "
+        "completion order keeps matching submission order (Kcompressd-"
+        "Unofficial 0.5, no 5.15 upstream patch exists)",
+        ["kcompressd-unofficial 0.5 (e4d131aaa669b6f, firelzrd/kcompressd-unofficial)"],
+        [_b41_kc.PAGE_IO],
+        _vm_kcompressd_swapout_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()
