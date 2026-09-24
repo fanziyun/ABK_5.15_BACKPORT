@@ -46,13 +46,22 @@ kernel/sysctl.c's vm_table[]; and the page ABI plus the three-argument
 __swap_writepage().  Three further corrections are the ones worth knowing:
 
   * abk_kcompressd_do_swapout() takes the page lock.  Upstream does not, and
-    the reason is a fact about 5.15 that also holds on 6.12:
-    shrink_page_list()'s cannot_free branch falls into keep_locked:, which
-    *unlocks* the page and puts it back on the LRU, so by the time kcompressd
-    runs nobody holds PG_locked -- while __swap_writepage() is a ->writepage
-    implementation and every one of its exits unlocks.  Upstream 0.5 carries
-    that latent double-unlock; it survives only because unlock_page()'s
-    VM_BUG_ON_PAGE(!PageLocked(page)) needs CONFIG_DEBUG_VM to be visible.
+    the reason is a fact about 5.15 that also holds on 6.12: an offloaded page
+    waits on the FIFO with no owner, so anyone may lock it meanwhile, while
+    __swap_writepage() is a ->writepage implementation and every one of its
+    exits unlocks.  Upstream 0.5 carries that latent double-unlock; it
+    survives only because unlock_page()'s VM_BUG_ON_PAGE(!PageLocked(page))
+    needs CONFIG_DEBUG_VM to be visible.
+  * swap_writepage() releases the page lock before returning from the
+    offload, and upstream does not.  That early return skips
+    __swap_writepage(), which is where the unlock normally happens, so the
+    page would reach ret_pages still locked: pageout() reads our 0 as
+    PAGE_SUCCESS, its `if (!trylock_page(page)) goto keep;` fails because
+    shrink_page_list() holds the lock it took before calling, and `keep:`
+    comes after keep_locked:'s unlock_page() so it unlocks nothing itself.
+    move_pages_to_lru() does not unlock either, so the kcompressd thread's
+    own lock_page() -- the line above -- would sleep forever.  Found on
+    vermeer with 26 pages queued and swapped pinned at 0.
   * mem_cgroup_zswap_writeback_enabled() does not exist here, so that gate is
     replaced by this module's own Batch-38 policy, memcg_is_dying()
     (include/linux/memcontrol.h, already reachable through the swap.h include
@@ -161,8 +170,33 @@ _C_OFFLOAD_OLD = (
 _C_OFFLOAD_NEW = (
     "\t/* ABK stable_515_backport: Batch 41 -- hand this page's\n"
     "\t * compression to the node's kcompressd thread. */\n"
-    "\tif (abk_kcompressd_store(page))\n"
+    "\tif (abk_kcompressd_store(page)) {\n"
+    "\t\t/* Release the page lock before returning, exactly as the\n"
+    "\t\t * fall-through path does.  __swap_writepage() is a\n"
+    "\t\t * ->writepage implementation and every exit of it unlocks\n"
+    "\t\t * the page, so on an unpatched kernel swap_writepage()\n"
+    "\t\t * returns with PG_locked clear; an offload has to leave the\n"
+    "\t\t * same invariant behind it.\n"
+    "\t\t *\n"
+    "\t\t * The cost of not doing so is not local.  pageout()\n"
+    "\t\t * (mm/vmscan.c) reads our 0 as PAGE_SUCCESS, and\n"
+    "\t\t * PAGE_SUCCESS's `if (!trylock_page(page)) goto keep;`\n"
+    "\t\t * then fails, because shrink_page_list() still holds the\n"
+    "\t\t * lock it took before calling us.  `keep:` sits *after*\n"
+    "\t\t * keep_locked:'s unlock_page(), so it performs no unlock of\n"
+    "\t\t * its own: the page reaches ret_pages still locked,\n"
+    "\t\t * move_pages_to_lru() never unlocks it either, and the\n"
+    "\t\t * kcompressd thread's lock_page() in\n"
+    "\t\t * abk_kcompressd_do_swapout() sleeps forever -- the thread\n"
+    "\t\t * in D state, its whole FIFO pinned, swapped stuck at 0\n"
+    "\t\t * while enqueued keeps climbing.  Measured on vermeer: 26\n"
+    "\t\t * pages queued and none ever written out.  Upstream 0.5\n"
+    "\t\t * returns early the same unlock-free way and carries the\n"
+    "\t\t * same defect on 6.12, whose pageout() has the identical\n"
+    "\t\t * PAGE_SUCCESS branch. */\n"
+    "\t\tunlock_page(page);\n"
     "\t\treturn 0;\n"
+    "\t}\n"
     "\n"
 ) + _C_OFFLOAD_OLD
 
@@ -442,27 +476,23 @@ static void abk_kcompressd_do_swapout(struct page *page)
 	}
 
 	/*
-	 * Not in upstream, and not optional here.  An offloaded page cannot be
-	 * freed on the pass that queued it: __remove_mapping()'s
-	 * page_ref_freeze(page, 1 + compound_nr(page)) wants the refcount to
-	 * match exactly, and abk_kcompressd_enqueue()'s get_page() makes it one
-	 * too many.  That is deliberate -- without the reference,
-	 * __delete_from_swap_cache() would hand the slot back while this page
-	 * still has a write pending -- but it means shrink_page_list() takes
-	 * cannot_free: and falls into keep_locked: (mm/vmscan.c:1874), which
-	 * *releases the page lock* and puts the page back on the LRU.  So by
-	 * the time this runs nobody holds PG_locked, while __swap_writepage()
-	 * is a ->writepage implementation whose every exit unlocks the page,
-	 * and unlock_page() has a VM_BUG_ON_PAGE(!PageLocked(page)) that needs
-	 * CONFIG_DEBUG_VM to be visible.  Taking the lock restores the contract
-	 * the synchronous path relies on.  6.12's keep_locked:
-	 * (mm/vmscan.c:1531) unlocks the same way, so upstream 0.5 carries this
-	 * latent double-unlock and this graft does not.
+	 * Not in upstream, and not optional here.  An offloaded page waits on
+	 * this FIFO with no owner: abk_kcompressd_store() unlocks it before
+	 * returning (see the unlock_page() in swap_writepage()), so nobody
+	 * holds PG_locked from the pass that queued it, and whoever reaches it
+	 * next -- a fault mapping it back in, or a later reclaim pass -- is free
+	 * to take the lock.  __swap_writepage() is a ->writepage
+	 * implementation whose every exit unlocks the page, so it must hold
+	 * PG_locked on entry; unlock_page() has a VM_BUG_ON_PAGE(!PageLocked())
+	 * that is only visible under CONFIG_DEBUG_VM, and the work itself has
+	 * to run against a page whose owning I/O this thread is the only one
+	 * doing.  Taking the lock restores the contract the synchronous path
+	 * relies on, and waiting on whoever holds it is what the synchronous
+	 * path does too.
 	 *
-	 * The page cannot have been freed under us: this path owns a reference.
-	 * It can be locked by whoever took it after keep_locked: let go -- a
-	 * fault mapping it back in, or a later reclaim pass -- and lock_page()
-	 * waits for them, which is what the synchronous path does too.
+	 * The reference is what keeps this safe: abk_kcompressd_enqueue()
+	 * took a get_page() before queueing, so the page cannot have been
+	 * freed underneath us no matter who else locked it.
 	 */
 	lock_page(page);
 

@@ -975,6 +975,21 @@ REQUIRED_CONTENT = {
         # The 5.15-specific calling convention.  `&wbc` is what separates this
         # from the pristine call in swap_writepage().
         "__swap_writepage(page, &wbc, end_swap_bio_write);",
+        # The early return has to give the page lock back, the way
+        # __swap_writepage() does on the path it skipped: pageout() would
+        # otherwise take the 0 as PAGE_SUCCESS, fail its trylock_page()
+        # (shrink_page_list() still holds the lock it took before calling),
+        # land on `keep:` -- which comes after keep_locked:'s unlock_page()
+        # and so unlocks nothing -- and the kcompressd thread's lock_page()
+        # would sleep forever with the whole FIFO pinned.  Measured on
+        # vermeer: 26 pages queued, swapped stuck at 0, thread in D state.
+        #
+        # Anchored on either side on purpose.  page_io.c's own text already
+        # calls unlock_page() four times, so the bare call would still match
+        # with the fix deleted; this form only matches where the offload
+        # block gives the lock back immediately before the fall-through.
+        "\t\tunlock_page(page);\n\t\treturn 0;\n\t}\n\n"
+        "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n",
         # The thread body.
         "current->flags |= PF_MEMALLOC | PF_KSWAPD;",
         "kfifo_out_locked(&kcd->fifo, &page, sizeof(page),",

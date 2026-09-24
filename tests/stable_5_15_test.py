@@ -5381,7 +5381,29 @@ def test_batch41_kcompressd_offload():
 
             # The engine, the thread and the knob really landed.
             check(f"{label} shape: the store path is hooked in",
-                  "\tif (abk_kcompressd_store(page))\n\t\treturn 0;\n" in text)
+                  "\tif (abk_kcompressd_store(page)) {\n" in text
+                  and "\t\treturn 0;\n" in text)
+            # The page lock must be released inside that block, before the
+            # return.  Without it the early return skips __swap_writepage(),
+            # which is where the unlock normally happens, so pageout() reads
+            # our 0 as PAGE_SUCCESS, its trylock_page() fails because
+            # shrink_page_list() still holds the lock, `keep:` (which sits
+            # after keep_locked:'s unlock_page()) does no unlocking itself,
+            # move_pages_to_lru() does not unlock either, and
+            # do_swapout()'s own lock_page() sleeps forever.  Measured on
+            # vermeer: 26 pages queued, swapped pinned at 0, thread in D.
+            #
+            # The block is cut out first and then searched, never searched in
+            # place: page_io.c calls unlock_page() in do_swapout() as well,
+            # and an unbounded regex walking forward from the `if` would find
+            # that one and pass with the fix deleted.  Verified by deleting
+            # the line and watching this go red.
+            offload_block = re.search(r"\tif \(abk_kcompressd_store\(page\)\)"
+                                      r" \{\n(.*?)\n\t\}\n", text, re.S)
+            check(f"{label} shape: the offload releases the page lock",
+                  offload_block is not None
+                  and "unlock_page(page);" in offload_block.group(1),
+                  offload_block.group(1) if offload_block else "(no block)")
             check(f"{label} shape: the thread is named kcompressd%d",
                   '"kcompressd%d", nid);' in text)
             check(f"{label} shape: per-node state is private",

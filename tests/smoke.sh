@@ -690,6 +690,20 @@ grep -q "unlikely(!kfifo_out(&kcd->fifo, &head, sizeof(page)))" "$PAGE_IO" \
   || fail "the head-drain that keeps completion order is missing"
 grep -q "if (!abk_kcompressd_threshold || unlikely(!kcd->task))" "$PAGE_IO" \
   || fail "the off/ disable check is missing, so vm.kcompressd=0 would not work"
+# The early return has to hand the page lock back, because it skipped the
+# __swap_writepage() that normally does it.  Without this, pageout() takes the
+# 0 as PAGE_SUCCESS, its trylock_page() fails (shrink_page_list() still holds
+# the lock), `keep:` comes after keep_locked:'s unlock_page() so it unlocks
+# nothing, move_pages_to_lru() never unlocks either, and do_swapout()'s
+# lock_page() sleeps forever with the whole FIFO pinned behind it.  This is a
+# measured deadlock on vermeer, not a theoretical one.
+#
+# The check is scoped to the offload block, because page_io.c's pristine text
+# already calls unlock_page() four times -- an unscoped grep for it would pass
+# with the fix removed, which is exactly a test with no discriminating power.
+sed -n '/if (abk_kcompressd_store(page)) {/,/^	}$/p' "$PAGE_IO" \
+  | grep -q "unlock_page(page);" \
+  || fail "the offload does not release the page lock, so do_swapout() deadlocks"
 # Node lifecycle: the teardown is what stops every memory-hotplug removal from
 # leaking a kthread, a ring and a task_struct, and the stop-aware predicate is
 # what stops kthread_stop() from blocking forever on a thread nothing wakes
