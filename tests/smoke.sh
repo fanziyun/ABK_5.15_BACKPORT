@@ -143,6 +143,11 @@ SMOKE_FILES=(
   fs/erofs/decompressor_lzma.c
   fs/erofs/zdata.c
   fs/erofs/zdata.h
+  # Batch 41: vm_kcompressd_swapout appends its whole engine here, so smoke
+  # needs the pristine file both to run the group over it and to compare the
+  # rollback against.  Without it the group degrades to blocked_by_shape in
+  # smoke only (the reference trees carry it).
+  mm/page_io.c
 )
 
 WORK="$(mktemp -d)"
@@ -657,6 +662,89 @@ fi
 # (asserted above), so nothing in this module writes any of those four symbols
 # any more and the assertions could only ever fail.
 
+# Batch 41: kcompressd moves kswapd's swap-out compression to a per-node thread.
+# The group is one whole engine appended to mm/page_io.c, and a pass-1 "applied"
+# says nothing about whether it is alive: there is no knob on the baseline, and
+# an engine that compiled but dequeued nothing would read exactly the same.  So
+# the thread name, the admission gate that restricts it to kswapd, and the
+# reference that keeps the swap slot valid while the page sits in the FIFO are
+# all pinned here.  The group applies on every baseline (there is no upstream
+# 5.15 patch, so nothing can pre-apply) and its only per-baseline variance --
+# the android_vh_shrink_page_lock_owner_clear() replica -- is asserted
+# conditionally below, because a call to a vendor hook the tree does not
+# declare would not compile on 167/178/194.
+PAGE_IO="$KERNEL_ROOT/common/mm/page_io.c"
+grep -q '"kcompressd%d", nid);' "$PAGE_IO" \
+  || fail "the drain thread is not named kcompressd per node"
+grep -q "static void abk_kcompressd_do_swapout(struct page \*page)" "$PAGE_IO" \
+  || fail "do_swapout() is missing, so nothing drains the queue"
+grep -q "static bool abk_kcompressd_enqueue(struct abk_kcompressd_node \*kcd," "$PAGE_IO" \
+  || fail "abk_kcompressd_enqueue() is missing"
+grep -q 'register_sysctl("vm", abk_kcompressd_sysctl_table);' "$PAGE_IO" \
+  || fail "vm.kcompressd is not registered"
+grep -q "if (!current_is_kswapd())" "$PAGE_IO" \
+  || fail "the kswapd-only gate is missing (direct reclaim would OOM)"
+grep -q "get_page(page);" "$PAGE_IO" \
+  || fail "the FIFO reference is missing, so the swap slot can be freed early"
+grep -q "unlikely(!kfifo_out(&kcd->fifo, &head, sizeof(page)))" "$PAGE_IO" \
+  || fail "the head-drain that keeps completion order is missing"
+grep -q "if (!abk_kcompressd_threshold || unlikely(!kcd->task))" "$PAGE_IO" \
+  || fail "the off/ disable check is missing, so vm.kcompressd=0 would not work"
+# The early return has to hand the page lock back, because it skipped the
+# __swap_writepage() that normally does it.  Without this, pageout() takes the
+# 0 as PAGE_SUCCESS, its trylock_page() fails (shrink_page_list() still holds
+# the lock), `keep:` comes after keep_locked:'s unlock_page() so it unlocks
+# nothing, move_pages_to_lru() never unlocks either, and do_swapout()'s
+# lock_page() sleeps forever with the whole FIFO pinned behind it.  This is a
+# measured deadlock on vermeer, not a theoretical one.
+#
+# The check is scoped to the offload block, because page_io.c's pristine text
+# already calls unlock_page() four times -- an unscoped grep for it would pass
+# with the fix removed, which is exactly a test with no discriminating power.
+sed -n '/if (abk_kcompressd_store(page)) {/,/^	}$/p' "$PAGE_IO" \
+  | grep -q "unlock_page(page);" \
+  || fail "the offload does not release the page lock, so do_swapout() deadlocks"
+# Node lifecycle: the teardown is what stops every memory-hotplug removal from
+# leaking a kthread, a ring and a task_struct, and the stop-aware predicate is
+# what stops kthread_stop() from blocking forever on a thread nothing wakes
+# (which would hold mem_hotplug_lock in write mode and wedge every other
+# hotplug operation).  Neither is visible in a pass-1 status.
+grep -q "static void abk_kcompressd_add_node(int nid)" "$PAGE_IO" \
+  || fail "there is no way to bring a hot-plugged node's thread up"
+grep -q "static void abk_kcompressd_del_node(int nid)" "$PAGE_IO" \
+  || fail "the node teardown is missing, so hotplug removal leaks a kthread"
+grep -q "register_memory_notifier(&abk_kcompressd_memory_nb);" "$PAGE_IO" \
+  || fail "the memory notifier is not registered, so hotplug is never seen"
+grep -q "case MEM_OFFLINE:" "$PAGE_IO" \
+  || fail "the notifier does not handle MEM_OFFLINE"
+grep -q "if (arg->status_change_nid < 0)" "$PAGE_IO" \
+  || fail "the teardown is not gated on the node becoming memoryless"
+grep -q "kthread_should_stop());" "$PAGE_IO" \
+  || fail "the wait predicate is not stop-aware, so kthread_stop() can hang"
+grep -q "wake_up_interruptible(&kcd->wait);" "$PAGE_IO" \
+  || fail "the teardown does not wake the thread before kthread_stop()"
+grep -q "kfifo_free(&kcd->fifo);" "$PAGE_IO" \
+  || fail "the teardown does not free the ring"
+grep -q "if (unlikely(!kcd->task)) {" "$PAGE_IO" \
+  || fail "the enqueue can touch a ring whose node was off-lined"
+# Tracepoint ownership: on the baseline that carries AOSP's
+# android_vh_shrink_page_lock_owner_clear(), mm/page_io.c is the translation
+# unit that *defines* its tracepoints (swap_writepage() already calls it there),
+# and the engine must not define them a second time or link a second set of
+# __tracepoint_ symbols.  On 167/178/194 there is no hook at all.  The tree's
+# own pristine page_io.c is the probe -- the same one the group applies.
+if grep -q "trace_android_vh_shrink_page_lock_owner_clear(page);" \
+     "$SOURCE_TREE/mm/page_io.c"; then
+  grep -q "trace_android_vh_shrink_page_lock_owner_clear(page);" "$PAGE_IO" \
+    || fail "the vendor hook replica is missing on this baseline"
+  [ "$(grep -c '^#define CREATE_TRACE_POINTS' "$PAGE_IO")" = "0" ] \
+    || fail "the engine redefined CREATE_TRACE_POINTS"
+else
+  if grep -q "trace_android_vh_shrink_page_lock_owner_clear" "$PAGE_IO"; then
+    fail "the graft called a vendor hook this baseline does not declare"
+  fi
+fi
+
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
@@ -685,6 +773,13 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/mm/swap.c" \
         "$KERNEL_ROOT/common/mm/swap.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/swap.c"
+fi
+# Batch 41 is the module's first mm/page_io.c write: the whole kcompressd engine
+# is appended there, so the file has to come back byte-identical too.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/page_io.c" \
+        "$KERNEL_ROOT/common/mm/page_io.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/page_io.c"
 fi
 # Batch 35 is the first group to write mm/truncate.c and the first to touch
 # include/linux/mm.h; both have to come back byte-identical too.

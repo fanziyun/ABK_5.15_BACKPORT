@@ -924,6 +924,76 @@ REQUIRED_CONTENT = {
         ["fs/erofs/zdata.c", "\t\t\t\t\t\tGFP_NOWAIT | __GFP_NORETRY"],
         ["fs/erofs/zdata.c", "\tpcl->besteffort = false;"],
     ],
+    "core:vm_kcompressd_swapout": [
+        "kcompressd%d",
+        "abk_kcompressd_store",
+        "abk_kcompressd_do_swapout",
+        "static int abk_kcompressd_threshold = 24;",
+        "static atomic_long_t abk_kcompressd_enqueued;",
+        "static atomic_long_t abk_kcompressd_swapped;",
+        "static atomic_long_t abk_kcompressd_sync;",
+        ".procname	= \"kcompressd\"",
+        "proc_dointvec_minmax",
+        "SYSCTL_ZERO",
+        # The gates.
+        "if (!current_is_kswapd())",
+        "if (!PageAnon(page))",
+        "if (memcg_is_dying(page_memcg(page)))",
+        "if (!frontswap_enabled() &&",
+        "SWP_SYNCHRONOUS_IO",
+        "if (!abk_kcompressd_threshold || unlikely(!kcd->task))",
+        # The reference and the ordering it buys.
+        "get_page(page);",
+        "put_page(page);",
+        "unlikely(!kfifo_out(&kcd->fifo, &head, sizeof(page)))",
+        "if (head)",
+        # Safety guards: the guard that must NOT be a WARN (a WARN is an oops,
+        # and panic_on_oops/panic_on_warn would turn our own "impossible"
+        # check into a panic -- strictly worse than what it guards), the
+        # self-enqueue guard (current_is_kswapd() admits kcompressd, because
+        # kcompressd sets PF_KSWAPD), and the fail-closed knob registration.
+        "pr_warn_once(\"kcompressd: dropping a queued page",
+        "if (unlikely(kcd->task == current))",
+        "cannot register /proc/sys/vm/kcompressd, offload disabled",
+        # Node lifecycle.  Without the teardown, every memory-hotplug removal
+        # leaks one kthread, one ring and one task_struct; without the
+        # stop-aware predicate, kthread_stop() in the teardown blocks forever
+        # on a thread that nothing wakes, holding mem_hotplug_lock in write
+        # mode.  Without the in-lock task re-check, a reclaim page that passed
+        # the (unlocked) task read can touch a ring that was just freed.
+        "static void abk_kcompressd_add_node(int nid)",
+        "static void abk_kcompressd_del_node(int nid)",
+        "register_memory_notifier(&abk_kcompressd_memory_nb);",
+        "case MEM_OFFLINE:",
+        "if (arg->status_change_nid < 0)",
+        "!kfifo_is_empty(&kcd->fifo) ||",
+        "kthread_should_stop());",
+        "static bool abk_kcompressd_store(struct page *page);",
+        "wake_up_interruptible(&kcd->wait);",
+        "kthread_stop(task);",
+        "if (unlikely(!kcd->task)) {",
+        # The 5.15-specific calling convention.  `&wbc` is what separates this
+        # from the pristine call in swap_writepage().
+        "__swap_writepage(page, &wbc, end_swap_bio_write);",
+        # The early return has to give the page lock back, the way
+        # __swap_writepage() does on the path it skipped: pageout() would
+        # otherwise take the 0 as PAGE_SUCCESS, fail its trylock_page()
+        # (shrink_page_list() still holds the lock it took before calling),
+        # land on `keep:` -- which comes after keep_locked:'s unlock_page()
+        # and so unlocks nothing -- and the kcompressd thread's lock_page()
+        # would sleep forever with the whole FIFO pinned.  Measured on
+        # vermeer: 26 pages queued, swapped stuck at 0, thread in D state.
+        #
+        # Anchored on either side on purpose.  page_io.c's own text already
+        # calls unlock_page() four times, so the bare call would still match
+        # with the fix deleted; this form only matches where the offload
+        # block gives the lock back immediately before the fall-through.
+        "\t\tunlock_page(page);\n\t\treturn 0;\n\t}\n\n"
+        "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n",
+        # The thread body.
+        "current->flags |= PF_MEMALLOC | PF_KSWAPD;",
+        "kfifo_out_locked(&kcd->fifo, &page, sizeof(page),",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -932,6 +1002,7 @@ REQUIRED_CONTENT = {
 # removal-graft shape) or a [rel, needle] pair (checked against that one
 # file only, for absence claims a *neighbouring* group's legitimate content
 # in a shared file would otherwise defeat).
+
 REQUIRED_ABSENT = {
     "perf:psi_oncpu_state_mask": [
         # The counter and the old "identical state makes the walk safe" trick
@@ -957,6 +1028,16 @@ REQUIRED_ABSENT = {
     "display:drm_valid_clones_revert": [
         "drm_atomic_check_valid_clones",
         "drm_atomic_check_valid_clones(state, crtc)",
+    ],
+    "core:vm_kcompressd_swapout": [
+        # No WARN family in this group.  The one "this cannot happen" guard it
+        # needs (queued page whose swap slot was freed) skips the write, which
+        # is already the safe action; a WARN_ON_ONCE() there would be an oops,
+        # and a device booted with panic_on_oops/panic_on_warn turns an oops
+        # into a panic -- strictly worse than the condition being guarded.
+        "WARN_ON_ONCE",
+        "WARN_ON(",
+        "WARN(",
     ],
     "perf:schedutil_smart_policy": [
         # The Batch 10-4c shapes: enabled by default, and a floor clamped *up
@@ -1872,6 +1953,55 @@ REQUIRED_IN_FUNCTION = {
           "kasan_enable_current();"],
          []),
     ],
+    # Kcompressd-Unofficial 0.5.  This is the group in the registry most able
+    # to compile and do nothing, so the behaviour-visible surface is pinned
+    # piece by piece rather than by name:
+    #   - the thread name is the only way to see from dmesg that the
+    #     per-node thread exists at all;
+    #   - the six admission gates, because a gate deleted "as unnecessary"
+    #     silently changes which pages are offloaded, and the two that are
+    #     *not* upstream (memcg_is_dying() in place of
+    #     mem_cgroup_zswap_writeback_enabled(), which 5.15 does not have, and
+    #     frontswap_enabled() in place of zswap_is_enabled(), also absent) are
+    #     the ones a future reader will be tempted to "fix" back;
+    #   - `page_ref_freeze`-adjacent `get_page(page)` -- upstream's comment
+    #     calls it "avoid it being freed", but here it is load-bearing (see
+    #     the do_swapout() banner): without it the swap slot is returned while
+    #     the write is still pending;
+    #   - the head-drain, which is the whole difference between Unofficial and
+    #     MediaTek's original and the reason this version was ported;
+    #   - the three-argument __swap_writepage() with `&wbc` (the pristine
+    #     swap_writepage() call is `__swap_writepage(page, wbc, ...)` without
+    #     the `&`), so a copy of the upstream two-argument form is caught;
+    #   - the AOSP vendor hook, present only where the tree has it -- so this
+    #     needle is asserted only for a baseline where the group applies and
+    #     the hook exists, via REQUIRED_CONTENT_OPTIONAL below.  A 4.15-style
+    #     "add the hook everywhere" would fail to compile on three of the four
+    #     baselines, and a "drop it everywhere" would break the lts contract.
+}
+
+# Needles that only exist on some baselines, so they can only be asserted on a
+# tree that carries the prerequisite -- which is the same text the group's own
+# shape probe discriminates on.  This audit runs one tree at a time against a
+# fixed sublevel (167), where the prerequisite is absent, so a locally green run
+# proves nothing about the variant; tests/stable_5_15_test.py carries the
+# fixture that does.  Needed because "add it everywhere" does not compile on
+# three of the four baselines and "drop it everywhere" breaks the lts contract.
+REQUIRED_CONTENT_IF_PRESENT = {
+    # child:group -> (rel, note, needles asserted when the pristine file
+    # already carries AOSP's hook)
+    "core:vm_kcompressd_swapout": (
+        "mm/page_io.c",
+        "trace_android_vh_shrink_page_lock_owner_clear(page);",
+        [
+            # The replica inside abk_kcompressd_do_swapout()'s frontswap
+            # branch, matching the call in swap_writepage() (mm/page_io.c:204
+            # on that baseline).  The __swap_writepage() half needs no
+            # replica: the hooks that path carries (mm/page_io.c:266/:308 and
+            # block/bdev.c:380) are inside the callee and travel with it.
+            "trace_android_vh_shrink_page_lock_owner_clear(page);",
+        ],
+    ),
 }
 
 
@@ -1970,6 +2100,22 @@ def run_tree(source):
                     if missing:
                         problems.append(f"{child}/{group.key}: missing "
                                         f"feature content {missing}")
+                key = f"{child}:{group.key}"
+                # Variants gated on the pristine tree's own shape: checked only
+                # where the baseline carries the prerequisite, because the
+                # other shape cannot hold the text without failing to compile.
+                if key in REQUIRED_CONTENT_IF_PRESENT and \
+                        status in ("applied", "partial"):
+                    rel, prerequisite, needles = REQUIRED_CONTENT_IF_PRESENT[key]
+                    pristine = src / rel
+                    if pristine.is_file() and prerequisite in \
+                            pristine.read_text(encoding="utf-8", errors="replace"):
+                        blob = ctx.read(rel) if ctx.path(rel).exists() else ""
+                        absent = [n for n in needles if n not in blob]
+                        if absent:
+                            problems.append(
+                                f"{child}/{group.key}: the {rel} shape carries "
+                                f"the prerequisite but the graft dropped {absent}")
                 if key in REQUIRED_ABSENT and status in ("applied", "partial"):
                     blob = "".join(ctx.read(f) for f in group.files
                                    if ctx.path(f).exists())

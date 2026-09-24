@@ -321,6 +321,20 @@ shape and splits the fallback claim and steal phases. `rmqueue_bulk()` carries
 the phase state only while its zone lock is held; `rmqueue_buddy()` starts from
 `RMQUEUE_NORMAL` for each independent allocation.
 
+Batch 41's `vm_kcompressd_swapout` is the first group with a **group-local**
+text probe rather than an engine one, because the shape it has to separate is
+not a kernel symbol: `swap_writepage()`'s `frontswap_store()` block gained
+AOSP's `trace_android_vh_shrink_page_lock_owner_clear(page)` call on
+`android13-5.15-lts` only, and 167/178/194 have neither the call nor its
+`DECLARE_HOOK` in `include/trace/hooks/vmscan.h`. No `CONFIG_*` gate can
+express that — there is nothing to gate on — so `_vm_kcompressd_swapout_apply`
+probes the two shapes of that block and emits the matching engine variant.
+`already_present` is not an available answer either (there is no upstream 5.15
+patch, so nothing can pre-apply), which is why an unrecognised shape reports
+`blocked_by_shape`: a hook replica emitted onto a tree without its declaration
+would be a compile error, and dropping it on a tree that has the call would
+break the vendor-hook contract.
+
 Batch 8's `rcu_nocb_cpu_default_all` is a three-file opt-in source graft:
 `kernel/rcu/Kconfig` adds the configuration symbol, the kernel-parameter
 documentation records explicit-mask precedence, and `kernel/rcu/tree_nocb.h`

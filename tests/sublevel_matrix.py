@@ -110,7 +110,21 @@ GROUP_COUNTS = {
     # reason -- a v6.9 performance change with no Cc: stable -- and its eight
     # anchors are byte-identical on all four (the pcluster struct it edits is
     # in fs/erofs/zdata.h on 5.15, which is why that file joined the fixture).
-    "stable_backport_core": 65,
+    # Batch 41 adds one: vm_kcompressd_swapout (Kcompressd-Unofficial 0.5 by
+    # firelzrd, no upstream 5.15 patch exists, so nothing can pre-apply).  It
+    # lands on every baseline, and it is the module's first mm/page_io.c group.
+    # Its three anchors are byte-identical pristine text on all four -- the
+    # one place the baselines disagree, android13-5.15-lts's
+    # android_vh_shrink_page_lock_owner_clear() call inside swap_writepage()'s
+    # frontswap_store() block, is resolved by a *text* probe in the group's
+    # _apply (ms/vmstat.c comment), not by a per-sublevel expectation: the
+    # group probes the shape, emits the matching engine variant and reports
+    # applied either way.  That same hook is also why the group cannot be
+    # registered to degrade: a baseline without the hook must not get a call to
+    # an undeclared vendor hook, so an unknown shape is blocked_by_shape here
+    # rather than silently half-applied -- which is a third status the matrix
+    # would need if any baseline ever matched neither shape.  None does.
+    "stable_backport_core": 66,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

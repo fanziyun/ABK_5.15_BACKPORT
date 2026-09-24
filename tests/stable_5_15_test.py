@@ -3033,7 +3033,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.45.0", "0.45.0"], _versions)
+          _versions == ["0.46.0", "0.46.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -5283,6 +5283,288 @@ def test_batch35_pagecache_pt():
               bare.read(b34.TRUNCATE) == "static int x;\n")
 
 
+def test_batch41_kcompressd_offload():
+    """Batch 41: kcompressd moves kswapd's swap-out compression off kswapd."""
+    print("Batch 41: vm_kcompressd_swapout (per-node kcompressd offload)")
+    import abk_stable_core as core
+    import batch41_core_vm_kcompressd as b41
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "vm_kcompressd_swapout"), None)
+    check("vm_kcompressd_swapout group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly mm/page_io.c",
+          group.files == [b41.PAGE_IO], group.files)
+
+    steps = b41.build_steps()
+    # Four, not three: the CI compile gate failed the first push because
+    # swap_writepage() calls abk_kcompressd_store() while the engine is appended
+    # *after* it, so a prototype is required (upstream's patch inserts the engine
+    # above swap_writepage() and never hits this).
+    check("four required steps, all in mm/page_io.c",
+          [rel for rel, _o, _n, req in steps] == [b41.PAGE_IO] * 4
+          and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    decl_step = next(s for s in steps if s[0] == b41.PAGE_IO
+                     and "static bool abk_kcompressd_store(struct page *page);"
+                     in s[2])
+    check("the prototype step keeps the pristine doc comment with its function",
+          b41._C_DECL_NEW.index(" * We may have stale swap cache pages")
+          > b41._C_DECL_NEW.index("static bool abk_kcompressd_store"),
+          b41._C_DECL_NEW)
+    check("the prototype's anchor is the doc comment plus the signature",
+          b41._C_DECL_OLD == b41.DECL_ANCHOR, b41._C_DECL_OLD)
+    # Trap 1: a replacement block that already exists in the pristine file is
+    # short-circuited by replace_once's idempotency pre-check and the real edit
+    # never lands, while the group still reports applied.  Asserted against the
+    # synthetic pristine fixture for both shapes.
+    def pristine_text(frontswap):
+        return (
+            "#include <linux/sched/task.h>\n"
+            "\n"
+            "/*\n"
+            " * We may have stale swap cache pages in memory: notice\n"
+            " * them here and get rid of the unnecessary final write.\n"
+            " */\n"
+            "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+            "{\n"
+            "\tint ret = 0;\n"
+            "\n"
+            + frontswap +
+            "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n"
+            "out:\n"
+            "\treturn ret;\n"
+            "}\n"
+            "\n"
+            + b41._ENGINE_ANCHOR_OLD
+        )
+
+    for label, frontswap in (("plain", b41.PLAIN_PROBE),
+                             ("hook", b41.HOOK_PROBE)):
+        base = pristine_text(frontswap)
+        for index, (_rel, _old, new, _req) in enumerate(steps):
+            check(f"{label} shape: step {index}'s replacement is not already "
+                  "in the pristine file", new not in base)
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
+            if i == j or new_i in old_j:
+                continue
+            check(f"step {i} does not pre-create step {j}'s replacement",
+                  new_j not in new_i)
+    check("the offload step keeps the pristine tail verbatim",
+          steps[1][2].endswith(b41._C_OFFLOAD_OLD), steps[1][2])
+    check("the engine step keeps the file's last function verbatim",
+          steps[3][2].startswith(b41._ENGINE_ANCHOR_OLD))
+
+    # Two fixture shapes: the 167/178/194 form and the android13-5.15-lts form
+    # carrying AOSP's android_vh_shrink_page_lock_owner_clear().  The probe is
+    # what discriminates them, because a hook call cannot be emitted on a tree
+    # whose DECLARE_HOOK does not exist.
+    prefixes = {
+        "plain": b41.PLAIN_PROBE,
+        "hook": b41.HOOK_PROBE,
+    }
+    for label, frontswap in prefixes.items():
+        pristine = pristine_text(frontswap)
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, {b41.PAGE_IO: pristine})
+            body = b41.swapout_body(ctx)
+            check(f"{label} shape: the probe resolves", body is not None)
+            if body is None:
+                continue
+            status, detail = core._vm_kcompressd_swapout_apply(ctx)
+            check(f"{label} shape: all three steps apply",
+                  status == "applied", (status, detail))
+            text = ctx.read(b41.PAGE_IO)
+
+            # The engine, the thread and the knob really landed.
+            check(f"{label} shape: the store path is hooked in",
+                  "\tif (abk_kcompressd_store(page)) {\n" in text
+                  and "\t\treturn 0;\n" in text)
+            # The page lock must be released inside that block, before the
+            # return.  Without it the early return skips __swap_writepage(),
+            # which is where the unlock normally happens, so pageout() reads
+            # our 0 as PAGE_SUCCESS, its trylock_page() fails because
+            # shrink_page_list() still holds the lock, `keep:` (which sits
+            # after keep_locked:'s unlock_page()) does no unlocking itself,
+            # move_pages_to_lru() does not unlock either, and
+            # do_swapout()'s own lock_page() sleeps forever.  Measured on
+            # vermeer: 26 pages queued, swapped pinned at 0, thread in D.
+            #
+            # The block is cut out first and then searched, never searched in
+            # place: page_io.c calls unlock_page() in do_swapout() as well,
+            # and an unbounded regex walking forward from the `if` would find
+            # that one and pass with the fix deleted.  Verified by deleting
+            # the line and watching this go red.
+            offload_block = re.search(r"\tif \(abk_kcompressd_store\(page\)\)"
+                                      r" \{\n(.*?)\n\t\}\n", text, re.S)
+            check(f"{label} shape: the offload releases the page lock",
+                  offload_block is not None
+                  and "unlock_page(page);" in offload_block.group(1),
+                  offload_block.group(1) if offload_block else "(no block)")
+            check(f"{label} shape: the thread is named kcompressd%d",
+                  '"kcompressd%d", nid);' in text)
+            check(f"{label} shape: per-node state is private",
+                  "static struct abk_kcompressd_node "
+                  "abk_kcompressd_nodes[MAX_NUMNODES];" in text,
+                  # the array is plural because the singular name was
+                  # already taken by the thread function below -- a
+                  # redefinition as different kinds of symbol that no
+                  # text audit could see (the CI compile gate found it).
+                  [ln.strip() for ln in text.splitlines()
+                   if "abk_kcompressd_nodes[" in ln])
+            check(f"{label} shape: the knob and its counters are registered",
+                  'register_sysctl("vm", abk_kcompressd_sysctl_table);' in text
+                  and ".procname	= \"kcompressd\"," in text
+                  and ".procname	= \"kcompressd_enqueued\"," in text)
+            check(f"{label} shape: the three-argument __swap_writepage form",
+                  "__swap_writepage(page, &wbc, end_swap_bio_write);" in text)
+            check(f"{label} shape: the reference the refcount argument needs",
+                  "get_page(page);" in text and "put_page(page);" in text)
+            check(f"{label} shape: the head-drain ordering",
+                  "unlikely(!kfifo_out(&kcd->fifo, &head, sizeof(page)))" in text
+                  and "if (head)" in text)
+            check(f"{label} shape: the gates",
+                  "if (!current_is_kswapd())" in text
+                  and "if (!PageAnon(page))" in text
+                  and "if (memcg_is_dying(page_memcg(page)))" in text
+                  and "if (!frontswap_enabled() &&" in text
+                  and "SWP_SYNCHRONOUS_IO" in text)
+
+            # The vendor hook is the shape's defining difference: replicating
+            # it where the tree has no DECLARE_HOOK would not compile, and
+            # dropping it where the tree has it would break the AOSP
+            # shrink_page_lock_owner_clear contract.  Count over the whole
+            # file: once in the fixture's own swap_writepage() on the hook
+            # shape (zero on the plain one) plus one in the engine's replica.
+            hook_call = "\t\ttrace_android_vh_shrink_page_lock_owner_clear(page);\n"
+            hooked = ("\t\tset_page_writeback(page);\n" + hook_call) in text
+            check(f"{label} shape: the frontswap hook follows the tree's shape",
+                  hooked == (label == "hook"), (hooked, label))
+            check(f"{label} shape: the engine replicates the hook exactly once",
+                  text.count(hook_call) == (2 if label == "hook" else 0),
+                  text.count(hook_call))
+
+            # One lock taken, and the counter/put_page shared by both branches.
+            # "unlock_page(page);" contains "lock_page(page);", so the lock is
+            # counted per line rather than by substring.
+            engine = text.split(
+                "ABK stable_515_backport: Batch 41 -- kcompressd swap-out"
+                " offload.", 1)[1]
+            do_swapout = engine[:engine.index("/*\n * abk_kcompressd_enqueue")]
+            locks = [ln.strip() for ln in do_swapout.split("\n")
+                     if ln.strip() == "lock_page(page);"]
+            check("do_swapout takes the page lock exactly once",
+                  locks == ["lock_page(page);"], locks)
+            check("do_swapout drops the reference on both exits",
+                  do_swapout.count("put_page(page);") == 2,
+                  do_swapout.count("put_page(page);"))
+            check("do_swapout counts both branches",
+                  do_swapout.count("atomic_long_inc(&abk_kcompressd_swapped);")
+                  == 1)
+            check("do_swapout has no leftover goto out",
+                  "goto out;" not in do_swapout)
+            check("the engine opens no preprocessor gate",
+                  "#if" not in engine and "#endif" not in engine)
+
+            # Safety guards.  These are the three that turn an unreachable or
+            # future condition into a fallback instead of a crash or a stall, so
+            # they are pinned like any behaviour-visible symbol.
+            guard = ('\tif (unlikely(!PageSwapCache(page))) {\n'
+                     '\t\tpr_warn_once("kcompressd: dropping a queued page')
+            check("the swap-slot guard skips the write instead of warning",
+                  guard in text, text.count("pr_warn_once"))
+            # Comment lines are excluded: the payload *names* WARN_ON_ONCE in
+            # the comment explaining why it is not used, which is the whole
+            # point of the assertion.
+            code_lines = [ln for ln in engine.split("\n")
+                          if not ln.lstrip().startswith(("*", "/*", "//"))]
+            warns = [ln.strip() for ln in code_lines
+                     if "WARN_ON" in ln or "WARN(" in ln]
+            check("no WARN in the payload's code (a WARN is an oops, and "
+                  "panic_on_oops turns it into a panic)",
+                  not warns, warns)
+            check("the drain thread cannot enqueue into its own FIFO",
+                  "if (unlikely(kcd->task == current))" in text)
+            check("the kswapd-only gate is still the one that rejects",
+                  "if (!current_is_kswapd())" in text)
+            check("the knob registration fails closed",
+                  "struct ctl_table_header *header;" in text
+                  and 'header = register_sysctl("vm", '
+                      'abk_kcompressd_sysctl_table);' in text
+                  and "if (!header) {" in text
+                  and 'pr_err("kcompressd: cannot register '
+                      '/proc/sys/vm/kcompressd, offload disabled' in text)
+
+            # Node lifecycle.  Without the teardown, every hotplug removal
+            # leaks a kthread + ring + task_struct; without the stop-aware
+            # predicate, kthread_stop() blocks forever on a thread nothing
+            # wakes, holding mem_hotplug_lock in write mode; without the
+            # in-lock task re-check, a reclaim page that passed the unlocked
+            # task read can touch a just-freed ring.
+            check("the node bring-up and teardown both exist",
+                  "static void abk_kcompressd_add_node(int nid)" in text
+                  and "static void abk_kcompressd_del_node(int nid)" in text)
+            check("the teardown NULLs the task pointer under the ring lock",
+                  "task = kcd->task;" + "\n" + "\t" + "kcd->task = NULL;" in text)
+            check("the teardown wakes before kthread_stop",
+                  text.index("wake_up_interruptible(&kcd->wait);")
+                  < text.index("kthread_stop(task);"))
+            check("the teardown drains and frees the ring",
+                  "while (kfifo_out(&kcd->fifo, &page, sizeof(page)))" in text
+                  and "kfifo_free(&kcd->fifo);" in text)
+            check("the stop flag is part of the wait predicate",
+                  "!kfifo_is_empty(&kcd->fifo) ||" in text
+                  and "kthread_should_stop());" in text)
+            check("the enqueue refuses a node whose thread is gone",
+                  "if (unlikely(!kcd->task)) {" in text)
+            check("the notifier is registered and returns NOTIFY_OK",
+                  "register_memory_notifier(&abk_kcompressd_memory_nb);" in text
+                  and "return NOTIFY_OK;" in text)
+            check("MEM_OFFLINE is gated on the node becoming memoryless",
+                  "if (arg->status_change_nid < 0)" in text
+                  and "case MEM_OFFLINE:" in text)
+            # The memcg gate is the only helper with a page-shape precondition
+            # (page_memcg's CONFIG_DEBUG_VM_PGFLAGS tail assert), so it has to run
+            # after every shape-agnostic gate.
+            order = [text.index("if (!current_is_kswapd())"),
+                     text.index("if (!PageAnon(page))"),
+                     text.index("if (!frontswap_enabled() &&"),
+                     text.index("if (memcg_is_dying(page_memcg(page)))")]
+            check("the memcg gate is evaluated last", order == sorted(order),
+                  order)
+
+            ctx2 = make_ctx(tmp, {b41.PAGE_IO: text})
+            status2, detail2 = core._vm_kcompressd_swapout_apply(ctx2)
+            check(f"{label} shape: second pass is already_present",
+                  status2 == "already_present", (status2, detail2))
+            check(f"{label} shape: second pass is byte-identical",
+                  ctx2.read(b41.PAGE_IO) == text)
+
+    # An unknown shape must stop the group, not make it guess: a tree whose
+    # frontswap branch is neither of the two is exactly the tree where the
+    # hook variant might be wrong.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b41.PAGE_IO:
+                             "#include <linux/sched/task.h>\n"
+                             "int other(void);\n"})
+        status, detail = core._vm_kcompressd_swapout_apply(ctx)
+        check("an unknown shape reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the unknown-shape tree is not written",
+              ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = core._vm_kcompressd_swapout_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written",
+              ctx.pending_writes() == [])
+
+
 def test_batch40_erofs_readahead():
     """Batch 40: the erofs readahead temporary-buffer relaxation."""
     print("Batch 40: erofs_readahead_relaxed_gfp (readahead allocs may fail)")
@@ -5518,6 +5800,7 @@ def main():
     test_batch37_reclaim_paths()
     test_batch35_pagecache_pt()
     test_batch40_erofs_readahead()
+    test_batch41_kcompressd_offload()
 
     print()
     if FAILURES:

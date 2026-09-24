@@ -550,6 +550,700 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+<a id="batch-41"></a>
+
+## Batch 41(v0.46.0)
+
+主题：**kcompressd —— 把 kswapd 在 `swap_writepage()` 里的压缩/换出工作搬到 per-node 的
+`kcompressd%d` kthread**。落地 **1 组**（`scripts/batch41_core_vm_kcompressd.py`，
+core 65 → **66**，模块 `0.45.0` → `0.46.0`）；这是本模块第一个 `mm/page_io.c` 组。
+
+上游是 [firelzrd/kcompressd-unofficial](https://github.com/firelzrd/kcompressd-unofficial) 的
+**Kcompressd-Unofficial 0.5**（作者 Masahito Suzuki，fork 自 MediaTek 的 Kcompressd，作者
+Qun-Wei Lin），补丁副本存 `research/upstream-5.15.y/patches/kcompressd-unofficial-0.5-linux6.12.44.patch`。
+**上游只发行 6.12.44 / 6.18 / 7.1-rc1 三个内核的 patch，没有 5.15 版**，所以本批不是回移，
+而是**改写载体**。交付时同时纠正 `plan.md` 里「kcompressd 这条线已由 Batch 10-1 接走」这个
+**不成立**的判断：Batch 10-1 的 `zram_async_recompress` 卸载的是**已入库页的二次重压缩**（省已用内存），
+kcompressd 卸载的是**首次换出时的压缩**（省回收延迟 / 分配停顿），两者对象不同，不互相覆盖。
+
+### 1. `struct pglist_data` 被 KMI 完整钉死 —— 上游载体不可用（硬约束，已查实）
+
+上游往 `struct pglist_data` 加 4 个字段（`kcompressd_wait` / `kcompressd` / `kcompress_fifo` /
+`kcompress_fifo_lock`），位置在 `kswapd_failures` 之后、`#ifdef CONFIG_COMPACTION` 之前。这条路
+在本树封死，证据（沿用前批做法：拉 `android/abi_gki_aarch64.xml` 逐结构核对，见 Batch 36 §1）：
+
+- `android/abi_gki_aarch64.xml`（14.6 MB，本批从 `android13-5.15-lts` 重新拉取并直接解析，
+  不是沿用前批结论）对 `struct pglist_data` **带完整布局**：`<class-decl name='pglist_data'
+  size-in-bits='56320' ... filepath='include/linux/mmzone.h' line='1023'>`，22 个成员从
+  `node_zones`(offset 0) 到 `totalreserve_pages`(offset 41280) **每一个都带
+  `layout-offset-in-bits`**。上游那 4 个字段本应插在 `kswapd_failures`(offset 40768) 之后、
+  `android_oem_data1`(offset 40832) 之前 —— 那会移动 `android_oem_data1` 及其后全部成员
+  ⇒ KMI 破坏。**量化的破坏**：`wait_queue_head_t` 192 bit + `struct task_struct *` 64 bit +
+  `struct kfifo`（5×`unsigned int`+指针，对齐到 32 B）256 bit + `spinlock_t` 32 bit = **544 bit
+  (68 B)**，会让 `android_oem_data1` 的 offset 从 40832 推到 41376、其后 15 个成员全部平移，
+  结构 `size-in-bits` 从 56320 变成 56864。XML 里该结构实际记了 30 个 `data-member`
+  （22 个手写成员 + `_pad1_`/`_pad2_` 等展开项）。
+- 该结构**没有 `ANDROID_KABI_RESERVE` 运行段**可花 —— 同一份 XML 里 `struct zone` 有
+  `android_kabi_reserved1` … `android_kabi_reserved4`（4 个空槽，`size-in-bits=12800`），
+  而 `pglist_data` 的成员名列表里 `reserve` 出现 6 次、全是 `lowmem_reserve` /
+  `nr_reserved_highatomic` 这类语义字段，**一个 KABI 槽都没有**。
+- 唯一看着空着的成员 `ANDROID_OEM_DATA(1)`（源码 `include/linux/mmzone.h:1075`，宏定义来自
+  `include/linux/android_vendor.h`）经本批核实**正是 `u64 android_oem_data1`**，而且它在 XML 里
+  有名字有 offset（40832 ⇒ 已计入 ABI）。宏本身 `#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA`
+  下才是这句，`#else` 分支展开为空 —— 8 字节单成员，塞不下 4 个字段，且归 OEM 私有，
+  不是本模块能用的 KABI 槽。
+
+### 2. 设计：7 个上游文件 → 本树 1 个文件，零结构体改动
+
+整包载荷落 `mm/page_io.c`，照 Batch 10-1 的既有范式（「模块私有状态代替改内核结构体」——
+Batch 10-1 用 `struct abk_zram_recomp_map` / `abk_zram_recomp_map_head` / `abk_zram_recomp_map_lock`
+三件套装 per-device worker，docstring 原文 "no struct zram change"）：
+
+| 上游 | 本树替代 |
+|---|---|
+| `struct pglist_data` 的 4 个字段 | `static struct abk_kcompressd_node abk_kcompressd[MAX_NUMNODES];`（`wait` / `task` / `fifo` / `lock`） |
+| `mm/mm_init.c` 的 `init_waitqueue_head` | 静态 BSS 零初始化 + initcall 里 `init_waitqueue_head()` |
+| `kswapd_run()` / `kswapd_stop()` 建/拆线程 | 一个 `late_initcall` 遍历 online node 建线程 |
+| `kernel/sysctl.c` 的 `vm_table[]` 项 | 同一 initcall 里 `register_sysctl("vm", table)` |
+| `include/linux/swap.h` 的 `extern int vm_kcompressd` | 变量 `static` 在 `mm/page_io.c` |
+
+索引用 `page_to_nid(page)`，不是上游的 `NODE_DATA(numa_node_id())`：语义上更正确（FIFO 上的页归它
+**自己**所在 node 的线程服务，压缩缓冲区也在本 node 上分配），并且不必为此新增
+`#include <linux/topology.h>`。`MAX_NUMNODES` 的取值已核实：`arch/arm64/Kconfig:1290` 的
+`NODES_SHIFT` 是 `range 1 10` / `default "4"` / `depends on NUMA`，而 `include/linux/numa.h`
+在 5.15 还是 `#ifdef CONFIG_NODES_SHIFT` 的老形状（v6.3 才改成 `NODE_DATA(nid)->nr_pages` 那套），
+所以要么 NUMA 关（=1），要么开（=16）；静态数组最多 16 × ~64 B ≈ 1 KB，零分配成本可忽略。
+`kfifo_alloc()` 放在 initcall 里而不是把 `DECLARE_KFIFO` 内嵌进结构体，是为了守住「per-node 静态
+足迹最小」；失败路径就是上游自己的处置——`pr_err` 后该 node 保持「无线程 → 同步」。
+
+**`mm/vmscan.c` 一行不碰。** 附带收益：照抄上游会在本树漏建线程——android13-5.15 的
+`kswapd_run()` 是 `void kswapd_run(int nid)`，**没有** `__meminit`，**没有** 6.x 的
+`pgdat_kswapd_lock()` 包裹，而是 `if (pgdat->kswapd) return;` + Android 的
+`trace_android_vh_kswapd_per_node(nid, &skip, true)`，`skip` 为真就提前 return。改用 initcall 后
+这个陷阱直接消失。
+
+**node 热插拔后新 node 拿不到线程**，`abk_kcompressd_store()` 读 `kcd->task == NULL` 就退回同步写。
+这是已论证过的安全退化（不是 BUG、不是内存泄漏、不产生半打补丁状态）：`mm/vmscan.c` 不碰，没有地方
+挂 memory notifier；代价只是那台新 node 上的回收线程得不到此项优化。
+
+### 3. 六道准入门：上游 5 道 + 本模块自己的政策 1 道
+
+上游 `kcompressd_store()` 的五道门，逐一在 5.15 上核实后处置；另加本模块政策一道（第 4 条）：
+
+1. `current_is_kswapd()` —— 5.15 自带（`include/linux/swap.h:39-42`，`mm/vmscan.c` 自己用了 20 处），
+   **原样保留**，且**不得放开到 direct reclaim**（详见 §5）。
+2. `vm_kcompressd != 0` 且线程已起 —— 保留。`vm.kcompressd` 的**双重语义**照上游：`0` = 整个功能
+   关闭；`>0` = FIFO 的**软上限**（提前多少个页就启动 head-drain），**不是队列容量**，物理容量恒为
+   `ABK_KCOMPRESS_FIFO_SIZE 256`（上游写死在 `mmzone.h`）。默认 24、范围 0..256、mode 0644、
+   `proc_dointvec_minmax` + `extra1 = SYSCTL_ZERO`。
+3. `folio_test_anon()` → `PageAnon(page)` —— 只匿名页。
+4. `mem_cgroup_zswap_writeback_enabled(folio_memcg(folio))` —— **5.15 无此符号，删掉**，换成
+   **本模块自己的政策**：`memcg_is_dying(page_memcg(page))`（Batch 38 `memcg_dying_bailout` 加进
+   `include/linux/memcontrol.h`）。这不是「上游有所以我们抄」，是政策一致性：本模块的回收政策是
+   「memcg 一旦进入拆除，回收就停」，kcompressd 是回收链上新出现的一个写者。零新 include 成本——
+   `page_memcg()` 与 `memcg_is_dying()` 经 `mm/page_io.c` 已有的 `linux/swap.h` → `linux/memcontrol.h`
+   已可达。
+5. swap 设备「同步高效」：上游 `!zswap_is_enabled() && !(swp_swap_info(folio->swap)->flags &
+   SWP_SYNCHRONOUS_IO)`。`zswap_is_enabled()` **5.15 无此符号**（5.15 还叫 `zswap_enabled()`，
+   6.12 才改名成 `zswap_is_enabled()`）⇒ 换成 `frontswap_enabled()`——同一问题的 5.15 拼法，
+   因为 5.15 的 zswap 是 frontswap 后端。**这道门在 zram 上是通的**（否则整套补丁在 Android 上就是
+   空转），两份时代各自的证据：
+   - **6.12**：`mm/swapfile.c` 用 `bdev_synchronous(si->bdev)`（queue 的 SYNC 标志）；zram 在
+     `drivers/block/zram/zram_drv.c` 用 `BLK_FEAT_SYNCHRONOUS` limit 声明 ⇒ 置位。
+   - **android13-5.15**：`mm/swapfile.c:3252` 是 `if (p->bdev && p->bdev->bd_disk->fops->rw_page)
+     p->flags |= SWP_SYNCHRONOUS_IO;`，而 zram 在同一 `zram_drv.c` 里实现了
+     `.rw_page = zram_rw_page` ⇒ **同样置位**。所以「纯 zram、没开 zswap」的 Android 设备上
+     offload 真实生效。这道门的用意是排掉异步慢速设备（网络 swap、慢 SSD）——那种场合把提交搬到
+     另一个线程只是把等待搬了个地方。
+6. FIFO 深度检查 → 队列到软上限时走 **head-drain**（§4）。
+
+### 4. 核心机制：FIFO 满时的顺序保持（Unofficial 相对 MediaTek 原版的主要改进，必须实现）
+
+```
+scoped_guard(spinlock_irqsave, &pgdat->kcompress_fifo_lock)      /* 5.15 手写成
+    if (kfifo_len(&pgdat->kcompress_fifo) >= sysctl_kcompressd * sizeof(folio) &&
+        unlikely(!kfifo_out(&pgdat->kcompress_fifo, &head, sizeof(folio))))
+        return false;                    /* 出队失败 → 退回同步 */
+
+get_page(folio)                          /* ← 承重墙，见 §5 */
+ret = kfifo_in(&pgdat->kcompress_fifo, &folio, sizeof(folio));
+if (likely(ret))  wake_up_interruptible(&pgdat->kcompressd_wait);
+else              put_page(folio);
+
+if (head)  do_swapout(head);             /* 把队头最老那个同步做掉，再返回 */
+return ret;
+```
+
+即：**队列到软上限时，把队头最老那一页取出来同步做掉，再把新页塞进去**。MediaTek 原版是「新请求走
+同步、老请求留在队列」，导致完成顺序与提交顺序颠倒 + 老数据饿死。Unofficial 的做法顺带得到背压：
+队列满后每入队一个新页都要先阻塞等一次老页的同步写，等于满了就自动退化回接近同步，但顺序仍是
+先到先服务。
+
+`do_swapout()` 上游形态就是 5.15 `swap_writepage()` 后半段的照搬（构造 `writeback_control`
+`WB_SYNC_NONE` / `nr_to_write=SWAP_CLUSTER_MAX` / `range_start=0` / `range_end=LLONG_MAX` /
+`for_reclaim=1`；先试 frontswap/zswap，成功则 `set_page_writeback` + `unlock_page` +
+`end_page_writeback`；否则 `__swap_writepage()`（其内部隐含解锁）；最后 `put_page`）。
+kcompressd 线程本体照上游：`current->flags |= PF_MEMALLOC | PF_KSWAPD;` +
+`wait_event_interruptible()` + `while (kfifo_out_locked(...)) do_swapout(page);`，
+无节流、无批合并、无 cgroup 限速。上游注释原文说 `PF_KSWAPD` 是 "prevents Intel Graphics driver
+from crashing the system in `i915_gem_shrinker_scan()`"；副作用是 shrinker 会把它当 kswapd 对待。
+
+### 5. 两处本批对上游的修正（a：页锁；b：引用计数的源码级论证）
+
+**(a) `do_swapout()` 必须自己 `lock_page(page)` —— 上游带着一个潜伏双解锁。**
+静态分析没能闭合的页锁/PG_writeback 时序问题，四问都已在 android13-5.15 源码上查实：
+
+| 问题 | 结论（源码位置） |
+|---|---|
+| stock zram rw_page 路径上 PG_writeback 由谁置位 | **`block/bdev.c` 的 `bdev_write_page()`**：`set_page_writeback(page)` 在 `ops->rw_page()` **之前**无条件调用（`bdev.c:370` on .216，`bdev.c:373` on 167/178/194）。`mm/page_io.c` 的 `bdev_write_page` 成功分支自己不调，所以在 `page_io.c` 里找是找不到的——它低一层 |
+| 页锁最终由谁释放 | 同步路径下是同一个 `bdev_write_page()`（成功分支 `unlock_page(page)`；之后 `rw_page` 里 `zram_rw_page()` 成功时经 `page_endio()` → `end_page_writeback()` 只清 PG_writeback、不解锁）。**offload 路径下不是它**——页在 `__remove_mapping()` 失败后走 `cannot_free` → `keep_locked:`（`mm/vmscan.c:1874`），那一段**自己 `unlock_page()`** 再把页放回 LRU（标签名是历史遗留，实际执行解锁）。所以 kcompressd 接手时 `PG_locked` 已无人持有 |
+| 搬到 kcompressd 线程后 (a)(b) 是否仍成立 | PG_writeback 仍由 `bdev_write_page()` 在 kcompressd 线程里置、由 `page_endio()` 清，链不变；但**页锁必须在 `do_swapout()` 里重新取**，因为 `keep_locked:` 已经放掉了。`__swap_writepage()` 是 `->writepage` 实现、每个出口（`bdev_write_page()`、`__swap_writepage()` 的 SWP_FS_OPS 分支、bio 分支）都 `unlock_page()`，而 `unlock_page()` 带 `VM_BUG_ON_PAGE(!PageLocked(page))`（要 `CONFIG_DEBUG_VM` 才可见）。不带 `CONFIG_DEBUG_VM` 时它表现为对已清的 PG_locked 位做一次无害 `clear_bit_unlock`，所以错误长期看不见 |
+| `end_page_writeback()` 里 `BUG()` 的触发条件 | `if (!test_clear_page_writeback(page)) BUG();` —— PG_writeback **未置位**时才触发。本路径上 `bdev_write_page()` 在 `rw_page` 前已置位，`zram_rw_page()` 成功时 `page_endio(page, op_is_write(op), 0)` 走 `end_page_writeback()` 直接清（`mm/filemap.c:1626`，err==0 分支不清 PG_writeback），⇒ **不触发** |
+
+上游 6.12 的 `keep_locked:`（`mm/vmscan.c:1531`）同样 `folio_unlock(folio)`，`__swap_writepage()` 的
+`swap_writepage_bdev_sync()` / `_async()` 也照样 `folio_unlock(folio)` ⇒ **上游 0.5 自己带着这个潜伏
+双解锁**，只因 `CONFIG_DEBUG_VM` 关着而没暴露。本批修掉它。
+
+**(b) 只有 kswapd 能 offload —— `page_ref_freeze()` 机制的必然推论，不是保守选择。**
+`shrink_page_list()` 自己持锁跑完整个 body（`mm/vmscan.c:1455` `if (!trylock_page(page)) goto keep;`），
+`pageout()` 返回 `PAGE_SUCCESS` 后落到 `__remove_mapping()`（`mm/vmscan.c:1829`）。它的门是
+（`mm/vmscan.c:1166-1168`）：
+
+```c
+	refcount = 1 + compound_nr(page);
+	if (!page_ref_freeze(page, refcount))
+		goto cannot_free;
+```
+
+`page_ref_freeze()` 是 `atomic_cmpxchg(&page->_refcount, count, 0)`，要求 refcount **恰好相等**。
+base 页 `compound_nr()==1` ⇒ 要求 == 2（隔离引用 1 份 + LRU 上 1 份）。`kcompressd_store()` 里
+`get_page(page)` 把 refcount 变成 3 → `page_ref_freeze` 失败 → `cannot_free`（`mm/vmscan.c:1225`）→
+`__remove_mapping()` 返 0 → `shrink_page_list` 走 `keep_locked`，页回 LRU，**swap cache 项保持存活**，
+等 kcompressd 写完 `put_page()` 后下一轮才真正释放。
+
+**这个引用计数是承重墙，不是可选项**：没有它，`__remove_mapping()` 会走到
+`__delete_from_swap_cache()` + `put_swap_page()`，swap slot 在 kcompressd 还没写的时候就归还空闲池、
+可能被别人领走，之后 kcompressd 往这个 slot 写 = 覆盖别人的换出数据。`remove_mapping()` 的注释原文：
+"If it is dirty or if **someone else has a ref on the page**, abort and return 0."
+
+而 `cannot_free` 路径**不计 `nr_reclaimed`**（`nr_reclaimed += nr_pages` 只在 `free_it:`
+`mm/vmscan.c:1840`）。于是 kcompressd 让**每一页**都走 cannot_free → 整趟 `shrink_page_list()` 返 0：
+
+- **kswapd**：`sc->nr_reclaimed` 也是 0，水位没达到，kswapd 继续转；下一轮 `put_page()` 落下后
+  `page_ref_freeze` 成功，页真被释放，水位达标。代价只是多扫一轮、多一会儿延迟 —— **收敛，不炸**。
+- **direct reclaim**：`shrink_inactive_list()` 返 0 → `do_try_to_free_pages()` 达不到
+  `sc->nr_to_reclaim` → 上报「什么都没回收」→ `__alloc_pages_slowpath()` 升级 →
+  **在有大量可回收内存的情况下走进 OOM killer**。
+
+另一条已排除的顾虑：推迟的页回 LRU 时 PG_dirty 已被 `clear_page_dirty_for_io()` 清掉，下一轮
+`if (PageDirty(page))` 为假，根本不进 `pageout()`，**不会重复入队**。
+
+顺带一个可观测的行为差异（已写进载荷注释）：offload 路径上 `pageout()` 回头看
+`!PageWriteback(page)` 为真（PG_writeback 还没置），于是执行 `ClearPageReclaim(page)`；同步路径上
+`bdev_write_page()` 已经置了 PG_writeback，那句不执行，最后由 `end_page_writeback()` 里的
+`rotate_reclaimable_page()` 把页塞进 LIFO 延迟移到尾。offload 路径少了这一次 rotate —— 而那页
+本来下一轮就会被（`put_page()` 之后的）释放掉，rotate 只会是白做的功。**净效果是少一次 lruvec
+操作，不改变任何正确性判定**（`rotate_reclaimable_page()` 还要求 `!PageLocked`，在 kcompressd 线程里
+恰好在 `bdev_write_page()` 刚解锁后成立，若真走到也是安全的）。
+
+### 6. AOSP vendor hook 契约：一个 step 覆盖不了的形状问题
+
+`mm/page_io.c` 在 5.15 全文只有 2 处 `#if`（THP、memcg+blkcg），**没有任何 `CONFIG_SWAP` 包裹**，
+所以这个组不需要 config 门。**但**：`android13-5.15-lts` 在 `swap_writepage()` 的三个解锁点、
+`__swap_writepage()` 的两处、以及 `block/bdev.c` 的 `bdev_write_page()` 成功分支里，各插了一个
+`trace_android_vh_shrink_page_lock_owner_clear(page)`（vendor hook 同批加进
+`include/trace/hooks/vmscan.h` 的 `DECLARE_HOOK`，并由 `mm/page_io.c` 的
+`#undef CREATE_TRACE_POINTS` + `#include <trace/hooks/vmscan.h>` 定义 tracepoint）。
+**167/178/194 三个基线既没有调用也没有 `DECLARE_HOOK`**（逐字节核实：.216 的
+`include/trace/hooks/vmscan.h` 比 194 只多这两段 `DECLARE_HOOK`）。
+
+所以 `do_swapout()` 接管的两条分支里，frontswap 那条要在本树复刻这个调用 —— 而它是
+**每基线不同的文本，不是 config gate**（无符号可 gate）。处置：`_vm_kcompressd_swapout_apply`
+按 `swap_writepage()` 的 `frontswap_store()` 块**探针**两个形状，载荷文本跟着变；两个形状都不匹配
+就报 `blocked_by_shape` 且一个字节都不写。`__swap_writepage()` 那半不需要复刻——它携带的 hook
+（`page_io.c:266` / `:308`、`bdev.c:380`）在 callee 里，跟着调用走。
+
+**一处精度修正（写进载荷注释与本章）**：`current_is_kswapd()` 测的是 `current->flags &
+PF_KSWAPD`，而 kcompressd 线程**自己就设了 `PF_KSWAPD`** —— 所以这道门机械上放行的是
+「kswapd **或 kcompressd 自己**」，不是严格的「只有 kswapd」。当前不构成危害：5.15 的 offload
+路径（`frontswap_store()` → zswap / `__swap_writepage()` → `bdev_write_page()` → `zram_rw_page()`
+→ `zcomp_compress()`）**没有任何一处会回调 `swap_writepage()`**，因此不存在自入队。但这是潜在
+的递归入队面（上游 0.5 完全一样），将来若给 `do_swapout()` 加任何会走回收或写回的路径，必须同时
+加一道「当前是 kcompressd」的排除，否则会把页重新塞回自己正在 drain 的 FIFO。
+
+**这是本模块第一个「非上游形态改写、且形状差异无法用 CONFIG 表达」的组**，`docs/porting_policy.md`
+的 shape registry 段落已补一段说明为什么它也不能用 `already_present` 收场（没有上游 5.15 patch，
+不存在 pre-apply）。
+
+### 7. 可观测性：三个只读计数器
+
+上游零计数器、零 tracepoint。本仓库有前车之鉴（Batch 8 的 RCU `offload_all` 报 `applied` 实际没
+生效；Batch 10-4 的 `[zram_recompd]` 线程建了但没有一页被重压缩），所以**同一个 sysctl table 里
+必须带只读计数器**：`vm.kcompressd_enqueued` / `kcompressd_swapped` / `kcompressd_sync`
+（mode 0444、`proc_doulongvec_minmax`，`atomic_long_t`——它的值就是第一个成员，`.data` 可以
+直接指过去）。`enqueued - swapped` 就是**实时队列深度**，一眼看出 offload 是活的还是死的。
+**没有动 `include/linux/vmstat.h`**（不在 fixture 里，会引入多余文件）。
+`vm.kcompressd` 落在 KSU 伴生模块已经在写的同一接口域
+（`ksu/abk_runtime_tunables/common.sh` 的 `swappiness` / `page-cluster` / `watermark_scale_factor` /
+`min_free_kbytes`），**不引入新政策域，伴生模块不用改**。
+
+### 8. 与现有模块的冲突分析（三层；标 `[复核]` 的是本批实测复核过的）
+
+**第一层：文本锚点 —— 零冲突 `[复核]`。** `mm/page_io.c` 出现在 **0 个**组的文件列表里
+（把 89 个 `PatchGroup` 的 `files` 枚举过一遍），本组载荷落在完全未被认领的文件上，不存在 trap 5
+（后组改前组生成的文本）的压力。没有任何组改写 `pageout()` / `add_to_swap()` /
+`clear_page_dirty_for_io()` / `__swap_writepage()` / `zram_rw_page()` / `zram_bvec_write()` /
+`zram_bvec_rw()`。相邻文件全都拥挤（`mm/vmscan.c` 8 组、`mm/memcontrol.c` 10 组、
+`include/linux/swap.h` 4 组、`include/linux/mmzone.h` 2 组），这印证「只动 page_io.c」是对的。
+**一个例外要知道** `[复核]`：`mglru_wake_flushers` 拿 `mm/vmscan.c` 的
+`reclaimed = shrink_page_list(&list, pgdat, sc, &stat, false);` 当锚加了 unqueued-dirty 统计与
+flusher 唤醒，位置紧贴 pageout 循环上游 —— 不同文件，不影响本组，但**别去动那行**。
+
+**第二层：同一个热路径 —— 三个交错点。**
+
+1. `[复核]` Batch 37 的 reclaim 链（`memcg_memory_reclaim` / `cached_freeze_reclaim` /
+   `reclaim_swappiness_defines` / `proactive_reclaim_swappiness_arg` /
+   `proactive_reclaim_suspend_abort` / `lru_add_drain_dead_folios` 六组按依赖顺序反复改同一处
+   `memory_reclaim()` 调用点）触发的是 **direct reclaim**，与 kcompressd 正好互补：
+   它由 userspace 发起 → `current_is_kswapd()` 为假 → kcompressd 不介入。**不重叠，也不冲突。**
+   但**别去动这条链**，它的顺序是载荷的一部分。
+2. `[复核]` Batch 38 的 `memcg_is_dying()`：本组 `abk_kcompressd_store()` 里用它替换上游那道
+   memcg 作用域门（适配清单 #4）。已实测：`memcg_dying_bailout` 在 167/178/194/216 四档都报
+   `applied`，`include/linux/memcontrol.h` 的 `mem_cgroup_soft_limit_reclaim()` 声明/存根锚点四档
+   俱在 ⇒ **`memcg_is_dying()` 四档都真的存在**（`plan.md` / Batch 40 记录的 167/178 红项在本批
+   复核时已不存在）。若它降级，失败形态是编译期报找不到 `memcg_is_dying`，不是静默半打补丁。
+3. 页锁 / PG_writeback 时序 —— §5(a)，本批的主要技术工作，已闭合。
+
+**第三层：运行时政策叠加 —— 一致，无需改伴生模块 `[复核]`。**
+KSU 伴生模块已在写四个 vm tunable，`vm.kcompressd` 落在同一既有接口域；`zram_algo_lock`（Batch 11）
+锁压缩算法、`zram_secondary_comp`（Batch 10-4）注册第二压缩算法，kcompressd 只搬执行上下文、不改
+算法选择 ⇒ 无冲突。Batch 10-1 的 per-device `zram_recompd` kthread_worker 与 per-node
+`kcompressd%d` 线程名不撞，且分居 `zram_drv.c` / `page_io.c` 两个文件。
+`abk_kcompressd_*` 新符号与 suite-detection marker 清单（`dead_grafts_review.md`：`abk_zram_*` /
+`abk_sf_*` / `abk_gfp_*` / `abk_dra_*`）**交付前 grep 过，零撞名**。
+
+### 9. 未闭合风险清单（交付时明确标出，没有默默略过）
+
+1. **`try_to_free_swap()` 的 swap 项摘除路径（原题，未闭合）。**
+   `free_swap_cache()`（`mm/swap_state.c`）→ `try_to_free_swap()`（`mm/swapfile.c`）里
+   `page_swapped()` 只看 swap_map 计数、**不看 kcompressd 持有的那个引用**。页在 FIFO 期间若有人走
+   这条路，swap 项理论上仍可能被摘掉。**本批把它的可达性往上追了一层**：`try_to_free_swap()`
+   第一句就要 `VM_BUG_ON_PAGE(!PageLocked(page))`，`free_swap_cache()` 用 `trylock_page()`，
+   `release_pages()` / `free_page_and_swap_cache()` 都要求调用方**已持有该页引用**，而推迟的页当时
+   挂在 LRU 上、引用由 reclaim 与 kcompressd 各持一份，没有第三个持有者会去调 `release_pages()`。
+   另一条可达路径是 `do_swap_page()` 的缺页：它 `lock_page_or_retry()` 后会检查
+   `!PageSwapCache(page) || page_private(page) != entry.val`，但 `try_to_free_swap` 不在它的路上，
+   而它找到 swap cache 里的页时**跳过 `swap_readpage()`**（把页当已 uptodate 直接映射）——
+   映射到的就是同一份 RAM 内容，kcompressd 随后往**仍然有效**的 slot 写同一份数据，
+   **不构成数据损坏**。
+   ⇒ **仍未静态证死，但已把可达面压到「调用方持引用」这一类。** 设计上额外规避：`do_swapout()`
+   起手 `WARN_ON_ONCE(!PageSwapCache(page))` 然后放弃这次写（宁可丢一页也不能覆盖别人的换出数据）。
+   **未采纳「排队期间置 PG_writeback」这个规避**：它能挡 `try_to_free_swap()` 的
+   `if (PageWriteback(page)) return 0;`，但会让 `set_page_writeback()` 被调两次、
+   `NR_WRITEBACK` / `NR_WRITEBACK_TEMP` 计数失衡，并且把 `pageout()` 的 `ClearPageReclaim(page)`
+   判定改掉（`rotate_reclaimable_page()` 改成从 kcompressd 线程跑），需要重新推演一圈才敢用。
+   代价大于收益。
+2. **编译未验证。** 本地没有内核源码树，ABK CI 的「编译内核」闸门本轮**没有跑**。本文档所有
+   编译期结论（含 §13 新引入的 `<linux/memory.h>`、`register_memory_notifier()`、
+   `struct memory_notify`、`pfn_to_nid()`、`NOTIFY_OK` 的可达性）（`register_sysctl()` 在 `!CONFIG_SYSCTL` 下退化为同一个 inline 存根；
+   `atomic_long_t` 的 `.data` 指针兼容；`CONFIG_SYSCTL` 由 `fs/proc/Kconfig` 的 `PROC_SYSCTL`
+   `select`，而 `PROC_SYSCTL` 只 depend 于 `PROC_FS` 的 `default y`；`LLONG_MAX` /
+   `WARN_ON_ONCE` / `memcg_is_dying()` 的可达性）都是**源码静态分析**结论，不是编译证据。
+3. **`register_sysctl()` 的返回值没有检查 —— knob 可能静默消失。**
+   `!CONFIG_SYSCTL` 下它是返回 `NULL` 的 inline 存根，本组的 `vm.kcompressd` 与三个计数器就
+   **一个都不会出现在 `/proc/sys/vm/`**，而载荷本身照常编译照常运行、阈值停在编译期默认 24。
+   上游 6.12 用 `kernel/sysctl.c` 的 `vm_table[]` 项，那个文件整个由 `CONFIG_SYSCTL` 门控，
+   **不存在「编得进但 knob 不在」这个中间态** —— 所以这是本组换载体后新引入的一个静默失败面。
+   GKI 必然 `PROC_FS=y` ⇒ `PROC_SYSCTL=y` ⇒ `select SYSCTL`（已核实 `fs/proc/Kconfig`），
+   实际上不可达；若要收紧，就在 `abk_kcompressd_init()` 里判空并 `pr_err_once`。
+4. **设备侧收益未测。** 没有做 A/B，不主张任何具体数字；上游 0.5 自己也没有 5.15 口径的实测。
+
+### 10. 验证（四档全跑，一个没省）
+
+```bash
+python3 -m py_compile scripts/*.py tests/*.py                       # 绿
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh      # 绿
+python3 tests/stable_5_15_test.py                                   # all checks passed
+bash tests/fetch_sublevel_tree.sh <branch> <tree>                   # 四档 gap-fill
+python3 scripts/abk_stable_core.py ... --dry-run                    # 见下表
+python3 tests/step_audit.py <tree>                                  # 见下表
+python3 tests/implementation_audit.py <tree>                        # 见下表
+bash tests/smoke.sh <tree>                                          # 见下表
+```
+
+| 门槛 | .167 | .178 | .194 | .216(lts) |
+|---|---|---|---|---|
+| dry-run 本组 | `applied` | `applied` | `applied` | `applied` |
+| dry-run 全 child | `{applied: 66}` | `{applied: 66}` | `{already_present: 3, applied: 63}` | `{already_present: 8, applied: 58}` |
+| step_audit | OK（core 349 步，二次幂等） | OK（core 350 步） | OK（core 341 步） | OK（core 341 步） |
+| implementation_audit | IMPLEMENTATION AUDIT OK | 同左 | 同左 | 同左 |
+| smoke | SMOKE OK | SMOKE OK | SMOKE OK | SMOKE OK |
+
+四档**都没有** `missing_anchor` / `blocked_by_shape`（`tests/sublevel_matrix.py` 的
+`GROUP_COUNTS["stable_backport_core"]` 65 → **66**，本组四档全 `applied`、**不进 `PRE_APPLIED`**）。
+fixture 三处同步：`tests/fetch_sublevel_tree.sh` 的 `FETCH_FILES`、`tests/step_audit.py` 的
+`AUDIT_FILES`、`tests/smoke.sh` 的 `SMOKE_FILES` 各加 `mm/page_io.c` —— 顺带把参考树里缺失的
+`mm/vmstat.c` 与五个 erofs 文件 gap-fill 掉（它们只是没下载全，`buddyinfo_nolock` 与
+`erofs_readahead_relaxed_gfp` 因此在本批复核前报过 `blocked_by_shape`，四档补齐后与本组同轮
+全部 `applied`）。
+
+新增/改动的门禁：
+
+- `tests/stable_5_15_test.py::test_batch41_kcompressd_offload` —— **两个 fixture 形状**
+  （plain / hook）各跑一遍全三步 `applied` + 二次幂等 + 字节不变；trap 1（`new` 不能已存在于
+  pristine）、trap 2（任一步的 `new` 不能包含后一步的 `new`）、hook 复刻随形状走、
+  `do_swapout()` 只取一次锁、两个分支都计数、无残留 `goto out`、载荷不开 `#if`；
+  未知形状与缺文件都 `blocked_by_shape` 且不写树。
+- `tests/implementation_audit.py` 的 `REQUIRED_CONTENT["core:vm_kcompressd_swapout"]` ——
+  行为可见符号逐条钉（线程名 `kcompressd%d`、三个计数器、六道门、`get_page` / `put_page`、
+  head-drain、`__swap_writepage(page, &wbc, end_swap_bio_write)` 的 `&wbc` 三参形态、
+  `memcg_is_dying` 检查、线程体 `PF_MEMALLOC | PF_KSWAPD`）。**vendor hook 那条不能无条件钉**
+  （三个基线没有该符号），新增 `REQUIRED_CONTENT_IF_PRESENT`：以 pristine 文件自身是否已带该调用为
+  条件，只在带的基线上断言复刻存在。
+- `tests/smoke.sh` —— 新增 grep 断言（线程名、`abk_kcompressd_do_swapout` /
+  `abk_kcompressd_enqueue` 定义、`register_sysctl`、kswapd-only 门、FIFO 引用、head-drain、
+  `vm.kcompressd=0` 的关闭检查）+ hook 形状条件分支（带的基线上必须复刻且不得
+  `#define CREATE_TRACE_POINTS`；不带的基线上一个都不许出现）+ `mm/page_io.c` 的
+  rollback 字节同一断言。
+
+### 11. 结论分类（哪些是源码静态分析、哪些实测、哪些没有）
+
+- **实测（本机四档参考树上逐字节读源码 + 跑门禁）**：`struct pglist_data` 的 KMI 钉死结论 ——
+  本批从 `android13-5.15-lts` 重新拉取 `android/abi_gki_aarch64.xml`（14,707,593 字节）并**直接
+  解析**（不是沿用 Batch 36 的结论）：`size-in-bits=56320`、22 个手写成员各带
+  `layout-offset-in-bits`、无 `ANDROID_KABI_RESERVE`、`android_oem_data1` 是在册成员且为单
+  `u64`；同一次解析也确认 `struct zone` 有 4 个 `android_kabi_reserved1..4`；`keep_locked:` 会解锁页；`bdev_write_page()` 是 PG_writeback 的置位点且成功分支不解锁；
+  `zram_rw_page()` 的返回 0 / 1 / <0 三分支；`SWP_SYNCHRONOUS_IO` 在两个时代的置位路径；
+  `NODES_SHIFT` 与 `MAX_NUMNODES` 的取值；`node_online()` / `page_to_nid()` 无条件可用；
+  `register_sysctl()` 由 `CONFIG_SYSCTL` 门控而 `PROC_SYSCTL` 只 depend 于 `default y` 的
+  `PROC_FS`；`proc_doulongvec_minmax` 对 NULL `extra1/extra2` 有判空；vendor hook 只存在于 .216；
+  `memcg_is_dying()` 四档俱在。§12 追加四类：`VM_BUG_ON`/`VM_BUG_ON_PAGE`/`VM_BUG_ON_PGFLAGS`
+  全部由 `CONFIG_DEBUG_VM`/`CONFIG_DEBUG_VM_PGFLAGS` 门控（`include/linux/mmdebug.h:16-65`，
+  所以 `__swap_writepage()` 与 `unlock_page()` 的断言在生产内核上都不是 panic）；
+  `zs_free()` 的 `if (unlikely(!handle)) return;` 是上游自带、不是 Batch 33 引入的；
+  `__test_set_page_writeback()`/`test_clear_page_writeback()` 的加减收支平衡（压缩失败重投路径
+  两升两降）；`shrink_page_list()` 的 `if (!PageSwapCache(page))` 包着 `add_to_swap()`。
+- **源码静态分析（未运行内核）**：`page_ref_freeze()` → `cannot_free` → direct reclaim OOM 的论证；
+  `do_swap_page()` 缺页路径不构成数据损坏的论证；`try_to_free_swap()` 可达面的收窄；head-drain 的
+  背压与顺序性质；`rotate_reclaimable_page()` 少跑一次的净效果；`kthread_stop()` 只置位不唤醒
+  因而上游谓词会持写锁死锁的论证；`MEM_OFFLINE` 与 `MEM_GOING_OFFLINE` 的时序取舍；
+  并发 bring-up 覆盖 `kcd->task` 的竞态论证（判为保险而非活竞态）。
+- **完全没做**：**`CONFIG_MEMORY_HOTPLUG_SPARSE=n` 的构建没有实测**；**真机热插拔没有跑过**
+  （本地没有可热插拔的内核树）；编译未验证；设备侧收益未测。
+- **编译：第一轮 CI 已跑并抓到两个真缺陷**（见 §14 —— `mm/page_io.o` 四个 error 同源成
+  两个：`abk_kcompressd_store` 缺前向声明、数组与线程函数同名不同类符号）。§14.3 的编译级
+  自查（去注释后的定义/声明/使用顺序、同名异类符号、goto/label 配对、comment/brace 平衡）
+  是**静态自查，不等于编译通过** —— 它只证明这两类不再存在，不证明没有第三类。
+  修复后尚未重新过 CI。
+- **设备侧收益未测**（无 A/B，不主张数字）；`kcompressd` 线程在真机上的实际排队深度与 CPU
+  占用**未观测**；真机热插拔（含节点增删）**从未跑过**。
+
+### 12. 安全加固一轮：移除自找的 panic 面、关闭自入队活锁、knob 改为失败即关
+
+本批落地后按「有没有安全防护 / 有没有潜在 panic / 压缩失败会怎样」三个问题把载荷重审了一遍。
+结论先说：**压缩失败这条路径载荷完全不碰，由 5.15 自己的重试机制兜住，且计数收支平衡**；
+真正改掉的是四处自找的暴露面。四处都落在同一个组内，不新增文件、不改任何 anchor
+（`REQUIRED_CONTENT` / `REQUIRED_ABSENT` / 单测相应加针）。
+
+#### 12.1 压缩失败：已核实由 stock 机制全额兜住，载荷不引入新行为
+
+逐层读源码（`drivers/block/zram/zram_drv.c` 的 `__zram_bvec_write()` / `zram_bvec_rw()` /
+`zram_rw_page()`、`block/bdev.c` 的 `bdev_write_page()`、`mm/page_io.c` 的
+`__swap_writepage()`、`mm/page-writeback.c` 的 `__test_set_page_writeback()` /
+`test_clear_page_writeback()`），`__zram_bvec_write()` 返回负值只有三个出口：
+
+1. `zcomp_compress()` 失败 —— `pr_err("Compression failed! err=%d\\n")` 后
+   `zs_free(zram->mem_pool, handle)`。**`handle` 在这里恒为 0**，而 5.15 原版
+   `mm/zsmalloc.c` 的 `zs_free()` 第一句就是 `if (unlikely(!handle)) return;`
+   （已核实是上游自带、不是 Batch 33 graft 引入的）⇒ 空操作，无解引用、无 VM_BUG。
+2. `zs_malloc()` 两个 gfp 档都失败 ⇒ `-ENOMEM`。
+3. `zram->limit_pages` 超限 ⇒ 先 `zs_free(handle)` 再 `-ENOMEM`。
+
+三条都返回负值 → `zram_rw_page()` 按它自己的注释走"不调 `page_endio()`，直接返回错误，
+让上层 `rw_page` 用 bio 重投"→ `bdev_write_page()` 见 `result != 0` 走
+`end_page_writeback(page)` 并返回错误 → `__swap_writepage()` 回落到 **bio 路径**
+（`bio_alloc(GFP_NOIO, 1)` → `set_page_writeback()` → `unlock_page()` → `submit_bio()`），
+由 `zram_submit_bio` 再压一次。**这正是 stock 的行为，kcompressd 只是换了执行线程。**
+
+PG_writeback 记账收支平衡（已逐行核）：`set_page_writeback()` →
+`__test_set_page_writeback()` 只在 `TestSetPageWriteback()` 返回 0（原本未置位）时
+`inc_lruvec_page_state(page, NR_WRITEBACK)`；`test_clear_page_writeback()` 只在返回 1
+时 `dec`。上面的序列是 set(++)→clear(--)→set(++)→bio 完成时 clear(--)，**两升两降，零漂移**，
+`end_page_writeback()` 里那条 `BUG()` 也不会触发（`bdev_write_page()` 在 `rw_page` 前已置位）。
+唯一与线程相关的是 `bio_alloc(GFP_NOIO, 1)` 跑在带 `PF_MEMALLOC` 的 kcompressd 上 ——
+那只会更容易成功，不会更难。
+
+#### 12.2 四处实际改动
+
+1. **"不可能"守卫从 `WARN_ON_ONCE()` 改成 `pr_warn_once()`。**
+   原实现里 `do_swapout()` 起手的 `WARN_ON_ONCE(!PageSwapCache(page))` 是整棵树上唯一一个
+   WARN。它守的条件（排队期间 swap 项被 `try_to_free_swap()` 摘掉）我们判断不可达，而
+   **触达时的动作（放弃这次写）本身就是安全动作** —— 所以 WARN 在这里不增加任何价值，
+   只增加一个风险：`WARN` 是一个 oops，而 `panic_on_oops` / `panic_on_warn` 会把 oops
+   变成 panic。也就是说，用 WARN 守一个"不可能"，等于**自己给内核装了一个 panic 引信**，
+   比它守的条件更糟。改成 `pr_warn_once()` 后在 dmesg 里照样留一行（带 `page_private()`
+   的 swap entry 号），`once` 版也不会变成热路径成本。
+   已在 `tests/implementation_audit.py` 的 `REQUIRED_ABSENT` 加针：本组**一个 WARN 都不许有**
+   （注释里也不许出现 `WARN_ON_ONCE` / `WARN_ON(` / `WARN(` —— 所以解释"为什么不用"的那段
+   注释特意改写措辞，用"WARN family"指代）。单测另有一条更精确的断言：**只查代码行**，
+   注释行不算。
+2. **关掉 kcompressd 自入队活锁。** `current_is_kswapd()` 测 `PF_KSWAPD`，而 **kcompressd
+   线程自己就设了 `PF_KSWAPD`**，所以那道门机械上放行"kswapd 或 kcompressd 自己"。
+   现在补一道 `if (unlikely(kcd->task == current)) goto sync;`。选"直接比 task 指针"而不是
+   per-cpu 标记：kthread 会迁移，per-cpu 标记在迁移后会失效，而 task 指针比较天然跟着线程走，
+   且零新 include、零新分配。
+   **当前不可达**（5.15 的 offload 链 `frontswap_store()`→zswap、`__swap_writepage()`→
+   `bdev_write_page()`→`zram_rw_page()`→`zcomp_compress()` 没有任何一处回调
+   `swap_writepage()`），所以这是**防未来路径**，不是修活 bug。若不防会发生什么：
+   enqueue 把页塞回自己正在 drain 的 FIFO → `kfifo_out_locked()` 那层循环永不清空 →
+   既不睡也不退出，每轮多钉一页 ⇒ **活锁，终点是 OOM killer**（不是 panic）。
+3. **`register_sysctl()` 失败即关。** 原实现丢掉返回值。`!CONFIG_SYSCTL` 下它是返回 `NULL`
+   的 inline 存根，`vm.kcompressd` 与三个计数器会**一个都不出现**，而载荷照常编译照常运行、
+   阈值停在默认 24 —— 也就是"功能在跑但操作者没有任何把手"。现在改成：返回值 NULL 就
+   `pr_err` + `return 0`，一个线程都不建。这既是"失败即关"，也更接近上游的真实形态：
+   上游 6.12 把 `vm_kcompressd` 和 `vm_table[]` 项都放在 `kernel/sysctl.c` 里，那个文件整体
+   由 `CONFIG_SYSCTL` 门控，**不存在"编得进但 knob 不在"这个中间态**。
+4. **`memcg_is_dying(page_memcg(page))` 移到六道门的最后。** `page_memcg()` 是这串门里
+   唯一带页形状前提的 helper（它的 `VM_BUG_ON_PGFLAGS(PageTail(page), page)` 是
+   `CONFIG_DEBUG_VM_PGFLAGS` 才有，所以不会 panic，但会把尾页的 `memcg_data` 当 slub objcg
+   读）。把它放到所有与形状无关的门之后，它就只会看见已经通过那些门的页。
+   **纯防御性**：`swap_writepage()` 只会被以 compound head page 调用，尾页根本到不了这里。
+   已加一条顺序断言把"memcg 门最后求值"钉住。
+
+#### 12.3 复核过但判定"不是新暴露面"的（不重复劳动，理由留档）
+
+- **双解锁**：`unlock_page()` 的 `VM_BUG_ON_PAGE(!PageLocked(page))` 已核为
+  `CONFIG_DEBUG_VM` 门控（`include/linux/mmdebug.h:55-65`），生产内核上不 panic；
+  `lock_page()` 那一处上一轮已经修掉。
+- **`__swap_writepage()` 的 `VM_BUG_ON_PAGE(!PageSwapCache(page), page)`**：同为
+  `CONFIG_DEBUG_VM` 门控，所以 12.2.1 那个守卫防的是**静默数据损坏**（把数据写进已回收的
+  slot），不是 panic。结论方向一致，措辞已按这个事实校正。
+- **排队页被重新隔离**：`shrink_page_list()` 在 `add_to_swap()` 外面套了
+  `if (!PageSwapCache(page))`（`mm/vmscan.c:1627`），已在 swap cache 的页**永远不会**走到
+  `add_to_swap()`，也就不可能撞上 `add_to_swap_cache()` 的
+  `VM_BUG_ON_PAGE(PageSwapCache(page), page)`。
+- **引用计数双释放**：`put_page()` 在 `do_swapout()` 里只出现两次、且互斥
+  （`pr_warn_once` 早退一条、if/else 之后一条）；`enqueue` 的 `kfifo_in` 失败路径另有一次，
+  与成功写入 FIFO 的那次互斥。每页恰好一放。
+- **迁移路径**：排队页"解锁 + PG_writeback + 在 LRU"这个组合与 stock bio 路径的窗口
+  逐状态相同，不是新暴露面。
+- **死锁**：`lock_page()` 在 kcompressd 上等待的持锁者（缺页、后续回收轮次）都不需要
+  FIFO 排空才能推进，无环。head-drain 在 `spin_unlock_irqrestore()` **之后**才调
+  `do_swapout()`，调用时不持 FIFO 锁，也不会自锁。
+
+#### 12.4 仍未做（本批明确不扩大范围）
+
+- 无（§13 把上一轮唯一剩下的拆除路径做完了）。§9 未闭合清单也随之收窄，见该节更新。
+- 编译仍未验证（本轮的四处改动同样是源码静态分析 + 文本审计，没有跑编译器）。
+
+
+### 13. 节点生命周期做完：memory notifier + 拆除路径
+
+上一轮把「`kswapd_stop()` 侧拆除路径」明确标为未做，原因是它要动 `memory_notifier` 且
+drain 时序必须与 `offline_pages()` 里 `kswapd_stop()` 的调用点对齐。本节把它做完。
+
+**为什么并进同一个组、不另起一批。** 原话写的是"独立批次的工作量"，但拆组会造一对
+trap-5（两个组写同一个 `abk_kcompressd_init` 函数体文本），而这条路的功能边界就是本组
+自己的线程生命周期。所以并进 `vm_kcompressd_swapout`：**不新增 `PatchGroup`、不动
+`GROUP_COUNTS`、不进 `PRE_APPLIED`、不动 `sublevel_matrix.py`、不新增 fixture 文件**，
+`module.conf` 也停在 0.46.0（本批尚未提交，见 `git status`）。改的是三个 anchor 里的
+include 块与 append 块，以及 import 步骤新加的一个 include 行。
+
+#### 13.1 全部源码事实（逐条读的不是记忆）
+
+| 事实 | 出处 |
+|---|---|
+| `struct memory_notify { start_pfn; nr_pages; status_change_nid_normal; status_change_nid_high; status_change_nid; }` | `include/linux/memory.h:95-101`，**在 `CONFIG_MEMORY_HOTPLUG` 之外** |
+| `MEM_ONLINE`/`MEM_OFFLINE` 是 `#define (1<<0)`/`(1<<2)` | `include/linux/memory.h:88-90` |
+| `register_memory_notifier()` 的一真一存根两个定义按 **`CONFIG_MEMORY_HOTPLUG_SPARSE`** 分（不是 `CONFIG_MEMORY_HOTPLUG`），`!SPARSE` 版是 `static inline ... return 0;` | `include/linux/memory.h:112-131` |
+| 链是**阻塞**链：`static BLOCKING_NOTIFIER_HEAD(memory_chain)` + `blocking_notifier_chain_register()` + `blocking_notifier_call_chain()` | `drivers/base/memory.c:91-103,173-176` |
+| `NOTIFY_OK == 0x0001`，`notifier_to_errno()` 返回 0 | `include/linux/notifier.h:176-178,196-199` |
+| online 顺序：`init_per_zone_wmark_min()` → `kswapd_run(nid)` → `kcompactd_run(nid)` → `writeback_set_ratelimit()` → `memory_notify(MEM_ONLINE, &arg)` | `mm/memory_hotplug.c:1144-1153` |
+| **offline 顺序**：`node_states_clear_node()` → **`kswapd_stop(node)`**（仅当 `arg.status_change_nid >= 0`）→ `writeback_set_ratelimit()` → **`memory_notify(MEM_OFFLINE, &arg)`** → `remove_pfn_range_from_zone()` | `mm/memory_hotplug.c:2063-2082` |
+| `arg.status_change_nid` 只在节点真的变成无内存时置为该 nid，否则 `NUMA_NO_NODE` | `node_states_check_changes_offline()`，`mm/memory_hotplug.c` |
+| `pfn_to_nid()` 在所有配置下都有定义：`CONFIG_FLATMEM` → `(0)`；`CONFIG_SPARSEMEM` + `CONFIG_NUMA` → `page_to_nid(pfn_to_page(pfn))`；其余 → `(0)` | `include/linux/mmzone.h:1490,1782-1790` |
+| `__kfifo_free()` 完整重置 in/out/esize/data/mask；`__kfifo_alloc()` 也重置后重新分配 ⇒ 节点可以先拆后建 | `lib/kfifo.c:24-63` |
+| `gki_defconfig` 有 `CONFIG_MEMORY_HOTPLUG=y`，arm64 选 `SPARSEMEM` ⇒ 目标是 `MEMORY_HOTPLUG_SPARSE` 实函数 | `arch/arm64/configs/gki_defconfig:117` |
+
+#### 13.2 实现的四件事
+
+**① `wait_event_interruptible()` 的谓词并入 `kthread_should_stop()`。**
+上游 0.5 的谓词只有 `!kfifo_is_empty()`。**照抄会在内存热拔时死锁**：
+`kthread_stop()` 只置位 `KTHREAD_SHOULD_STOP` 然后等线程退出，**它不唤醒线程**；
+线程睡在 `kcompressd_wait` 上，FIFO 空着，没人 `wake_up_interruptible`，于是
+`kthread_stop()` 永久阻塞，而它持着**写模式的 `mem_hotplug_lock`** ——
+`/sys/devices/system/memory/.../online` 的 write 永不返回，后面每个热插拔操作全部堵死。
+（5.15 自己的 kswapd 靠 `wakeup_kswapd()` 在每次分配时被叫醒逃过这一劫，`mm/vmscan.c:7129`
+的谓词同样不含 stop；我们的线程没有这种流量，**必须显式**。）
+
+**② `abk_kcompressd_del_node()`：NULL 任务指针 → `wake_up_interruptible` → `kthread_stop` → drain → `kfifo_free`。**
+三步的先后是设计核心：
+
+- **先 `spin_lock_irqsave` 里把 `kcd->task` 置 NULL**，再干别的。`abk_kcompressd_store()`
+  对 `kcd->task` 的读是**不带锁的**快路径，所以一个"已经看过线程存在"的回收页仍可能在
+  `abk_kcompressd_del_node()` 释放环形缓冲后才调进来 —— **在已释放的 ring 上
+  `spin_lock_irqsave`**。把置空挪进 lock 里，再在 `abk_kcompressd_enqueue()` 已有的
+  临界区里加一道 `if (unlikely(!kcd->task)) return false;`，二者就变成互斥而不是竞态。
+- **`wake_up_interruptible()` 放在 `kthread_stop()` 之前**：没有谓词配合它没用，
+  没有它谓词白写。
+- **drain 放在 `kthread_stop()` 返回之后**：线程自己会 drain 到 FIFO 空，但"最后一次
+  drain 结束"与"看到 stop 位"之间仍可能有页入队（那时 `kcd->task` 已 NULL，只会是拆
+  之前入的），所以调用方必须兜底。**ring 必须在 free 前为空**：每个 entry 持一个页引用
+  加一个活着的 swap slot，而那些页正是被拆节点的页 —— 丢弃而不写 = 留下"数据从未写出、
+  干净位却已清掉"的 swap-cache 页，没有任何代码路径会替我们重新弄脏它。
+
+**③ 拆除点选 `MEM_OFFLINE`，不是 `MEM_GOING_OFFLINE`。**
+`MEM_GOING_OFFLINE`（`mm/memory_hotplug.c:1992`）发出时，页区正在
+`start_isolate_page_range()` 后被 `scan_movable_pages()`/`do_migrate_range()` 迁移，
+那时 drain 会踩到正在被 isolate 的页；而且 `MEM_CANCEL_OFFLINE` 还可能回滚。
+到 `MEM_OFFLINE`（`:2076`）时：`node_states_clear_node()` 已跑完（节点已出 `N_MEMORY`，
+不会有新工作路由进来）、`kswapd_stop(node)` 已跑完（该节点的 kswapd 已停）、
+`remove_pfn_range_from_zone()` 还没跑（页仍在 zone 里但已孤立）。这正是题面要求的
+"与 `kswapd_stop()` 对齐"：kswapd 先停，我们再停。
+
+**④ `abk_kcompressd_add_node()` 同时服务开机 initcall 循环和 `MEM_ONLINE`。**
+"节点怎么拿到线程"只有一处定义。`MEM_ONLINE` 用 `pfn_to_nid(arg->start_pfn)` 而不是
+`arg->status_change_nid`：`online_pages()` 对**每一次** block 加入都调 `kswapd_run(nid)`，
+不只第一次 —— 一个只认 `status_change_nid` 的 notifier 会漏掉"本模块加载前该节点已有
+内存、后续才加第二个 block"那种情况。`add_node()` 幂等，多覆盖不花钱。
+另加一道 `kfifo_alloc()`（会睡眠）之后的**锁内复检**：两次并发 bring-up 会让输家覆盖
+`kcd->task`，泄漏它的线程同时它正在 drain 的 ring 被释放。内存通知由写模式的
+`mem_hotplug_lock` 串行化、开机循环在注册前单线程跑，所以这是保险而不是修活竞态。
+
+删除点与加建点都加了 `nid >= 0 && nid < MAX_NUMNODES` 边界检查：notifier 的 data 来自
+别处，静态数组越界索引是不容许存在的形状。
+
+#### 13.3 一个配置维度的说明
+
+`register_memory_notifier()` 在 `!CONFIG_MEMORY_HOTPLUG_SPARSE` 下是返回 0 的 inline 存根，
+所以**无条件下发调用**即可：没有热插拔的内核上注册是 no-op，回调永不发生，开机循环覆盖
+系统将拥有的全部节点。因此这一处不需要 config gate，也不需要 `#ifdef`。
+新 include 只有一个 `<linux/memory.h>`（`struct memory_notify`、`MEM_*`、`NOTIFY_OK`、
+`struct notifier_block`、两个注册函数都在里面），**没有引入 `<linux/memory_hotplug.h>`** ——
+那里面有 `CONFIG_MEMORY_HOTPLUG` 门控的东西，本组一行都不碰。
+
+#### 13.4 仍未做
+
+- **只覆盖节点变空**（`status_change_nid >= 0`）。节点不为空的内存 block 级别增删不需要
+  动线程（`kcd->task` 幂等挡着），所以这不是缺口，是边界。
+- **`MEM_GOING_OFFLINE` 不提前停新工作**：从那一步到 `MEM_OFFLINE` 之间仍可能有页入队。
+  已论证安全（到 `MEM_OFFLINE` 时节点已出 `N_MEMORY`，且入队的页照样被 drain）。要更早
+  停可以另加，但会引入"offline 可能取消"的回滚路径，代价大于收益。
+- **编译仍未验证**：本节同样是源码静态分析 + 文本审计，没有跑编译器。
+- **`CONFIG_MEMORY_HOTPLUG_SPARSE=n` 的构建没有实测**：该路径退化成"无 notifier"，
+  与本节之前的行为逐字节等价，但没有在真机上跑过热插拔。
+
+#### 13.5 验证
+
+| 门槛 | .167 | .178 | .194 | .216(lts) |
+|---|---|---|---|---|
+| dry-run 本组 | `applied` | `applied` | `applied` | `applied` |
+| dry-run 全 child | `{applied: 66}` | `{applied: 66}` | `{already_present:3, applied:63}` | `{already_present:8, applied:58}` |
+| step_audit | OK | OK | OK | OK |
+| implementation_audit | OK | OK | OK | OK |
+| smoke | OK | OK | OK | OK |
+| 单测 | 全过（新增 9 条生命周期断言 × 两个形状） | | | |
+
+新断言分三处：`REQUIRED_CONTENT` 钉 add/del/notifier 的符号与三个"没有就会出事的"
+形状（stop-aware 谓词、先唤醒后 stop、锁内置空）；`REQUIRED_ABSENT` 继续禁止 WARN 家族；
+`tests/smoke.sh` 加 9 条 grep（其中"谓词必须含 stop"与"必须唤醒后 stop"两条是上面
+①/② 的回归防线）；单测里另逐条断言 `wake_up_interruptible` 的偏移小于 `kthread_stop`。
+
+
+### 14. CI 编译门禁抓到的两个 C 级错误（文本审计看不见）
+
+PR #27 推送后 ABK CI 的「内核编译」job（android13-5.15-lts）失败，
+`fan221153-blip/ABK` run 35852802085，`mm/page_io.o` 四个 error
+（`mm/page_io.c:217 / 689 / 802 / 950`）。四个 error 同源，实际是**两个**缺陷：
+
+```
+error: implicit declaration of function 'abk_kcompressd_store'
+       [-Werror,-Wimplicit-function-declaration]
+error: static declaration of 'abk_kcompressd_store' follows non-static declaration
+error: redefinition of 'abk_kcompressd' as different kind of symbol
+error: incompatible pointer types passing 'struct abk_kcompressd_node[1]'
+       to parameter of type 'int (*)(void *)'
+```
+
+**这正是 AGENTS.md 陷阱 6 的原样复现**：C 级错误，四道文本审计（`step_audit.py` 查
+comment/brace/`#ifdef` 平衡与幂等，`implementation_audit.py` 查内容）一个都看不见，
+编译器是唯一的门。上一轮的结论分类里写的是「编译未验证」，现在它验证了，而且一下就
+抓到两条。
+
+#### 14.1 缺陷一：调用点在定义点之前，缺前向声明
+
+`swap_writepage()` 在文件第 217 行调 `abk_kcompressd_store(page)`，而引擎整个 append 在
+文件尾部（第 689 行起）。我在设计注释里写的理由是"引擎 append 在最后一个函数之后，
+所以它调用的东西都已声明，不需要发明前向声明"——**这个理由只涵盖了引擎调用的东西，
+漏了引擎自己也是被调用方**：`swap_writepage()` 在 append 点之前。
+
+上游 0.5 永远不会撞上这个：它的 patch 把 `do_swapout()`/`kcompressd_store()` 插在
+`@@ -234,6 +236,101 @@` 那个 hunk，**位置在 `swap_writepage()` 的 hunk
+（`@@ -276,6 +373,15 @@`）之前**。本树选择 append 到文件尾，于是顺序反了。
+
+**修法**：新增第 3 个 step（第 2b 步），在 `swap_writepage()` 之前插一行
+`static bool abk_kcompressd_store(struct page *page);`。
+锚点是 **pristine 的 doc comment + 函数签名整块**，声明 emit 在 comment **上方**
+而不是 `*/` 与函数之间 —— 插在中间会让那段 pristine 注释读起来像在描述
+`abk_kcompressd_store()` 而不是 `swap_writepage()`，而这种回归同样没有审计能看见。
+锚点在四个基线上各出现一次（已逐个 grep 验证）。步骤数 3 → 4。
+
+#### 14.2 缺陷二：数组与线程函数同名，不同类符号重定义
+
+上游的载体是 `pgdat->kcompressd`（结构体**成员**）对 `int kcompressd(void *p)`
+（**函数**）—— 两个名字空间，永不相撞。本树把 pglist_data 成员换成文件内静态数组，
+数组和线程函数就都成了同一 TU 的普通标识符，且都叫 `abk_kcompressd`：
+
+```c
+static struct abk_kcompressd_node abk_kcompressd[MAX_NUMNODES];   /* 502 行 */
+...
+static int abk_kcompressd(void *p)                                 /* 802 行 */
+```
+
+第三个 error（`incompatible pointer types passing 'struct abk_kcompressd_node[1]' to
+'int (*)(void *)'`）是同一个根因的连带：名字先解析到数组，于是函数指针类型不对。
+
+任务简报里写的是"命名前扫一遍 `docs/porting_policy.md` 与既有组名，避免撞名或撞
+suite-detection marker"——我扫了**跨组**撞名（`abk_kcompressd_*` 与 `abk_zram_*` /
+`abk_sf_*` / `abk_gfp_*` / `abk_dra_*` 零撞），**漏了本 TU 内部自己两个符号相撞**。
+
+**修法**：数组改名 `abk_kcompressd_nodes`（复数），线程函数保持 `abk_kcompressd`。
+5 处引用同步改。数组不是任何必需 marker（`REQUIRED_CONTENT` 钉的是
+`abk_kcompressd_store` / `abk_kcompressd_do_swapout`，smoke 钉的是
+`'kcompressd%d', nid;`），所以改名没有门禁代价。
+
+#### 14.3 之后做的编译级自查（本地无内核树，只能静态）
+
+不能本地编译，所以把这两类错误系统性地自查了一遍，写进一次性脚本
+（跑完即弃，非仓库文件）：
+
+1. **去注释后逐标识符核对「定义点 / 前向声明点 / 第一个使用点」**，含**取函数地址**
+   的用法（`kthread_create_on_node(abk_kcompressd, ...)`、`.notifier_call =
+   abk_kcompressd_memory_notifier` —— 这两处不产生 `name(`，只查 `name(` 会漏）。
+   结果：8 个符号全部"先定义后使用"，唯一需要前向声明的就是 `abk_kcompressd_store`。
+2. **同一 TU 内同名不同类符号**：清零。
+3. **goto / label 配对**：`out` / `sync` / `reprobe` / `bad_bmap` 四个，无悬空。
+4. **comment / brace 平衡**：`/* : */ ` 54:54，`{ : }` 65:65。
+
+**这些是静态自查，不等于编译通过** —— 它只能证明"这两类已发现的错误不再存在"，
+不能证明没有第三类。
+
+#### 14.4 门禁同步
+
+- `tests/stable_5_15_test.py`：步骤数断言 3 → 4，并加两条 shape 断言
+  （原型步保持 pristine 注释与函数相邻；`_C_DECL_OLD` 与新的
+  `b41.DECL_ANCHOR` 常量逐字节相等 —— 常量单独存在就是为了让"锚点不再是
+  comment+签名"这种改动失败在测试上，而不是静默产出拆注释的形状）。
+- 夹具 `pristine_text()` 补上那段 doc comment，否则新锚点匹配不上、整组退化成
+  `blocked_by_shape`。
+- 数组名断言改为 `abk_kcompressd_nodes[`，并把"为什么是复数"写进注释。
+- `tests/implementation_audit.py` 的 `REQUIRED_CONTENT` 增加
+  `static bool abk_kcompressd_store(struct page *page);`。
+- 引擎步索引 2 → 3。
+
+
+---
+
 <a id="batch-40"></a>
 
 ## Batch 40(v0.45.0)
