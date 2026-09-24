@@ -696,8 +696,8 @@ from crashing the system in `i915_gem_shrinker_scan()`"；副作用是 shrinker 
 | 问题 | 结论（源码位置） |
 |---|---|
 | stock zram rw_page 路径上 PG_writeback 由谁置位 | **`block/bdev.c` 的 `bdev_write_page()`**：`set_page_writeback(page)` 在 `ops->rw_page()` **之前**无条件调用（`bdev.c:370` on .216，`bdev.c:373` on 167/178/194）。`mm/page_io.c` 的 `bdev_write_page` 成功分支自己不调，所以在 `page_io.c` 里找是找不到的——它低一层 |
-| 页锁最终由谁释放 | 同步路径下是同一个 `bdev_write_page()`（成功分支 `unlock_page(page)`；之后 `rw_page` 里 `zram_rw_page()` 成功时经 `page_endio()` → `end_page_writeback()` 只清 PG_writeback、不解锁）。**offload 路径下不是它**——页在 `__remove_mapping()` 失败后走 `cannot_free` → `keep_locked:`（`mm/vmscan.c:1874`），那一段**自己 `unlock_page()`** 再把页放回 LRU（标签名是历史遗留，实际执行解锁）。所以 kcompressd 接手时 `PG_locked` 已无人持有 |
-| 搬到 kcompressd 线程后 (a)(b) 是否仍成立 | PG_writeback 仍由 `bdev_write_page()` 在 kcompressd 线程里置、由 `page_endio()` 清，链不变；但**页锁必须在 `do_swapout()` 里重新取**，因为 `keep_locked:` 已经放掉了。`__swap_writepage()` 是 `->writepage` 实现、每个出口（`bdev_write_page()`、`__swap_writepage()` 的 SWP_FS_OPS 分支、bio 分支）都 `unlock_page()`，而 `unlock_page()` 带 `VM_BUG_ON_PAGE(!PageLocked(page))`（要 `CONFIG_DEBUG_VM` 才可见）。不带 `CONFIG_DEBUG_VM` 时它表现为对已清的 PG_locked 位做一次无害 `clear_bit_unlock`，所以错误长期看不见 |
+| 页锁最终由谁释放 | 同步路径下是同一个 `bdev_write_page()`（成功分支 `unlock_page(page)`；之后 `rw_page` 里 `zram_rw_page()` 成功时经 `page_endio()` → `end_page_writeback()` 只清 PG_writeback、不解锁）。**offload 路径下不是它**——`swap_writepage()` 提前 `return 0`，整条 `__swap_writepage()` 被跳过，所以没有任何人解锁。~~原判为走 `cannot_free` → `keep_locked:`（`mm/vmscan.c:1874`）由那段解锁，实测证明这条路走不到，见 §15~~ |
+| 搬到 kcompressd 线程后 (a)(b) 是否仍成立 | PG_writeback 仍由 `bdev_write_page()` 在 kcompressd 线程里置、由 `page_endio()` 清，链不变；但**页锁必须在 `do_swapout()` 里重新取**。~~原由是 `keep_locked:` 已经放掉了~~，实测后的正确理由是：`swap_writepage()` 现在负责解锁（§15），而页在 FIFO 里等待期间是无主的，任何人——把它 fault 回来的缺页、下一轮回收——都可能拿到锁，与 `keep_locked:` 无关。`__swap_writepage()` 是 `->writepage` 实现、每个出口（`bdev_write_page()`、`__swap_writepage()` 的 SWP_FS_OPS 分支、bio 分支）都 `unlock_page()`，而 `unlock_page()` 带 `VM_BUG_ON_PAGE(!PageLocked(page))`（要 `CONFIG_DEBUG_VM` 才可见）。不带 `CONFIG_DEBUG_VM` 时它表现为对已清的 PG_locked 位做一次无害 `clear_bit_unlock`，所以错误长期看不见 |
 | `end_page_writeback()` 里 `BUG()` 的触发条件 | `if (!test_clear_page_writeback(page)) BUG();` —— PG_writeback **未置位**时才触发。本路径上 `bdev_write_page()` 在 `rw_page` 前已置位，`zram_rw_page()` 成功时 `page_endio(page, op_is_write(op), 0)` 走 `end_page_writeback()` 直接清（`mm/filemap.c:1626`，err==0 分支不清 PG_writeback），⇒ **不触发** |
 
 上游 6.12 的 `keep_locked:`（`mm/vmscan.c:1531`）同样 `folio_unlock(folio)`，`__swap_writepage()` 的
@@ -1245,6 +1245,78 @@ suite-detection marker"——我扫了**跨组**撞名（`abk_kcompressd_*` 与 
 ---
 
 <a id="batch-40"></a>
+
+### 15. 设备实测抓到的一个死锁：offload 必须自己释放页锁（vermeer 真机）
+
+§5a 的页锁结论是**静态分析**得出的，真机第一次跑就把它推翻了。
+
+#### 15.1 现象
+
+把 kswapd 逼出来扫页（`watermark_scale_factor` 500 + tmpfs 填充）后：
+
+```
+kcompressd_enqueued = 26      kcompressd_swapped = 0
+队列深度 = 26（恒定，60 秒内不动）
+kcompressd0: state=D  wchan=abk_kcompressd_do_swapout
+               abk_kcompressd_do_swapout+0x120/0x268
+               abk_kcompressd+0x134/0x1b0
+```
+
+线程永久卡死，26 个页全部堵在 FIFO 里一页都没写出去。`enqueued - swapped` 不再变化，
+四个计数器全部静止。`wchan` 落在 `do_swapout` 自身而非更深函数，而 5.15 的 `__lock_page()` 是 static 会被内联 ⇒ 卡住的正是 `lock_page(page)`。
+
+#### 15.2 根因链条（逐段在 5.15 源码上核对）
+
+`swap_writepage()` 的 offload 分支 `return 0` 时**没有解锁**——而同步路径是 `__swap_writepage()` 以 `unlock_page()` 结束的，这个不变量没有被复制过来。后果不是局部的：
+
+1. `pageout()`（`mm/vmscan.c:1082`）拿到 `res=0`，既非负也不是 `AOP_WRITEPAGE_ACTIVATE` ⇒ 判定为 `PAGE_SUCCESS`（`vmscan.c:1131`）。
+2. `PAGE_SUCCESS` 先看 `PageWriteback` / `PageDirty`（都不满足，`clear_page_dirty_for_io()` 已经清了），再执行 `if (!trylock_page(page)) goto keep;`（`vmscan.c:1783`）——**失败**，因为 `shrink_page_list()` 在调 `pageout()` 之前自己持着锁。
+3. `keep:` 标签位于 `keep_locked:` 的 `unlock_page(page)` **之后**（`vmscan.c:1916` 解锁 → `1918` `list_add`），所以 `goto keep` **不解锁**，页带着 `PG_locked` 进 `ret_pages`。
+4. `move_pages_to_lru()`（`vmscan.c:2236`）只做 `SetPageLRU` / `put_page_testzero` / `add_page_to_lru_list`，**也不解锁**。
+
+页因此带着 PG_locked 挂回 LRU，再没有人会释放它；kcompressd 线程的 `lock_page()` 永久睡眠。这正是 §5a 原本以为会走、实际走不到的那条 `cannot_free` → `keep_locked` 路径被提前截断的结果。
+
+#### 15.3 修复
+
+`swap_writepage()` 的 offload 分支补 `unlock_page(page)`，复制同步路径的锁不变量。
+上游 0.5 同样提前返回且不解锁，而 6.12 的 `pageout()` 有一模一样的 `PAGE_SUCCESS` 分支，所以**上游带着同一个缺陷**。
+
+修复还带来一个原本没看到的附带效果：`trylock_page()` 由失败转成功后，流程改道了——
+
+- 修复前：`goto keep`（不解锁）→ `stat->nr_pageout` 也没记账，
+- 修复后：`trylock` 成功 → 继续走到 `__remove_mapping()` → FIFO 的引用让 `page_ref_freeze()` 失败 → `cannot_free:`（`vmscan.c:1250`）→ `goto keep_locked`，
+  **由 `keep_locked:` 负责 `unlock_page()`**，且 `nr_pageout` 恢复记账。
+
+也就是说 §5a 描述的路径本身没错，错在没有解锁时它根本到达不了。
+
+#### 15.4 修复后实测（同一台 vermeer，同一套加压流程）
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `kcompressd_enqueued` | 26 | 696874 |
+| `kcompressd_swapped` | 0 | 696874（逐一对等）|
+| 队列深度 | 26，永久不降 | 0 |
+| 线程 | D，卡死 `do_swapout` | S，正常等 FIFO |
+| pstore 崩溃记录 | — | 无 |
+
+复测 10 项全过：kswapd 唤醒 +352833 页、`enqueued` +155428、`swapped` +154696、深度归零、线程未卡、`vm.kcompressd=0` 时计数器完全静止（+0）、恢复 24 后重新计数（+17771）、`BUG/Oops/panic/refcount_t/list_add corruption` 全 0、无任何 WARNING 涉及本方代码。
+
+#### 15.5 一处可观测性缺陷（不是功能缺陷）
+
+并发读取三个 sysctl 时，`enqueued - swapped` 会瞬时读到**负值**（实测 −732）。两个计数器在不同线程递增（`enqueued` 在 kswapd 上下文的 `enqueue()`、`swapped` 在 kcompressd 线程的 `do_swapout()`），而 sysctl 是逐文件读的，两个读时刻之间有窗口。多轮测试后深度稳定回到 0，说明没有页泄漏；真实的 `enqueued - swapped` 在数学上不可能为负（每个 `swapped++` 都对应一个曾 `enqueued++` 后才入队的页）。要让这个指标可信，应另暴露一个 `kfifo_len()` 读数而不是用两个计数器相减。**未改**，超出本批范围。
+
+#### 15.6 这一轮同时暴露的覆盖面事实（不是缺陷，是移植取舍）
+
+offload 能否触发完全取决于 kswapd 是否醒来，因为第一道内容闸就是 `current_is_kswapd()`：
+
+- 空闲启动、内存充足时：`pgsteal_kswapd = 0`，`pgsteal_direct = 2500432` ⇒ offload 零触发；
+- 持续真实压力下：`enqueued 501620` vs `sync 433683`，offload 约占 54%。
+
+这道闸是上游的设计，本批原样保留：`enqueue()` 的 `get_page()` 让页引用多 1，于是 `PAGE_SUCCESS` 里 `__remove_mapping()` 的 `page_ref_freeze()` 失败、页无法在该轮释放、`nr_reclaimed` 不增加（只在 `free_it:` 累加）。对 kswapd 无所谓（下一轮再来，届时 kcompressd 已丢引用）；对 direct reclaim 则意味着 `do_try_to_free_pages()` 永远够不到 `sc->nr_to_reclaim`，`__alloc_pages_slowpath()` 会升级到 **OOM killer**——在系统明明有大量可回收内存的情况下。所以这不是"偏好 kswapd"，是 direct reclaim 的调用方等不起这个延迟。
+
+#### 15.7 测试的判别力
+
+新增的检查全部限定作用域。`mm/page_io.c` 的 `do_swapout()` 里也调用 `unlock_page()`，所以整文件搜索这个调用在修复被删掉时**依然通过**——等于没有判别力的测试。`stable_5_15_test.py` 改为先把 offload 块切出来再搜索，`smoke.sh` 用 `sed` 范围限定同一块，`implementation_audit.py` 把 needle 两侧都锚在 fall-through 调用上。已用反向验证确认：删掉那行 `unlock_page(page);`，plain 与 hook 两个 shape 立刻 FAIL。
 
 ## Batch 40(v0.45.0)
 
