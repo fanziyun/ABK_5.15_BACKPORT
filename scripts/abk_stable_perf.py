@@ -2407,6 +2407,93 @@ PATCH_GROUPS = PATCH_GROUPS + [
 ]
 
 # ============================================================================
+# Batch 42: the un-landed half of Batch 10-2's WALT smart_freq scope -- the
+# freq_cap[] -> min(freq, cap) clamp.  Steps live in
+# scripts/batch42_perf_schedutil_smart_cap.py.
+#
+# Batch 10-2's scope was "reason election + deactivation hysteresis +
+# frequency cap + per-cluster threshold table"; schedutil_smart_policy landed
+# the first two (per-cluster sustained-high-util reason election and the
+# frequency floor) and the cap never landed.  This group is the cap, from the
+# same upstream code (smart_freq.c:433/505, cpufreq_walt.c:264) and on the same
+# hook, off by default and gated exactly as hard.
+#
+# ORDERING -- the reason this group is registered immediately after
+# schedutil_smart_policy and not anywhere else in this child:
+#
+# Both payloads register on android_vh_cpufreq_resolve_freq in the same
+# translation unit, and android_vh probes run in registration order, so
+# registration order IS execution order.  The clause has to be "cap first,
+# floor second": a floor that runs first would raise the target above the cap
+# and the cap would be applied to a target it can no longer see.  Both groups
+# use late_initcall, so within one translation unit that is text order -- and
+# the cap's payload is therefore grafted *in front of* the
+# cpufreq_governor_init(schedutil_gov); anchor this group's predecessor is
+# appended behind.  That placement is also the only one that is idempotent for
+# both groups: inserting after that anchor would sandwich the cap between the
+# anchor and the floor payload, so on the second pass the floor group's
+# replacement would stop matching while its anchor still did and it would
+# append a second floor payload -- the Batch-21 psi_account_irqtime() trap
+# (group_recipe.md §2 trap 5).
+#
+# "Cap first" alone does not settle the conflict, because the floor runs after
+# the clamp and can only raise.  The cap therefore keeps a second probe on the
+# same hook, registered at late_initcall_sync (which orders after the floor's
+# late_initcall), that re-asserts the clamp this pass took -- so while the cap
+# owns a policy's range the floor yields, and the two never trade the range
+# back and forth.  The floor payload itself is byte-frozen (Batch 10-5's
+# migration anchor), so the yield is enforced on the cap's side rather than by
+# rewriting code that already-grafted trees would stop recognising.  Both
+# payloads expose a read-only node (abk_sc_capped, abk_sf_boosting) so which of
+# them owns a range is observable instead of inferred from frequencies.
+# ============================================================================
+import batch42_perf_schedutil_smart_cap as _b42_cap  # noqa: E402
+
+
+def _sched_smart_cap_apply(ctx):
+    rel = "kernel/sched/cpufreq_schedutil.c"
+    try:
+        text = ctx.read(rel)
+    except FileNotFoundError:
+        # Let apply_steps report the missing file as a degraded shape, exactly
+        # as it does for any other absent anchor.
+        text = ""
+    if _b42_cap.has_unknown_cap(text):
+        # A cap payload that matches no known anchor still leaves _TAIL_OLD in
+        # place, so the plain insert would define the payload twice and the
+        # group would still report applied.  Refuse, and write nothing.
+        return "blocked_by_shape", (
+            "an unrecognised smart-freq cap payload is already in the tree; "
+            "inserting would duplicate its definitions, so nothing was "
+            "written")
+    # The shared header block is added by schedutil_smart_policy's include step
+    # when that group runs first (it does: this group is registered after it),
+    # so probing for it is what keeps this group's own include step from
+    # short-circuiting to already_present.
+    steps = _b42_cap.build_steps(
+        add_headers=not _b42_cap.has_header_block(text))
+    status, _results, detail = apply_steps(ctx, steps)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail + "; payload " + _b42_cap.cap_sha256()
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "schedutil_smart_cap",
+        "schedutil smart_freq cap (Batch 10-2's un-landed half): clamp the resolved frequency to abk_sc_cap_pct of cpuinfo.max_freq inside android_vh_cpufreq_resolve_freq (fast and slow path), released on the direction of the frequency request after abk_sc_hold_ms and re-asserted only when every CPU of the policy has been below abk_sc_release_pct for abk_sc_release_ms; per-policy state under a raw spinlock (fast_switch runs under rq->lock), off by default and gated to schedutil DVFS ownership exactly like schedutil_smart_policy (inspired by WALT smart_freq)",
+        [
+            "popsicle-w-oss walt smart_freq freq_cap[] election",
+            "research/popsicle_w_oss/walt_extract/smart_freq.c",
+            "research/popsicle_w_oss/walt_extract/cpufreq_walt.c",
+            "research/popsicle_w_oss/walt_pelt_survey.md",
+        ],
+        ["kernel/sched/cpufreq_schedutil.c"],
+        _sched_smart_cap_apply,
+    ),
+]
+
+# ============================================================================
 # Batch 15: ABK_ABI_PATCH_SUITE absorption -- scheduler refinements + EEVDF.
 # Steps live in scripts/batch15_perf_sched_refinements.py and
 # scripts/batch15_perf_eevdf.py.

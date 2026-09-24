@@ -164,7 +164,17 @@ GROUP_COUNTS = {
     # groups are registered in dependency order -- psi_irq_tracking first (the
     # switch patches the walk it appends), psi_cgroup_pressure_switch next (the
     # ONCPU group edits its disabled branch).
-    "stable_perf_backport": 23,
+    # Batch 42 adds one: schedutil_smart_cap, the freq_cap[] -> min(freq, cap)
+    # clamp that Batch 10-2 scoped and never landed.  It lands on every
+    # baseline for the same reason -- it is this module's own payload, grafted
+    # on the android_vh_cpufreq_resolve_freq() hook, so no baseline can carry it
+    # -- and it shares its only two anchors with schedutil_smart_policy (the
+    # shared include block plus the cpufreq_governor_init() line this payload is
+    # grafted *in front of*), both byte-identical pristine text on all four
+    # trees.  Registered immediately after schedutil_smart_policy because
+    # registration order IS execution order for android_vh probes and the cap
+    # has to clamp before the floor raises; see abk_stable_perf.py.
+    "stable_perf_backport": 24,
     "stable_display_fix": 1,
 }
 

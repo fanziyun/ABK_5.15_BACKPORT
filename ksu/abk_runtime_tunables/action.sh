@@ -119,6 +119,18 @@ abk_status_report() {
   # the floor can be diagnosed without inferring it from frequencies.
   abk_show_or_absent "abk_sf_boosting" \
     "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sf_boosting"
+  # Batch 42: the smart_freq cap, on the same hook and in the same file as the
+  # floor.  Its two read-only nodes are how "who owns this range" is answered
+  # while both groups are armed -- abk_sc_capped is keyed by policy->cpu, so a
+  # three-CPU big cluster holding one bit means the cap, not the floor.
+  abk_show_or_absent "abk_sc_enable" \
+    "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sc_enable"
+  abk_show_or_absent "abk_sc_cap_pct" \
+    "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sc_cap_pct"
+  abk_show_or_absent "abk_sc_capped" \
+    "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sc_capped"
+  abk_show_or_absent "abk_sc_boosting" \
+    "$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters/abk_sc_boosting"
   abk_show "fas registration" \
     "$(abk_read "$ABK_FAS_NODE" | tr -d '\n')$( [ -e "$ABK_FAS_NODE" ] || echo ' (no /proc/fas: not a FAS kernel)')"
   _sr_dvfs=""

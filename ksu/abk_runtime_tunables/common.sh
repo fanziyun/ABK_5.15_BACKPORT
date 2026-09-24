@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.13.0"
+ABK_VERSION="v0.14.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -252,6 +252,11 @@ sched.abk_sf_enable
 sched.abk_sf_floor_pct
 sched.abk_sf_sustained_ms
 sched.abk_sf_exit_ms
+sched.abk_sc_enable
+sched.abk_sc_cap_pct
+sched.abk_sc_hold_ms
+sched.abk_sc_release_pct
+sched.abk_sc_release_ms
 readahead.dynamic_readahead
 psi.cgroup
 psi.cgroup.protect
@@ -517,6 +522,69 @@ abk_apply_sched_knobs() {
     fi
   fi
 
+  # --- Batch 42: the smart_freq *cap* -----------------------------------
+  # Same shape as the floor above, and the same reason it is stated off in
+  # tunables.conf: the kernel ships it off, and arming it on a device whose
+  # governor is not schedutil is a no-op by construction (abk_sc_owns()
+  # refuses), so a companion that armed it would only be arming a lie.
+  #
+  # abk_sc_entry_pct has no knob here on purpose.  It feeds nothing but the
+  # read-only abk_sc_boosting reason election -- it gates no decision of its
+  # own -- so a writable copy would invite someone to chase the floor's old
+  # 70-90% dead band by raising a number that cannot move it.  Read it with
+  # action.sh status if the election matters; the clamp is tuned by cap_pct
+  # and the two release windows below.
+  _sk_val="$(abk_cfg sched.abk_sc_enable '')"
+  if [ -n "$_sk_val" ]; then
+    case "$_sk_val" in
+      0|1)
+        abk_write "$_sk_dir/abk_sc_enable" "$_sk_val" \
+          && abk_log "abk_sc_enable=$_sk_val"
+        ;;
+      *) abk_warn "sched.abk_sc_enable: '$_sk_val' is not 0|1, ignored" ;;
+    esac
+  fi
+
+  _sk_val="$(abk_cfg sched.abk_sc_cap_pct '')"
+  if [ -n "$_sk_val" ]; then
+    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 100)"; then
+      abk_write "$_sk_dir/abk_sc_cap_pct" "$_sk_c" \
+        && abk_log "abk_sc_cap_pct=$_sk_c"
+    else
+      abk_warn "sched.abk_sc_cap_pct: '$_sk_val' is not a number, ignored"
+    fi
+  fi
+
+  _sk_val="$(abk_cfg sched.abk_sc_hold_ms '')"
+  if [ -n "$_sk_val" ]; then
+    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
+      abk_write "$_sk_dir/abk_sc_hold_ms" "$_sk_c" \
+        && abk_log "abk_sc_hold_ms=$_sk_c"
+    else
+      abk_warn "sched.abk_sc_hold_ms: '$_sk_val' is not a number, ignored"
+    fi
+  fi
+
+  _sk_val="$(abk_cfg sched.abk_sc_release_pct '')"
+  if [ -n "$_sk_val" ]; then
+    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 100)"; then
+      abk_write "$_sk_dir/abk_sc_release_pct" "$_sk_c" \
+        && abk_log "abk_sc_release_pct=$_sk_c"
+    else
+      abk_warn "sched.abk_sc_release_pct: '$_sk_val' is not a number, ignored"
+    fi
+  fi
+
+  _sk_val="$(abk_cfg sched.abk_sc_release_ms '')"
+  if [ -n "$_sk_val" ]; then
+    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
+      abk_write "$_sk_dir/abk_sc_release_ms" "$_sk_c" \
+        && abk_log "abk_sc_release_ms=$_sk_c"
+    else
+      abk_warn "sched.abk_sc_release_ms: '$_sk_val' is not a number, ignored"
+    fi
+  fi
+
   return 0
 }
 
@@ -552,7 +620,14 @@ abk_report_dvfs_state() {
   _rs_fas="$(abk_read_flat "$ABK_FAS_NODE")"
   _rs_enable="$(abk_read_flat "$_rs_sf/abk_sf_enable")"
   _rs_boost="$(abk_read_flat "$_rs_sf/abk_sf_boosting")"
-  abk_log "dvfs: fas=${_rs_fas:-no /proc/fas} abk_sf_enable=${_rs_enable:-absent} abk_sf_boosting=${_rs_boost:-absent}"
+  # Batch 42 added the cap on the same hook and in the same file as the floor,
+  # so its two nodes are the other half of the same picture: abk_sc_capped is
+  # per-policy and says whose target is being suppressed right now, which is the
+  # only way to tell "the cap is armed and idle" from "the cap is holding this
+  # cluster" without reading frequencies and guessing.
+  _rs_sc_enable="$(abk_read_flat "$_rs_sf/abk_sc_enable")"
+  _rs_sc_capped="$(abk_read_flat "$_rs_sf/abk_sc_capped")"
+  abk_log "dvfs: fas=${_rs_fas:-no /proc/fas} abk_sf_enable=${_rs_enable:-absent} abk_sf_boosting=${_rs_boost:-absent} abk_sc_enable=${_rs_sc_enable:-absent} abk_sc_capped=${_rs_sc_capped:-absent}"
 
   _rs_foreign=0
   _rs_pinned=0

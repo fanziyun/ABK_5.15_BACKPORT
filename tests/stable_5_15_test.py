@@ -2992,6 +2992,23 @@ def test_runtime_tunables_module():
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
+    # The shipped files must be LF, not CRLF, and this is a load-bearing pin
+    # rather than tidiness.  A Windows text-mode write (python's
+    # Path.write_text()) turns every LF into CRLF; nothing complains at
+    # `bash -n`, and the failure shows up as an inert supervisor instead of a
+    # syntax error: bash dies on `$'\r': command not found`, so
+    # abk_zram_supervisor_main never runs and the harness reports
+    # supervisor_runs="" (which then crashes int('')).  The packer zips the
+    # working tree, so a CRLF source is a CRLF device -- and Android's mksh
+    # chokes exactly like bash.  For tunables.conf specifically it is worse
+    # than a broken script: abk_cfg's awk strips trailing spaces and tabs but
+    # not \r, so `sched.abk_sf_floor_pct=85` yields "85\r", abk_clamp_uint
+    # rejects it as "not a number", and the knob writes nothing.
+    for name in required:
+        blob = (module_dir / name).read_bytes()
+        check(f"{name} is LF, not CRLF", b"\r\n" not in blob,
+              blob.count(b"\r\n"))
+
     props = {}
     for line in (module_dir / "module.prop").read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.startswith("#"):
@@ -3033,7 +3050,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.46.0", "0.46.0"], _versions)
+          _versions == ["0.47.0", "0.47.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3123,6 +3140,13 @@ def test_runtime_tunables_module():
     # log the symptom has nothing to start from.
     dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):
                      common_sh.index("abk_apply_readahead_knob() {")]
+    # The knob applier the cap's blocks were added to, sliced the same way the
+    # existing checks slice their targets.
+    sched_knobs = common_sh[common_sh.index("abk_apply_sched_knobs() {"):
+                            common_sh.index("abk_read_flat() {")]
+    # Comments may explain an omission; only the code may not carry the knob.
+    sched_knobs_code = "\n".join(l for l in sched_knobs.splitlines()
+                                 if not l.lstrip().startswith("#"))
     check("the DVFS report logs the capacity the placer sees",
           "cap_view=" in dvfs and "_rs_capv" in dvfs)
     check("the DVFS report warns when the super core is no bigger than a weaker cluster",
@@ -3132,6 +3156,67 @@ def test_runtime_tunables_module():
           and "pre-10-5 payload" in dvfs and "abk_sf_boosting node" in dvfs)
     check("the DVFS capacity math goes through abk_mul_div, not shell arithmetic",
           'abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax"' in dvfs)
+
+    # Batch 42's cap shares the hook and the file with the floor, so the
+    # companion has to report both halves of the same range.  This was the gap
+    # that shipped: the device log showed the floor's three nodes and nothing of
+    # the cap, so "who owns this range" had no answer for a grafted tree.
+    action_source = (module_dir / "action.sh").read_text(encoding="utf-8")
+    tunables_conf = (module_dir / "tunables.conf").read_text(encoding="utf-8")
+    for node in ("abk_sc_enable", "abk_sc_cap_pct", "abk_sc_capped",
+                 "abk_sc_boosting"):
+        check(f"action.sh status reports the cap node {node}",
+              re.search(rf'abk_show_or_absent "{node}"', action_source)
+              is not None, action_source.count("abk_show_or_absent"))
+    check("the cap's boot line carries both of its nodes",
+          "_rs_sc_enable=" in dvfs and "_rs_sc_capped=" in dvfs
+          and "abk_sc_cap=${_rs_sc_capped" not in dvfs,
+          [l for l in dvfs.splitlines() if "_rs_sc_" in l])
+    check("abk_capped is read from the cap payload, not the floor's",
+          "_rs_sc_capped=\"$(abk_read_flat \"$_rs_sf/abk_sc_capped\")\"" in dvfs)
+    # abk_cfg_lint() warns on any tunables.conf key outside abk_known_keys(), so
+    # a knob that is not listed there is refused at every boot -- which is how
+    # the companion ends up reporting a node it cannot drive.
+    check("every sched.abk_sc knob is a known key",
+          all(f"sched.abk_sc_{k}" in common_sh for k in
+              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")))
+    check("abk_apply_sched_knobs drives the cap's five knobs",
+          all(f'abk_write "$_sk_dir/abk_sc_{k}"' in sched_knobs_code for k in
+              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")),
+          [l for l in sched_knobs_code.splitlines() if "abk_sc_" in l])
+    # abk_sc_entry_pct has no companion knob on purpose: it feeds only the
+    # read-only abk_sc_boosting election and gates no decision, so a writable
+    # copy would be the number reached for first when chasing the floor's old
+    # 70-90% dead band -- and moving it changes nothing.
+    # Comments in both files explain the omission; an *active* key is the defect.
+    tunables_code = "\n".join(l for l in tunables_conf.splitlines()
+                              if not l.lstrip().startswith("#"))
+    check("no companion knob for the diagnostic-only entry_pct",
+          "sched.abk_sc_entry_pct" not in tunables_code
+          and "abk_sc_entry_pct" not in sched_knobs_code)
+    # The companion arms both halves for this device, and the kernel payloads
+    # stay false -- that split is the point.  The tunables block also has to
+    # keep the two percentages from crossing: cap_pct <= floor_pct means the
+    # cap's re-assert probe clamps, on every resolve_freq call, exactly what the
+    # floor just lifted, and the cluster pins at that one frequency.
+    sched_block = "\n".join(l for l in tunables_conf.splitlines()
+                            if not l.lstrip().startswith("#"))
+    sf_floor = int(re.search(r"(?m)^sched\.abk_sf_floor_pct=(\d+)$",
+                             sched_block).group(1))
+    sc_cap = int(re.search(r"(?m)^sched\.abk_sc_cap_pct=(\d+)$",
+                           sched_block).group(1))
+    check("the companion arms both the floor and the cap",
+          re.search(r"(?m)^sched\.abk_sf_enable=1$", sched_block) is not None
+          and re.search(r"(?m)^sched\.abk_sc_enable=1$", sched_block) is not None,
+          [l for l in sched_block.splitlines() if l.startswith("sched.")])
+    check("the cap stays above the floor (a crossed band is a frequency lock)",
+          sc_cap - sf_floor >= 5 and sc_cap <= 100,
+          (sf_floor, sc_cap))
+    check("... and the band's inequality is stated where the next editor reads it",
+          "floor_pct=85" in tunables_conf and "cap_pct=95" in tunables_conf
+          and "Batch 10-4c ratchet" in tunables_conf,
+          [l for l in tunables_conf.splitlines()
+           if "floor_pct" in l or "cap_pct" in l])
     # Comments may name the path they are avoiding; only the code must not.
     dvfs_code = "\n".join(l for l in dvfs.splitlines()
                           if not l.lstrip().startswith("#"))
@@ -5801,12 +5886,272 @@ def main():
     test_batch35_pagecache_pt()
     test_batch40_erofs_readahead()
     test_batch41_kcompressd_offload()
+    test_batch42_schedutil_smart_cap()
 
     print()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")
         sys.exit(1)
     print("all checks passed")
+
+
+def test_batch42_schedutil_smart_cap():
+    """Batch 42: the freq_cap[] clamp, and its ordering against the floor.
+
+    Two things here are structural rather than cosmetic and are what the test
+    is really for.  First, the cap's payload has to end up *textually ahead* of
+    schedutil_smart_policy's, because android_vh probes run in registration
+    order and the clamp must be the first thing the floor sees -- so the test
+    runs the two groups in both orders and demands the same file.  Second, the
+    release decision must be the request direction, not the util time window
+    whose 70-90% dead band latched the floor's reason on a real device, so the
+    payload is pinned to not contain any of that idiom.
+    """
+    print("Batch 42 schedutil_smart_cap (freq_cap[] -> min(freq, cap))")
+    import abk_stable_perf as perf
+    import batch10_perf_sched_policy as b10
+    import batch42_perf_schedutil_smart_cap as b42
+
+    for key in ("schedutil_smart_policy", "schedutil_smart_cap"):
+        check(f"{key} group registered",
+              any(g.key == key for g in perf.PATCH_GROUPS))
+    keys = [g.key for g in perf.PATCH_GROUPS]
+    check("the cap is registered after the floor (registration order is "
+          "execution order)",
+          keys.index("schedutil_smart_cap") > keys.index("schedutil_smart_policy"),
+          keys[keys.index("schedutil_smart_policy") - 1:
+               keys.index("schedutil_smart_cap") + 1])
+
+    rel = "kernel/sched/cpufreq_schedutil.c"
+    pristine = b42._INC_OLD + "void governor(void);\n" + b42._TAIL_OLD
+    # A tree the floor group has already helped: the include block and the
+    # payload are in, so the cap must not re-add the header.
+    floor_only = (b10._INC_NEW + "void governor(void);\n" + b10._TAIL_OLD
+                  + b10._POLICY_V2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {rel: floor_only})
+        status, detail = perf._sched_smart_cap_apply(ctx)
+        check("the cap adds no duplicate include on a floor-shaped tree",
+              status == "applied", (status, detail))
+        text = ctx.read(rel)
+        for found, want, name in [
+            ("#include <trace/hooks/cpufreq.h>\n"
+             "#include <linux/math.h>\n"
+             "#include <linux/moduleparam.h>\n"
+             "#include <linux/string.h>\n", 1,
+             "the shared header block appears once"),
+            ("#include <trace/hooks/sched.h>", 1,
+             "the sched hook header appears once"),
+        ]:
+            check(name, text.count(found) == want, text.count(found))
+
+    # Registry order: floor first, then cap.  This is the order the child ships.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {rel: pristine})
+        st_p, d_p = perf._sched_smart_policy_apply(ctx)
+        st_c, d_c = perf._sched_smart_cap_apply(ctx)
+        check("both payloads apply on the pristine fixture",
+              (st_p, st_c) == ("applied", "applied"), (st_p, st_c, d_p, d_c))
+        text = ctx.read(rel)
+        cap_init = text.index("late_initcall(abk_sc_init);")
+        floor_init = text.index("late_initcall(abk_sf_init);")
+        # Registration order is execution order for android_vh probes.  Both
+        # probes clamp-or-raise are level 7, so within this one translation
+        # unit source order decides: the cap's has to come first, which is what
+        # grafting the payload in front of the anchor buys.
+        check("cap's late_initcall is textually before the floor's, so the "
+              "clamp is the first thing the floor sees",
+              cap_init < floor_init, (cap_init, floor_init))
+        check("the re-assert probe sits one initcall level later (7s), which "
+              "orders after every level-7 entry including the floor's",
+              "late_initcall_sync(abk_sc_reassert_init);" in text
+              and "late_initcall_sync(abk_sf_init);" not in text)
+        check("the cap payload lands ahead of the anchor",
+              text.index("ABK stable_515_backport: Batch 42 schedutil "
+                         "smart_freq cap") < text.index(b42._TAIL_OLD),
+              None)
+        check("neither payload is defined twice",
+              text.count("static bool abk_sf_enable") == 1
+              and text.count("static bool abk_sc_enable") == 1
+              and text.count("static void abk_sc_resolve_freq(") == 1
+              and text.count("static void abk_sc_reassert_freq(") == 1
+              and text.count("static void abk_sf_resolve_freq(") == 1,
+              None)
+        for g in perf.PATCH_GROUPS:
+            if g.key in ("schedutil_smart_policy", "schedutil_smart_cap"):
+                st2 = g.run(ctx)["status"]
+                check(f"{g.key} is idempotent", st2 == "already_present",
+                      (g.key, st2))
+
+    # The placement has to make the two orders converge: graft the cap first,
+    # then the floor, and the file must be byte-identical.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {rel: pristine})
+        perf._sched_smart_cap_apply(ctx)
+        perf._sched_smart_policy_apply(ctx)
+        reversed_text = ctx.read(rel)
+        ctx2 = make_ctx(tmp + "-b", {rel: pristine})
+        perf._sched_smart_policy_apply(ctx2)
+        perf._sched_smart_cap_apply(ctx2)
+        check("either application order produces the same file",
+              reversed_text == ctx2.read(rel))
+        check("cap-before-floor holds in the reversed order too",
+              reversed_text.index("late_initcall(abk_sc_init);")
+              < reversed_text.index("late_initcall(abk_sf_init);"))
+
+    payload = b42._CAP
+    # module_param(NAME, ...) compiles the identifier NAME as the variable, so
+    # every one-name form must really declare it (ABK CI caught the
+    # counterexample in Batch 12; no text audit can see this class).
+    declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", payload))
+    for name in re.findall(r"(?m)^module_param\((\w+),", payload):
+        check(f"one-name module_param {name!r} really declares that variable",
+              name in declared, (name, sorted(declared)))
+
+    for name, cond in {
+        # --- knobs and defaults (upstream constants in parentheses) ---
+        "cap ships disabled": "static bool abk_sc_enable = false;" in payload,
+        "cap_pct defaults to no clamp": "static uint abk_sc_cap_pct = 100;" in payload,
+        "hold_ms is upstream UNCAP_THRES":
+            "static uint abk_sc_hold_ms = 300;" in payload,
+        "entry_pct is upstream UTIL_THRESHOLD":
+            "static uint abk_sc_entry_pct = 90;" in payload,
+        "release_pct/release_ms defaults":
+            "static uint abk_sc_release_pct = 70;" in payload
+            and "static uint abk_sc_release_ms = 250;" in payload,
+        "the cap is a fraction of cpuinfo.max_freq":
+            "return mult_frac(policy->cpuinfo.max_freq, pct, 100);" in payload,
+        "cap_pct > 100 is treated as 100":
+            "if (pct > 100)\n\t\tpct = 100;" in payload,
+        "all six knobs are 0644":
+            len(re.findall(r"(?m)^module_param\(abk_sc_\w+, \w+, 0644\);",
+                           payload)) == 6,
+        # --- gates: every one of them, or the ratchet is back ---
+        "ownership gate: a non-schedutil governor is refused":
+            'strcmp(policy->governor->name, "schedutil") != 0' in payload,
+        "ownership gate: the helper is this payload's own, not the floor's":
+            "static bool abk_sc_dvfs_owned(struct cpufreq_policy *policy)"
+            in payload and "abk_sf_dvfs_owned(" not in payload,
+        "a collapsed range is refused":
+            "policy->min == policy->max" in payload,
+        "a cap without headroom is never applied":
+            "if (c <= policy->min || c >= policy->max)" in payload,
+        "the clamp itself is upstream's form":
+            "*target_freq = cap;" in payload,
+        # --- the lesson: release is request-direction, not a util window ---
+        "the dead-band lesson is cited in the payload":
+            "ABK_SC_RELEASE IS NOT A UTIL WINDOW" in payload
+            and "70-90% dead band" in payload,
+        "release is driven by the request direction":
+            "p->high_start = jiffies;" in payload
+            and "time_after(jiffies, p->high_start +" in payload
+            and "msecs_to_jiffies(abk_sc_hold_ms)))" in payload,
+        "a request at or below the cap restarts the window":
+            "p->high_start = 0;" in payload,
+        "the util window only re-asserts an already-released cap":
+            "p->released = false;" in payload
+            and "abk_sc_cooled(policy)" in payload,
+        "the release expires on jiffies, not on a tick (NO_HZ_IDLE)":
+            "time_after(jiffies, oldest + msecs_to_jiffies(abk_sc_release_ms))"
+            in payload,
+        "none of smart_policy's util-window idiom is reused":
+            not re.search(r"\b(ABK_SF_\w+|boost_release)\b", payload)
+            # the single abk_sf_ token left is the comment that explains why
+            # the ownership gate is duplicated here rather than shared
+            and len(re.findall(r"\babk_sf_\w+", payload)) == 1,
+        # --- per-policy state under a raw spinlock ---
+        "state is per-policy, not per-CPU":
+            "struct abk_sc_policy {" in payload
+            and "abk_sc_policies[policy->cpu]" in payload,
+        "the ladder is guarded by a raw spinlock (fast_switch, rq->lock)":
+            "raw_spinlock_t lock;" in payload
+            and "raw_spin_lock_irqsave(&p->lock, flags)" in payload
+            and "raw_spin_unlock_irqrestore(&p->lock, flags)" in payload,
+        "the policy locks are initialised":
+            "raw_spin_lock_init(&abk_sc_policies[cpu].lock);" in payload,
+        "the arrays are zeroed allocations, with a matching free":
+            "kcalloc(num_possible_cpus(), sizeof(*abk_sc_cpus)," in payload
+            and "kcalloc(num_possible_cpus(), sizeof(*abk_sc_policies)," in payload
+            and "kfree(abk_sc_cpus);" in payload,
+        # --- the floor yields: the re-assert probe ---
+        "the re-assert probe re-applies this pass's clamp only":
+            "if (p->capped && *target_freq > cap)" in payload
+            and "late_initcall_sync(abk_sc_reassert_init);" in payload,
+        "the re-assert cannot touch a target the cap did not clamp":
+            "if (!target_freq || !abk_sc_owns(policy, &cap))" in payload,
+        # --- observability ---
+        "both read-only nodes are 0444":
+            "module_param_cb(abk_sc_boosting, &abk_sc_boosting_ops, "
+            "NULL, 0444);" in payload
+            and "module_param_cb(abk_sc_capped, &abk_sc_capped_ops, "
+            "NULL, 0444);" in payload,
+        "the reason election is the upstream thres_based_uncap shape":
+            "time_after(now, c->reason_start +" in payload
+            and "c->reason_start = 0;" in payload,
+        "the reason mask is derived, never latched":
+            "c->reason = c->reason_start &&" in payload,
+        "no knob name collides with the floor's abk_sf_ namespace":
+            re.search(r"(?m)^(?:static\s+)?[\w \t\*]+?\babk_sf_\w+", payload) is None,
+        "the only abk_sf_ mention is the comment naming the duplicate":
+            payload.count("abk_sf_") == 1
+            and "abk_sf_dvfs_owned" in payload,
+        # --- quality red lines ---
+        "no debug residue": "pr_err(" not in payload and "pr_debug(" not in payload
+            and payload.count("pr_info(") == 1
+            and payload.count("pr_warn(") == 3,
+        "no uclamp misuse": "uclamp" not in payload,
+        "no Kconfig, no structure change, no iowait boost":
+            not any(s in payload for s in
+                    ("Kconfig", "#if", "iowait_boost", "arch_scale_freq_invariant")),
+        "every new line carries the marker":
+            "/*\n * ABK stable_515_backport: Batch 42 schedutil smart_freq cap"
+            in payload
+            # the header plus the three pr_warn lines plus the one pr_info.
+            and payload.count("ABK stable_515_backport:") == 5,
+    }.items():
+        check(name, cond)
+
+    check("the unknown-shape probe trips on the payload's declaring line",
+          b42.has_unknown_cap("\nstatic bool abk_sc_enable = true;\n"))
+    check("the unknown-shape probe is quiet on the current payload and on a "
+          "tree that has none",
+          not b42.has_unknown_cap(payload)
+          and not b42.has_unknown_cap(pristine))
+    check("the header-block probe agrees with what the include step produces",
+          b42.has_header_block(b42._INC_NEW)
+          and not b42.has_header_block(b42._INC_OLD)
+          and b42._INC_HINT in b42._INC_NEW)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stray = (b42._INC_OLD + "void governor(void);\n" + b42._TAIL_OLD
+                 + "\n/*\n * ABK stable_515_backport: Batch 9-9 cap.\n */\n"
+                 "static bool abk_sc_enable = true;\n")
+        check("an unnamed cap shape is not mistaken for the current one",
+              b42.has_unknown_cap(stray) and not b42.has_current_cap(stray))
+        ctx = make_ctx(tmp, {rel: stray})
+        st_u, d_u = perf._sched_smart_cap_apply(ctx)
+        check("an unnamed cap payload is refused, not applied",
+              st_u == "blocked_by_shape" and "unrecognised" in d_u,
+              (st_u, d_u))
+        check("and the refusal writes nothing",
+              ctx.pending_writes() == [], ctx.pending_writes())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx2 = make_ctx(tmp, {})
+        st_m, d_m = perf._sched_smart_cap_apply(ctx2)
+        check("the cap degrades on an empty tree",
+              st_m.startswith("blocked") and ctx2.pending_writes() == [],
+              (st_m, d_m))
+        # A tree whose include block has a shape this module cannot recognise:
+        # the required anchor misses, so nothing at all is written.
+        odd = ("#include <linux/sched/cpufreq.h>\n" + "void governor(void);\n"
+               + b42._TAIL_OLD)
+        ctx3 = make_ctx(tmp, {rel: odd})
+        st_o, d_o = perf._sched_smart_cap_apply(ctx3)
+        check("an unrecognised include shape reports blocked_by_shape",
+              st_o == "blocked_by_shape" and ctx3.pending_writes() == [],
+              (st_o, d_o, ctx3.pending_writes()))
 
 
 if __name__ == "__main__":

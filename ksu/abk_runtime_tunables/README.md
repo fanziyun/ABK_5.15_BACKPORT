@@ -211,10 +211,15 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
-| `sched.abk_sf_enable` | `0` | the smart-freq floor; leave at `0` whenever a vendor FAS/WALT governor owns DVFS (see below) |
-| `sched.abk_sf_floor_pct` | *(empty)* | 0..100 |
-| `sched.abk_sf_sustained_ms` | *(empty)* | 1..60000 |
-| `sched.abk_sf_exit_ms` | *(empty)* | 1..60000 |
+| `sched.abk_sf_enable` | `1` | the smart-freq floor; `1` only on a device whose governor is really `schedutil` (see below) |
+| `sched.abk_sf_floor_pct` | `85` | the floor end of the band; **must stay below `sched.abk_sc_cap_pct`** |
+| `sched.abk_sf_sustained_ms` | `300` | ms at >=90% of capacity before a CPU starts boosting (0..100) |
+| `sched.abk_sf_exit_ms` | `250` | ms below 70% before a boosting CPU clears (1..60000) |
+| `sched.abk_sc_enable` | `1` | the Batch 42 smart_freq cap; same ownership gates as the floor |
+| `sched.abk_sc_cap_pct` | `95` | the ceiling end of the band; **must stay above `sched.abk_sf_floor_pct`**, and `100` is no clamp |
+| `sched.abk_sc_hold_ms` | `300` | ms the request must stay above the cap before it is released (1..60000) |
+| `sched.abk_sc_release_pct` | `70` | every CPU of the policy below it, for `release_ms`, re-asserts the cap |
+| `sched.abk_sc_release_ms` | `250` | (1..60000) |
 | `readahead.dynamic_readahead` | *(empty)* | `0`/`1` |
 | `psi.cgroup` | `keep` | per-cgroup pressure accounting: `keep` (the built-in default, and the shipped value) leaves every group as the kernel set it; `auto` switches off only groups holding no tasks and no memory, which this device measured to be a no-op; `aggressive` switches off everything outside the protect list |
 | `psi.cgroup.protect` | `system` built-in, `system,protect_memcg` shipped | path **prefixes** that keep their accounting -- narrow on purpose, and the shipped value covers this ROM's own memory-daemon groups |
@@ -247,6 +252,33 @@ pre-10-5 kernel runs) froze a cluster at 1785600 for a whole game session while
 generations are tellable apart from userspace: only 10-5 exposes the read-only
 `abk_sf_boosting` node.
 
+Batch 42 adds the *cap* -- the `freq_cap[]` half of WALT `smart_freq` that Batch
+10-2 scoped and never landed -- on the same hook and in the same file, so the two
+groups register on one `android_vh_cpufreq_resolve_freq` and registration order is
+execution order: the cap's `late_initcall` runs first (its payload is grafted ahead
+of the floor's `cpufreq_governor_init()` anchor, which is also the only placement
+that leaves both groups idempotent), and the floor's raise is answered by a second
+probe at `late_initcall_sync` that re-asserts the clamp, so while the cap owns a
+range the floor yields.  `action.sh status` reports both: `abk_sc_enable` /
+`abk_sc_cap_pct` and the read-only `abk_sc_capped` (which `policy->cpu` is being
+suppressed right now) and `abk_sc_boosting` (the upstream `thres_based_uncap`
+reason).  `abk_sc_capped` carrying a bit while `abk_sf_boosting` carries none is
+how you tell the cap is the layer holding that cluster.
+
+The cap ships off for the same reason the floor does, and it is gated as hard:
+`abk_sc_owns()` refuses any policy whose governor is not `schedutil`, whose range
+has collapsed to `min == max`, or whose cap would land at or beyond either end
+(a cap that `__resolve_freq()`'s own clamp already satisfies is a frequency lock,
+not a cap).  Its release is deliberately *not* a util time window -- the floor's
+`≥90% in / ≥70% renew / 250 ms below 70%` window is what produced a measured
+70-90% dead band, where util parked at 75-85% never satisfied the exit condition
+and the reason never cleared.  The cap releases on the direction of the frequency
+request instead, and its util window only ever re-asserts a cap that has already
+been released, which is the one direction that cannot hold a frequency down.
+`sched.abk_sc_entry_pct` has no companion knob because it feeds nothing but the
+read-only reason election; it is the number that would be reached for first when
+chasing that dead band, and moving it changes nothing.
+
 The same ceiling reaches *placement*, which no frequency check can see.  EAS and
 WALT rank cores by DMIPS capacity scaled by the policy's own ceiling, so whoever
 writes `scaling_max_freq` also decides how big each core looks.  Measured on
@@ -273,6 +305,34 @@ knob is runtime-only there, so a reboot can re-arm an ungated floor (pin
 `sched.abk_sf_enable=0` in this file instead).  Only arm
 `abk_sf` on a device whose governor really is `schedutil`, and re-check with
 `--probe` after.
+
+Both halves are armed for this device, and together they are a **band**, not a
+tug-of-war.  The floor is the low end: while any CPU of a policy has been at
+>=90% of its capacity for 300 ms, `resolve_freq` raises the target to at least
+`sched.abk_sf_floor_pct` of `cpuinfo.max_freq`, so a sustained frame does not
+drop the frequency right after a busy window.  The cap is the high end: above
+`sched.abk_sc_cap_pct` the target is clamped, unless requests have stayed above
+it for 300 ms.  Shipped values put those ends at **85% and 95%**, with demand free
+to move inside the band.
+
+Two facts about that band, both learned the hard way on this line:
+
+- **`cap_pct` must stay above `floor_pct`.**  The cap registers a second probe at
+  `late_initcall_sync`, so it runs *after* the floor's raise.  At
+  `cap_pct <= floor_pct` the floor lifts, the cap clamps back, on every
+  `resolve_freq` call forever -- and the cluster pins at that one frequency the
+  moment sustained load appears.  That is the Batch 10-4c ratchet, and it is the
+  whole reason the cap was written.  Want a tighter ceiling?  Lower `floor_pct`
+  first and keep the gap; do not push `cap_pct` down to meet it.
+- **The governor decides whether either end is live at all.**  Measured while
+  gaming, the scheduler profile in play leaves the policy on `schedutil`, which
+  is the one governor both payloads accept.  The boot-time `dvfs:` line still
+  reads `walt` because it is taken at post-fs-data, before any profile switches
+  anything -- so `walt` at boot and `schedutil` in a game are both true, and the
+  second is the state worth tuning for.
+
+`sched.abk_sc_entry_pct` has no companion knob because it feeds nothing but the
+read-only `abk_sc_boosting` election and gates no decision.
 
 The compaction gate exists because of a measured kill-storm on device: after an
 app-cleaner killed every user process, `mm_stat` showed `mem_used_total` 352 MB
