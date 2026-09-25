@@ -5,7 +5,10 @@ build/
 *.ko
 *.img
 *.bin
-research/hunks_dump.txt
+# Local-only workspace: upstream patch snapshots, reference trees, device-check
+# records and the dev helpers (hunks.py / fetch_all_trees.sh).  Never published
+# with the repo -- docs citing research/... point at the maintainer's checkout.
+research/
 .idea/
 .zcode/
 

@@ -1,7 +1,10 @@
 """Dev-time helper: dump .patch hunks as LF old/new block pairs.
 
-Lives under research/ and is NOT part of the shipped module.  Used to lift
-hunk content into the anchor groups of abk_stable_core.py / abk_stable_perf.py.
+Lives under tools/ and is NOT part of the shipped module -- unlike the device
+CLIs beside it, it is not listed in
+ksu/abk_runtime_tunables/embed.conf, so the packager never copies it into the
+zip.  Used to lift hunk content into the anchor groups of
+abk_stable_core.py / abk_stable_perf.py.
 """
 
 import sys

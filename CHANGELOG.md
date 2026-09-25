@@ -2,6 +2,8 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。91 个移植组（core 66 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+
 <a id="overview-nine"></a>
 
 ## 交付日志总览：九项优化（按清单顺序）
@@ -145,7 +147,7 @@ Batch 17（v0.22.0）core 组，上游系列一 v6「zram: introduce writeback b
 v6.13）驱动分批，而 5.15 **0 命中** → in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE`
 表达：前者让 `recompress_store()` / `abk_zram_recomp_work()` 在 slot lock 下跳过飞行中的槽，
 后者（`zram_free_page()` 入口清 IDLE、`idle_store()` 拒绝给 UNDER_WB 标 IDLE）就是
-「这个槽还是我读到的那一个」的可靠判据。上游的独立 `zram_writeback_slots()` 在 5.15 是
+「这个槽还是此前那一个」的可靠判据。上游的独立 `zram_writeback_slots()` 在 5.15 是
 **内联在** `writeback_store()` 里，保留内联（函数切分是 pp-slot 两阶段选择才需要的）。
 
 **真机数据**（同一次 vermeer 实测，每例校验写回前后读回 md5）：
@@ -219,7 +221,7 @@ logcat**（失败的是重定向、不是 echo —— 活树上漏了 28 行，�
 打包门禁抓到 shipped 代码里的 `/system/bin/true` 与夹具路径。
 
 验证：`py_compile`、`bash -n` + `sh -n`（含 dash）、策略 selftest PASS（7 条断言）、
-`stable_5_15_test.py` all checks passed（**+22 条断言**，含一条钉住我一开始写错的来源判断：
+`stable_5_15_test.py` all checks passed（**+22 条断言**，含一条钉住初版写错的来源判断：
 这个节点是本模块 Batch 21 的 graft，**不是**上游自带）、167/178/194/216 四档
 `step_audit`/`implementation_audit`/`smoke` 全绿。**registry / sublevel_matrix / module.conf 一行未动**
 （companion 批次只 bump `module.prop`，先例 `a50df6e`）。
@@ -280,7 +282,7 @@ Batch 21 的 `cgroup.pressure`、Batch 25 的策略，**在任何 android13-5.15
    （第一版是 `sleep 0` 在循环里，toybox sleep 会 fork），现在钉「wake 风暴代码里不得出现 `printf`」
    + `echo x >&3` + `echo y; done <`；`--help` 也从固定行范围改成「第一个非注释行之前」（头部一长就会被截断）；
 4. **策略 walk 把「走到一半消失的组」记成 `refused`**。真机上任何一个正在退出的 app 都会制造一次，
-   而首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不让我写」——
+   而首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不允许写入」——
    于是一条退出记录就能在开机第一趟把策略**停掉整个 boot**。改为独立计数器 `vanished`
    （`gone/cgroup.pressure` 单独归类），`--selftest` 断言 `vanished=1`。
 
@@ -423,7 +425,7 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 "mm/mglru: performance optimizations, v4"（Yu Zhao，2024-12-31，lore
 20241231043538.4075764-1-yuzhao@google.com；封面 0/7 + 7 个补丁——任务书里
 「8 个」是把封面计入）。本批把 plan.md 延后项 `mglru_612_refresh` **重新定性**：
-对象不是 6.12，正是这 7 个补丁；按用户决定落地 6 组、放弃 2 条。
+对象不是 6.12，正是这 7 个补丁；按既定范围落地 6 组、放弃 2 条。
 
 ### 0. 审计先行：基线形态判定（决定锚点怎么挂）
 
@@ -457,7 +459,7 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 
 ### 2. 排除记录（2 条放弃 + 2 条核销）
 
-- **`4d5d14a01e2c`（6/7，rework workingset protection）——放弃**。用户拍板
+- **`4d5d14a01e2c`（6/7，rework workingset protection）——放弃**：判定依据是
   「6、7 收益不高难度大」。`LRU_REFS_FLAGS` 语义重定义（`PG_referenced|PG_workingset`
   → `LRU_REFS_MASK|PG_referenced`）+ `lru_gen_folio_seq()` 重写落代 + 四处文件
   联动，且 `mm_inline.h` 的 MGLRU 段是 page 形态（`lru_gen_add_page`），
@@ -481,7 +483,7 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
   （4×2×3 → 4×2×4 个 `unsigned long`，+64B），`struct lruvec` 内其后的
   `mm_state`/`pgdat`/`ANDROID_VENDOR_DATA(1)` 后移，`lruvec` 及嵌入者
   （`mem_cgroup_per_node`/`pgdat`）变大。该数组扩容不是加字段、无
-  `ANDROID_KABI_RESERVE` 槽可借，**经用户确认接受**（3/4/6 打包的先决条件；
+  `ANDROID_KABI_RESERVE` 槽可借，**已接受**（3/4/6 打包的先决条件；
   6 虽随后放弃，3 照做）。
 - 页标志布局零变化：`LRU_REFS_WIDTH` 不动，`PG_workingset`/`PG_referenced`
   只改语义不改位。`lru_gen_mm_walk` 是 kmalloc 私有结构，`can_swap`→`swappiness`
@@ -569,9 +571,7 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 | `tools/abk_fas_check.sh` → `bin/` | addon 1 | addon 2 |
 | Batch 10-5 / Batch 42 两组内核 graft | **留在 ABK 内核模块** | —— |
 
-**为什么内核侧不动**:KernelSU 模块是用户态,无法携带编译后的内核代码。先问过用户
-一次(给了 A/B 两条路),用户最终确认「我指的是原模块 1 的东西搬迁到模块 2」,即
-用户态这一侧。
+**为什么内核侧不动**:KernelSU 模块是用户态,无法携带编译后的内核代码。范围是用户态这一侧的整体搬迁，即模块 1 的 Companion 内容并入模块 2。
 
 **搬迁是字节级 move,不是重写**:`ksu/abk_sched_tunables/common.sh` 里 449 行(10 个
 函数:`abk_apply_sched_knobs`、七个 `abk_gov_*`、`abk_read_flat`、
@@ -604,7 +604,7 @@ README 删掉 governor 段与 band 讨论,换成指针。addon 1 版本 v0.15.0 
 **期间自己制造并修掉的两个缺陷**:
 
 1. 在 `module.conf` 的 `ABK_MODULE_SET_ITEMS` 里写了 `Batch 10-2's` / `Batch 42's`
-   —— **撇号会提前终止单引号 shell 串**。仓库此前特意把这些撇号全去掉了,我这次
+   —— **撇号会提前终止单引号 shell 串**。仓库此前特意把这些撇号全去掉了,本轮
    又带回来两个。表现为「every child row keeps the 12-field module-set shape」
    失败。已去掉,并 `source module.conf` 实测 + 逐行数 pipes(11)。
 2. Python heredoc 里把 `"
@@ -621,7 +621,7 @@ README 删掉 governor 段与 band 讨论,换成指针。addon 1 版本 v0.15.0 
 **设备侧**:两个 zip 均已构建(确定性构建,SHA256 见交付记录),addon 2 共 9 个条目。
 **尚未刷入设备验证** —— 刷入后 addon 2 会与仍在校内的 addon 1 v0.15.0 并存,需要
 一次重启才能让 addon 1 的新版本(v0.16.0,不再写这些节点)与 addon 2 交接;这一步
-待用户确认后做。
+待确认后做。
 
 <a id="companion-v0-15-0"></a>
 
@@ -634,8 +634,8 @@ README 删掉 governor 段与 band 讨论,换成指针。addon 1 版本 v0.15.0 
 governor 的入口**(`cpufreq_set_policy` 不在导出表里);而 `drivers/cpufreq/cpufreq.c`
 是内建 vmlinux,本模块的 `files/` 只能覆盖已嫁接的那一棵树里的文件,外部模块没法
 往里塞代码。所以唯一通道就是 `scaling_governor` 这个 sysfs 节点 —— 这与
-Batch 10-5「ABK 绝不参与抢调频」不矛盾:那一批的结论是**我们的 payload 不该跟
-vendor FAS 抢**,而这里改的是 governor 本身,是用户明确要的行为。
+Batch 10-5「ABK 绝不参与抢调频」不矛盾:那一批的结论是**本模块的 payload 不该跟
+vendor FAS 抢**,而这里改的是 governor 本身,是明确要求的行为。
 
 **机制(全部真机实测,vermeer / android13-5.15 / 5.15.216 / SELinux Enforcing)。**
 
@@ -703,9 +703,9 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 `abk_spawn` 为什么要先 `pkill` 同名 supervisor),已按 pid 清干净。
 
 **未验证。** ① **重启后是否仍然成立未测**:supervisor 会在每次开机重新 chmod +
-写入,但真机重启需要用户确认,本次未做;② 写入 walt 回退的那一方**未确认**,30 秒
+写入,但真机重启未验证,本次未做;② 写入 walt 回退的那一方**未确认**,30 秒
 间隔是推理值而非按实测节奏调的;③ **没有做性能 A/B**,不主张任何吞吐/功耗/温度数字 ——
- vendor 默认选 walt 自有其理由,本次只交付"用户要的行为",不附带"这样更好"的结论;
+ vendor 默认选 walt 自有其理由,本次只交付目标行为,不附带"这样更好"的结论;
 ④ 全局 schedutil 会让 Batch 10-5/42 的 payload 从"退让"变为"可能接管"
 (`abk_report_dvfs_state()` 的 `_rs_foreign` 不再置位),这是预期的耦合,但这条链
 本身没有单独测过。
@@ -713,7 +713,7 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 
 ### 重启后复测:governor 侧闭环,band 侧发现 95% 从未生效
 
-用户重启后实测(vermeer / 5.15.216,uptime 3672s):暂存的 v0.15.0 已生效(live
+重启后实测(vermeer / 5.15.216,uptime 3672s):暂存的 v0.15.0 已生效(live
 `service.sh` 3695 字节、`update` 目录消失),开机日志
 `gov: want=schedutil policy0=schedutil ...` 三个 policy 全在 schedutil;
 `--supervise-gov` supervisor 存活(pid 文件写的是 `$$`),且**抓到了回退事件本尊**
@@ -805,7 +805,7 @@ hook `android_vh_cpufreq_resolve_freq`。
 `abk_sc_resolve_freq` 上面的注释块以 `ABK_SC_RELEASE IS NOT A UTIL WINDOW` 开头，逐字引用了这条
 教训及其成因：`schedutil_smart_policy` 第一种形态按 util 时间窗退出（≥90% 进入、≥70% 续期、
 连续 250ms <70% 才退出），**实机上它造成 70%–90% 死区** —— 滑动/后台负载把 util 稳在 75–85%，
-退出窗口永不成立，reason 永不清除，频率被摁住不降（用户实测复现过）。
+退出窗口永不成立，reason 永不清除，频率被摁住不降（实测复现过）。
 
 所以本批的放开判据**只看频率请求方向**。剩下的那个 util 窗口只负责**另一侧**：把一个**已经放开**的
 cap 重新收回。这个不对称是刻意的，也是安全的那一侧 —— **一个只能让功能重新上线的窗口不可能把频率
@@ -927,7 +927,7 @@ v0.23.0（Batch 18）的真机构建产物，之后的批次新增了 tier。本
   "unknown key ignored"，companion 就成了"看得见但驱动不了"。
 - **`sched.abk_sc_entry_pct` 故意不给 knob**：它只喂只读的 `abk_sc_boosting` 选举、不 gate 任何
   决策，给一个可写副本会让人为了追 floor 那个 70-90% 死区去改一个改不动的数字。
-- **本设备要求两个 enable 都置 1，并按「频带」而不是「拔河」理解**（用户指定）。真机实测：跑游戏时
+- **本设备要求两个 enable 都置 1，并按「频带」而不是「拔河」理解**（既定约定）。真机实测：跑游戏时
   scheduler profile 把 policy 留在 **schedutil**，这正是两个载荷唯一接受的 governor；开机日志里
   三个 policy 是 `walt`，是因为那条 `dvfs:` 记录在 post-fs-data 打、profile 还没切 governor ——
   两句都成立，要调的是后面那个状态。最终配置 `floor_pct=85` / `cap_pct=95`，间隔 10 点。
@@ -956,14 +956,14 @@ v0.23.0（Batch 18）的真机构建产物，之后的批次新增了 tier。本
 
 - harness 一 `. common.sh`，bash 就满屏 `$'
 ': command not found`，`abk_zram_supervisor_main`
-  静默不跑，`supervisor_runs` 空串，单测在 `int('')` 上抛 ValueError。**这同时证明了它是被我的
+  静默不跑，`supervisor_runs` 空串，单测在 `int('')` 上抛 ValueError。**这同时证明了它是由本轮
   改动引入的**：`/tmp/pristine_mod`（`git archive HEAD`，LF）在同一 harness 上 `supervisor_runs=4`。
 - 更要紧的是 `scripts/build_ksu_module.py` 是按**工作树**打包的，所以一个 CRLF 的 `common.sh`
   会直接进 anykernel3 的 companion zip，Android 的 mksh 会像 bash 一样噎死 —— 正是
   `AGENTS.md`「bash -n 不是手机上跑的那个 shell」那一课。已实测打包产物：修复后
   `common.sh` crlf=0 / lf=905，打包幂等。
 
-已把 8 个被我写坏的文件按 `.gitattributes` 的 `eol=lf`（索引 LF）全部归位，`.patch` 文件是
+已把 8 个格式写坏的文件按 `.gitattributes` 的 `eol=lf`（索引 LF）全部归位，`.patch` 文件是
 `-text` 且索引本就是 CRLF，未动。教训：在这个仓库里改文件用文本编辑器/Edit，不要用
 `Path.write_text()`；`read_text`/`write_text` 这一对在 Windows 上不守恒。
 
@@ -1070,7 +1070,7 @@ Batch 10-1 用 `struct abk_zram_recomp_map` / `abk_zram_recomp_map_head` / `abk_
 3. `folio_test_anon()` → `PageAnon(page)` —— 只匿名页。
 4. `mem_cgroup_zswap_writeback_enabled(folio_memcg(folio))` —— **5.15 无此符号，删掉**，换成
    **本模块自己的政策**：`memcg_is_dying(page_memcg(page))`（Batch 38 `memcg_dying_bailout` 加进
-   `include/linux/memcontrol.h`）。这不是「上游有所以我们抄」，是政策一致性：本模块的回收政策是
+   `include/linux/memcontrol.h`）。这不是「上游有所以就抄」，是政策一致性：本模块的回收政策是
    「memcg 一旦进入拆除，回收就停」，kcompressd 是回收链上新出现的一个写者。零新 include 成本——
    `page_memcg()` 与 `memcg_is_dying()` 经 `mm/page_io.c` 已有的 `linux/swap.h` → `linux/memcontrol.h`
    已可达。
@@ -1408,7 +1408,7 @@ PG_writeback 记账收支平衡（已逐行核）：`set_page_writeback()` →
 
 1. **"不可能"守卫从 `WARN_ON_ONCE()` 改成 `pr_warn_once()`。**
    原实现里 `do_swapout()` 起手的 `WARN_ON_ONCE(!PageSwapCache(page))` 是整棵树上唯一一个
-   WARN。它守的条件（排队期间 swap 项被 `try_to_free_swap()` 摘掉）我们判断不可达，而
+   WARN。它守的条件（排队期间 swap 项被 `try_to_free_swap()` 摘掉）判定不可达，而
    **触达时的动作（放弃这次写）本身就是安全动作** —— 所以 WARN 在这里不增加任何价值，
    只增加一个风险：`WARN` 是一个 oops，而 `panic_on_oops` / `panic_on_warn` 会把 oops
    变成 panic。也就是说，用 WARN 守一个"不可能"，等于**自己给内核装了一个 panic 引信**，
@@ -1505,7 +1505,7 @@ include 块与 append 块，以及 import 步骤新加的一个 include 行。
 `kthread_stop()` 永久阻塞，而它持着**写模式的 `mem_hotplug_lock`** ——
 `/sys/devices/system/memory/.../online` 的 write 永不返回，后面每个热插拔操作全部堵死。
 （5.15 自己的 kswapd 靠 `wakeup_kswapd()` 在每次分配时被叫醒逃过这一劫，`mm/vmscan.c:7129`
-的谓词同样不含 stop；我们的线程没有这种流量，**必须显式**。）
+的谓词同样不含 stop；本模块的线程没有这种流量，**必须显式**。）
 
 **② `abk_kcompressd_del_node()`：NULL 任务指针 → `wake_up_interruptible` → `kthread_stop` → drain → `kfifo_free`。**
 三步的先后是设计核心：
@@ -1521,7 +1521,7 @@ include 块与 append 块，以及 import 步骤新加的一个 include 行。
   drain 结束"与"看到 stop 位"之间仍可能有页入队（那时 `kcd->task` 已 NULL，只会是拆
   之前入的），所以调用方必须兜底。**ring 必须在 free 前为空**：每个 entry 持一个页引用
   加一个活着的 swap slot，而那些页正是被拆节点的页 —— 丢弃而不写 = 留下"数据从未写出、
-  干净位却已清掉"的 swap-cache 页，没有任何代码路径会替我们重新弄脏它。
+  干净位却已清掉"的 swap-cache 页，没有任何代码路径会替它重新弄脏它。
 
 **③ 拆除点选 `MEM_OFFLINE`，不是 `MEM_GOING_OFFLINE`。**
 `MEM_GOING_OFFLINE`（`mm/memory_hotplug.c:1992`）发出时，页区正在
@@ -1530,7 +1530,7 @@ include 块与 append 块，以及 import 步骤新加的一个 include 行。
 到 `MEM_OFFLINE`（`:2076`）时：`node_states_clear_node()` 已跑完（节点已出 `N_MEMORY`，
 不会有新工作路由进来）、`kswapd_stop(node)` 已跑完（该节点的 kswapd 已停）、
 `remove_pfn_range_from_zone()` 还没跑（页仍在 zone 里但已孤立）。这正是题面要求的
-"与 `kswapd_stop()` 对齐"：kswapd 先停，我们再停。
+"与 `kswapd_stop()` 对齐"：kswapd 先停，本模块后停。
 
 **④ `abk_kcompressd_add_node()` 同时服务开机 initcall 循环和 `MEM_ONLINE`。**
 "节点怎么拿到线程"只有一处定义。`MEM_ONLINE` 用 `pfn_to_nid(arg->start_pfn)` 而不是
@@ -1604,7 +1604,7 @@ comment/brace/`#ifdef` 平衡与幂等，`implementation_audit.py` 查内容）�
 #### 14.1 缺陷一：调用点在定义点之前，缺前向声明
 
 `swap_writepage()` 在文件第 217 行调 `abk_kcompressd_store(page)`，而引擎整个 append 在
-文件尾部（第 689 行起）。我在设计注释里写的理由是"引擎 append 在最后一个函数之后，
+文件尾部（第 689 行起）。设计注释里的理由是"引擎 append 在最后一个函数之后，
 所以它调用的东西都已声明，不需要发明前向声明"——**这个理由只涵盖了引擎调用的东西，
 漏了引擎自己也是被调用方**：`swap_writepage()` 在 append 点之前。
 
@@ -1635,7 +1635,7 @@ static int abk_kcompressd(void *p)                                 /* 802 行 */
 'int (*)(void *)'`）是同一个根因的连带：名字先解析到数组，于是函数指针类型不对。
 
 任务简报里写的是"命名前扫一遍 `docs/porting_policy.md` 与既有组名，避免撞名或撞
-suite-detection marker"——我扫了**跨组**撞名（`abk_kcompressd_*` 与 `abk_zram_*` /
+suite-detection marker"——扫过**跨组**撞名（`abk_kcompressd_*` 与 `abk_zram_*` /
 `abk_sf_*` / `abk_gfp_*` / `abk_dra_*` 零撞），**漏了本 TU 内部自己两个符号相撞**。
 
 **修法**：数组改名 `abk_kcompressd_nodes`（复数），线程函数保持 `abk_kcompressd`。
@@ -1685,7 +1685,7 @@ core 64 → **65**，模块 `0.44.0` → `0.45.0`）；这是本模块第一个 
 
 ### 1. 调查结论（本批的起点）：erofs 补丁**无法**提升 zram 压缩性能
 
-用户的原始请求是「查看上游是否有 erofs 相关的优化补丁，移植下来以此优化 zram 等的压缩性能」。
+原始需求是「查看上游是否有 erofs 相关的优化补丁，移植下来以此优化 zram 等的压缩性能」。
 调查结论是**这条桥不存在**，五条证据（已写进 `plan.md` 的「排除记录（不再重议）」）：
 
 1. **代码上不共享压缩路径。** erofs 的解压实现全在 `fs/erofs/` 内——LZ4 走
@@ -1945,7 +1945,7 @@ free 路径两条都不通：`CONFIG_INIT_ON_FREE_DEFAULT_ON` 在 `gki_defconfig
   `kasan_has_integrated_init()` 只有 `should_skip_kasan_unpoison()` 末行
   `init_tags || (flags & __GFP_SKIP_KASAN_UNPOISON)`（`mm/page_alloc.c:2537`）一条路，
   而 `__GFP_ZEROTAGS` 被上面的 `init_tags` 分支自己消费（该分支已置 `init = false`），
-  `__GFP_SKIP_KASAN_UNPOISON` 在**全树没有任何用户**（已 grep）。
+  `__GFP_SKIP_KASAN_UNPOISON` 在**全树无任何使用方**（已 grep）。
 - `free_pages_prepare()` 断言 `!PageTail(page)`，两个调用点都从 head page 传 `1 << order`，
   区间确实连续——这正是单次 `memset` 的前提。`!IS_ENABLED(CONFIG_HIGHMEM)` 即 arm64 的配置，
   所有可达页面都在线性映射内，`page_address()` 有效。
@@ -2041,7 +2041,7 @@ v7.2 触及 `mm/` 的 commit 共 **366** 条。这个数字是拿 tag 可达性�
 `sha=v7.1` 与 `sha=v7.2` 下分别列 `path=mm`，取差集；再用 cgit 的 `log/mm/?id=v7.1..v7.2`
 全量翻页交叉核对，两者一致（差集的 245 条全部落在 cgit 的 366 条内，零遗漏）。
 
-我最初的窗口法（committer date 2026-06-13..08-16）只覆盖到 **121** 条、漏掉 **245** 条，
+最初的窗口法（committer date 2026-06-13..08-16）只覆盖到 **121** 条、漏掉 **245** 条，
 而且混入了 **432** 条 v7.2 之后才进 master 的 commit——原因是子系统树在 Linus 拉取前几周
 就提交了补丁，committer date 落在 4/5 月。**教训记在这里，后续任何按版本筛选的调研都适用。**
 
@@ -2120,7 +2120,7 @@ v7.2 触及 `mm/` 的 commit 共 **366** 条。这个数字是拿 tag 可达性�
 `memcg_dying_bailout` 的主动回收那条，上游把它紧贴在 `signal_pending()` 判断之后。但 5.15 上那个
 循环是 Batch 37 `memcg_memory_reclaim` **生成**的 `memory_reclaim()`（在 `mm/memcontrol.c`，
 不是 vmscan.c），而 Batch 37 的 `proactive_reclaim_suspend_abort` 组正好重写那一段并把
-`/* This is the final attempt...` 注释作为自己 `new` 块的结尾。**我的插入落在它中间，就把那个
+`/* This is the final attempt...` 注释作为自己 `new` 块的结尾。**插入操作落在它中间，就把那个
 `new` 块劈成两半**：第二遍时它的 `old`（`-EINTR`）匹配不上、`new` 也匹配不上，于是在已打补丁的树上
 降级成 `blocked_by_shape`。这是 `step_audit.py` 的第二遍断言抓到的，第一遍全绿。
 
@@ -2224,7 +2224,7 @@ mmap_miss = READ_ONCE(ra->mmap_miss);`，行号对、函数错，`replace_once` 
 所以只加新的 `FAULT_FLAG_TRIED` 一项，既有的多减行为保持上游所见。该改动只可能
 **跳过**一次递减（`mmap_miss > 0` 边界检查保留），不会引入下溢。
 
-### 9. MGLRU 改为默认开启（用户要求「该 PR 的优化全部默认开启」）
+### 9. MGLRU 改为默认开启（既定要求「该 PR 的优化全部默认开启」）
 
 `LRU_GEN_ENABLED` 从 `_ALIGN_CONFIGS`（opt-in）挪进 `_MODULE_CONFIGS`（默认层），
 `/sys/kernel/mm/lru_gen/enabled` 开机即非零。
@@ -2255,7 +2255,7 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
 Batch 37 的 v6.14 六组，不是 survey §1 那版。若要 survey 里那组收益（吞吐 +29%／延迟 −23%／
 refault −43%，服务器数字），得先把 12 条落地。
 
-**按用户划定的范围，其余 opt-in 层不动**：`TCP_CONG_ADVANCED`/`TCP_CONG_BBR`/`BLK_WBT`/
+**按既定范围，其余 opt-in 层不动**：`TCP_CONG_ADVANCED`/`TCP_CONG_BBR`/`BLK_WBT`/
 `BLK_DEV_THROTTLING`/`TASK_DELAY_ACCT`（align 层，6.6-GKI 对齐而非本模块优化）、
 per-cgroup PSI（psi 层，删 `cgroup_disable=pressure` 的设备级开销）、`abk_sf_enable`
 （vendor FAS/WALT 拥有 DVFS 时频率地板会变天花板锁）、伴生 `zram.writeback.trigger`（闪存磨损）。
@@ -2293,7 +2293,7 @@ defconfig 改写实测：`enable_configs` 在 `arch/arm64/configs/gki_defconfig`
 结论：无锁读回读的数据是对的，且同文件里带锁的那个读法（`pagetypeinfo_showfree`）
 没有被误改——它仍返回正确数据。
 
-> 过程中我自己造过一个伪指标并弃用：曾用「`nr_free[o+1] <= nr_free[o]` 是结构不变量」
+> 过程中曾造过一个伪指标并弃用：「`nr_free[o+1] <= nr_free[o]` 是结构不变量」
 > 判定撕裂读，报出 buddyinfo 200/2000 违反、pagetypeinfo 0/2000。**该不变量本身是错的**——
 >  buddy 分配器的高阶空闲块不拆成低阶计数，`nr_free[1]` 完全合法地远大于 `nr_free[0]`；
 > 修好 pagetypeinfo 解析后两个读法违反次数完全相同（各 200），证实是伪指标。
@@ -2541,7 +2541,7 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
 
 | 轴 | 发现 | 处理 |
 |---|---|---|
-| Spec | **`generic_perform_write()` 的论据在本树上不成立**：我按上游 commit message 写它「只在无进展分支 fault」，但 5.15 的 `mm/filemap.c` 里它**仍在循环头** fault（`Bring in the user page that we will copy from _first_`）。那句话对 v6.15+ 的上游为真 | docstring 改写成可核对的形态：分别陈述「上游为什么这么做」与「5.15 上为什么仍然安全」（新 fault 落在 `unlock_page()`/`put_page()` 之后，且 `copy_page_from_iter_atomic()` 不 fault），并显式声明这是**上游的**理由、本模块没有独立测量。plan.md 的「与 `generic_perform_write()` 同形」同样加了限定。见 §6 |
+| Spec | **`generic_perform_write()` 的论据在本树上不成立**：按上游 commit message 写成「只在无进展分支 fault」，但 5.15 的 `mm/filemap.c` 里它**仍在循环头** fault（`Bring in the user page that we will copy from _first_`）。那句话对 v6.15+ 的上游为真 | docstring 改写成可核对的形态：分别陈述「上游为什么这么做」与「5.15 上为什么仍然安全」（新 fault 落在 `unlock_page()`/`put_page()` 之后，且 `copy_page_from_iter_atomic()` 不 fault），并显式声明这是**上游的**理由、本模块没有独立测量。plan.md 的「与 `generic_perform_write()` 同形」同样加了限定。见 §6 |
 | Spec | 「5.15 的 `get_tree_bdev()` 对非块设备以 `-ENOTBLK` 返回」这条论据，初稿只写到函数名、没写可核对的出处（而按上游路径去 `fs/block_dev.c` 找会 404 —— 这仓的块设备代码在 `block/bdev.c`） | 实测 `block/bdev.c` 的 `lookup_bdev()`（`error = -ENOTBLK; if (!S_ISBLK(inode->i_mode)) goto out_path_put;`）并把路径这条容易踩空的差异写进模块 docstring / plan.md / 本节 §1 |
 | Standards | 模块 docstring 的 grep 证据表把符号拼成 `super_sysfs_name_generic`（真名是 `super_set_sysfs_name_generic`），`plan.md` / CHANGELOG 用的是对的 —— 一张「grep 结果」的表列了一个从未被搜索过的串 | 改成真名并把表格重排（每行一个符号），三处拼写现在一致 |
 | Standards | 同一段说前提是「194 与 lts 两棵树的 grep」，而 `plan.md` / CHANGELOG 都写成「四条基线」—— 两边必有一处夸大 | 补测 167/178 的 `fs/erofs/`，把「四条基线」**做成事实**：四条 `internal.h` 同为 15955 字节，列出的 10 个符号在四条上各 0 处，`fileio.c` 不在任何一条的 `Makefile` 里 |
@@ -2557,7 +2557,7 @@ ACK 的 5.15 erofs 是 **iomap 时代**的树，三处结构性差异各自都�
 | Spec | **「原生 `read_folio` 取代了 iomap」是错的**：上游 erofs 到 v6.12、乃至 v6.16 的 bdev 通路**仍然是 iomap**（`erofs_read_folio()` → `iomap_read_folio(..., &erofs_iomap_ops)`，v6.12 里 `iomap` 出现 37 次、v6.16 里 41 次）。file-backed mount 是**并列**加一套 `erofs_fileio_aops`，不是替换 iomap —— 这反而让「前置链」变短了 | 模块 docstring / `plan.md` / 本节 §1 全部改写：前置是 **metabuf 层 + `fileio.c`**，并显式写明「不是取代 iomap」以及上游仍在 iomap 的版本证据 |
 | Spec | **fscache/ondemand 被当成前置，其实不是**：上游把 fileio 与 fscache 当**互斥模式**（`erofs_is_fileio_mode()` 为真时 `erofs_is_fscache_mode()` 返回假），回移它是另一个独立选择 | 从三处前置链里去掉，`plan.md` 的 `[~]` 追问项里补一句「不在链上」 |
 | Spec | 两处版本归属错：`struct erofs_buf`「6.4 的 metabuf 层」（实测 v5.19/v6.0–v6.3 各 7 处，早已存在）；`get_tree_bdev()` 改成 `lookup_bdev()`+`sget_dev()`「6.11」（实测 **v6.6**：v6.5 仍是 `blkdev_get_by_path()`、v6.6 起才是新形态并带上那句 `Can't lookup blockdev`） | 分别改成「约 5.19 起」与「**v6.6**（v6.5 还是 `blkdev_get_by_path()`）」 |
-| Spec | 「只有 167 的 `inode.c` 有差异」对 lts 不成立（216 另有 `decompressor.c`/`dir.c`/`zdata.c`/`zdata.h` 差异）—— 我那条只比了下载到的 6 个文件就写成了全目录结论 | 收窄成实测到的那一条：四条 `internal.h` 同为 15955 字节**且逐字节相同**（结论不受影响：11 个符号在四条上仍各 0 处） |
+| Spec | 「只有 167 的 `inode.c` 有差异」对 lts 不成立（216 另有 `decompressor.c`/`dir.c`/`zdata.c`/`zdata.h` 差异）—— 初版只比了下载到的 6 个文件就写成了全目录结论 | 收窄成实测到的那一条：四条 `internal.h` 同为 15955 字节**且逐字节相同**（结论不受影响：11 个符号在四条上仍各 0 处） |
 
 Spec 轴没有推翻本批的结论 —— erofs 那对确实不能落（`fileio.c` 与 metabuf 层是硬前置），
 `get_tree_bdev()` 确实以 `-ENOTBLK` 返回（它在真实基线里追到了 `block/bdev.c` 的 `lookup_bdev()`），
@@ -2614,7 +2614,7 @@ memory for the lruvec and memcg stats），Shakeel Butt，patch 存
 - 两个结构都**没有 `ANDROID_KABI_RESERVE` 槽**；而且本批的动作是「缩小/移除已存在的内嵌
   数组成员」，reserve 本来就只保护新增 ⇒ **没有任何掩护手段**。
 
-用户拍板：**不接受 KMI break**。忠实移植两条因此不可落地——它们省内存的全部手段就是改这些
+结论：**不接受 KMI break**。忠实移植两条因此不可落地——它们省内存的全部手段就是改这些
 内嵌布局（`ff48c71c26aa` 砍 `state[]`/`state_pending[]` 的宽度直接挪动 `mem_cgroup` 后续
 所有成员；`70a64b7919cb` 把内嵌 `lruvec_stats` 变成指针直接挪动 `mem_cgroup_per_node`）。
 改走 **KMI 中性的私有改写**（偏离上游形态的理由写进组 banner 注释与
@@ -3114,11 +3114,11 @@ FAIL  companion ships inside the kernel zip, not via an app download []
 
 | 轴 | 发现 | 处理 |
 |---|---|---|
-| Spec | **`zs_pool_stats_read()` 是 6.x 的名字，5.15 没有**（`grep` 全文件 0 处）。我拿它当了「每类统计必须留在锁内」的理由 | 换成可核对的事实：`class->stats.objs[]` 是普通 `unsigned long`，`zs_stat_dec()` 用 `-=` 更新，读者是 `zs_can_compact()`（经 `zs_stat_get()`、在 `class->lock` 下）。5 处引用（模块 / 单测 / 审计 / CHANGELOG / plan）全部改写，并在本节显式记下「别按现代树的名字去找」 |
+| Spec | **`zs_pool_stats_read()` 是 6.x 的名字，5.15 没有**（`grep` 全文件 0 处）。初版拿它当了「每类统计必须留在锁内」的理由 | 换成可核对的事实：`class->stats.objs[]` 是普通 `unsigned long`，`zs_stat_dec()` 用 `-=` 更新，读者是 `zs_can_compact()`（经 `zs_stat_get()`、在 `class->lock` 下）。5 处引用（模块 / 单测 / 审计 / CHANGELOG / plan）全部改写，并在本节显式记下「别按现代树的名字去找」 |
 | Spec | `README.md` 的组数普查没有把本组算进去（core 39、合计 63），而它同一段就断言「必须与 `GROUP_COUNTS` 一致」；顺带发现 Batch 31 的 `arm64_pte_mkwrite_clean` 也没进那一串枚举（那些批次只改了 `GROUP_COUNTS`，没改 README） | 改成 core **40** / perf 23 / 合计 **64**，并把**两个**缺的组都补进枚举（只补自己那半句的话，数字与实际枚举仍然对不上） |
 | Spec | `research/zsmalloc_lockfree/` 未跟踪，而模块 / plan / CHANGELOG 都引它当证据 | 随本批提交 |
 | Standards | 新 helper 自身没带 ABK 标记（标记落在了外壳函数上） | 标记注释移到 `__free_zspage_lockless()` 之前 |
-| Standards | 上游是 `static inline`，我写成了 `static` | 改回 `static inline`（签名换行，与该文件 `free_zspage()` 的续行风格一致）；探针改成不含存储类的签名前缀，去掉这层无谓耦合 |
+| Standards | 上游是 `static inline`，模块写成了 `static` | 改回 `static inline`（签名换行，与该文件 `free_zspage()` 的续行风格一致）；探针改成不含存储类的签名前缀，去掉这层无谓耦合 |
 | Standards | 「为什么 patch 1/2 不落」的论据在 4 处重复（模块 docstring / registry banner / CHANGELOG / plan），docstring 92 行远超 Batch 24 的 46 行——本仓先例（`e1f7874`「hand the landed-batch prose back to CHANGELOG.md」）是把落批叙事交回 CHANGELOG | docstring 收到 58 行、只留工程事实并指向 CHANGELOG；registry banner 收到 16 行；论据完整版只留在 CHANGELOG 与本条的排除记录 |
 | Standards | 未用 `research/hunks.py` 转换 | 保留人工转换，理由见 §4（`.patch` 上下文是现代树的 `zpdesc` 形态，转换器在这里不适用） |
 
@@ -3356,7 +3356,7 @@ KMI 无影响：inline helper 内部两行，不增删任何导出结构成员�
 
 ## Batch 30(v0.32.0)
 
-起因：用户点名「6.18 的 `e338d8353154` 要不要 backport」。逐条查证后落地**一组**：
+起因：候选问题「6.18 的 `e338d8353154` 要不要 backport」。逐条查证后落地**一组**：
 `readahead_mmap_miss_race`。`module.conf` 0.31.1 → **0.32.0**，`GROUP_COUNTS` core **36 → 37**。
 本批**不在**「九项优化」清单内（见 [交付日志总览](#overview-nine)）——它是 mm/readahead 启发式的
 一次上游对齐；政策上属「优化/行为修正」而非 security-only，故在范围内。
@@ -3553,7 +3553,7 @@ sweep 并没有施加的保护。出厂默认仍是 `cfr.enable=0`，态度不�
 
 **第二段（重启关掉插件后，本批真正的结论）**
 
-用户随后说明：先前那 9 个 v2 冻结 pid **不是平台行为，是他外装的一个 LSPosed 插件**。重启关掉后实测，
+后续核查：先前那 9 个 v2 冻结 pid 不是平台行为，是外装的一个 LSPosed 插件。重启关掉后实测，
 冻结档并没有归零，而是**大大收窄**——这比「平台不冻结」更值得记：
 
 | 采样 | 冻结 pid 数 |
@@ -3930,8 +3930,8 @@ Batch 28 落地后做了一次**逐特性存活审计**（44 个 agent：13 个�
 | # | 什么 | 为什么是空的 |
 |---|---|---|
 | 1 | `PREEMPT_SHORT` / `abk_eevdf_preempt_short()` | `se->slice` 只有两个写入点，都写 `sysctl_sched_min_granularity`；读取点的零回退也是同一个全局量 ⇒ `abk_eevdf_slice(pse) >= abk_eevdf_slice(se)` 是 **X ≥ X**，函数恒返回 false。`SCHED_FEAT(PREEMPT_SHORT, true)` 是**静态分支为真、toggle 它什么也不变**的开关，而 KABI 槽 4 花在一个常量上 |
-| 2 | `wakeup_preempt_entity` / `wakeup_gran` / `__pick_next_entity` | 零调用者，ThinLTO 直接删掉（`nm` 与镜像 BTF 表里都没有）。我写的注释 **"kept for out-of-tree users" 是假的** —— 它们是 `static`、无 `EXPORT_SYMBOL`，树外模块引用不到 |
-| 3 | **缺了上游的 `curr = NULL if !eligible` 前置门** | 不是我加的行，是我**没加**的行。后果：RUN_TO_PARITY 的触发状态严格宽于上游；而且它**早于 skip 判定**就 `return curr`，于是 `yield_task_fair()` 设的 skip buddy 被遮住 —— `sched_yield()` 退化成"跑完当前 slice"，**比原版 CFS 还弱**，而 A2 声称修好了它 |
+| 2 | `wakeup_preempt_entity` / `wakeup_gran` / `__pick_next_entity` | 零调用者，ThinLTO 直接删掉（`nm` 与镜像 BTF 表里都没有）。所写注释 **"kept for out-of-tree users" 是假的** —— 它们是 `static`、无 `EXPORT_SYMBOL`，树外模块引用不到 |
+| 3 | **缺了上游的 `curr = NULL if !eligible` 前置门** | 不是新加的行，是**漏加**的行。后果：RUN_TO_PARITY 的触发状态严格宽于上游；而且它**早于 skip 判定**就 `return curr`，于是 `yield_task_fair()` 设的 skip buddy 被遮住 —— `sched_yield()` 退化成"跑完当前 slice"，**比原版 CFS 还弱**，而 A2 声称修好了它 |
 | 4 | `sched_vslice()` 的 START_DEBIT 计算被 `initial` 分支覆盖 | 属于"被取代的死计算"，非行为缺陷 |
 
 第 2、3 条合起来还使 **EEVDF 版 yield 的放弃逻辑在常见路径上不生效**：`yield_task_fair()` 先调
@@ -3963,7 +3963,7 @@ Batch 28 落地后做了一次**逐特性存活审计**（44 个 agent：13 个�
    `check_preempt_wakeup()`、`check_preempt_tick()` 三处各一个分支。于是
    `__pick_next_entity` / `wakeup_preempt_entity` / `wakeup_gran` 重新有调用者，
    `__maybe_unused` 与其上那句假注释一并去掉。
-   - 这是**上游自己的中途形态**，不是我发明的回退路径。
+   - 这是**上游自己的中途形态**，不是自创的回退路径。
    - 它同时给了一个**运行期回到 CFS 选择的开关**——在刚刚发生过真机异常之后，这个价值不低于可读性。
    - 边界要写清楚：它不是"关掉 EEVDF"。`place_entity()` 仍做 EEVDF 放置，所以它是
      **选择/抢占面的回退**，不是整族回滚。
@@ -4024,14 +4024,14 @@ AUDIT FAIL: perf/sched_eevdf_modern_fields:
 - **`sched_setattr(sched_runtime)` 现在对普通任务开放**。这是上游语义，钳位也是上游的
   （100us..100ms），但它确实是一条新的、非特权可达的调度策略面。Android 自己是否用它、
   以及要不要在 SELinux 侧收紧，都不是本批次能定的。
-- **性能仍未测量**。上一轮的 A/B 因事故中断，一个有效采样都没有。而且我在审计里写的
+- **性能仍未测量**。上一轮的 A/B 因事故中断，一个有效采样都没有。而且审计里写的
   "旧选择器 O(n²)–O(n³)" **是夸大的**：旧代码对尚未用尽 slice 的实体是提前 return 的，
   常见代价是**每个节点一次 `sched_slice()`**，真实量级 **O(n)**，O(n²) 只在大量实体同时过期
   时出现。审计文档里那条结论已按此更正，**实际收益比原文写的小**。
 
 ### 14. 真机事故（未定论，如实留档）
 
-2026-09-16 的一次 A/B 测量把设备搞挂了：我把 **200 个 CPU-bound 任务用 `taskset` 钉在同一个
+2026-09-16 的一次 A/B 测量把设备搞挂了：**200 个 CPU-bound 任务用 `taskset` 钉在同一个
 核（cpu3）**，用来放大调度器信号。后果见 dmesg：
 
 ```
@@ -4070,9 +4070,9 @@ pending: psi_avgs_work ×67, kfree_rcu_monitor, lru_add_drain_per_cpu, vmstat_up
 | KernelSU root / companion | 正常（`u:r:ksu:s0`）/ `v0.10.0` 在位 ⇒ `sched_entity` 槽 4 的认领**没有破坏 KMI** |
 | 温和负载（8 个**不钉核**的 hog，8 核各一） | ctxt ≈ 9,805/s，无 stall、无 lockup，负载退出后回落 |
 
-### 16. 更正：那两个开关在设备上**是可观测的**（我之前说错了两次）
+### 16. 更正：那两个开关在设备上**是可观测的**（初版判断错了两处）
 
-前文（§5、§8）我说 `/sys/kernel/debug/sched/features` 不存在，并先把原因归给
+前文（§5、§8）称 `/sys/kernel/debug/sched/features` 不存在，并先把原因归给
 "`CONFIG_SCHED_DEBUG` 关着"，后来改成"ROM 把 debugfs 藏了"。**两条都不对，正确的是**：
 
 - `CONFIG_SCHED_DEBUG=y`、`CONFIG_JUMP_LABEL=y`（已从构建出的 `.config` 核实）；
@@ -4120,7 +4120,7 @@ state after on : EEVDF
 
 ## Batch 27(companion v0.11.0)
 
-起因：用户要求「查找优化 `launch_boost` 解决冷启动过慢」。本批**不引入任何 `PatchGroup`**
+起因：需求「查找优化 `launch_boost` 解决冷启动过慢」。本批**不引入任何 `PatchGroup`**
 —— registry 与 `GROUP_COUNTS` 未动，`module.conf` 本批不改（工作树里的 0.30.1 是并行的
 zram writeback 修复批次改的），只 bump companion 的 `module.prop`，沿用 Batch 25 先例。
 完整原文、脚本与原始输出：**`research/launch/vermeer_launch_20260915/FINDINGS.md`**。
@@ -4135,7 +4135,7 @@ zram writeback 修复批次改的），只 bump companion 的 `module.prop`，�
 - **而且当前完全没在运行**：`iorapd=stopped`、`PrereadEnable=false`、AIDL 服务未注册、
   无内核节点、无 `CONFIG_LAUNCH_BOOST`、`kallsyms` 无符号。
 
-内核侧没有这个东西可调，用户态那条链也没在跑 —— 所以按用户裁定「先测量归因再定」+
+内核侧没有这个东西可调，用户态那条链也没在跑 —— 所以按「先测量归因再定」的方针+
 「先只做判定观测」，本批只交付工装，**不指名任何杠杆**。
 
 ### 2. 交付物
@@ -4234,7 +4234,7 @@ AOSP `android13-5.15-lts` 的 `arch/arm64/configs/gki_defconfig` 自带：
 
 设计判断：**默认关**。token 去掉后那 ~450 个组会各自推导/计时自己的状态，直到 companion 的
 `psi.cgroup=aggressive` 把它们逐个关掉——这正是 token 免费做到的事。所以这一档是「把
-Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFCONFIG_ROM=1` 一样由用户显式打开。
+Batch 21/25 变成可运行」的开关，不是性能选项，跟 `ABK_515_DEFCONFIG_ROM=1` 一样需显式打开。
 
 ### 5. 验证
 
@@ -4308,7 +4308,7 @@ A/B 的**符号**第一次是不确定的（§5.1 上表：一次负、两次正
    现在钉「wake 风暴代码里不得出现 `printf`」+ `echo x >&3` + `echo y; done <`。
    工装还顺手把 `--help` 从固定行范围改成「第一个非注释行之前」——头部一长，用法段就被截断。
 2. **策略 walk 把「走到一半消失的组」记成 `refused`。** 真机上任何一个正在退出的 app 都会制造一次，
-   而 supervisor 的首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不让我写」，
+   而 supervisor 的首趟规则是「没有一个 off、没有一个 disabled、**却有 refused** ⇒ 这个内核不允许写入」，
    于是一条退出记录就能在开机第一趟把策略**停掉整个 boot**。改为独立计数器 `vanished`
    （`gone/cgroup.pressure` 单独归类），`--selftest` 断言 `vanished=1`。
 
@@ -4331,7 +4331,7 @@ A/B 的**符号**第一次是不确定的（§5.1 上表：一次负、两次正
 
 Batch 21 把 per-cgroup PSI 开关（`cgroup.pressure`）graft 进内核，Batch 22 收了 PSI 家族的
 内部同步，**但那个开关从落地那天起没被按过一次**。这一批是它的设备侧策略：不加任何
-graft（节点已经在我们自己的树上），只做「谁该关、什么时候关、关掉之后怎么证明」。
+graft（节点已经在本模块自己的树上），只做「谁该关、什么时候关、关掉之后怎么证明」。
 
 ### 1. 点名先行
 
@@ -4344,7 +4344,7 @@ graft（节点已经在我们自己的树上），只做「谁该关、什么时
 | 全设备打开着 pressure 文件的只有 `lmkd` / `system_server` / `mimd`，且都是 `/proc/pressure/memory` | 全局账由根组服务，分组开关碰不到它 |
 | **没有任何进程打开过 per-cgroup 的 PSI 文件** | 这份工没有主 |
 
-由此推翻我自己给的第一版默认：`auto`（只关空组）在这台机器上是**零收益的 no-op**——空组里
+由此推翻第一版默认：`auto`（只关空组）在这台机器上是**零收益的 no-op**——空组里
 没有任务，就永远不会触发 `psi_group_change()` 那段被省的代码。有意义的对照只剩 `keep` vs
 `aggressive`，而后者才是唯一真能省到东西的模式，也顺带是唯一可能拒绝掉「vendor 守护进程
 明天开始 poll 某个组」的模式。所以出厂默认写回 `keep`，`auto` 保留并在工具头里注明它为什么
@@ -4369,15 +4369,15 @@ graft（节点已经在我们自己的树上），只做「谁该关、什么时
 
 ### 3. 来源误判（这条最值得留）
 
-我最初在四处注释里写「这个开关是从上游 5.15 继承来的，所以本批只是策略不是 graft」。
+初版在四处注释里写「这个开关是从上游 5.15 继承来的，所以本批只是策略不是 graft」。
 **错**——`git log` 里 `534ede0 feat(perf): Batch 21 -- per-cgroup PSI accounting switch
-(cgroup.pressure)` 一句话就把我顶回来了：那是**我们自己 graft 进去的**（android13-5.15 没有
+(cgroup.pressure)` 一句话就推翻了它：那是**本模块自己 graft 进去的**（android13-5.15 没有
 这个节点）。写错的代价不只是注释难看：它会让「老内核优雅跳过」这条分支被理解成「照顾十几年
 前的内核」，而它真正照顾的是**没带 Batch 21 的 ABK 构建**和 ROM 自带内核。四处（工具头、
 `common.sh`、`tunables.conf`、`module.prop`）都改了，并且把这件事本身钉成断言：
-`"Batch 21" in tool and "inherited upstream" not in tool`——防止我或下一个人再写回去。
+`"Batch 21" in tool and "inherited upstream" not in tool`——防止后续再写回去。
 
-顺带一条同源的更正：上游那版开关的「重开不是可恢复状态」在**我们的移植里并不成立**（Batch 21
+顺带一条同源的更正：上游那版开关的「重开不是可恢复状态」在**本模块的移植里并不成立**（Batch 21
 把状态放在 cgroup 自己的 flags 位，什么都没释放，重开有 `psi_cgroup_restart()` 逐 cpu 重建
 state mask）。工具仍然只写 0，但理由换成真理由：companion 会跑在它没构建过的内核上，而它在
 用户态分不清两种实现。
@@ -4407,7 +4407,7 @@ state mask）。工具仍然只写 0，但理由换成真理由：companion 会�
    不是 `echo` 报的，`2>/dev/null` 作用在命令上而不是重定向的建立过程。WSL 真树上漏出 28 条
    才发现，改成 `if ( echo 0 > node ) 2>/dev/null`。
 3. **bench 一开始恒报 `cpu_jiffies=0`**：awk 程序写成 `'^cpu  {...}'`，少了正则斜杠，gawk 报
-   语法错——而我给读数函数套了 `2>/dev/null`，于是「测量失败」长得跟「读数为 0」一模一样。现在
+   语法错——而读数函数套了 `2>/dev/null`，于是「测量失败」长得跟「读数为 0」一模一样。现在
    用 `/^cpu  /`、不吞 stderr、并且**读不到就退出**（`refusing to print a zero as a
    measurement`）。AGENTS.md 里「绿灯的坏代码」那一类，这次轮到工装自己。
 4. **指标本身要先证明可信**：1000 / 4000 / 16000 次 fork → 145 / 590 / 2330 忙 jiffies，线性、
@@ -4443,7 +4443,7 @@ state mask）。工具仍然只写 0，但理由换成真理由：companion 会�
 `max_pages`（mainline `34efe1c3b688`，v6.10），顺带把同函数上后来的
 `2f529e73d720`（v7.1，拒绝无法识别的 `type=` 值）一起收进来。
 android13-5.15 两条都没有——它的重压缩面本来就是本模块从 android15-6.6 自己生成的，
-所以这两条在这里也只存在于我们生成的文本里。
+所以这两条在这里也只存在于本模块生成的文本里。
 
 ### 1. 为什么要这条
 
@@ -4468,7 +4468,7 @@ companion 每 `zram.recomp.interval_sec`（默认 1800s）跑一趟重压缩。*
 | `recompress_async_store()` | 同样三处——这个节点是 Batch 10-1 自造的，其 docstring 明说「与 recompress 同一套 type/threshold/algo 语法」，语法就不能只有一半 |
 
 语义逐条对齐上游：**计的是「尝试」不是「成功」**。上游把减量放在
-`recompress_slot()` 里 `zcomp_compress` 之后（哪怕这次压缩失败也扣，「因为我们确实
+`recompress_slot()` 里 `zcomp_compress` 之后（哪怕这次压缩失败也扣，「计数器确实
 花了这份资源」）。5.15 这边 `zram_recompress()` 内部自己按优先级循环，把减量放进去
 要么改签名、要么被 Batch 10-1 的 async worker 一起继承——所以减量落在调用点：
 上面每个候选过滤分支都是 `goto next`，能走到这一行就等于一次尝试，位置等价。
@@ -4495,7 +4495,7 @@ trap 5，Batch 21 踩过一次；这是本模块**第一个**故意破「没有�
 
 第一次跑，本组在 216 上是 `blocked_by_shape`：
 `required anchor missing (...:applied x5; ...:missing_anchor)`——第 6 步没锚上。
-原因：`_ASYNC_ENQUEUE_OLD` 的续行我从 registry 里 Batch 10-1 的写法「看着一样」抄了
+原因：`_ASYNC_ENQUEUE_OLD` 的续行照 registry 里 Batch 10-1 的写法「看着一样」抄了
 **10 个 tab**，树里实际是 **9 个**（那行续行的缩进是 `_tabs()` 由 4 空格/层换算出来的，
 人眼数不出来）。
 
@@ -4548,7 +4548,7 @@ trap 5，Batch 21 踩过一次；这是本模块**第一个**故意破「没有�
   max_pages (v0.29.0)`（编的就是这个提交）、`[ABK module] version: 0.29.0`（版本进到了产物里）、
   `stable_backport_core/zram_recompress_max_pages: applied`（本组真的落在树上）。
 
-一条自我更正：本节口述过的另一个号 **34897210323 不存在**，那是笔误。取号的正确方式不是记号，
+一处更正：本节先前给出的另一个号 **34897210323 不存在**，那是笔误。取号的正确方式不是记号，
 是把 run 的日志 grep 一遍、确认 `version:` 与 `head_log:` 跟自己的 HEAD 对得上——对不上就说明
 那次编的不是这份代码，绿灯也无意义。
 
@@ -4572,7 +4572,7 @@ zram_drv.c:2163: error: no member named 'wb_compressed' in 'struct zram'
 而树里的 `gki_defconfig` 根本没有 ZRAM 的任何符号 —— 这个配置由 ABK 的 `use_zram` /
 `custom_kernel_options` 注入，**默认不带** `CONFIG_ZRAM_WRITEBACK`。上一次跑绿（run 34871776161）
 的 dispatch 带 `custom_kernel_options: "CONFIG_ZRAM_WRITEBACK=y"`，而仓库里存着的
-`.commandcode/dispatch.json` 是**旧版**（该字段为空），我复用了它 —— 于是模块在一份关闭了
+`.commandcode/dispatch.json` 是**旧版**（该字段为空），复用了它 —— 于是模块在一份关闭了
 writeback 的树上编译，Batch 17 加的那几个辅助函数就找不到字段了。
 
 **但这暴露的是模块自己的问题，不是 dispatch 的问题**：模块把 `CONFIG_ZRAM_WRITEBACK` 当作
@@ -4664,7 +4664,7 @@ Batch 17 加的三个块漏了。
 
 6.1 的 `psi_group_change()` 里还有一句 `lockdep_assert_rq_held(cpu_rq(cpu));`。它属于另一处
 上游改动（把"调用者必须持 rq 锁"变成机械断言），本模块的调用点里 `psi_cgroup_restart()` 持锁、
-`psi_task_change/switch` 由 scheduler 持锁，但把这条断言一起搬进来等于给全部路径加一个我无法在
+`psi_task_change/switch` 由 scheduler 持锁，但把这条断言一起搬进来等于给全部路径加一个无法在
 本仓库内证明的前置条件 —— 故记录在案、不移植。
 
 ### 4. 验证
@@ -4969,7 +4969,7 @@ lts 从 `5.15.211` 起，AOSP 把 `task_struct` 的 KABI 槽 1 占成了 `user_d
 
 lts 分支**已经带了** `8fe7de5d1c7f`（5.15.198）的全部 payload：`pm_wakeup_pending()` 逃逸、
 `clear_bit(BLK_MQ_S_INACTIVE)`、`ret = -EBUSY`、`return ret`。唯一差别是 AOSP 把
-`#include <linux/suspend.h>` 包在 `#ifndef __GENKSYMS__` 里（他们靠这个保持 CRC 不变），
+`#include <linux/suspend.h>` 包在 `#ifndef __GENKSYMS__` 里（靠这个保持 CRC 不变），
 而本组的第一个 `required` 步锚的是**未包裹的 include 对** → 整组 `blocked_by_shape`，
 报的却是「锚点缺失」，读起来像缺功能。
 
@@ -5126,7 +5126,7 @@ tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报
 
 | 上游机制 | 5.15 事实 | 本批改写 |
 |---|---|---|
-| batching 由 pp-slot 机制驱动（`zram_pp_ctl`/`zram_pp_slot`/`ZRAM_PP_SLOT`，v6.13） | 5.15 **0 命中** | in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE` 表达：前者让 `recompress_store()` / `abk_zram_recomp_work()` 在 slot lock 下跳过飞行中的槽，后者（`zram_free_page()` 入口清 IDLE、`idle_store()` 拒绝给 UNDER_WB 标 IDLE）就是「这个槽还是我读到的那一个」的可靠判据 |
+| batching 由 pp-slot 机制驱动（`zram_pp_ctl`/`zram_pp_slot`/`ZRAM_PP_SLOT`，v6.13） | 5.15 **0 命中** | in-flight 窗口用 5.15 自己的 `ZRAM_UNDER_WB` + `ZRAM_IDLE` 表达：前者让 `recompress_store()` / `abk_zram_recomp_work()` 在 slot lock 下跳过飞行中的槽，后者（`zram_free_page()` 入口清 IDLE、`idle_store()` 拒绝给 UNDER_WB 标 IDLE）就是「这个槽还是此前那一个」的可靠判据 |
 | 独立 `zram_writeback_slots()` | 5.15 循环**内联在** `writeback_store()` | 保留内联，不引入上游的函数切分（那是 pp-slot 两阶段选择才需要的） |
 | `zram_read_from_zspool_raw()` 用 `zs_obj_read_begin/end` | 5.15 无此 API | 用 `zs_map_object(..., ZS_MM_RO)`：`mm/zsmalloc.c:1131 __zs_map_object()` **总是**把对象拷进 per-cpu `area->vm_buf` 再返回（`1149-1154` 从两页分别 memcpy，`1156 return area->vm_buf`），而 `vm_buf` 的注释就是 "copy buffer for objects that span pages" ——**映射本身就是 bounce buffer，不需要 zsmalloc 重写** |
 | `zstrm->local_copy` | 5.15 `zcomp_strm` 只有 `void *buffer`（`__get_free_pages(..., 1)` = 2 页） | 解压中转用 `zstrm->buffer` |
@@ -5164,7 +5164,7 @@ tcontext=u:object_r:zram_data_file:s0`），每页退化成 `-EIO`，写回**报
    `page = alloc_page(GFP_KERNEL);`，而 `_B_LOOP_TAIL_NEW` 的注释写着 "a blocking
    `submit_bio_wait()`"（分批后不再成立）。第一次只缩短了 `_B_POSTLOCK`（old），忘了它的
    `_B_POSTLOCK_NEW`（new）——结果 batch14 把那一行**又插了一遍**，扫描循环里出现两个
-   `page = alloc_page()`，我的页分配步替换掉了 pristine 那份，留下了刚插入的那份：
+   `page = alloc_page()`，本模块的页分配步替换掉了 pristine 那份，留下了刚插入的那份：
    **所有文本审计全绿**（锚点合法、结构平衡、两遍幂等、实现审计通过），因为这是一个纯 C 级错误。
    修法是把 `_B_POSTLOCK_NEW` 一并缩短到 `backing_dev` 检查的 `}`，并把这个不变量钉进单元测试：
    *后面步骤的锚点不得出现在前面步骤的替换文本里*。
@@ -5279,7 +5279,7 @@ batch 256 把上下文切换再压到 1/17（439 vs 7673），但墙钟不再改
 即：写侧省掉那次解压（任务 CPU 低 15–25%），但把 64MiB 全部读回时**读侧系统级 CPU 高约 48%**
 （解压被搬到 `system_highpri_wq`，所以不计在读者 syscall 上，但机器要付）。上游的立论是
 「写回的页大多不会被读回」，按这里的量级盈亏平衡点约在**读回率 25–30%** —— 因此**默认 0 是正确取舍**，
-模块不应强行替用户打开（`zram0` 上 `compressed_writeback=0` 是因为后备设备由 ROM 的 mmd 挂、
+模块不应强行代为开启（`zram0` 上 `compressed_writeback=0` 是因为后备设备由 ROM 的 mmd 挂、
 `abk_zram_has_writeback_owner()` 为真，模块按设计只保留不重写）。
 
 **写回上限记账**：`writeback_limit=100` 块，batch 1/32/256 都**恰好写 100 页**（`bd=[100 0 100]`，
@@ -5360,13 +5360,13 @@ writeback**，所以这两个特性在本机是「**不可达**」，而不是�
 | `vendor.zram.disable` | **`1`** |
 | `losetup -a` 的 loop49（zram0 的后备设备） | `/dev/block/loop49: [64819]:313194 ()` —— **文件名是空的**，即后备文件已被 unlink，loop 设备还挂着那个孤立 inode |
 | `/data/per_boot/zram/` | 只剩本次实验的 `b17_probe.img`，**ROM 自己的后备文件不在** |
-| zram0 本次开机 615 秒后 `bd_stat` | `[1 0 1]` —— 那 1 块来自我们自己的实验 |
+| zram0 本次开机 615 秒后 `bd_stat` | `[1 0 1]` —— 那 1 块来自本模块自己的实验 |
 | companion 侧 | `abk_zram_attach_writeback()` 只**挂/保**后备设备，**没有任何一处写 `writeback` 节点** |
 
 含义：**「连续打开 20 个应用」不可能测到这两个特性** —— 应用启动走的是 zram 压缩/换出热路径，
 而 batching 与 cwb 都在 `writeback_store()` 里；本机连一次 writeback 都不会发生，预期差异恒等于 0。
 这不是测法不够灵敏，而是**被测路径没有被进入**。因此 Batch 17/18 的代码在本机当前配置下是
-**未被执行过的代码**（除我们的实验）。它是否值得保留取决于是否要让 writeback 真的跑起来 ——
+**未被执行过的代码**（除本模块的实验）。它是否值得保留取决于是否要让 writeback 真的跑起来 ——
 这是产品决策，不是性能决策：要跑起来必须有人 (a) 让 ROM 的 mmd 回来（其后备文件现在已被 unlink），
 或 (b) 让 companion 自己按预算发 sweep（`echo <age> > idle` + `echo idle > writeback`，受
 `writeback_limit` 约束）。后者会给闪存写入量，且 cwb 的盈亏平衡点在 §8 的读回率 ~25–30% ——
@@ -5454,22 +5454,22 @@ GKI 树**当消费者语料做静态反查，再把结果与 **CI 复刻构建�
 ### 后续追问：被删的两处「是不是只是没挂上」
 
 Batch 16 把四处真空实现分成「删掉」与「接上」两类；被删的是 `se->slice` 槽 4 和 nohz 的
-四个谓词 + 两个导出。追问是合理的：**如果消费者本来就该由我们的某个补丁挂进去而没挂上，
-那我数的就是自己的 bug，然后把它删了。** 因此判据改回**套件原文**重取（不能在自家 graft
+四个谓词 + 两个导出。追问是合理的：**如果消费者本来就该由本模块的某个补丁挂进去而没挂上，
+那数的就是本模块自己的 bug，然后把它删了。** 因此判据改回**套件原文**重取（不能在自家 graft
 完的树上数调用者）：
 
 - `ABK_ABI_PATCH_SUITE/scripts/abk_feature_porting.py` 里
   `nohz_cpu_state_test`/`_inidle`/`_idle_active`/`_tick_stopped` 只出现在头文件插入块
   （:2122-2174）和它自己的 presence 自检表（:2789-2793），**套件里也 0 个调用点**；
-  套件 `tests/smoke.sh:494-507` 同样是 grep 存在性——自证式检查，检查「我插入了我插入的
-  东西」。`nohz_cpu_idle_calls` 的消费者只有 tick-sched.c 里两个函数，而那两个改写我们的
+  套件 `tests/smoke.sh:494-507` 同样是 grep 存在性——自证式检查，检查「插入的是插入的
+  东西」。`nohz_cpu_idle_calls` 的消费者只有 tick-sched.c 里两个函数，而那两个改写本模块的
   port **是有的**（`batch15_perf_sched_refinements.py:314-342` + 步骤 687-688），所以它
   降为 file-local `static` 后依然在干活。
 - `se->slice`：套件里唯一出现就是 `abk_eevdf_slice()` 的那一次写入（:643-649），
   `abk_eevdf_vslice()` 用的是**返回值**（:653）。即使照套件原样，该字段也只写不读。
 - 树外也扫过（`ABK`、`ABK_repo`、同目录其它模块）：无引用。
   **证据边界**：导出符号的消费者可以在树外，这里能证明的只是「现有这些树里没有」。
-- 结论：这两处是**套件自带的死面**，不是我们的接线遗漏。同类确有一例是真的——
+- 结论：这两处是**套件自带的死面**，不是本模块的接线遗漏。同类确有一例是真的——
   `offload_all`（见上），处置是**接上**而不是删除。
 
 ### 后续追问：把这一类做成闸门（`tests/config_gate_audit.py`）
@@ -5487,7 +5487,7 @@ Batch 16 把四处真空实现分成「删掉」与「接上」两类；被删�
 
 归属必须用 diff：先写的启发式版本（30 行窗口找标记）**既误报又漏报**——把上游的
 `IS_ENABLED(CONFIG_FS_DAX_PMD)`（`mm/huge_memory.c:585`）和 `CONFIG_PREEMPT_RT`
-（`mm/slub.c:3228`）当成我们的门，同时漏掉 RCU 那条（它的标记在 `#if` **上方**，不在门内）。
+（`mm/slub.c:3228`）当成本模块的门，同时漏掉 RCU 那条（它的标记在 `#if` **上方**，不在门内）。
 两个错误都是实测撞出来的，记在这里以免下次退回启发式。
 
 实测（对 CI 复刻构建的 `.config`；60 个 `.abk-orig`，A 类 37 行 / B 类 18 处）：
@@ -5875,7 +5875,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
 | 装 v0.2.0 模块 | `ksud module install` + 就地应用 `modules_update`，`action.sh status` 打出新字段（`zram.abk_lock_algo absent (module enforces the policy instead)`、`policy in force`） |
 | 监督 tick | 日志每 60 s 一条（`reassert=60s`），与 `zram.reassert_interval_sec` 一致 |
 | **用户切断算法** | 模拟 root 用户 `swapoff + reset + echo deflate + disksize + swapon`：60 s 内被模块发现并改写回 `[lz4kd]`，日志 `algorithms changed behind the module (primary=deflate …)` → `rewrite: size=17179869184 …` → `zram ready` |
-| 容量保持 | 同一次改写把 ROM/用户的 **16 GiB 原样保留**（`/proc/swaps` 16777212 KB） |
+| 容量保持 | 同一次改写把 ROM 配置的 **16 GiB 原样保留**（`/proc/swaps` 16777212 KB） |
 | `mem_limit` | `mm_stat` f4 = `3983622144`（RAM 25%）真机写成功 |
 | writeback 原语 | 在本机（无 `CONFIG_ZRAM_WRITEBACK`）直接调用 `abk_zram_create_backing_dev`：生成稀疏 1 GiB 文件（`ls` 显示 1073741824 B，仅占 ~1 MiB 块）、`losetup -f` 取到 `/dev/block/loop49`、挂载成功、`losetup -d` 卸载干净 |
 | 未验证 | 内核锁本身（需要刷入用当前仓库重建的内核）；`backing_dev` 节点的真正写入（需要 `CONFIG_ZRAM_WRITEBACK`） |
@@ -5983,7 +5983,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
 
 结论：`lz4hc` 在主/二级两个位置都是劣解（热路径压缩成本翻倍只换 5.6% 压缩率；
 重复数据上甚至不如 `lz4kd`）。主算法取 `lz4kd`、二级取 `zstd`，
-且**不允许用户修改**：内核参数只读、模块无任何算法/容量配置项。
+且**不允许运行时修改**：内核参数只读、模块无任何算法/容量配置项。
 
 ### Batch 11 落地进度
 
@@ -6028,7 +6028,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
 
 ### Batch 10-6 落地进度（超大核"不被调用"结案：上限持有者同时在决定放置，v0.17.1）
 
-症状（用户报）：刷机后打开应用时超大核很闲，负载基本落在别的核上。
+症状（上报）：刷机后打开应用时超大核很闲，负载基本落在别的核上。
 设备 Redmi K70（vermeer / SM8550），`5.15.215-202609201-FanZiyun`，无线 adb + su。
 
 **结案链（每一步都是真机实测，不是推理）**
@@ -6041,7 +6041,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
 | 4 | 上限以 ~12.5 Hz 抖动，放置决策读到的是抖动快照 | 4 秒内 `update_cpu_capacity` 137 次、`cpu_frequency_limits` 44 次；超大核 `total_trans` 已达 5.4e5（little 1.3e5、mid 1.0e5），`--sample 10` 实测 trans/s ≈ 64~96 |
 | 5 | 冷启动实测：主线程基本不上 prime | 4 个真实应用（网易云/微信/酷安/高德）冷启动，`sched_find_best_target` 的 `most_spare_cap` 直方图里 app 线程几乎全是 3/4/5/6；`start_cpu=7` 的扫描每次都退回非 prime；主线程 50 ms 采样落在 cpu7 的比例 1/40~16/40；启动瞬间超大核上限常为 729600~998400（23%~31%） |
 | 6 | **A/B 证明归因** | `kill -STOP scene-daemon` + `echo 3187200 > policy7/scaling_max_freq`：该 policy 在整次启动窗口内 `cpu_frequency_limits` **0 次**（上限不再抖动），`rq_cpu_capacity_orig` 稳定 1024；网易云冷启动主线程在 50ms 采样里落在 prime 的次数 **5/36 → 11/37**，`TotalTime` 2661 ms → **2227 ms（−16%）**，cpu7 占用从"最低"变成与中核持平（91% vs 93%）。随后 `kill -CONT`，Scene 已在数秒内重新接管（下一轮 p7 上限又变回 1708800/864000） |
-| 7 | 另有两处 Scene 主动改写、非 ABK | `/proc/sys/walt/sched_upmigrate` 从 `60 95` 变成 `70 70`（实验中途被 Scene 写入，我最后一轮已交还给 Scene）；cpuset：`common_app` = `0-2 / 0-6 / 0-6 / 0-7`、`common_gaming` = `0-2 / 0-5 / 0-5 / 0-7`，实测王者荣耀 236 个线程全在 `top-app/0-5`（物理上碰不到 cpu6/7） |
+| 7 | 另有两处 Scene 主动改写、非 ABK | `/proc/sys/walt/sched_upmigrate` 从 `60 95` 变成 `70 70`（实验中途被 Scene 写入，最后一轮已交还给 Scene）；cpuset：`common_app` = `0-2 / 0-6 / 0-6 / 0-7`、`common_gaming` = `0-2 / 0-5 / 0-5 / 0-7`，实测王者荣耀 236 个线程全在 `top-app/0-5`（物理上碰不到 cpu6/7） |
 
 **本批落地的修法（不越红线：ABK 不抢调频权，只把这件事变成可判定、可回归的观测）**
 
@@ -6082,7 +6082,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
       （`4e2a7a19be82aba2`），其后 `a1d38d8` / `8b8bf5d` 两次构建均 success（见 10-6 节
       CI 表），编译结论对 10-5 载荷成立。
 
-**交给用户在 Scene 侧的执行项（本模块不能替它改，改了就是抢调频权）**
+**Scene 侧执行项（本模块不能替它改，改了就是抢调频权）**
 
 1. `profile.json` → `features.limiter` 里第三个条目（= `policy7`）的 `max` 提到 3187200，
    至少保证 `cap_view(超大核) > cap_view(中核)`：即 `max7 > max3 × 1024/855`；
@@ -6102,7 +6102,7 @@ push，当前凭据不可用，远端仍在 `a016643`）。
 
 审查方式：`git diff HEAD`（16 文件 / +1397）交给两个互不共享上下文的子代理并行做——
 Standards 轴对照 AGENTS.md、docs/group_recipe.md、docs/porting_policy.md 加 Fowler 味道基线；
-Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码里验，不信声明**。
+Spec 轴以本文件的两节 + 当次需求为规格，**逐条去代码里验，不信声明**。
 
 **Standards 轴 3 条硬伤（全部已修）**
 
@@ -6117,7 +6117,7 @@ Spec 轴以本文件的两节 + 用户当次指令为规格，**逐条去代码�
 
 **Spec 轴 5 条**
 
-- **P1（缺失，已补）**：我声称扩写了 `docs/porting_policy.md` 红线 5，实际文件里只有 10-5 的旧文本——**这条当时根本没写进去**。现已写真：`scaling_max_freq` 同时是容量节点，以及"放置失败是静默的，没有任何节点会报告这个核不可选"。
+- **P1（缺失，已补）**：声称扩写了 `docs/porting_policy.md` 红线 5，实际文件里只有 10-5 的旧文本——**这条当时根本没写进去**。现已写真：`scaling_max_freq` 同时是容量节点，以及"放置失败是静默的，没有任何节点会报告这个核不可选"。
 - **P2（本批最严重）**：Batch 10-6 的"更正"本身是错的（见上一节的证据行 1）。它让一份未提交的批次里同时存在两种矛盾叙述：工具/README/plan 说"惰性"，而载荷 docstring、`_POLICY_V1` 注释、10-5 自己的 A/B 说"会执行"。现已全部收敛为一种说法，并补上可操作的判别法（`abk_sf_boosting` 是否存在）。
 - **P3（真机缺陷，已修）**：工具采样临时文件写死 `${TMPDIR:-/data/local/tmp}`，在没有该目录的测试机上被 `set -e` 直接打死 ⇒ 改为 TMPDIR → /data/local/tmp → /tmp → `.` 取第一个存在者。
 - **P4**：即 S1，两轴各自独立发现同一件事。
