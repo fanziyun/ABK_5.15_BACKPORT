@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Pack a KernelSU module from ``ksu/<id>/`` into a flashable zip.
 
-The module source is ``ksu/abk_runtime_tunables/``; this script turns it into
-``build/ksu/abk_runtime_tunables.zip``, which the KernelSU manager can flash and
-``ksud module install`` can install over adb.
+The default module source is ``ksu/abk_runtime_tunables/``; this script turns it
+into ``build/ksu/abk_runtime_tunables.zip``, which the KernelSU manager can flash
+and ``ksud module install`` can install over adb.  Pass ``--module`` for the
+second module (``ksu/sailboat_addon_2``).  The AK3 bundler renames each zip to
+the ``id=`` inside its module.prop, because the installer derives the install
+directory from that basename -- so module 1 keeps its original id (an installed
+copy must upgrade in place rather than be orphaned) and module 2, being new, is
+free to take the sailboat_addon_2 id.
 
 Three details matter:
 

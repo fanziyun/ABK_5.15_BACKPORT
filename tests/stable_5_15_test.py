@@ -3009,6 +3009,25 @@ def test_runtime_tunables_module():
         check(f"{name} is LF, not CRLF", b"\r\n" not in blob,
               blob.count(b"\r\n"))
 
+    # `required` is what the module must ship; a file that is *not* in it is not
+    # covered by the loop above, which is how a CRLF file would ship silently.
+    # The pin below flips that: the directory as it stands must contain exactly
+    # the known set, so adding a file means adding it to `required` here, where
+    # the CRLF and read-only-partition sweeps then reach it too.  state/ and run/
+    # are runtime directories (the module's log, its pid files) and are excluded
+    # by name so a device-side tree is not mistaken for a stray source file.
+    shipped = sorted(path for path in module_dir.rglob("*")
+                     if path.is_file() and path.suffix != ".log"
+                     and "state" not in path.parts and "run" not in path.parts)
+    shipped_names = {path.name for path in shipped}
+    check("the companion ships exactly the files this list knows about",
+          shipped_names == set(required),
+          sorted(shipped_names ^ set(required)))
+    for path in shipped:
+        blob = path.read_bytes()
+        check(f"{path.relative_to(module_dir)} is LF, not CRLF",
+              b"\r\n" not in blob, blob.count(b"\r\n"))
+
     props = {}
     for line in (module_dir / "module.prop").read_text(encoding="utf-8").splitlines():
         if "=" in line and not line.startswith("#"):
@@ -3132,101 +3151,6 @@ def test_runtime_tunables_module():
           'ABK_ZRAM_SECONDARY="zstd"' in common_sh)
     check("the dominated lz4hc is never selected as a policy value",
           not re.search(r'(?m)^\s*ABK_ZRAM_\w+="lz4hc"', common_sh + policy))
-
-    # The DVFS ownership report (Batch 10-5/10-6).  A cluster's *placement
-    # weight* is its DMIPS capacity scaled by the ceiling somebody else wrote to
-    # scaling_max_freq, which is how a userspace limiter ends up deciding that
-    # the super core never runs an app launch.  Without that number in the boot
-    # log the symptom has nothing to start from.
-    dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):
-                     common_sh.index("abk_apply_readahead_knob() {")]
-    # The knob applier the cap's blocks were added to, sliced the same way the
-    # existing checks slice their targets.
-    sched_knobs = common_sh[common_sh.index("abk_apply_sched_knobs() {"):
-                            common_sh.index("abk_read_flat() {")]
-    # Comments may explain an omission; only the code may not carry the knob.
-    sched_knobs_code = "\n".join(l for l in sched_knobs.splitlines()
-                                 if not l.lstrip().startswith("#"))
-    check("the DVFS report logs the capacity the placer sees",
-          "cap_view=" in dvfs and "_rs_capv" in dvfs)
-    check("the DVFS report warns when the super core is no bigger than a weaker cluster",
-          "is capped to" in dvfs and "abk_warn" in dvfs)
-    check("the smart-freq floor warns per payload generation, not per governor name",
-          "_rs_foreign" in dvfs and "_rs_pinned" in dvfs
-          and "pre-10-5 payload" in dvfs and "abk_sf_boosting node" in dvfs)
-    check("the DVFS capacity math goes through abk_mul_div, not shell arithmetic",
-          'abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax"' in dvfs)
-
-    # Batch 42's cap shares the hook and the file with the floor, so the
-    # companion has to report both halves of the same range.  This was the gap
-    # that shipped: the device log showed the floor's three nodes and nothing of
-    # the cap, so "who owns this range" had no answer for a grafted tree.
-    action_source = (module_dir / "action.sh").read_text(encoding="utf-8")
-    tunables_conf = (module_dir / "tunables.conf").read_text(encoding="utf-8")
-    for node in ("abk_sc_enable", "abk_sc_cap_pct", "abk_sc_capped",
-                 "abk_sc_boosting"):
-        check(f"action.sh status reports the cap node {node}",
-              re.search(rf'abk_show_or_absent "{node}"', action_source)
-              is not None, action_source.count("abk_show_or_absent"))
-    check("the cap's boot line carries both of its nodes",
-          "_rs_sc_enable=" in dvfs and "_rs_sc_capped=" in dvfs
-          and "abk_sc_cap=${_rs_sc_capped" not in dvfs,
-          [l for l in dvfs.splitlines() if "_rs_sc_" in l])
-    check("abk_capped is read from the cap payload, not the floor's",
-          "_rs_sc_capped=\"$(abk_read_flat \"$_rs_sf/abk_sc_capped\")\"" in dvfs)
-    # abk_cfg_lint() warns on any tunables.conf key outside abk_known_keys(), so
-    # a knob that is not listed there is refused at every boot -- which is how
-    # the companion ends up reporting a node it cannot drive.
-    check("every sched.abk_sc knob is a known key",
-          all(f"sched.abk_sc_{k}" in common_sh for k in
-              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")))
-    check("abk_apply_sched_knobs drives the cap's five knobs",
-          all(f'abk_write "$_sk_dir/abk_sc_{k}"' in sched_knobs_code for k in
-              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")),
-          [l for l in sched_knobs_code.splitlines() if "abk_sc_" in l])
-    # abk_sc_entry_pct has no companion knob on purpose: it feeds only the
-    # read-only abk_sc_boosting election and gates no decision, so a writable
-    # copy would be the number reached for first when chasing the floor's old
-    # 70-90% dead band -- and moving it changes nothing.
-    # Comments in both files explain the omission; an *active* key is the defect.
-    tunables_code = "\n".join(l for l in tunables_conf.splitlines()
-                              if not l.lstrip().startswith("#"))
-    check("no companion knob for the diagnostic-only entry_pct",
-          "sched.abk_sc_entry_pct" not in tunables_code
-          and "abk_sc_entry_pct" not in sched_knobs_code)
-    # The companion arms both halves for this device, and the kernel payloads
-    # stay false -- that split is the point.  The tunables block also has to
-    # keep the two percentages from crossing: cap_pct <= floor_pct means the
-    # cap's re-assert probe clamps, on every resolve_freq call, exactly what the
-    # floor just lifted, and the cluster pins at that one frequency.
-    sched_block = "\n".join(l for l in tunables_conf.splitlines()
-                            if not l.lstrip().startswith("#"))
-    sf_floor = int(re.search(r"(?m)^sched\.abk_sf_floor_pct=(\d+)$",
-                             sched_block).group(1))
-    sc_cap = int(re.search(r"(?m)^sched\.abk_sc_cap_pct=(\d+)$",
-                           sched_block).group(1))
-    check("the companion arms both the floor and the cap",
-          re.search(r"(?m)^sched\.abk_sf_enable=1$", sched_block) is not None
-          and re.search(r"(?m)^sched\.abk_sc_enable=1$", sched_block) is not None,
-          [l for l in sched_block.splitlines() if l.startswith("sched.")])
-    check("the cap stays above the floor (a crossed band is a frequency lock)",
-          sc_cap - sf_floor >= 5 and sc_cap <= 100,
-          (sf_floor, sc_cap))
-    check("... and the band's inequality is stated where the next editor reads it",
-          "floor_pct=85" in tunables_conf and "cap_pct=95" in tunables_conf
-          and "Batch 10-4c ratchet" in tunables_conf,
-          [l for l in tunables_conf.splitlines()
-           if "floor_pct" in l or "cap_pct" in l])
-    # Comments may name the path they are avoiding; only the code must not.
-    dvfs_code = "\n".join(l for l in dvfs.splitlines()
-                          if not l.lstrip().startswith("#"))
-    # The report reads sysfs by design; what must never appear is an Android
-    # partition path.  That is the precise rule, and it is the sweep over every
-    # installed script (including bin/) below that enforces it.
-    check("the DVFS report reads plain sysfs paths",
-          "/devices/system/cpu/cpufreq/policy" in dvfs_code
-          and "/devices/system/cpu/cpu" in dvfs_code)
-
     takeover = policy[policy.index("abk_zram_takeover() {"):policy.index("abk_zram_reassert() {")]
     takeover_order = [takeover.index(token) for token in
                       ("ABK_SWAPOFF", 'reset" 1', "abk_zram_set_algorithms",
@@ -3490,14 +3414,14 @@ def test_runtime_tunables_module():
             check("embedded reclaim tool is byte-identical to tools/",
                   archive.read("bin/cached_freeze_reclaim.sh")
                   == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
-            check("embed.conf contributes exactly the six device tools",
+            check("embed.conf contributes exactly the five device tools",
                   sorted(name for name in names if name.startswith("bin/"))
-                  == ["bin/abk_fas_check.sh",
-                      "bin/abk_launch_bench.sh",
+                  == ["bin/abk_launch_bench.sh",
                       "bin/abk_psi_bench.sh",
                       "bin/abk_psi_policy.sh",
                       "bin/cached_freeze_reclaim.sh",
-                      "bin/zram_recompress_trigger.sh"])
+                      "bin/zram_recompress_trigger.sh"],
+                  sorted(name for name in names if name.startswith("bin/")))
             check("embedded launch bench is byte-identical to tools/",
                   archive.read("bin/abk_launch_bench.sh")
                   == (repo / "tools" / "abk_launch_bench.sh").read_bytes())
@@ -3595,9 +3519,6 @@ def test_runtime_tunables_module():
             check("the bench cannot overflow its 32-bit arithmetic",
                   "_diff / (_on_tot / 1000)" in _psi_bench_code
                   and "* 10000 / _on_tot" not in _psi_bench_code)
-            check("embedded FAS check tool is byte-identical to tools/",
-                  archive.read("bin/abk_fas_check.sh")
-                  == (repo / "tools" / "abk_fas_check.sh").read_bytes())
             # Installed under bin/, these are module code as much as service.sh
             # is, so the same two invariants apply to them.
             for _bin in sorted(n for n in names if n.startswith("bin/")):
@@ -3611,21 +3532,6 @@ def test_runtime_tunables_module():
                 check(f"{_bin} never relaxes SELinux",
                       "setenforce" not in _bin_code
                       and "permissive" not in _bin_code.lower())
-            _fas_tool = archive.read("bin/abk_fas_check.sh").decode("utf-8")
-            check("the shipped FAS check ranks clusters by the capacity the placer sees",
-                  "cap_view" in _fas_tool and "const_for" in _fas_tool)
-            check("the shipped FAS check says an off smart-freq knob is runtime-only on a pre-10-5 payload",
-                  "runtime-only" in _fas_tool
-                  and "no abk_sf_boosting node" in _fas_tool)
-            check("the shipped FAS check has its own exit code for a starved super core",
-                  "flag 4" in _fas_tool
-                  and "capped out of the placement decision" in _fas_tool)
-            check("the shipped FAS check judges load by measured busy time, not loadavg",
-                  '(busy + 0 < minbusy + 0) ? "PARKED_IDLE" : "FROZEN_UNDER_LOAD"' in _fas_tool)
-            check("the shipped FAS check scales capacity through awk, not 32-bit shell math",
-                  "a * f / m" in _fas_tool and "$2 / 1000) * $1" not in _fas_tool)
-            check("the shipped FAS check caches the constants out of the sample loop",
-                  "POLICY_LIST=" in _fas_tool and "head -n 1" in _fas_tool)
             modes = {info.filename: (info.external_attr >> 16) & 0o777
                      for info in archive.infolist()}
             check("every module script is 0755",
@@ -5830,6 +5736,280 @@ def test_batch40_erofs_readahead():
               bare.read(b40.COMPRESS_H) == "static int x;\n")
 
 
+def test_sched_tunables_module():
+    """sailboat addon 2: the cpufreq/scheduler half, split out of addon 1.
+
+    Every pin below moved here from test_runtime_tunables_module() when the
+    scheduling keys did, so the constants they hold are the ones that were
+    measured on the device.  What is *new* is the split itself: the failure mode
+    of a bad split is silent and expensive -- a key that lands in both modules is
+    written twice by two authors, and a key that lands in neither is a node
+    nobody drives -- so the two key sets are pinned against each other rather
+    than each against a literal.
+    """
+    print("sailboat addon 2 (schedutil governor + smart-freq band)")
+    repo = Path(__file__).resolve().parent.parent
+    module_dir = repo / "ksu" / "sailboat_addon_2"
+    check("sched module directory exists", module_dir.is_dir(), module_dir)
+    if not module_dir.is_dir():
+        return
+
+    required = ("module.prop", "common.sh", "service.sh", "post-fs-data.sh",
+                "action.sh", "tunables.conf", "embed.conf", "README.md")
+    for name in required:
+        check(f"module ships {name}", (module_dir / name).is_file())
+
+    # Same CRLF pin as addon 1, and for the same measured reason: a Windows
+    # text-mode write turns every LF into CRLF, `bash -n` says nothing, and the
+    # failure shows up as an inert supervisor.  For tunables.conf it is worse
+    # than a broken script: abk_cfg's awk strips trailing spaces and tabs but not
+    # \r, so sched.abk_sf_floor_pct=85 yields "85\r", abk_clamp_uint rejects it,
+    # and the knob writes nothing at all.
+    for name in required:
+        blob = (module_dir / name).read_bytes()
+        check(f"{name} is LF, not CRLF", b"\r\n" not in blob,
+              blob.count(b"\r\n"))
+    shipped = sorted(path for path in module_dir.rglob("*")
+                     if path.is_file() and path.suffix != ".log"
+                     and "state" not in path.parts and "run" not in path.parts)
+    check("the module ships exactly the files this list knows about",
+          {path.name for path in shipped} == set(required),
+          sorted({path.name for path in shipped} ^ set(required)))
+
+    props = {}
+    for line in (module_dir / "module.prop").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+    check("module id matches the directory KernelSU installs into",
+          props.get("id") == module_dir.name == "sailboat_addon_2",
+          props.get("id"))
+    # The name is the user-facing contract: addon 1 was renamed to (一) and this
+    # is (二), and the id must NOT follow the display name, because changing an
+    # installed module's id orphans it instead of upgrading it.
+    check("the display name is sailboat addon 2",
+          props.get("name") == "sailboat 附加模块（二）", props.get("name"))
+    check("the id is not the display name",
+          props.get("id") != props.get("name") and "sailboat_addon_2" in (props.get("id") or ""))
+    check("module versionCode is a positive integer",
+          props.get("versionCode", "").isdigit() and int(props["versionCode"]) > 0)
+
+    common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
+    tunables_conf = (module_dir / "tunables.conf").read_text(encoding="utf-8")
+    action_source = (module_dir / "action.sh").read_text(encoding="utf-8")
+    service_source = (module_dir / "service.sh").read_text(encoding="utf-8")
+    post_fs_data = (module_dir / "post-fs-data.sh").read_text(encoding="utf-8")
+    readme_source = (module_dir / "README.md").read_text(encoding="utf-8")
+
+    # --- the split itself ---------------------------------------------------
+    # Addon 1 must no longer own any of this.  A key left behind there is a key
+    # two modules write.
+    one = repo / "ksu" / "abk_runtime_tunables"
+    one_common = (one / "common.sh").read_text(encoding="utf-8")
+    one_tunables = (one / "tunables.conf").read_text(encoding="utf-8")
+    one_action = (one / "action.sh").read_text(encoding="utf-8")
+    one_props = {}
+    for line in (one / "module.prop").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            one_props[key.strip()] = value.strip()
+    check("addon 1 was renamed to sailboat addon 1",
+          one_props.get("name") == "sailboat 附加模块（一）", one_props.get("name"))
+    check("addon 1 kept its id, so an installed copy upgrades instead of being orphaned",
+          one_props.get("id") == "abk_runtime_tunables", one_props.get("id"))
+    for token in ("abk_gov_wanted", "abk_gov_set_one", "abk_gov_enforce",
+                  "abk_gov_supervisor_main", "abk_apply_sched_knobs",
+                  "abk_report_dvfs_state", "ABK_FAS_NODE"):
+        check(f"addon 1 no longer defines {token}", token not in one_common,
+              [l for l in one_common.splitlines() if token in l][:2])
+    _keys_list = common_sh.split("cat <<'EOF'", 1)[1].split("EOF", 1)[0]
+    sched_keys = [k for k in _keys_list.split() if k.startswith("sched.")]
+    check("this module owns exactly the eleven scheduling keys",
+          len(sched_keys) == 11, sched_keys)
+    check("addon 1's tunables.conf carries none of them",
+          all(f"{k}=" not in one_tunables for k in sched_keys),
+          [k for k in sched_keys if f"{k}=" in one_tunables])
+    check("addon 1's linter does not know them either, so it cannot drive them",
+          all(k not in one_common for k in sched_keys))
+    check("addon 1's action.sh points here instead of reading those nodes",
+          "ksu/sailboat_addon_2" in one_action
+          and "abk_sc_cap_pct" not in one_action)
+    # The packer installs every zip in the bundle directory, which is what makes
+    # two modules ride one AnyKernel3 zip; if that loop ever narrows to a single
+    # id, addon 2 stops shipping silently.
+    bundler = (repo / "scripts" / "ak3_bundle_ksu_module.py").read_text(encoding="utf-8")
+    check("the AK3 installer installs every bundled module, not just one",
+          '*' in bundler and '*.zip' in bundler,
+          [l.strip() for l in bundler.splitlines() if ".zip" in l][:3])
+
+    # --- the knobs ---------------------------------------------------------
+    dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):]
+    sched_knobs = common_sh[common_sh.index("abk_apply_sched_knobs() {"):
+                           common_sh.index("abk_gov_wanted() {")]
+    sched_knobs_code = "\n".join(l for l in sched_knobs.splitlines()
+                                if not l.lstrip().startswith("#"))
+    check("the DVFS report logs the capacity the placer sees",
+          "cap_view=" in dvfs and "_rs_capv" in dvfs)
+    check("the DVFS report warns when the super core is no bigger than a weaker cluster",
+          "is capped to" in dvfs and "abk_warn" in dvfs)
+    check("the smart-freq floor warns per payload generation, not per governor name",
+          "_rs_foreign" in dvfs and "_rs_pinned" in dvfs
+          and "pre-10-5 payload" in dvfs and "abk_sf_boosting node" in dvfs)
+    check("the DVFS capacity math goes through abk_mul_div, not shell arithmetic",
+          'abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax"' in dvfs)
+
+    # action.sh reports the payload nodes from one `for node in ...` loop, so the
+    # pin is the loop's membership rather than ten separate lines.  The gap that
+    # actually shipped was action.sh listing the floor's nodes and nothing of the
+    # cap's, which made "who owns this range" unanswerable on device.
+    # A backslash line-continuation joins the loop's three lines into one, so
+    # the membership is the whole `for ... in ...; do` clause with the
+    # continuations collapsed.
+    _loop = re.search(r"(?ms)^  for node in (.*?); do", action_source)
+    check("action.sh reports the payload nodes from one loop",
+          _loop is not None)
+    _node_names = []
+    if _loop:
+        _node_names = re.sub(r"\\\s+", " ", _loop.group(1)).split()
+    for node in ("abk_sf_enable", "abk_sf_floor_pct", "abk_sf_sustained_ms",
+                 "abk_sf_exit_ms", "abk_sc_enable", "abk_sc_cap_pct",
+                 "abk_sc_hold_ms", "abk_sc_release_pct", "abk_sc_release_ms"):
+        check(f"action.sh status reports the node {node}",
+              node in _node_names, _node_names)
+    # ... and the two read-only nodes are reported beside them, by name.
+    for node in ("abk_sf_boosting", "abk_sc_capped", "abk_sc_boosting"):
+        check(f"action.sh status reports the read-only node {node}",
+              f'abk_show_or_absent "{node}"' in action_source)
+
+    check("the cap's boot line carries both of its nodes",
+          "_rs_sc_enable=" in dvfs and "_rs_sc_capped=" in dvfs)
+    check("abk_capped is read from the cap payload, not the floor's",
+          "_rs_sc_capped=\"$(abk_read_flat \"$_rs_sf/abk_sc_capped\")\"" in dvfs)
+    check("every sched.abk_sc knob is a known key",
+          all(f"sched.abk_sc_{k}" in common_sh for k in
+              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")))
+    check("abk_apply_sched_knobs drives the cap's five knobs",
+          all(f'abk_write "$_sk_dir/abk_sc_{k}"' in sched_knobs_code for k in
+              ("enable", "cap_pct", "hold_ms", "release_pct", "release_ms")),
+          [l for l in sched_knobs_code.splitlines() if "abk_sc_" in l])
+    tunables_code = "\n".join(l for l in tunables_conf.splitlines()
+                              if not l.lstrip().startswith("#"))
+    check("no companion knob for the diagnostic-only entry_pct",
+          "sched.abk_sc_entry_pct" not in tunables_code
+          and "abk_sc_entry_pct" not in sched_knobs_code)
+    sched_block = tunables_code
+    sf_floor = int(re.search(r"(?m)^sched\.abk_sf_floor_pct=(\d+)$",
+                             sched_block).group(1))
+    sc_cap = int(re.search(r"(?m)^sched\.abk_sc_cap_pct=(\d+)$",
+                           sched_block).group(1))
+    check("the module arms both the floor and the cap",
+          re.search(r"(?m)^sched\.abk_sf_enable=1$", sched_block) is not None
+          and re.search(r"(?m)^sched\.abk_sc_enable=1$", sched_block) is not None,
+          [l for l in sched_block.splitlines() if l.startswith("sched.")])
+    check("the cap stays above the floor (a crossed band is a frequency lock)",
+          sc_cap - sf_floor >= 5 and sc_cap <= 100,
+          (sf_floor, sc_cap))
+    check("... and the band's inequality is stated where the next editor reads it",
+          "floor_pct=85" in tunables_conf and "cap_pct=90" in tunables_conf
+          and "Batch 10-4c ratchet" in tunables_conf,
+          [l for l in tunables_conf.splitlines()
+           if "floor_pct" in l or "cap_pct" in l])
+    dvfs_code = "\n".join(l for l in dvfs.splitlines()
+                          if not l.lstrip().startswith("#"))
+    check("the DVFS report reads plain sysfs paths",
+          "/devices/system/cpu/cpufreq/policy" in dvfs_code
+          and "/devices/system/cpu/cpu" in dvfs_code)
+
+    # --- the governor ------------------------------------------------------
+    # The band is inert unless the policy's governor is schedutil, and this ROM
+    # leaves it on walt outside games.  This is the one capability here that has
+    # to fight for the node it writes, and the fight has four load-bearing steps,
+    # each pinned below: the write is refused on the node the policy ships (0444
+    # root:root, EACCES even for root -- measured), the chmod that opens it is
+    # what makes the write succeed, the readback is the only way to tell "armed"
+    # from "actually running", and the supervisor is what keeps it that way.
+    gov_block = common_sh[common_sh.index("abk_gov_wanted() {"):
+                          common_sh.index("abk_read_flat() {")]
+    gov_code = "\n".join(l for l in gov_block.splitlines()
+                         if not l.lstrip().startswith("#"))
+    check("the governor is read through the tunables, with the CR stripped",
+          "abk_cfg sched.abk_governor ''" in gov_code
+          and "tr -d '\\r'" in gov_code,
+          [l for l in gov_code.splitlines() if "abk_gov_wanted" in l])
+    check("the re-assert interval is clamped to a sane range",
+          'abk_clamp_uint "$_gi" 5 3600' in gov_code)
+    check("the policy list is a glob, so post-fs-data finds nothing safely",
+          'policy*' in gov_code and "[ -d \"$_gp_d\" ]" in gov_code)
+    check("the chmod is reached only after a refused write",
+          'if ! echo "$_gs_want" > "$_gs_node" 2>/dev/null; then' in gov_code
+          and 'chmod 0644 "$_gs_node"' in gov_code,
+          [l for l in gov_code.splitlines() if "chmod" in l or "_gs_node\" 2>" in l])
+    check("the write is verified by reading the node back",
+          gov_code.count('"$_gs_node"') >= 2
+          and "verify failed" in gov_code)
+    set_one = gov_code[gov_code.index("abk_gov_set_one() {"):
+                       gov_code.index("abk_gov_enforce() {")]
+    check("the per-policy setter logs nothing (its stdout is captured)",
+          "abk_log" not in set_one and "abk_warn" not in set_one,
+          [l for l in set_one.splitlines() if "abk_" in l])
+    check("the enforcer reports failure through its exit status",
+          '[ "$_ge_bad" -eq 0 ] || return 1' in gov_code)
+    check("a governor the policy does not offer is refused before any write",
+          "not offered by" in gov_code
+          and "scaling_available_governors" in gov_code)
+    check("the supervisor stops itself when every write is refused",
+          "three rounds running" in gov_code
+          and "_gm_streak" in gov_code)
+    check("the supervisor logs only on change, so a stable device is silent",
+          'if [ "$_gm_line" != "$_gm_prev" ]; then' in gov_code)
+    check("an empty key spawns no governor supervisor at all",
+          "[ -n \"$(abk_gov_wanted)\" ]" in service_source
+          and "leaving the ROM's own governor in charge" in service_source)
+    for key in ("sched.abk_governor", "sched.abk_governor_interval_sec"):
+        check(f"{key} is a known key", key in common_sh)
+        check(f"{key} is assigned in the shipped tunables.conf",
+              re.search(r"(?m)^" + re.escape(key) + r"=", tunables_conf) is not None)
+    check("the shipped governor is schedutil, not the ROM's walt default",
+          re.search(r"(?m)^sched\.abk_governor=schedutil$", tunables_conf)
+          is not None,
+          [l for l in tunables_code.splitlines() if l.startswith("sched.")])
+    check("the DVFS report reads the governor but never writes it",
+          "abk_gov_state_line" in dvfs and "abk_gov_enforce" not in dvfs)
+    # The boot order is the whole point of the governor being here at all: the
+    # band and the payloads' ownership gates both need schedutil, so writing the
+    # band first would arm it against a governor that ignores it.
+    _pfd_code = "\n".join(l for l in post_fs_data.splitlines()
+                          if not l.lstrip().startswith("#"))
+    early_order = [_pfd_code.index(t) for t in
+                   ("abk_gov_enforce", "abk_apply_sched_knobs")]
+    check("the governor is established before the band is written",
+          early_order == sorted(early_order), early_order)
+    check("the boot pass logs what the enforce actually did",
+          'abk_log "gov: $_ae_gov"' in post_fs_data)
+    check("service.sh runs the governor supervisor and gates it on the key",
+          "--supervise-gov" in service_source
+          and "abk_gov_supervisor_main" in service_source)
+    check("action.sh can apply the governor now and print the verdict",
+          "governor)" in action_source
+          and '"$(abk_gov_enforce)"' in action_source)
+    check("status shows the wanted governor, the real one, and the supervisor",
+          "abk_gov_state_line" in action_source
+          and "abk_supervisor_state gov" in action_source)
+    check("the README states the mechanism, the revert, and the unknown trigger",
+          "chmod 0644" in readme_source
+          and "sched.abk_governor=" in readme_source
+          and "event-driven" in readme_source,
+          "README must carry the chmod route, how to revert, and that the"
+          " vendor's revert has no identified trigger")
+    # The measured reason cap_pct is 90 and not 95: the vendor pins
+    # scaling_max_freq to 92-94% of cpuinfo.max_freq, and abk_sc_owns() refuses
+    # any cap at or above the pin -- so 95 was armed and never once ran.
+    check("the README records why cap_pct is 90 and not 95",
+          "92-94%" in readme_source and "never once run" in readme_source)
+    check("tunables.conf says the same thing where the next editor reads it",
+          "92-94%" in tunables_conf)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -5864,6 +6044,7 @@ def main():
     test_batch10_daemon_script()
     test_batch10_zram_trigger_script()
     test_runtime_tunables_module()
+    test_sched_tunables_module()
     test_batch8_autofdo_tool()
     test_madvise_collapse_step_independence()
     test_madvise_collapse_revalidate_convention()

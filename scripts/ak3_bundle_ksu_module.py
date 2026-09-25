@@ -96,7 +96,7 @@ abk_tu_install_ksu_modules() {{
     if [ -n "$ABK_TU_VIA" ]; then
       ui_print "  -> ABK Runtime Tunables: module $ABK_TU_ID installed via $ABK_TU_VIA"
     else
-      ui_print "  -> ABK Runtime Tunables: WARNING could not install $ABK_TU_ID, flash abk_runtime_tunables.zip manually"
+      ui_print "  -> ABK Runtime Tunables: WARNING could not install $ABK_TU_ID; flash that module zip manually"
     fi
   done
 }}
