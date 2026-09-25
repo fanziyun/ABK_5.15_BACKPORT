@@ -1,0 +1,6 @@
+id=sailboat_addon_2
+name=sailboat 附加模块（二）
+version=v0.1.0
+versionCode=1
+author=FanZiyun
+description=Holds the cpufreq governor on schedutil and drives the ABK smart-freq floor and cap.

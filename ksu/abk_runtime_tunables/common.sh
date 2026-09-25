@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.14.0"
+ABK_VERSION="v0.16.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -51,10 +51,6 @@ ABK_ZRAM_REASSERT_SECS=60   # how often the policy is re-checked once running
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_PROC_SWAPS="${ABK_PROC_SWAPS:-/proc/swaps}"
 ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
-# The kernel's FAS foreground-app registration (metis exposes proc_show_fas /
-# proc_write_fas).  Read-only for this module: it reports who owns DVFS, it is
-# never written here.
-ABK_FAS_NODE="${ABK_FAS_NODE:-/proc/fas}"
 # The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
 # *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
 # not a missing feature.
@@ -248,15 +244,6 @@ vm.min_free_kbytes
 lru_gen.enable
 lru_gen.min_ttl_ms
 thp.mode
-sched.abk_sf_enable
-sched.abk_sf_floor_pct
-sched.abk_sf_sustained_ms
-sched.abk_sf_exit_ms
-sched.abk_sc_enable
-sched.abk_sc_cap_pct
-sched.abk_sc_hold_ms
-sched.abk_sc_release_pct
-sched.abk_sc_release_ms
 readahead.dynamic_readahead
 psi.cgroup
 psi.cgroup.protect
@@ -477,230 +464,6 @@ abk_apply_thp() {
   return 0
 }
 
-abk_apply_sched_knobs() {
-  _sk_dir="$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters"
-  [ -d "$_sk_dir" ] || return 0
-
-  _sk_val="$(abk_cfg sched.abk_sf_enable '')"
-  if [ -n "$_sk_val" ]; then
-    case "$_sk_val" in
-      0|1)
-        abk_write "$_sk_dir/abk_sf_enable" "$_sk_val" \
-          && abk_log "abk_sf_enable=$_sk_val"
-        ;;
-      *) abk_warn "sched.abk_sf_enable: '$_sk_val' is not 0|1, ignored" ;;
-    esac
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sf_floor_pct '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 0 100)"; then
-      abk_write "$_sk_dir/abk_sf_floor_pct" "$_sk_c" \
-        && abk_log "abk_sf_floor_pct=$_sk_c"
-    else
-      abk_warn "sched.abk_sf_floor_pct: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sf_sustained_ms '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
-      abk_write "$_sk_dir/abk_sf_sustained_ms" "$_sk_c" \
-        && abk_log "abk_sf_sustained_ms=$_sk_c"
-    else
-      abk_warn "sched.abk_sf_sustained_ms: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sf_exit_ms '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
-      abk_write "$_sk_dir/abk_sf_exit_ms" "$_sk_c" \
-        && abk_log "abk_sf_exit_ms=$_sk_c"
-    else
-      abk_warn "sched.abk_sf_exit_ms: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  # --- Batch 42: the smart_freq *cap* -----------------------------------
-  # Same shape as the floor above, and the same reason it is stated off in
-  # tunables.conf: the kernel ships it off, and arming it on a device whose
-  # governor is not schedutil is a no-op by construction (abk_sc_owns()
-  # refuses), so a companion that armed it would only be arming a lie.
-  #
-  # abk_sc_entry_pct has no knob here on purpose.  It feeds nothing but the
-  # read-only abk_sc_boosting reason election -- it gates no decision of its
-  # own -- so a writable copy would invite someone to chase the floor's old
-  # 70-90% dead band by raising a number that cannot move it.  Read it with
-  # action.sh status if the election matters; the clamp is tuned by cap_pct
-  # and the two release windows below.
-  _sk_val="$(abk_cfg sched.abk_sc_enable '')"
-  if [ -n "$_sk_val" ]; then
-    case "$_sk_val" in
-      0|1)
-        abk_write "$_sk_dir/abk_sc_enable" "$_sk_val" \
-          && abk_log "abk_sc_enable=$_sk_val"
-        ;;
-      *) abk_warn "sched.abk_sc_enable: '$_sk_val' is not 0|1, ignored" ;;
-    esac
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sc_cap_pct '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 100)"; then
-      abk_write "$_sk_dir/abk_sc_cap_pct" "$_sk_c" \
-        && abk_log "abk_sc_cap_pct=$_sk_c"
-    else
-      abk_warn "sched.abk_sc_cap_pct: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sc_hold_ms '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
-      abk_write "$_sk_dir/abk_sc_hold_ms" "$_sk_c" \
-        && abk_log "abk_sc_hold_ms=$_sk_c"
-    else
-      abk_warn "sched.abk_sc_hold_ms: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sc_release_pct '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 100)"; then
-      abk_write "$_sk_dir/abk_sc_release_pct" "$_sk_c" \
-        && abk_log "abk_sc_release_pct=$_sk_c"
-    else
-      abk_warn "sched.abk_sc_release_pct: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  _sk_val="$(abk_cfg sched.abk_sc_release_ms '')"
-  if [ -n "$_sk_val" ]; then
-    if _sk_c="$(abk_clamp_uint "$_sk_val" 1 60000)"; then
-      abk_write "$_sk_dir/abk_sc_release_ms" "$_sk_c" \
-        && abk_log "abk_sc_release_ms=$_sk_c"
-    else
-      abk_warn "sched.abk_sc_release_ms: '$_sk_val' is not a number, ignored"
-    fi
-  fi
-
-  return 0
-}
-
-# abk_read_flat <path>: single-line node value, newline stripped.
-abk_read_flat() {
-  abk_read "$1" | tr -d '\n'
-}
-
-# --- DVFS ownership report --------------------------------------------------
-# Whether FAS is driving, and whether this module's own smart-freq floor is
-# staying out of its way, cannot be read off one node: a FAS owner keeps
-# scaling_min_freq == scaling_max_freq == its current target, so a healthy
-# cluster and a locked one look identical in a snapshot, and the cpufreq nodes
-# are themselves permission-managed at runtime by whichever scheduler profile
-# is in play.  Record the ownership picture once per boot so "the frequency
-# stopped moving" starts from something in the log; the on-demand,
-# verdict-carrying version of the same look (including an active load/decay
-# probe) ships as bin/abk_fas_check.sh.
-#
-# The same pass scales each cluster's DMIPS capacity by its own ceiling, because
-# that is the number EAS/WALT rank cores by: a profile that edits
-# scaling_max_freq therefore also edits where light work is *placed*, and a
-# cluster logged as no bigger than a weaker one explains "the super core is never
-# used for anything" without any scheduler bug being involved.
-abk_report_dvfs_state() {
-  _rs_sf="$ABK_SYS_ROOT/module/cpufreq_schedutil/parameters"
-  _rs_policies=""
-  for _rs_d in "$ABK_SYS_ROOT"/devices/system/cpu/cpufreq/policy*; do
-    [ -d "$_rs_d" ] && _rs_policies="$_rs_policies $_rs_d"
-  done
-  [ -n "$_rs_policies" ] || return 0
-
-  _rs_fas="$(abk_read_flat "$ABK_FAS_NODE")"
-  _rs_enable="$(abk_read_flat "$_rs_sf/abk_sf_enable")"
-  _rs_boost="$(abk_read_flat "$_rs_sf/abk_sf_boosting")"
-  # Batch 42 added the cap on the same hook and in the same file as the floor,
-  # so its two nodes are the other half of the same picture: abk_sc_capped is
-  # per-policy and says whose target is being suppressed right now, which is the
-  # only way to tell "the cap is armed and idle" from "the cap is holding this
-  # cluster" without reading frequencies and guessing.
-  _rs_sc_enable="$(abk_read_flat "$_rs_sf/abk_sc_enable")"
-  _rs_sc_capped="$(abk_read_flat "$_rs_sf/abk_sc_capped")"
-  abk_log "dvfs: fas=${_rs_fas:-no /proc/fas} abk_sf_enable=${_rs_enable:-absent} abk_sf_boosting=${_rs_boost:-absent} abk_sc_enable=${_rs_sc_enable:-absent} abk_sc_capped=${_rs_sc_capped:-absent}"
-
-  _rs_foreign=0
-  _rs_pinned=0
-  _rs_big=""; _rs_bigarch=0; _rs_bigcapv=0
-  _rs_oth=""; _rs_othcapv=0
-  for _rs_p in $_rs_policies; do
-    _rs_gov="$(abk_read_flat "$_rs_p/scaling_governor")"
-    _rs_max="$(abk_read_flat "$_rs_p/scaling_max_freq")"
-    _rs_imax="$(abk_read_flat "$_rs_p/cpuinfo_max_freq")"
-    # The same glob trick reaches the DMIPS capacity of the policy's first cpu,
-    # and scaling_max_freq/cpuinfo_max_freq turns it into the capacity EAS and
-    # WALT actually rank cores by: a profile that writes that ceiling is editing
-    # placement, not only frequency.
-    _rs_cpu="$(cut -d' ' -f1 "$_rs_p/affected_cpus" 2>/dev/null)"
-    _rs_arch=""
-    [ -n "$_rs_cpu" ] && _rs_arch="$(abk_read_flat "$ABK_SYS_ROOT/devices/system/cpu/cpu$_rs_cpu/cpu_capacity")"
-    _rs_capv=0
-    _rs_ok=1
-    for _rs_v in "$_rs_arch" "$_rs_max" "$_rs_imax"; do
-      case "$_rs_v" in ''|*[!0-9]*) _rs_ok=0 ;; esac
-    done
-    # 855 * 2803200 is 2.4e9, past this ROM's mksh arithmetic, so the scaling goes
-    # through abk_mul_div like every other product in this module.
-    if [ "$_rs_ok" = "1" ] && [ "$_rs_imax" -gt 0 ]; then
-      _rs_capv="$(abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax")"
-    fi
-    _rs_min="$(abk_read_flat "$_rs_p/scaling_min_freq")"
-    abk_log "dvfs: ${_rs_p##*/} gov=$_rs_gov cur=$(abk_read_flat "$_rs_p/scaling_cur_freq") min=$_rs_min max=$_rs_max trans=$(abk_read_flat "$_rs_p/stats/total_trans") arch=${_rs_arch:-?} cap_view=${_rs_capv:-?}"
-    case "$_rs_gov" in
-      '') : ;;
-      schedutil) : ;;
-      *) _rs_foreign=1 ;;
-    esac
-    [ -n "$_rs_min" ] && [ "$_rs_min" = "$_rs_max" ] && _rs_pinned=1
-    [ "$_rs_capv" -gt 0 ] || continue
-    if [ "${_rs_arch:-0}" -gt "$_rs_bigarch" ]; then
-      if [ -n "$_rs_big" ] && [ "$_rs_bigcapv" -gt "$_rs_othcapv" ]; then
-        _rs_oth="$_rs_big"; _rs_othcapv="$_rs_bigcapv"
-      fi
-      _rs_big="$_rs_p"; _rs_bigarch="$_rs_arch"; _rs_bigcapv="$_rs_capv"
-    elif [ "$_rs_capv" -gt "$_rs_othcapv" ]; then
-      _rs_oth="$_rs_p"; _rs_othcapv="$_rs_capv"
-    fi
-  done
-
-  if [ -n "$_rs_big" ] && [ -n "$_rs_oth" ] && [ "$_rs_othcapv" -ge "$_rs_bigcapv" ]; then
-    abk_warn "dvfs: ${_rs_big##*/} is capped to ${_rs_bigcapv}/${_rs_bigarch} of its DMIPS capacity while ${_rs_oth##*/} stands at ${_rs_othcapv}: the biggest core is not the biggest core on offer, so light work (an app launch) will not be placed on it. Whoever owns policy*/scaling_max_freq is choosing placement. bin/abk_fas_check.sh --sample 20 says how much of the time this holds."
-  fi
-
-  # The combination that pins a cluster by itself: this module's floor armed
-  # while another owner holds the range.  The floor is applied from
-  # android_vh_cpufreq_resolve_freq and sampled from android_vh_scheduler_tick --
-  # both governor-independent -- so a foreign governor does not make it safe, and
-  # a payload that predates Batch 10-5 has no ownership gate at all.  The
-  # abk_sf_boosting node only exists from 10-5 on, which is how this module tells
-  # the two payload generations apart from userspace.
-  _rs_state=0
-  [ "$_rs_foreign" = "1" ] && _rs_state=1
-  [ "$_rs_pinned" = "1" ] && _rs_state=1
-  case "$_rs_enable" in
-    Y|y|1)
-      if [ "$_rs_state" = "1" ]; then
-        if [ "$_rs_boost" != "absent" ]; then
-          abk_log "abk_sf_enable=Y while a policy is foreign-governored or pinned at min == max; this payload carries the Batch 10-5 ownership gates and stands down there, but sched.abk_sf_enable=0 is the shipped intent"
-        else
-          abk_warn "abk_sf_enable=Y on a pre-10-5 payload (no abk_sf_boosting node) while a policy is foreign-governored or pinned at min == max: that payload has no ownership gate, so the floor is clamped to policy->max and ratchets the cluster to its ceiling. Set sched.abk_sf_enable=0 and graft the current payload."
-        fi
-      fi
-      ;;
-  esac
-  return 0
-}
-
 abk_apply_readahead_knob() {
   _ra_node="$ABK_SYS_ROOT/module/readahead/parameters/dynamic_readahead"
   [ -e "$_ra_node" ] || return 0
@@ -899,8 +662,6 @@ abk_apply_early_knobs() {
   abk_apply_vm_knobs
   abk_apply_lru_gen
   abk_apply_thp
-  abk_apply_sched_knobs
   abk_apply_readahead_knob
-  abk_report_dvfs_state
   return 0
 }

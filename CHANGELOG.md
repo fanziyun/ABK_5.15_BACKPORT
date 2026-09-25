@@ -550,6 +550,191 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+
+## companion v0.16.0 + sailboat 附加模块（二）:调度侧拆成独立模块
+
+**用户要求**:把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个
+模块,命名「sailboat 附加模块（二）」;原 `ABK 5.15 Runtime Tunables` 改名
+「sailboat 附加模块（一）」」。
+
+**拆的是什么**——companion(用户态)这一侧整体搬迁,内核 graft 一行未动:
+
+| 内容 | 从 | 到 |
+|---|---|---|
+| `sched.abk_gov*`(governor 强制) | addon 1 | addon 2 |
+| `sched.abk_sf_*`(floor 五键) | addon 1 | addon 2 |
+| `sched.abk_sc_*`(cap 五键) | addon 1 | addon 2 |
+| `abk_apply_sched_knobs()` / `abk_report_dvfs_state()` / 七个 `abk_gov_*` | addon 1 | addon 2 |
+| `ABK_FAS_NODE`、`/proc/fas` 报告行 | addon 1 | addon 2 |
+| `tools/abk_fas_check.sh` → `bin/` | addon 1 | addon 2 |
+| Batch 10-5 / Batch 42 两组内核 graft | **留在 ABK 内核模块** | —— |
+
+**为什么内核侧不动**:KernelSU 模块是用户态,无法携带编译后的内核代码。先问过用户
+一次(给了 A/B 两条路),用户最终确认「我指的是原模块 1 的东西搬迁到模块 2」,即
+用户态这一侧。
+
+**搬迁是字节级 move,不是重写**:`ksu/abk_sched_tunables/common.sh` 里 449 行(10 个
+函数:`abk_apply_sched_knobs`、七个 `abk_gov_*`、`abk_read_flat`、
+`abk_report_dvfs_state`)用 `sed -n '482,930p'` 从 addon 1 逐字节切出;
+`tunables.conf` 的 sched 块 94 行同样整段搬走。手写的只有文件头、精简后的
+`abk_known_keys`(11 个键 + `report.logcat`),以及 addon 2 自己的
+`module.prop`/`service.sh`/`post-fs-data.sh`/`action.sh`/`embed.conf`/`README.md`。
+shared helper(`abk_cfg`/`abk_clamp_uint`/`abk_log`/`abk_mul_div`/`abk_pid_*`
+等)是**有意复制**的:KernelSU 模块单独刷入,不能去读另一个模块的文件,重复正是
+独立的代价。
+
+**id 与显示名分开**:addon 1 的 `id` 保持 `abk_runtime_tunables`(只改 `name=`),
+否则设备上已安装的那份会被当成另一个模块残留下来;addon 2 的 `id` 是
+`abk_sched_tunables`,显示名「sailboat 附加模块（二）」——AK3 安装块用
+`basename "$ABK_TU_ZIP" .zip` 当模块 id,所以 zip 名必须等于 id。
+
+**打包链路不用改**:`ak3_bundle_ksu_module.py` 的安装循环是
+`for ABK_TU_ZIP in "$ABK_TU_SRC"/*.zip`,本来就按 glob 装**每一个** zip;两个模块
+一起进同一个 AnyKernel3 zip,刷内核时装上两个。这条被单测钉住了——哪天循环收窄成
+单个 id,addon 2 会静默不再随包下发。
+
+**addon 1 侧删除干净并逐项验证**:`common.sh` 1142 → 667 行,`abk_gov_*` /
+`abk_apply_sched_knobs` / `abk_report_dvfs_state` / `ABK_FAS_NODE` / 十个
+`sched.abk_*` 键全部不在;`tunables.conf` 删掉 sched 块(保留 readahead);`service.sh`
+去掉 `--supervise-gov` 与 spawn;`action.sh` 去掉 `governor` 子命令与全部
+`abk_sf_/abk_sc_/dvfs/fas` 行,改为一行指向 addon 2;`embed.conf` 摘掉 fas 工具;
+README 删掉 governor 段与 band 讨论,换成指针。addon 1 版本 v0.15.0 → **v0.16.0**
+(versionCode 20)。
+
+**期间自己制造并修掉的两个缺陷**:
+
+1. 在 `module.conf` 的 `ABK_MODULE_SET_ITEMS` 里写了 `Batch 10-2's` / `Batch 42's`
+   —— **撇号会提前终止单引号 shell 串**。仓库此前特意把这些撇号全去掉了,我这次
+   又带回来两个。表现为「every child row keeps the 12-field module-set shape」
+   失败。已去掉,并 `source module.conf` 实测 + 逐行数 pipes(11)。
+2. Python heredoc 里把 `"
+"` 过度转义,在测试文件里留下一个字面换行断开字符串。
+   `py_compile` 抓住的。
+
+**测试**:`stable_5_15_test.py` 新增 `test_sched_tunables_module()`,从
+`test_runtime_tunables_module()` 接管 34 条随搬迁移动的断言,并新增「拆分本身」的
+断言:addon 1 七个符号必须不在、11 个键两边必须不相交、addon 1 的 `action.sh` 必须
+指向这里、AK3 安装循环必须仍是 glob、显示名与 id 必须分开、以及 cap_pct=90 的实测
+理由必须同时写在 README 和 tunables 里。另把 CRLF 断言从硬编码清单升级为扫整个目录
+(两个模块都受益:清单外的新文件不在原覆盖范围内)。全套 **1329 项全绿**。
+
+**设备侧**:两个 zip 均已构建(确定性构建,SHA256 见交付记录),addon 2 共 9 个条目。
+**尚未刷入设备验证** —— 刷入后 addon 2 会与仍在校内的 addon 1 v0.15.0 并存,需要
+一次重启才能让 addon 1 的新版本(v0.16.0,不再写这些节点)与 addon 2 交接;这一步
+待用户确认后做。
+
+<a id="companion-v0-15-0"></a>
+
+## companion v0.15.0(把 cpufreq governor 全局钉在 schedutil)
+
+**为什么不是内核侧。** 设备内核导出的 cpufreq 符号(从 `/proc/kallsyms` 的
+`__ksymtab_cpufreq_*` 实取)覆盖 `cpufreq_register_governor`、
+`cpufreq_unregister_governor`、`cpufreq_get_policy`、`cpufreq_cpu_get_raw`、
+`cpufreq_update_policy`、`cpufreq_registry_notifier` 等,但**没有任何一个切换
+governor 的入口**(`cpufreq_set_policy` 不在导出表里);而 `drivers/cpufreq/cpufreq.c`
+是内建 vmlinux,本模块的 `files/` 只能覆盖已嫁接的那一棵树里的文件,外部模块没法
+往里塞代码。所以唯一通道就是 `scaling_governor` 这个 sysfs 节点 —— 这与
+Batch 10-5「ABK 绝不参与抢调频」不矛盾:那一批的结论是**我们的 payload 不该跟
+vendor FAS 抢**,而这里改的是 governor 本身,是用户明确要的行为。
+
+**机制(全部真机实测,vermeer / android13-5.15 / 5.15.216 / SELinux Enforcing)。**
+
+1. policy 开机默认 `walt`,`scaling_governor` 是 **0444 root:root**,root shell
+   直接写 `echo schedutil > ...` 返回 **EACCES**(复现三次全一致)。
+2. 同一个 root 对同一节点 **`chmod 0644` 成功**,随后写成功,读回即 `schedutil`。
+   属主不变,所以 0644 没有给任何非 root 调用方放权 —— 这正是 ROM 自己在游戏里
+   把 governor 切到 schedutil 时用的同一权限(它的用户态也得能写)。
+3. **`chmod` 买到的是写权,不是持久性**:vendor 之后会把 `walt` 写回来。一次观测
+   是设好后约 15 分钟内被写回,而权限位仍停在本模块留下的 0644(即只重写值、
+   不重新锁权限);同一状态下 60 秒监听内没有回退。所以回退是**事件驱动**而非持续
+   对抗,写入者未确认(最大嫌疑 `scene-daemon`,它对每个 policy 的
+   `scaling_max_freq` 持 fd,即 CHANGELOG 里 Batch 10-6 认定的那个 FAS 写入者,
+   且它会自行重启),`sched.abk_governor_interval_sec=30` 因此按「一分钟内追上一次
+   变化」而不是「跟写入者赛跑」来定。游戏是 vendor **也**会切成 schedutil 的状态,
+   所以游戏期间变成三次读、零次写。
+
+**实现**(companion v0.14.0 → v0.15.0,`module.conf` 保持 0.47.0 不动,按本仓库
+「只有 companion 的批次只 bump `ksu/*/module.prop`」先例):
+
+- `common.sh`:`abk_gov_wanted`(读 tunables,顺手 `tr -d '\r'`,见下)/
+  `abk_gov_interval`(`abk_clamp_uint` 夹在 5..3600)/
+  `abk_gov_policies`(glob,post-fs-data 阶段找不到东西时安全返回)/
+  `abk_gov_set_one`(先查 `scaling_available_governors` 防拼错旋钮后每轮空写,
+  写失败才 `chmod` 再写,**写完回读**)/
+  `abk_gov_enforce`(打一行 `ok=N tot=N set=N bad=N [why:policyX=<原因>]`)/
+  `abk_gov_state_line`(只读,给报告与 status 用)/
+  `abk_gov_supervisor_main`(只在行变化时打日志;连续三轮**每个** policy 都被拒就
+  停,而不是对着一个锁死的节点空转 —— 与 `abk_psi_supervisor_main` 同一条规则)。
+- `tunables.conf`:`sched.abk_governor=schedutil` + `sched.abk_governor_interval_sec=30`;
+  置空 = 完全不碰,ROM 自己的选择继续生效。
+- `service.sh`:`--supervise-gov` 分支 + 只在配置了 governor 时才 `abk_spawn`
+  (空键时连进程都不起)。`abk_apply_early_knobs()` 里 governor 先于 band 生效 ——
+  band 以及 Batch 10-5/42 的 `abk_sf_owns()`/`abk_sc_owns()` 都只在 governor 是
+  schedutil 时才动作,顺序反了就有一段「band 已武装但 governor 不理它」的窗口。
+- `action.sh`:新命令 `action.sh governor`(立刻执行一次并打同一行结论),status 加
+  「governor wanted / governor in force / governor supervisor」三行 —— 前者是意图、
+  后两者是设备实况,两者的差就是要盯的东西。
+
+**为什么不放松 SELinux。** 全程没有一条 `allow`,没有 `setenforce`,没有
+`permissive`;`sepolicy.rule` 未动。chmod 的对象是 root 自己的节点属主位,
+SELinux 的 label 一个没改。
+
+**验证。**
+
+- `tests/stable_5_15_test.py`:companion 段新增 22 条断言(机制必要性、chmod 只在
+  写失败后到达、回读校验、setter 不写日志(它的 stdout 被 `$( )` 捕获,而 action.sh
+  里 `ABK_STDOUT=1`)、enforcer 用退出状态报失败、supervisor 自停与"只在变化时
+  打日志"、DVFS 报告只读不写、boot 阶段顺序、action.sh 三行、README 三要素)。
+  顺带把 CRLF 断言从「硬编码的 `required` 清单」升级为**扫整个目录**:清单外的
+  新文件原先不在那条断言覆盖范围内,等于可以带着 CRLF 静默上线;现在多一个文件就会
+  同时被 CRLF、只读分区、SELinux 三道扫到。全套 **1292 项全绿**。
+- `bash -n` 四个 shell 文件全过;CRLF 实测 0。
+- **真机功能验证(在设备上直接跑改后的 `common.sh`/`action.sh`/`service.sh`,
+  mksh)**:`abk_gov_set_one` 打过 `set`/`same`/`not offered by policy7`/`no node`
+  四个分支;节点锁死时打 `unlocked+set`(chmod 分支);`abk_gov_enforce` 从全 walt
+  打成 `ok=3 tot=3 set=3 bad=0`,再来一次 `ok=3 tot=3 set=0 bad=0`(幂等);
+  `action.sh governor` 同一行;supervisor 实跑 5 轮(interval=5)只留 3 行日志
+  (启动 + `set=3` + 变成 `set=0` 那次),pid 文件写的是 `$$`。结束时三个 policy
+  均为 `schedutil`。
+
+**测试期间自己制造的两次教训**(已修,均不影响交付物):① 一次 `sed in tunables.conf >
+tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺带证明空键分支正常;
+② 两轮测试各泄漏一个 supervisor 进程,额外日志行来自它们(这正是 `service.sh` 的
+`abk_spawn` 为什么要先 `pkill` 同名 supervisor),已按 pid 清干净。
+
+**未验证。** ① **重启后是否仍然成立未测**:supervisor 会在每次开机重新 chmod +
+写入,但真机重启需要用户确认,本次未做;② 写入 walt 回退的那一方**未确认**,30 秒
+间隔是推理值而非按实测节奏调的;③ **没有做性能 A/B**,不主张任何吞吐/功耗/温度数字 ——
+ vendor 默认选 walt 自有其理由,本次只交付"用户要的行为",不附带"这样更好"的结论;
+④ 全局 schedutil 会让 Batch 10-5/42 的 payload 从"退让"变为"可能接管"
+(`abk_report_dvfs_state()` 的 `_rs_foreign` 不再置位),这是预期的耦合,但这条链
+本身没有单独测过。
+
+
+### 重启后复测:governor 侧闭环,band 侧发现 95% 从未生效
+
+用户重启后实测(vermeer / 5.15.216,uptime 3672s):暂存的 v0.15.0 已生效(live
+`service.sh` 3695 字节、`update` 目录消失),开机日志
+`gov: want=schedutil policy0=schedutil ...` 三个 policy 全在 schedutil;
+`--supervise-gov` supervisor 存活(pid 文件写的是 `$$`),且**抓到了回退事件本尊**
+—— 开机第 34 秒 `gov: ok=3 tot=3 set=3 bad=0`,即 vendor 把 walt 写回来、下一轮
+30 秒内被改回去;此后一小时零回退、日志不再增长(这就是"只在变化时打日志"的设计)。
+
+**但 band 没有像预期那样开始工作**:换到 schedutil 之后三个 policy 的窗口确实是开的
+(policy3 是 614400..2592000),`abk_sc_capped` 却仍是 `0x89`。逐簇按 gate 重算发现
+真因不在 governor,而在 vendor 的钉子 —— 它把 `scaling_max_freq` 压在
+**cpuinfo.max_freq 的 92-94%**(1900800/2016000、2592000/2803200、2956800/3187200),
+而 `cap_pct=95` 换算出的 cap 高于这三个钉子,`abk_sc_owns()` 的
+`cap >= policy->max` 每次都拒绝:**95% 这个值从落地起一次都没有钳过**,`0x89` 是
+残留(与 Batch 42 交付时记录的残留缺陷同一回事,只是当时归因于游戏时的 min==max,
+现在看到稳态下是同一条路径)。
+
+**据此把 cap_pct 95 → 90**(floor 仍 85,band 收窄到 5 个点,即仓库单测允许的最小
+间隔):90% 换算为 1814400 / 2522880 / 2868480,三个都低于 vendor 的钉子,gate 得以
+通过。`tunables.conf` 注释、README 行、以及"band 不等式"那款断言同步改为 90,并在
+注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
+**这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
+
 <a id="batch-42"></a>
 
 ## Batch 42(v0.47.0)
