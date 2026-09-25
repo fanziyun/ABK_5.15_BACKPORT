@@ -406,6 +406,47 @@ REQUIRED_CONTENT = {
         "static bool abk_sf_cpu_boosting(int cpu)",
         "module_param_cb(abk_sf_boosting, &abk_sf_boosting_ops, NULL, 0444);",
     ],
+    "perf:schedutil_smart_cap": [
+        "Batch 42 schedutil smart_freq cap",
+        # Ships off, and every default is an upstream constant or a no-op.
+        "static bool abk_sc_enable = false;",
+        "static uint abk_sc_cap_pct = 100;",
+        "static uint abk_sc_hold_ms = 300;",     # UNCAP_THRES
+        "static uint abk_sc_entry_pct = 90;",    # UTIL_THRESHOLD
+        "static uint abk_sc_release_pct = 70;",
+        "static uint abk_sc_release_ms = 250;",
+        # The clamp itself, upstream's form: min(freq, cap).
+        "return mult_frac(policy->cpuinfo.max_freq, pct, 100);",
+        "*target_freq = cap;",
+        # Every gate.  A cap on a range the owner has already pinned is the
+        # Batch 10-4c ratchet from this direction, and each of these is the
+        # half of the pair that stops it.
+        "static bool abk_sc_dvfs_owned(struct cpufreq_policy *policy)",
+        'strcmp(policy->governor->name, "schedutil") != 0',
+        "if (abk_sc_dvfs_owned(policy) || policy->min == policy->max)",
+        "if (c <= policy->min || c >= policy->max)",
+        # The release is request-direction driven, not the util time window
+        # whose 70-90% dead band latched smart_policy's reason on a real device.
+        "ABK_SC_RELEASE IS NOT A UTIL WINDOW",
+        "unsigned long high_start;",
+        "p->high_start = jiffies;",
+        "p->high_start = 0;",
+        "p->released = false;",
+        # Per-policy state under a raw spinlock: fast_switch calls resolve_freq
+        # under rq->lock from several CPUs of one policy at once, so the ladder
+        # cannot live per-CPU and cannot be lock-free.
+        "struct abk_sc_policy {",
+        "raw_spinlock_t lock;",
+        "raw_spin_lock_irqsave(&p->lock, flags)",
+        "raw_spin_lock_init(&abk_sc_policies[cpu].lock);",
+        # The cap has to survive schedutil_smart_policy's floor, which runs
+        # after it on the same hook (registration order is execution order).
+        "late_initcall_sync(abk_sc_reassert_init);",
+        "if (p->capped && *target_freq > cap)",
+        # Both read-only nodes, so who owns a range is observable.
+        "module_param_cb(abk_sc_boosting, &abk_sc_boosting_ops, NULL, 0444);",
+        "module_param_cb(abk_sc_capped, &abk_sc_capped_ops, NULL, 0444);",
+    ],
     "core:zram_secondary_comp": [
         "Batch 10-4 secondary zram compressor",
         "abk_zram_recomp_algo",
@@ -1396,8 +1437,57 @@ REQUIRED_IN_FUNCTION = {
           "cgroup_kn_unlock(of->kn);"],
          ["psi_trigger_create"]),
     ],
+    "perf:schedutil_smart_cap": [
+        # The ownership and headroom gates belong in the shared front both
+        # probes go through: a gate that lands in a helper nobody calls is the
+        # "compiles but behaves like the source kernel" failure this audit
+        # exists for.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sc_owns",
+         ["if (abk_sc_dvfs_owned(policy) || policy->min == policy->max)",
+          "c = abk_sc_cap(policy);",
+          "if (c <= policy->min || c >= policy->max)"],
+         ["*cap = policy->max"]),
+        # The clamp itself, on the resolve path, in the raw spinlock that the
+        # fast_switch context requires.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sc_resolve_freq",
+         ["raw_spin_lock_irqsave(&p->lock, flags)",
+          "if (abk_sc_cooled(policy))",
+          "p->high_start = jiffies;",
+          "p->high_start = 0;",
+          "*target_freq = cap;",
+          "raw_spin_unlock_irqrestore(&p->lock, flags)"],
+         # No util time window on the release: that is the 70-90% dead band
+         # that latched smart_policy's reason for a whole game session, and it
+         # is the one thing this payload must never grow back.
+         ["util * 100 >= cap * abk_sc_entry_pct",
+          "abk_sc_entry_pct",
+          # No print in a path the fast_switch caller runs under rq->lock, and
+          # no uclamp: the cap is this module's own budget, and uclamp wants a
+          # task and a clamp group, so pairing them double-clamps the same
+          # frequency from two owners.
+          "pr_info(", "pr_err(", "pr_warn(", "pr_debug(", "printk(",
+          "uclamp", "trace_printk"]),
+        # The floor yields only because this probe re-asserts after it, so its
+        # own guard matters as much as the clamp's.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sc_reassert_freq",
+         ["if (!target_freq || !abk_sc_owns(policy, &cap))",
+          "if (p->capped && *target_freq > cap)",
+          "*target_freq = cap;"],
+         ["pr_info(", "pr_err(", "pr_warn(", "printk(", "uclamp"]),
+        # The re-cap window has to expire on jiffies, not on a tick: an idle
+        # CPU stops ticking under NO_HZ_IDLE and a tick-fed window never runs.
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sc_cooled",
+         ["for_each_cpu(cpu, policy->cpus)",
+          "time_after(jiffies, oldest + msecs_to_jiffies(abk_sc_release_ms))"],
+         ["abk_sc_entry_pct"]),
+        ("kernel/sched/cpufreq_schedutil.c", "abk_sc_init",
+         ["register_trace_android_vh_scheduler_tick(abk_sc_tick, NULL)",
+          "abk_sc_resolve_freq, NULL);",
+          "raw_spin_lock_init(&abk_sc_policies[cpu].lock);",
+          "kcalloc(num_possible_cpus(), sizeof(*abk_sc_policies),"],
+         ["pr_err(", "pr_debug("]),
+    ],
     "perf:schedutil_smart_policy": [
-        # The ownership gate has to sit in the resolve path itself: a gate that
         # lands in a helper nobody calls is exactly the "compiles but behaves
         # like the source kernel" failure this audit exists for.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sf_resolve_freq",

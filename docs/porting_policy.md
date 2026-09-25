@@ -58,6 +58,29 @@
    `tools/abk_fas_check.sh` (shipped as `bin/abk_fas_check.sh`) is the
    read-only check that tells a healthy single-point owner from a lock.
 
+   The same rule covers the *ceiling* direction, which is Batch 42
+   (`schedutil_smart_cap`, Batch 10-2's un-landed `freq_cap[]` half): the
+   clamp is off by default, gated by the same ownership probe, and it refuses
+   a cap that `__resolve_freq()`'s own `[policy->min, policy->max]` clamp
+   already satisfies — a cap at or below `policy->min` is a no-op and one at or
+   above `policy->max` is a frequency lock, i.e. the 10-4c ratchet seen from
+   this side. Two further points are specific to a cap and worth carrying
+   into any future cpufreq group in this file: **state is per-policy under a
+   raw spinlock**, because `__resolve_freq()` runs on the `fast_switch` path
+   with `rq->lock` held and several CPUs of one shared policy can be inside it
+   at once; and **the release must not be a util time window** — the floor's
+   original `≥90% in / ≥70% renew / 250 ms below 70% to exit` window is what
+   produced the measured 70-90% dead band (util parked at 75-85% never
+   satisfied the exit condition, so the reason never cleared and the frequency
+   was held). Batch 42 releases on the direction of the frequency *request*
+   instead and confines its util window to re-asserting a cap that has already
+   been released, which is the one direction that cannot hold a frequency
+   down. Because both groups register on `android_vh_cpufreq_resolve_freq`,
+   registration order is execution order: the cap is grafted ahead of the
+   floor's payload so its `late_initcall` runs first, and it keeps a second
+   probe at `late_initcall_sync` to re-assert a clamp a later probe raised
+   back above the cap — a payload the owner cannot override is not a cap.
+
    The same rule reaches further than frequency, and that is the part to
    internalise before adding any cpufreq-adjacent group: **`scaling_max_freq` is
    also a capacity node.** EAS and WALT scale a policy's reported capacity by

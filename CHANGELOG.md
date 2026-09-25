@@ -550,6 +550,252 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 - core 46 → 53（45 + 并行两批 Batch 36 各 1 组 + 本批的 6）。
 ---
 
+<a id="batch-42"></a>
+
+## Batch 42(v0.47.0)
+
+主题：**把 WALT `smart_freq` 四件套里唯一没落地的那件补上 —— `freq_cap[]` → `freq = min(freq, cap)`
+上限钳制**。落地 **1 组**（`scripts/batch42_perf_schedutil_smart_cap.py`，perf 23 → **24**，
+模块 `0.46.0` → `0.47.0`），组名 `schedutil_smart_cap`，落点 `kernel/sched/cpufreq_schedutil.c`，
+hook `android_vh_cpufreq_resolve_freq`。
+
+> **编号说明（与需求的原话不一致，属账目冲突而非设计变更）**：需求写的是「Batch 40,
+> v0.44.0 → 0.45.0」，但本仓库当时已经落了两批 —— Batch 40 = `erofs_readahead_relaxed_gfp`
+> (v0.45.0)、Batch 41 = `vm_kcompressd_swapout` (v0.46.0)。复用 `Batch 40` 会让同一个编号指向
+> 两个不同组，所以本批取 `Batch 42`、版本 `0.46.0` → `0.47.0`。组名、落点、旋钮名、语义、
+> 闸门与需求逐条一致，未自行扩张。
+
+### 1. 补的是哪一半，以及它从来没有落地的原因
+
+`CHANGELOG.md#batch-10-2` 的 Batch 10-2 设计草案把范围定为「reason 选举 + 去激活迟回 +
+**freq 上限钳制** + per-cluster 阈值表」四件。`schedutil_smart_policy`（Batch 10-2/10-4c/10-5）
+落地的是前两件（per-policy 持续高载 reason 选举 + resolve 时抬底的 floor），**上限钳制那一件
+从设计草案起就写着、从未实现**。本批只补这一件，不多做。
+
+上游出处（行号指 `research/popsicle_w_oss/walt_extract/` 的抽取件）：
+
+| 位置 | 内容 | 本批对应物 |
+|---|---|---|
+| `smart_freq.c:433` `smart_freq_update_one_cluster()` | `max_cap` 初值取 `NO_REASON_SMART_FREQ` 的 `freq_allowed`，只有某 reason 仍活着才向 `max_possible_freq` 长；结果发布为 `freq_cap[SMART_FREQ][cluster->id]` | `abk_sc_policies[policy->cpu]` 的 `released`/`capped` 二态阶梯 |
+| `smart_freq.c:505` `#define UNCAP_THRES 300000000` / `UTIL_THRESHOLD 90` | 「持续」的两个常量 | `abk_sc_hold_ms`(默认 300) / `abk_sc_entry_pct`(默认 90) |
+| `cpufreq_walt.c:264` `get_smart_freq_limit()` | `if (freq > smart_freq) { freq = smart_freq; ... }` | `*target_freq = cap;` 一行照搬 |
+
+挂点沿用 `research/popsicle_w_oss/walt_pelt_survey.md` §3B 的结论：`android_vh_cpufreq_resolve_freq`
+的调用点在 `drivers/cpufreq/cpufreq.c` 的 `__resolve_freq()` 里，位于 policy min/max clamp 之后、
+查频表之前，**fast_switch 与 slow 两路都覆盖** —— 这正是「smart_freq 上限钳制最佳落点」。
+§4.1 列的四项可保留物 (a) reason 位图+去激活迟回、(b) `freq_cap[]`→`min()` 钳制、
+(c) per-cluster 阈值表中，(a) 已由 `schedutil_smart_policy` 落地，**(b) 即本批**；(c) 不落 ——
+5.15 cpufreq 没有 `walt_sched_cluster`，按 cpufreq policy 取状态是等价且更小的形态。
+
+### 2. 语义（按需求逐条，未扩张）
+
+- `cap = mult_frac(policy->cpuinfo.max_freq, abk_sc_cap_pct, 100)`；`cap_pct > 100` 一律按 100 算。
+- 目标频率 `> cap` 且未放开 → 压到 `cap`，并记下这次「高于 cap」的请求时间戳。
+- **放开判据是频率请求方向驱动**：最近一次被压制的请求**仍然**高于 `cap`，且这种状态**连续**持续
+  `abk_sc_hold_ms`（上游 `UNCAP_THRES`）= 持续需求 → 放开通涨到 100%。
+- 一次 `target <= cap` 的请求把时间戳清零（窗口要求「连续」），**但不收回已放开的 cap** ——
+  否则一帧之间的塌陷就会把一场持续会话已经放开的 cap 重新压上。
+- `util` 跌破 `abk_sc_release_pct` 并保持 `abk_sc_release_ms` → 收回 cap、清时间戳。
+- `abk_sc_entry_pct`（上游 `UTIL_THRESHOLD`）只喂 `abk_sc_boosting` 那个只读 reason 位图
+  （上游 `thres_based_uncap()` 的判定，逐窗重算、不锁存），**不 gate 任何决策**。
+
+旋钮全部在 `/sys/module/cpufreq_schedutil/parameters/`，0644：
+
+| 旋钮 | 默认 | 含义 |
+|---|---|---|
+| `abk_sc_enable` (bool) | `false` | 总开关 |
+| `abk_sc_cap_pct` (uint) | `100` | 上限占 `cpuinfo.max_freq` 百分比，100 = 不压 |
+| `abk_sc_hold_ms` (uint) | `300` | = 上游 `UNCAP_THRES`（300 ms） |
+| `abk_sc_entry_pct` (uint) | `90` | = 上游 `UTIL_THRESHOLD` |
+| `abk_sc_release_pct` (uint) | `70` | 全 policy CPU 都低于它才算退让 |
+| `abk_sc_release_ms` (uint) | `250` | 退让保持这么久才收回 cap |
+
+只读诊断两个（0444）：`abk_sc_boosting`（当前持有上游形状 reason 的 CPU 位图）、
+`abk_sc_capped`（当前被压制的 policy 位图，按 `policy->cpu` 编号，一个三核大簇只置一位）。
+全部 `abk_sc_` 前缀，与既有 `abk_sf_` 零重名 —— 同一 TU 里两个同名函数是编译错误而不是第二意见，
+所以 `abk_sc_dvfs_owned()` 是 `abk_sf_dvfs_owned()` 的本 payload 私有副本（已在注释里点明）。
+
+### 3. 死区教训：为什么放开判据不用 util 时间窗（需求第 4 条，硬性）
+
+`abk_sc_resolve_freq` 上面的注释块以 `ABK_SC_RELEASE IS NOT A UTIL WINDOW` 开头，逐字引用了这条
+教训及其成因：`schedutil_smart_policy` 第一种形态按 util 时间窗退出（≥90% 进入、≥70% 续期、
+连续 250ms <70% 才退出），**实机上它造成 70%–90% 死区** —— 滑动/后台负载把 util 稳在 75–85%，
+退出窗口永不成立，reason 永不清除，频率被摁住不降（用户实测复现过）。
+
+所以本批的放开判据**只看频率请求方向**。剩下的那个 util 窗口只负责**另一侧**：把一个**已经放开**的
+cap 重新收回。这个不对称是刻意的，也是安全的那一侧 —— **一个只能让功能重新上线的窗口不可能把频率
+摁住不放**，于是旧故障形态在这里没有可咬的东西：util 稳在 75–85% 时请求窗口照常开，cap 被放开，
+频率是自由的。单测与 `implementation_audit` 都把这一点钉住了：`abk_sc_resolve_freq` 的函数体
+`must_not_have` 里列了 `util * 100 >= cap * abk_sc_entry_pct` 与 `abk_sc_entry_pct` 本身。
+
+### 4. 与 `schedutil_smart_policy` 的耦合：cap 先于 floor，且 cap 得赢
+
+两者注册同一个 hook、同一个文件，而 `android_vh` 探针**按注册顺序执行**（5.15
+`tracepoint_add_func()` 在相同 prio 下 FIFO 追加，`__DO_TRACE()` 从头走链表）。需求规定
+「cap 先于 floor」：floor 先跑会把目标抬到 cap 之上，cap 再压就压不到它了。两者都是
+`late_initcall`、又在同一个 TU，所以在 TU 内就是文本顺序 —— 于是本 payload 被嫁接在
+`cpufreq_governor_init(schedutil_gov);` **这一行的前面**（floor 跟在它后面追加）。
+
+这个位置同时是三件事的唯一解：
+
+1. 文本上先于 floor payload ⇒ cap 的 `late_initcall` 先跑 ⇒ clamp 是 floor 看到的第一个值；
+2. 与引擎先跑哪个组无关（两个顺序收敛到同一个文件，单测双向断言）；
+3. **对两个组都幂等**。若改成接在锚点之后，本 payload 就落在锚点与 floor payload 之间，
+   第二遍时 floor 组的 `new` 不再匹配而它的 `old`（同一行）仍匹配 ⇒ 再 append 一份 floor ——
+   正是 group_recipe §2 trap 5（Batch 21 的 `psi_account_irqtime()` 重复定义事故）。
+   `step_audit.py` 的 patched-tree 断言能抓到它，单测也用双向顺序断言钉住。
+
+「cap 先跑」本身还不够：floor 后跑且只会抬。所以 cap 在 `late_initcall_sync`（7s，排在所有
+7 级条目之后，含 floor 的 `late_initcall`）再注册一个尾探针，**只在本趟已经压过、且有后来的探针
+把目标抬回 cap 之上时**重压回 cap —— cap 生效时 floor 让位。之所以在 cap 这一侧实现而不是去改
+floor payload：floor payload 是 Batch 10-5 的字节冻结迁移锚点，改它会让已嫁接的树同时不匹配
+`has_current_policy` 也不匹配 `has_legacy_policy`，于是 `has_unknown_policy()` 判它「不可命名」整组
+`blocked_by_shape`，把每棵已嫁接的树都堵死。两者各自的只读节点（`abk_sc_capped` /
+`abk_sf_boosting`）让人能看见当前谁在管事，不用再靠频率猜。
+
+### 5. 闸门（一条不少，否则就是 Batch 10-4c 棘轮事故重演）
+
+`abk_sc_owns()` 是两趟探针共用的前置，四条全在其中：
+
+1. `abk_sc_enable` 默认 `false`；
+2. `abk_sc_dvfs_owned()`：`policy->governor` 名不是 `"schedutil"` 直接 return（vendor FAS/WALT
+   以 `min == max == 自己的目标` 驱动 cpufreq，压它等于把它变成锁频）；
+3. `policy->min == policy->max` 拒绝（thermal / perf cap 把范围塌成单点的同一死路）；
+4. `cap <= policy->min` 或 `cap >= policy->max` 直接 return —— `__resolve_freq()` 自己的
+   `[policy->min, policy->max]` clamp 已经满足前者，后者没有可压区间，应用任何一个都是锁频。
+
+### 6. 状态与并发
+
+per-**policy**（不是 per-CPU）状态 + `raw_spinlock_t`：`__resolve_freq()` 在 `fast_switch` 路径上、
+在 `rq->lock` 下被同一 policy 的多个 CPU 并发调用，共享 policy 的两个 CPU 必须看到同一把阶梯，
+而不是两把。**没有抄社区 schedhorizon fork 那个无锁 `current_step` 的写法** —— 那个实现带类型
+不匹配、阈值表长度自相矛盾、调试打印残留，一处都没搬。tick 侧只写自己 CPU 的条目；`abk_sc_cooled()`
+在 `p->lock` 外读这些值（两个方向都只朝「已退让」移动，陈旧读最多晚一个 tick），并在需求第 6 条
+之外顺手解决了 NO_HZ_IDLE：退让判据由 `jiffies` 与"最后一次 ≥ release_pct 的 tick 时刻"相减得出，
+空闲 CPU 不打 tick 也会到期，不是靠 tick 推进的窗口（`schedutil_smart_policy` 曾在这一点上把 flag
+锁到 CPU 重新忙碌）。
+
+### 7. 质量红线
+
+- 不碰 iowait boost、不碰 `arch_scale_freq_invariant()`；不加 Kconfig（`config_gate_audit.py` 的
+  新增门因此为 0）；不动任何 KABI/结构体 —— 嫁接文件的非 static 顶层声明数、`EXPORT_SYMBOL` 数
+  (0)、`ANDROID_KABI` 数 (0) 与嫁接前逐项相同 ⇒ `abi_symbollist` 不变。
+- 每步 `replace_once` 精确锚点；`ABK stable_515_backport:` marker 只加在模块自产行上。
+- 两个 `kcalloc()` 配 `kfree()`；除"hook 不可用"的 `pr_warn` 与一条自述 `pr_info` 外
+  **无任何 `pr_err`/`pr_debug`/`printk` 调试残留**（单测与 `implementation_audit` 双向钉住）。
+- 树形不匹配就报 `blocked_by_shape`，不半 patch：`has_unknown_cap()` 遇到不可命名的 cap payload
+  宁可整组拒写（与 batch10 的 `has_unknown_policy()` 同一个理由），include 块形状不认识时 required
+  锚点不中 ⇒ `apply_steps` 事务性回滚，一字不写。
+
+### 8. 验证结果（如实报告）
+
+| 门禁 | 167 | 178 | 194 | 216 |
+|---|---|---|---|---|
+| `tests/stable_5_15_test.py` | 全绿（含本批 63 项新断言） | 同左 | 同左 | 同左 |
+| `tests/step_audit.py` | STEP AUDIT OK | STEP AUDIT OK | STEP AUDIT OK | STEP AUDIT OK |
+| `tests/implementation_audit.py` | IMPLEMENTATION AUDIT OK | 同左 | 同左 | 同左 |
+| `tests/smoke.sh` | SMOKE OK | SMOKE OK | SMOKE OK | SMOKE OK |
+| perf 子 child dry-run | `schedutil_smart_cap: applied` | 同左 | 同左 | 同左 |
+
+- `python3 -m py_compile scripts/*.py tests/*.py`、`bash -n setup.sh scripts/*.sh tests/*.sh
+  tools/*.sh ksu/*/*.sh` 均通过。
+- `tests/sublevel_matrix.py` `GROUP_COUNTS["stable_perf_backport"]` 23 → **24**；`PRE_APPLIED` /
+  `KNOWN_DEBT` 不变（本组是本模块自己的 payload，四条基线都不可能自带它），四档 dry-run 全是
+  `applied`，没有 `blocked_by_shape`。
+- `implementation_audit.py` 为本组新增 `REQUIRED_CONTENT` 25 条、`REQUIRED_IN_FUNCTION` 5 项
+  （含 `abk_sc_resolve_freq` / `abk_sc_reassert_freq` 的 `must_not_have`：`pr_info(`、`pr_err(`、
+  `printk(`、`uclamp`、以及 util 时间窗 idiom），另加 `abk_sc_init` 的 `must_not_have pr_err(/pr_debug(`。
+- `tests/smoke.sh` 四档通过，rollback 逐字节还原。
+
+**ABK CI 编译闸门未跑**：那是在 ABK 仓库的 `build.yml` 里、需要 API key 与完整内核构建的外部工作流，
+本机没有。能做的是静态等价论证（见 §7：无新增导出符号、无 KABI、无 Kconfig），以及复用 batch10
+同一挂点同一 include 集已在 CI 编过这一事实 —— 本 payload 只用那两个组已用的符号
+（`mult_frac` / `strcmp` / `sprintf` / `kcalloc` / `register_trace_android_vh_*` /
+`cpu_util_cfs` / `arch_scale_cpu_capacity` / `for_each_*cpu` / `time_after` / `msecs_to_jiffies`），
+外加 5.15 就有的 `late_initcall_sync` 与 `<linux/spinlock.h>`（本文件 pristine 侧第 408/516 行
+已经在调 `raw_spin_lock()` / `raw_spin_lock_irqsave()`，第 30 行已在用 `raw_spinlock_t`，所以锁族
+与 `sprintf`/`kcalloc`/`for_each_*cpu` 的可见性由既有代码保证，不需要新增 include）。**这不能替代 CI，需在 CI 上复跑编译确认。**
+
+**config_gate_audit 在补丁树上失败一处，且与本批无关**：
+`mm/page_alloc.c:1403` 的 `CONFIG_HIGHMEM` 在 `research/config_audit/vermeer-5.15.216-ci.config`
+里是absent。已用 `git archive HEAD` 取 pristine 模块在同一棵补丁树上复现**完全相同**的失败，
+确认是 `AGENTS.md` 明说的「拿旧 `.config` 跑会（正确地）报 tier/config 矛盾」：那份 `.config` 是
+v0.23.0（Batch 18）的真机构建产物，之后的批次新增了 tier。本批不新增任何 Kconfig 符号，对它既无
+贡献也无恶化。
+
+### 9. 补漏：companion 的节点清单（交付后回填）
+
+第一轮交付漏了 runtime companion：`ksu/abk_runtime_tunables` 的节点清单里只有 Batch 10-5
+的 `abk_sf_enable` / `abk_sf_floor_pct` / `abk_sf_boosting` 三个，Batch 42 的 cap 一个都不显示
+—— 真机 `action.sh status` 的日志（vermeer，companion v0.13.0）证实了这一点。已补齐：
+
+- `action.sh`：新增 `abk_sc_enable` / `abk_sc_cap_pct` / `abk_sc_capped` / `abk_sc_boosting`
+  四个 `abk_show_or_absent` 行。`abk_sc_capped` 按 `policy->cpu` 编号，是「cap 和 floor 谁在管事」
+  的答案：`abk_sc_capped` 有位而 `abk_sf_boosting` 全 0，就是 cap 在压。
+- `common.sh` 的 `abk_report_dvfs_state()`：开机那一行补上 `abk_sc_enable=` / `abk_sc_capped=`；
+  实测两种内核下分别打 `... abk_sc_enable=N abk_sc_capped=0x0` 与 `... abk_sc_enable=absent
+  abk_sc_capped=absent`。
+- `abk_apply_sched_knobs()` + `abk_known_keys()` + `tunables.conf`：新增五个可写旋钮
+  （`abk_sc_enable`/`abk_sc_cap_pct`/`abk_sc_hold_ms`/`abk_sc_release_pct`/`abk_sc_release_ms`），
+  默认同样写死 0（与 floor 一致：内核默认关，companion 也声明关，避免一个"armed 的谎言"）。
+  **必须同时登记进 `abk_known_keys()`**，否则 `abk_cfg_lint()` 每次开机都会 warn
+  "unknown key ignored"，companion 就成了"看得见但驱动不了"。
+- **`sched.abk_sc_entry_pct` 故意不给 knob**：它只喂只读的 `abk_sc_boosting` 选举、不 gate 任何
+  决策，给一个可写副本会让人为了追 floor 那个 70-90% 死区去改一个改不动的数字。
+- **本设备要求两个 enable 都置 1，并按「频带」而不是「拔河」理解**（用户指定）。真机实测：跑游戏时
+  scheduler profile 把 policy 留在 **schedutil**，这正是两个载荷唯一接受的 governor；开机日志里
+  三个 policy 是 `walt`，是因为那条 `dvfs:` 记录在 post-fs-data 打、profile 还没切 governor ——
+  两句都成立，要调的是后面那个状态。最终配置 `floor_pct=85` / `cap_pct=95`，间隔 10 点。
+- **`cap_pct` 必须大于 `floor_pct`，这条已从注释升级成单测断言**。cap 在 `late_initcall_sync`
+  再注册一个尾探针，所以它跑在 floor 抬升**之后**；一旦 `cap_pct <= floor_pct`，每次
+  `resolve_freq` 都是「floor 抬到 floor_pct → cap 压回 cap_pct」，簇在持续高载出现的那一刻被钉死在
+  同一个频率上 —— 那正是 Batch 10-4c 的事故，也正是这个 cap 被写出来的原因。所以把 cap_pct 往下调
+  去贴 floor_pct 不是「更大的 cap」，是锁频；想要更紧的天花板，先降 floor_pct 保住间隔。单测直接读
+  `tunables.conf` 里的两个值，断言 `cap_pct - floor_pct >= 5`，并把不等式写进文件注释。
+- 内核载荷的两个静态默认**保持 `false` 不动**：载荷层「出货即关」的红线、以及 `implementation_audit`
+  的 `static bool abk_sc_enable = false;` 都不改，改的只有 companion 的 `tunables.conf`。这样已嫁接树的
+  `has_current_policy()` / `has_current_cap()` 仍逐字匹配，不会掉进 `blocked_by_shape`。
+- `module.prop` v0.13.0 → v0.14.0（versionCode 17 → 18），`common.sh` 的 `ABK_VERSION` 同步
+  （单测钉住两者一致，历史上漂过一次）；README 补 5 行表格 + 一段 cap 说明。
+- 单测新增 10 项断言：四个节点的显示、开机行读写的是 cap 自己的节点、五个 knob 都是 known key
+  且都真的被 `abk_apply_sched_knobs` 驱动、`entry_pct` 在两层里都没有 knob、两层都写死关。
+- 另在 `tests/implementation_audit.py` 与 `tests/sublevel_matrix.py` 无改动（本项不涉及 graft）。
+
+### 10. 一个自己造出来的缺陷：Windows 文本模式把 LF 写成了 CRLF
+
+补 companion 时用 `python3 Path.write_text()` 回写文件，Windows 上 `newline=None` 会把 `
+`
+翻成 `
+
+`，于是 `ksu/abk_runtime_tunables/common.sh` 变成全 CRLF。后果不是"看起来不整齐"：
+
+- harness 一 `. common.sh`，bash 就满屏 `$'
+': command not found`，`abk_zram_supervisor_main`
+  静默不跑，`supervisor_runs` 空串，单测在 `int('')` 上抛 ValueError。**这同时证明了它是被我的
+  改动引入的**：`/tmp/pristine_mod`（`git archive HEAD`，LF）在同一 harness 上 `supervisor_runs=4`。
+- 更要紧的是 `scripts/build_ksu_module.py` 是按**工作树**打包的，所以一个 CRLF 的 `common.sh`
+  会直接进 anykernel3 的 companion zip，Android 的 mksh 会像 bash 一样噎死 —— 正是
+  `AGENTS.md`「bash -n 不是手机上跑的那个 shell」那一课。已实测打包产物：修复后
+  `common.sh` crlf=0 / lf=905，打包幂等。
+
+已把 8 个被我写坏的文件按 `.gitattributes` 的 `eol=lf`（索引 LF）全部归位，`.patch` 文件是
+`-text` 且索引本就是 CRLF，未动。教训：在这个仓库里改文件用文本编辑器/Edit，不要用
+`Path.write_text()`；`read_text`/`write_text` 这一对在 Windows 上不守恒。
+
+doc 同步两处（`README.md` 的 companion 职责清单里补上 cap；`docs/porting_policy.md` §5 的
+「不夺 DVFS 所有权」规则补上天花板那一侧，以及 per-policy raw spinlock 与「放开判据不能用 util
+时间窗」两条，留给以后在同一文件加 cpufreq 组的人）。
+
+**运行时未验证 —— 需刷带 payload 的内核后复测。** 当前真机 vermeer（Redmi K70 Pro，23113RKC6C）
+刷的是 `5.15.216-android13-8-g5bfe2b8c1439`，该构建里 `abk_sf_*` 符号 **0 个**、且
+`/sys/module/cpufreq_schedutil/parameters/` **整个目录都不存在** —— 这台机器上没有任何本模块的
+payload，因此**不能声称在真机上验证过**。要做真机验证必须先用一个注入了
+`stable_perf_backport` 的 build（ABK CI `after_patch` 产物）刷机，然后至少核查：两个
+`abk_sc_*` 只读节点出现、默认 `applied` 后频率行为与嫁接前逐场景对比、以及 §3 那条死区是否真的
+不再出现（util 稳在 75–85% 时 cap 是否如期放开）。**未做，不主张任何设备侧效果数字。**
+
+---
+
 <a id="batch-41"></a>
 
 ## Batch 41(v0.46.0)

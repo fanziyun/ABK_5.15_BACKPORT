@@ -166,7 +166,8 @@ compressor on the dominated `lz4hc` before `disksize` — after which the node i
 * it drives age-marked recompression sweeps through the kernel's async worker
   (this is the only part that is on by default);
 * it reports — or optionally applies — the remaining runtime knobs: MGLRU, THP,
-  `vm.swappiness`, the schedutil smart-freq policy, dynamic readahead,
+  `vm.swappiness`, the schedutil smart-freq policy, the schedutil smart-freq
+  frequency cap, dynamic readahead,
   cgroup-v1 proactive reclaim, and per-cgroup pressure (PSI) accounting;
 * it switches off per-cgroup PSI accounting for the groups nobody reads
   (`psi.cgroup`, Batch 25 — the `cgroup.pressure` node is this module's own Batch 21
