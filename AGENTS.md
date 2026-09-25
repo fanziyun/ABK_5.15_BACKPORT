@@ -37,7 +37,11 @@ paths under the tree.
 
 1. Register: source the commit in `plan.md`, save the upstream `.patch` under
    `research/upstream-5.15.y/patches/`, convert to old/new blocks with
-   `python research/hunks.py research/upstream-5.15.y/patches`.
+   `python3 tools/hunks.py research/upstream-5.15.y/patches`.
+   (`research/` is a **local-only, git-ignored workspace** — the `.patch` archive
+   and the reference-tree snapshots are not published with this repo and live
+   only in your own checkout. The converter itself *is* published: it sits in
+   `tools/`, see "Distribution assets" below.)
 2. Implement a `_xyz_apply(ctx)` function + a `PatchGroup(...)` entry in the right
    child. Split into `(rel, old, new, required)` steps. Keep rename→user chains
    `required` (transactional: a required miss writes nothing); cosmetic hunks
@@ -50,10 +54,11 @@ paths under the tree.
 A reference tree is required for the tree-level audits. Fetch one without cloning
 history: `bash tests/fetch_sublevel_tree.sh <branch> <outdir>` (gitiles-encoded,
 only the ~78 files the groups touch). Real branches per baseline are in
-`tests/fetch_sublevel_tree.sh` and `docs/porting_policy.md`. `research/fetch_all_trees.sh`
-brings down all four into `build/abk-trees/<sublevel>`, which is where the reference trees
-this repository audits against live -- **`tmp/r167`/`tmp/r216` and friends are report
-directories, not trees**, and every one of the three tree audits fails on them with
+`tests/fetch_sublevel_tree.sh` and `docs/porting_policy.md`. `tools/fetch_all_trees.sh`
+brings down all four into `build/abk-trees/<sublevel>`,
+which is where the reference trees this repository audits against live --
+**`tmp/r167`/`tmp/r216` and friends are report directories, not trees**, and every
+one of the three tree audits fails on them with
 `reference tree is missing Documentation/admin-guide/cgroup-v2.rst`. A tree fetched before
 `FETCH_FILES` grew entries is missing them too; re-fetch rather than working around it.
 
@@ -202,7 +207,13 @@ required strings.
 
 ## Source-of-truth docs
 
-- `README.md` — overview, injection string, per-child contents.
+- `README.md` (Chinese) and `README_en.md` — the user-facing overview: what the
+  module does, the injection string, per-child contents. Deliberately *short*:
+  per-batch technical detail (why a group landed the way it did, anchor shapes,
+  KMI slots, device measurements) belongs in `CHANGELOG.md`, and the two READMEs
+  point there rather than repeating it. Keep them that way when editing.
+- `CHANGELOG.md` — the technical record of every landed batch; the first place
+  to look for "why is this graft shaped like this".
 - `docs/porting_policy.md` — scope, KMI red lines, shape registry, three-module
   composition, report contract.
 - `docs/group_recipe.md` — the add-a-group recipe and the traps above.
@@ -295,6 +306,21 @@ Distribution assets live outside the graft: `tools/` (device-facing CLIs, shippe
 into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
 implementation) and `ksu/` (the KernelSU module source). `patches/` and `files/`
 stay empty.
+
+What the repo **publishes** is only what the module needs: the registry
+(`scripts/`), its tests (`tests/`), the docs, `setup.sh`, `module.conf`, `public.md`
+and the two distribution trees (`tools/`, `ksu/`). Everything else is **local-only
+and git-ignored**: `research/` (upstream `.patch` archive, reference-tree snapshots,
+per-batch device-check records), `build/abk-trees/`, `tmp/` and `tests/out/`. Doc
+paths that point into `research/` therefore refer to the maintainer's checkout, not
+to a published artefact.
+
+`tools/` carries two kinds of script and the split matters: the five **device
+CLIs** listed in `ksu/abk_runtime_tunables/embed.conf` ship verbatim into the
+companion module's `bin/` and must survive Android mksh; `tools/hunks.py` and
+`tools/fetch_all_trees.sh` are **build-host dev helpers** (`bash`/`python3`, they
+touch `build/abk-trees/` and the upstream `.patch` archive) and are deliberately
+absent from `embed.conf`, so the packager never copies them into the zip.
 
 Each module ships its **own** `scripts/libabk.sh`; ABK provides nothing shared. The
 reference template (`xingguangcuican6666/ABK_KSU_SANDBOX_MODULE`) has a fuller

@@ -6,12 +6,17 @@ batch is three steps.
 
 ## 1. Register the candidate
 
+`research/` is a **local-only, git-ignored workspace** — the upstream `.patch`
+archive and the reference-tree snapshots under it are not published with this
+repo, so they exist only in your own checkout. (The converter below *is*
+published, in `tools/`.)
+
 - Pick the commit from `docs/survey_5_15_168_218.md` backlog (or survey a
   new one via `research/upstream-5.15.y/` path listings).
 - Save the upstream `.patch` under `research/upstream-5.15.y/patches/`
   (`curl -L https://github.com/gregkh/linux/commit/<sha>.patch -o <sha>.patch`).
 - Convert it to old/new blocks with the dev helper:
-  `python research/hunks.py research/upstream-5.15.y/patches`.
+  `python3 tools/hunks.py research/upstream-5.15.y/patches`.
 - Add a checkbox line to `plan.md` with the sublevel and target child.
 
 ## 2. Implement the group

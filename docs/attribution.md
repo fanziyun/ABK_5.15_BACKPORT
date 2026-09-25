@@ -233,6 +233,11 @@ is only recoverable from the upstream tree itself.
 
 ## Where the rest of the provenance lives
 
+`research/` is a **local-only, git-ignored workspace**: the snapshots and `.patch`
+archives below are kept by the maintainer and are *not* published with this repo, so
+these paths refer to that checkout rather than to a cloneable artefact. They remain
+the evidence of record for what each graft was taken from.
+
 Not every graft has an archived `.patch`. The remaining sources, each with its
 own upstream attribution:
 
