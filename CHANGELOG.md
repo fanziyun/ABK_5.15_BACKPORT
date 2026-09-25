@@ -553,7 +553,7 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 
 ## companion v0.16.0 + sailboat 附加模块（二）:调度侧拆成独立模块
 
-**用户要求**:把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个
+把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个
 模块,命名「sailboat 附加模块（二）」;原 `ABK 5.15 Runtime Tunables` 改名
 「sailboat 附加模块（一）」」。
 
