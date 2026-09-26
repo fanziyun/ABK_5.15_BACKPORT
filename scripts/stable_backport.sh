@@ -3,6 +3,11 @@
 #
 # Composition contract (all stages are after_patch):
 #   1. ABK_F2FS_FIX_MODULE storage rollbacks restore the storage baseline first.
+#      Not a courtesy: Batch 43 opened fs/f2fs and drivers/scsi/ufs as graft
+#      targets, so this ordering is the only configuration in which a storage
+#      graft composes. The rollback is `git apply --reverse --check` of
+#      android13-5.15-*-*.patch and breaks on a tree this module already
+#      rewrote. See docs/porting_policy.md "Footprint overlap".
 #   2. This module grafts upstream 5.15.y feature/optimization commits on top.
 #   3. ABK_ABI_PATCH_SUITE runs last; its fd_alloc_hotpath probe detects the
 #      upstream fdtable shape landed by stable_backport_core and adapts.
@@ -108,9 +113,10 @@ abk_stable_backport_preflight_display() {
 # layout so BAR0 is assigned and WiFi comes up.  Verified on vermeer by flashing
 # a 5.15.216 build carrying only this overlay.
 #
-# Gated on the rework marker so it is a no-op on baselines that never carried it
-# (5.15.167/.178/.194): those trees are already in the target form, and their
-# unrelated of_node_get line must not be disturbed.  The original file is
+# Gated on the rework marker so it is a no-op on any tree already in the target
+# form.  That was the 5.15.167/.178/.194 case (dropped in Batch 44); the
+# supported android13-5.15-lts tree carries the rework, so the overlay is live
+# there.  A tree without the rework keeps its unrelated of_node_get line.  The original file is
 # snapshotted to <file>.abk-orig once, matching the Python grafts' rollback
 # convention (scripts/abk_rollback.sh restores it).
 abk_stable_backport_overlay_of_address() {

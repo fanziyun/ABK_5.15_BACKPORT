@@ -34,7 +34,9 @@
 - Hot paths for fd-table allocation, `close_range`, slab alloc/free and fault
   allocation;
 - the erofs read path requests its temporary bounce pages with `GFP_NOWAIT`, so a
-  readahead shot no longer enters direct reclaim;
+  readahead shot no longer enters direct reclaim, and the readmore prefetch walk
+  stops at EOF so a read at a large page offset cannot spin through the whole
+  file's page count;
 - arm64 LSE percpu atomics, batched TLB flushes, batched page-cache shadow
   eviction, and FUSE's write-path prefault moved out of the critical path.
 
@@ -49,14 +51,17 @@
 
 | child id | content | groups |
 |---|---|---:|
-| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 66 |
+| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 67 |
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 24 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**91 graft groups** in total; one injection string covers 5.15.167 / .178 / .194.
+**92 graft groups** in total; one injection string covers `android13-5.15-lts`.
 
-Supported baselines: `5.15.167` (android13-5.15-2024-11), `5.15.178`
-(-2025-03), `5.15.194` (-2025-12), `android13-5.15-lts`.
+Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
+keyed to the tree's current Makefile `SUBLEVEL`, 216 as of 2026-09). Batch 44
+dropped the `5.15.167` / `.178` / `.194` release baselines. This registry never
+version-gated anything -- it gates on text anchors only -- so the discard does
+not change any group's shape.
 
 ---
 
@@ -114,10 +119,10 @@ Full knob table:
 python3 -m py_compile scripts/*.py tests/*.py                  # syntax gate
 bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh # shell syntax gate
 python3 tests/stable_5_15_test.py                              # unit tests (no tree needed)
-bash tests/fetch_sublevel_tree.sh android13-5.15-2025-12 /tmp/tree194   # fetch a reference tree
-python3 tests/implementation_audit.py /tmp/tree194             # content audit
-python3 tests/step_audit.py /tmp/tree194                       # per-step anchor audit
-bash tests/smoke.sh /tmp/tree194                               # end-to-end + rollback
+bash tests/fetch_sublevel_tree.sh android13-5.15-lts build/abk-trees/216  # fetch a reference tree
+python3 tests/implementation_audit.py build/abk-trees/216      # content audit
+python3 tests/step_audit.py build/abk-trees/216                # per-step anchor audit
+bash tests/smoke.sh build/abk-trees/216                        # end-to-end + rollback
 ```
 
 ---
