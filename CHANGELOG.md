@@ -735,6 +735,508 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+<a id="batch-46"></a>
+
+## Batch 46(erofs readmore EOF 收口,v0.49.0)
+
+主题：**把 erofs readmore 的预读循环在 EOF 处收口**。来源
+`docs/survey_erofs_upstream.md` §4.1 —— 该 survey 的 §7 建议是"先单独落地这
+一条"。落地 **1 组**（全 core，core 66 → 67 组），`ABK_MODULE_VERSION` /
+`ABK_MODULE_SET_VERSION` 0.48.0 → **0.49.0**。
+
+### 1. 落了什么
+
+| 组 | 来源 | 文件 | 步数 |
+|---|---|---|---|
+| `erofs_readmore_past_eof` | `936aa701d82d`（mainline v6.5，Chunhai Guo / vivo，2023-07-10，"erofs: avoid useless loops in z_erofs_pcluster_readmore() when reading beyond EOF"） | `fs/erofs/zdata.c` | 1（required） |
+
+一字改动：
+
+```c
+-	while (cur >= end) {
++	while ((cur >= end) && (cur < i_size_read(inode))) {
+```
+
+`z_erofs_pcluster_readmore()` 从 `map->m_la + map->m_llen - 1` 开始**倒着**每次
+一页地预读正在读的那一页身后的页，它的上界是**映射范围**而不是**文件大小**，所以
+一次大页偏移的小文件读会让循环从 EOF 很远处启动，把整个文件的页数都走一遍。
+上游复现例：`offset = 19217289215`、`inode_size = 1442672` —— 4,691,368 次
+迭代，约 27 秒。
+
+**范围判定**：这个提交带 `Fixes: 386292919c25`（最早的 readmore 系列）但**没有
+`Cc: stable`**，所以它是一个 v6.5 性能改动而不是被回移植的修复，任何 5.15 树都不
+会自带 —— 这正是本组不可能在滚动 lts 上以 `already_present` 到达的原因。
+commit message 只把问题说成白跑（"which is unnecessary should be
+prevented"），**没有 CVE、没有安全措辞**，因此落在本模块"feature/优化/重构"范围
+内。触发场景是一次非常大的页偏移越界读，正常访问模式碰不到，**不声称任何提速**。
+
+### 2. 安全论证是查出来的，不是推出来的
+
+整条论证依赖"5.15 的目标形状与上游修复后一致"，所以把
+`z_erofs_pcluster_readmore()` 在**取回的 216 树**与**tag v6.5** 之间做了整函数
+diff。三处差异，没有一处落在循环上：
+
+| 差异 | 内容 | 影响 |
+|---|---|---|
+| 签名 | v6.5 是 `(f, rac, backmost)`，去掉了 `end`（从 `f->headoffset` 重算）和 `pagepool` | 无，本组不改签名 |
+| `backmost` 分支 | v6.5 用 `headoffset + readahead_length(rac) - 1` 算 `end`、用 `headoffset` 展开；5.15 从调用方取 `end`、用 `readahead_pos(rac)` 展开。v6.5 还顺手修了该分支注释里 "expend"→"expand" 的拼写 | **这就是 survey 警告的那个坑**：锚点必须够不着它 |
+| 循环体控制流 | v6.5 是 `if (page) { ... } else { ... }`，5.15 是 `if (!page) goto skip;` … `skip:` | 语义等价（NULL → 跳到收尾；已 uptodate → 解锁 put 后跳到收尾；其余落到收尾） |
+
+**锚点因此从 `cur = map->m_la + map->m_llen - 1;` 起**：那一行、`while` 行、`pgoff_t
+index` 行在两边逐字节相同，而 `backmost` 分支不是。216 树上这三行锚点**只出现
+一次**（实测 count=1）。
+
+**guard 只会把预读变窄，不会把读出错。** readmore 是预读：调用者真要的那一页由
+`z_erofs_readpage()` 里 `backmost` 调用**之后**的 `z_erofs_do_read_page()` 无条件读，
+`z_erofs_readahead()` 则由自己的循环读。被 guard 跳过的每一个页都在 `i_size`
+之后，不含文件数据；谁需要它，同步路径会带着自己的映射重新进来读对。
+
+一个边界细节**写明而不是抹过**：guard 判的是**字节偏移** `cur` 而不是页索引，
+所以落在最后一个不完整页内但 `>= i_size` 的 `cur` 也会被跳过。这是上游原形、
+不是移植选择，而且只有第一次迭代是非页对齐值（此后每个 `cur` 都是页对齐减一），
+代价是少一次预读而不是错一次读。
+
+### 3. 锚点前置检查
+
+* 三行锚点在 `fs/erofs/zdata.c` 中 **count = 1**；
+* `inode` 是函数顶部绑定的非 const `struct inode *`，匹配 `i_size_read()` 的
+  `const struct inode *` 形参；
+* `i_size_read` 在该文件中**出现 0 次** —— 没有别的读取点会混淆，也没有同名局部量
+  会被遮蔽；
+* `i_size_read()` 是 `include/linux/fs.h` 里**无条件**的 `static inline`（只有
+  32-bit-SMP 函数体带 `#if`，arm64 无关），而该头文件可达：
+  `zdata.c` → `zdata.h` → `internal.h` → `<linux/fs.h>`。
+  **这一项必须查**：缺声明正是三道文本审计看不见的 C 级缺陷（AGENTS.md 里
+  Batch 12 的 `module_param` 那一类）。
+* `fs/erofs/zdata.c` 自 Batch 40 起就在 `FETCH_FILES` 里，**没有 fixture 缺口**。
+
+上游 patch 已存到 `research/erofs_readmore_eof/patches/936aa701d82d.patch`
+（`research/` 仅本地保留）。
+
+### 4. 与 Batch 40 的同文件共存
+
+Batch 40 在同一文件里有 7 步（`compress.h` 的请求结构、两个
+`erofs_allocpage()`、collector 与请求初始化器、collection teardown），本组的
+三行锚点与其中任何一个都不重叠 ⇒ 无顺序约束、无 trap-5 暴露。
+本组也不自带 shape probe：它只有一步上游形状改写，而 `replace_once` 先查 `new`
+块，所以自带该提交的树直接 `already_present` 且保持逐字节相同。
+
+### 5. 顺手补的两个口子
+
+1. **`tests/smoke.sh` 从来没断言过 `fs/erofs/zdata.c` 的回滚。** Batch 40 是第一个
+   写该文件的组（3 步），但 smoke 的回滚清单只列了 `fs/file.c`、drm、
+   `mm/filemap.c`、`mm/swap.c`、`mm/page_io.c`、`mm/truncate.c`、
+   `include/linux/mm.h`。实测回滚后该文件逐字节还原，已按仓库惯例（"第一个写 X 的
+   批次"注释 + `diff -q` 断言）补上。
+2. **`module.conf` 里 Batch 40 遗留的措辞。** `ABK_MODULE_DESCRIPTION` 与 core 子
+   描述各有一句 `The request that prompted the batch -- whether any erofs patch
+   could speed up zram compression -- is answered no: ...`，是工作日志式归因。
+   Batch 45 的清扫只覆盖了中文措辞，英文叙述漏了。已按 AGENTS.md 规范改成
+   "Whether erofs can speed up zram compression is answered no: ..."（问题作为
+   设计事实陈述）。同处另有一句仍把 android15-6.6 zram backport 描述成落在
+   `5.15.167 GKI baseline` 上 —— Batch 44 撤基线时漏的第 5 处，已改为
+   `android13-5.15-lts`。
+
+### 6. 验证
+
+六道门禁，四档实测（参考树 `build/abk-trees/216`，SUBLEVEL 216）：
+
+```text
+python3 -m py_compile scripts/*.py tests/*.py      OK
+bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh   OK
+python3 tests/stable_5_15_test.py                   all checks passed
+python3 tests/step_audit.py build/abk-trees/216     STEP AUDIT OK (92 组)
+python3 tests/implementation_audit.py build/abk-trees/216   IMPLEMENTATION AUDIT OK
+bash tests/smoke.sh build/abk-trees/216            SMOKE OK
+```
+
+单测新增 `test_batch46_erofs_readmore_eof()`（26 条断言）：组已注册、只拥有
+`fs/erofs/zdata.c`、一步 required、`new` 不在 `old` 内、无 ABK 标记、锚点够不着
+`backmost`、锚点起于映射范围行、三行里只有 `while` 行改变、EOF 测试是**第二个**
+合取项且 `cur >= end` 仍在、上界与 EOF 测试都写对、落地、二次 pass
+`already_present` 且逐字节相同、自带该提交的树（上游自己的 `(f, rac, backmost)`
+签名形状）也报 `already_present` 且不被重写、锚点缺失时降级且不写盘。
+
+`implementation_audit.py` 三处钉住：`REQUIRED_CONTENT` 钉整条合取条件 +
+`cur < i_size_read(inode)`；`REQUIRED_ABSENT` 钉 `zdata.c` 不得出现 ABK 标记；
+`REQUIRED_IN_FUNCTION` 在 `z_erofs_pcluster_readmore()` 体内同时要求合取条件与
+映射范围行、并**禁止**两条形状：裸的 `while (cur >= end) {`，以及
+`	while ((cur >= end) || (cur < i_size_read(inode))) {
+` —— 后者是极性错误，
+它是 `cur >= end` 的**超集**，pathological 循环会活过这次修复而 guard 仍读作存在。
+
+`tests/sublevel_matrix.py`：`stable_backport_core` 66 → **67**，
+`PRE_APPLIED` / `KNOWN_DEBT` 不变（无 `Cc: stable`，不可能先到）。
+smoke 的 pass1 `{'already_present': 8, 'applied': 59}` 合计 67，与矩阵一致。
+
+**尚未做的**：ABK CI 编译闸门未跑，真机未验证。
+<a id="batch-45"></a>
+
+## Batch 45(文档规范清扫,无新增组)
+
+主题：**把本仓库的文档改成面向外部读者,而不是工作日志**。`scripts/*.py`、
+`tests/*`、`module.conf` 一行未动 ⇒ 91 个组、`GROUP_COUNTS`、
+`ABK_MODULE_VERSION`（保持 **0.48.0**）全部不变,与 Batch 43 同为纯政策/文档批次。
+
+### 1. 规则
+
+`AGENTS.md` 的 "Source-of-truth docs" 里 `CHANGELOG.md` 那一条新增写作规范,
+适用范围是**本仓库发布的每一份文档**（`CHANGELOG.md`、`plan.md` 的批次索引行、
+`docs/survey_*` 等）,不是只针对新写的内容:
+
+- 不写归因 —— 去掉 `用户要求：…` / `维护者要求：…`;
+- 不用第一人称 —— `我` / `我们` / `笔者`;
+- 不写 `已与用户确认` / `未代用户删除` 这类过程叙述;
+- **需求是一件设计事实,就按设计事实写**:"目标:只维护 `android13-5.15-lts`",
+  而不是"用户要求只维护 lts"。
+
+两条豁免写进规则本身,免得后来者误删:「用户」在 *userspace* / *终端用户* 意义
+上是技术术语（`fs/file.c` 的 fd table、`kernfs` 的用户态写入者等处大量出现）;
+`自我 DoS` 这类 `自我` 是 self- 的技术前缀,不是第一人称。
+
+### 2. 清扫范围与结果
+
+扫的是全部发布文件的类型（`*.md` / `*.py` / `*.sh` / `*.conf` /
+`*.properties` / `*.rule` / `*.bp` / `*.bzl` / `*.txt`），排除 `build/`、
+`research/` 这类 git-ignored 本地目录。命中 5 行,全部改掉:
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `plan.md` Batch 38 索引 | （用户要求「该 PR 的优化全部默认开启」） | （本条 PR 的优化全部默认开启） |
+| `plan.md` Batch 37 索引 | （用户拍板「6、7 收益不高难度大」） | （6、7 收益不高、难度大） |
+| `plan.md` Batch 37 索引 | 无 KABI 槽可用,经用户确认接受 | 无 KABI 槽可用,予以接受 |
+| `plan.md` Batch 37 索引 | 我们的 skip 判定在扫描**内** | 本模块的 skip 判定在扫描**内** |
+| `plan.md` companion v0.16.0 索引 | (先问过用户 A/B 两条路,最终确认「…」) | (A/B 两案比较后取「…」) |
+| `docs/survey_popsicle_w_611.md` | 用户提出「从小米 17 Pro 内核分支…」 | **目标**:从小米 17 Pro 内核分支… |
+
+其中 `plan.md` 的 companion v0.16.0 那条是唯一一处**删掉会丢信息**的:原文用
+「问过用户 A/B 两条路」记录「这个取舍是被认真做过比较的」。改成「A/B 两案比较后
+取」保留了这层信息,只去掉了对提问对象的指称。
+
+Batch 43/44 里同类措辞在同一批前一次改动中已清（见 `CHANGELOG.md#batch-44` §1、
+§3、§9 与 `#batch-43` §1）。
+
+### 3. 验证与残留
+
+- 复扫全部发布文件类型，归因/第一人称模式命中 **0**;
+- `自我 DoS`（`CHANGELOG.md`）与 userspace 意义的「用户」为豁免项，保留；
+- `py_compile` / `bash -n` / `stable_5_15_test.py` 与三道树级审计不受影响
+  （本批不改任何代码），实测 `all checks passed`。
+
+<a id="batch-44"></a>
+
+## Batch 44(v0.48.0)
+
+主题：**撤掉 `5.15.167 / .178 / .194`，只维护 `android13-5.15-lts` 滚动分支**。
+本批次 `scripts/*.py` 的组一行未动 —— 91 个组、`GROUP_COUNTS`
+（core 66 / perf 24 / display 1）、`KNOWN_DEBT`（空）全部保持。真正被改的是
+**期望矩阵与门禁**，外加一份文档漂移修正。
+
+### 1. 目标与范围判定
+
+目标：只维护 `android13-5.15-lts` 滚动分支，撤掉 `5.15.167 / .178 / .194`
+三个发布基线。
+
+第一个问题是「这到底改不改 registry」。答案是**不改**，且证据是查出来的而不是
+引用文档：
+
+- `scripts/abk_backport_engine.py` 的 `sub_level` 只有 4 处：`:38` 存、
+  `:309` 进报告字典、`:344` 进 markdown 行、CLI 贯通 `:371`→`:382`，
+  **没有任何比较**；
+- `scripts/stable_backport.sh` 的 family 门禁（`:29-46`）只按
+  `VERSION.PATCHLEVEL` 分支，从不看 `SUBLEVEL`；`abk_stable_backport_sub_level()`
+  （`:21-27`）读了之后原样传给 `--sub-level`，没有白名单；
+- 全 `scripts/` 用正则 `["'](1[0-9]{2}|2[0-9]{2})["']` 扫数字 sublevel，
+  命中 **0** —— 那些 `batchNN_*.py` 里的 167/178/194 全是注释与 docstring；
+- 看起来「只匹配部分基线」的 shape probe（kstack 的 slot 2..8 RESERVE 运行段、
+  `get_swappiness()` ACK hook、`swap_writepage()` frontswap hook、fd-table 的
+  5.15.191 形状）全是**文本**探针，形状不认时输出 `blocked_by_shape`，
+  没有一个读 Makefile 来决定是否写入。
+
+所以 `AGENTS.md` 那句「引擎只按锚点门控」是真的，撤档不改变任何组的形态。
+
+**为什么值得做**：CI 本来只编 lts —— `.github/workflows/abk-kernel-compile.yml`
+派发的 payload 是 `sub_level: "X"` + `os_patch_level: "lts"`，`STATUS_CONTEXT`
+就是 `ABK kernel compile (android13-5.15-lts)`，`ABK_JOB_PREFIX` 是
+`5.15.X-android13-lts`。也就是说「支持四档」这句话此前只由
+`tests/sublevel_matrix.py` 的四行 `PRE_APPLIED` 承载，而没有任何 CI 组合去
+验证前三行。本批是让**已验证的事实追上文档的声明**，不是缩小覆盖面。
+
+### 2. 期望矩阵（`tests/sublevel_matrix.py`）
+
+- 删掉 `"167"` / `"178"` / `"194"` 三行 `PRE_APPLIED`，只留 lts 行；
+- `DEFAULT_SUB_LEVEL` `"167"` → `"216"`；`SUPPORTED = tuple(PRE_APPLIED)`
+  随之变成单元素，无需另改；
+- `KNOWN_DEBT` 仍是空（每个组在受支持基线上都真的落地）；
+- `pre_applied()` 的 `SystemExit` 从一行扩成自解释的四段：点名 Batch 44、说明
+  唯一一行是滚动 lts 且按 Makefile SUBLEVEL 为键、给出「分支滚了 → 重新建键并
+  逐项重新证明」的处方，并明确 `ABK_TEST_SUB_LEVEL` 不能替代重新证明。
+
+lts 行的内容本身未动：core 9 组、perf 8 组、display 0 组 pre-applied，
+与实测一致（core pass1 = 58 applied + 8 present，perf = 16 applied + 8
+present，display = 1 applied）。
+
+### 3. 滚动键的取舍
+
+唯一一块需要拍板的设计：lts 是滚动分支，矩阵那一行的键怎么定。
+
+- **维持以 Makefile `SUBLEVEL` 为键**；
+- 否掉的是改成稳定 `lts` 标签 —— 那样 `pre_applied()` 会继续按旧行的答案回答，
+  陈旧期望**静默通过**；而以 SUBLEVEL 为键时，roll 到 220 会让所有审计以
+  `no expectation recorded for sublevel '220'; supported sublevels: 216`
+  硬失败，强迫一次有意识的重新建键。
+
+代价写在这里：每次 lts 前进都要改矩阵并重新证明。
+
+### 4. 单测：把跨基线断言换成单基线等价物
+
+`tests/stable_5_15_test.py` 原来的
+
+```python
+check("167 is the all-applied baseline for forward grafts",
+      all(not sublevel_matrix.pre_applied("167", c)
+          for c in registries if c != "stable_display_fix"))
+```
+
+撤档后会 `SystemExit`，必须重写。它守的东西在单基线世界里换了个更尖锐的
+形式：**一个把本模块仍需要的组悄悄吃掉的 `PRE_APPLIED` 行，会让三道树级审计
+全部变成空转却一片绿**。所以换成：
+
+```python
+only = sublevel_matrix.SUPPORTED[0]
+for child, groups in registries.items():
+    if child == "stable_display_fix":
+        continue
+    keys = {g.key for g in groups}
+    leftover = keys - sublevel_matrix.pre_applied(only, child)
+    check(f"{child} still really grafts on {only}", leftover, ...)
+# display 是 revert，恒等式反向：滚动分支带 5.15.185，其组必须真的 apply
+check("display revert really applies on the rolling baseline",
+      not sublevel_matrix.pre_applied(only, "stable_display_fix"), ...)
+check("the default baseline is a supported one",
+      sublevel_matrix.DEFAULT_SUB_LEVEL in sublevel_matrix.SUPPORTED, ...)
+```
+
+顺带清掉硬编码 sublevel 的 fixture：`GraftContext(..., "167", ...)` 三处、
+`sub_level="194"` 一处、`sub_level = "167"` 一处、autofdo 的
+`SUBLEVEL = 167` Makefile fixture（连同它那条 `kernel_version=5.15.167`
+断言）、以及把 `_BATCH31_PGTABLE_167` 改名为 `_BATCH31_PGTABLE_PRECOMMIT`
+——那个 fixture 描述的是 commit 之前的 pgtable 形状，不是「167 的形状」。
+`tests/implementation_audit.py:2157` 的 ctx sublevel 改用
+`sublevel_matrix.DEFAULT_SUB_LEVEL`（并补上 `import sublevel_matrix`）。
+
+### 5. 顺手堵两个洞
+
+**(a) `tests/smoke.sh` 没有 SUPPORTED 预检。** 撤档后把一棵 194 的树喂给它，
+脚本会先完整跑一遍 graft —— 真的把树改写一遍 —— 再在矩阵查询处 `SystemExit`。
+两分钟白跑，外加一棵被动过的树。现在在 pass 1 **之前**就拒：
+
+```
+supported: 216
+unsupported baseline 5.15.194; the lts row in tests/sublevel_matrix.py must be re-keyed and re-proven before this tree can be audited
+exit=2
+```
+
+已实测：`.abk-orig` 快照数前后都是 0，即树未被触碰。
+（第一版用了 `fail()`，但那个函数定义在 207 行、晚于检查块，会
+`fail: command not found`；改成与紧邻上一支一致的 `echo >&2; exit 2`。）
+
+**(b) `tests/step_audit.py:detect_sub_level()` 静默回落。** Makefile 缺失或
+没有 SUBLEVEL 行时，它返回 `sublevel_matrix.DEFAULT_SUB_LEVEL`，而 `:559` 的
+`SUB_LEVEL not in SUPPORTED` 成员检查**又恰好被同一个默认值满足** —— 等于用
+一棵认不出的树去审 lts 的期望，而日志声称审的是那棵树。单基线下这是该审计
+唯一可能看错树的路径，所以改成 `raise`。`detect_sub_level` 只有 `main()` 一处
+调用，改动安全。
+
+### 6. 取树与文档
+
+- `tests/fetch_sublevel_tree.sh`：抬头只列 `android13-5.15-lts`，并写明这是
+  滚动分支、重取后要重新建键；用法提示的 `sed -n '2,17p'` 跟着改成 `2,23p`；
+- `tools/fetch_all_trees.sh`：只取 lts，并在最后自报「分支滚到 5.15.X 但
+  `SUPPORTED` 是 216」的不一致；
+- `docs/porting_policy.md`：`## Supported baselines` 整节重写（只剩一行表格，
+  数字按当前 registry 重测），新增 `## Lts-only maintenance` 一节，写清重键
+  处方与「CI 编译闸门**不**能替代本地树级审计」的理由；
+- `AGENTS.md`：抬头改为「只维护 android13-5.15-lts」，新增 `## Lts-only
+  maintenance` 一节，dry-run 示例的 `--sub-level` 改 216；
+- `README.md` / `README_en.md`：支持基线块与本地验证命令的树路径；
+- `module.conf`：`ABK_MODULE_DESCRIPTION` / `ABK_MODULE_SET_DESCRIPTION` 的
+  基线表述；`ABK_MODULE_VERSION` / `ABK_MODULE_SET_VERSION` `0.47.0` →
+  **`0.48.0`**；
+- `docs/group_recipe.md`：`--sub-level 216`、「每档基线重复干跑」改为单基线下
+  的取树指引；
+- `docs/survey_erofs_upstream.md`（Batch 43 的产物）：§2 从「两个形状组」改为
+  「受支持基线只有一个形状组」，保留三档作为 provenance 说明 —— 那些 delta
+  是 `latest` 评估器同样会撞上的，也是当初钉住这些 commit 的方式；
+- `scripts/stable_backport.sh` / `files/README.md`：overlay 注释里「在
+  5.15.167/.178/.194 上是 no-op」改为历史陈述（门禁是文本标记，对任何树都成立）。
+
+### 7. 顺带修掉一处与本批无关的文档漂移
+
+`AGENTS.md` 原先两处写「`patches/` 和 `files/` 两个目录刻意留空」，但
+`files/drivers/of/address.c` **真实存在**，且 `files/README.md` 自述它是
+「唯一例外」。没有任何测试钉这条，所以漂移一直没有暴露。现已改为准确的
+`### File payloads (the one exception)` 小节，说明它存在的理由（整文件 revert
+上游 `ranges` flags parser rework，是锚点 graft 表达不了的一类改动）、它的文本
+标记门禁、以及 `.abk-orig` 快照/回滚约定；同时保留「`patches/` 为空、不要再加
+`.patch`」这条仍然成立的红线。
+
+### 8. 验证
+
+四道门禁，全在当前 registry 上跑过：
+
+| 门禁 | 结果 |
+|---|---|
+| `python3 -m py_compile scripts/*.py tests/*.py` | 过 |
+| `bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh` | 过 |
+| `python3 tests/stable_5_15_test.py` | **all checks passed** |
+| `python3 tests/step_audit.py build/abk-trees/216` | STEP AUDIT OK（91 组，二遍幂等） |
+| `python3 tests/implementation_audit.py build/abk-trees/216` | IMPLEMENTATION AUDIT OK |
+| `bash tests/smoke.sh build/abk-trees/216` | SMOKE OK（两遍 + 回滚逐字节） |
+
+**反向检查**（证明撤档真的生效、且报错清楚而不是静默通过）：
+
+| 命令 | 结果 |
+|---|---|
+| `python3 tests/sublevel_matrix.py 194` | exit 1，报 `supported sublevels: 216` + 重键指引 |
+| `python3 tests/step_audit.py build/abk-trees/194` | exit 1，报 `no expectation matrix for 5.15.194` |
+| `bash tests/smoke.sh build/abk-trees/194` | exit 2，**在 pass 1 之前**拒绝；树未被触碰 |
+
+另外：重取后的四棵树各 92 个文件，`fs/erofs/` 五个文件已到位（改用前是
+Batch 40 的组会在四档上失败的空目录状态）。
+
+### 9. 已知风险（写明而不是略过）
+
+1. **CI 编译闸门抓不到矩阵漂移。** 它把 `already_present` 归入
+   `GOOD_STATUSES`（`:430`）并且从不读矩阵，所以「lts 吸收了某 commit、而该组
+   不在 `PRE_APPLIED`」这一类漂移在 CI 上永远绿，而唯一能抓到的树级审计从来
+   不在 CI 里跑。**每次重取 lts 之后跑本地 `step_audit` / `implementation_audit` /
+   `smoke` 是强制项。**
+2. **滚动前进必然震断门禁。** 这是 SUBLEVEL 为键的故意代价；`tools/fetch_all_trees.sh`
+   会在取树时给出提示，但提示不等于重新证明。
+3. **未做**：`build/abk-trees/{167,178,194}` 三个旧夹具仍在原处（git-ignored 的
+   本地文件，不随仓库发布）；ABK CI 编译闸门未跑；真机未验证 —— 本批不改 graft
+   形态，真机行为与 v0.47.0 逐场景相同，但这只是推论，不是实测。
+4. `docs/porting_policy.md` 里指向 `build.yml KNOWN_KERNEL_PAIRS` 的引用已随
+   重写移除（该文件在 ABK 仓库，不在此仓库；本仓库只有
+   `abk-kernel-compile.yml`）。
+
+<a id="batch-43"></a>
+
+## Batch 43(政策变更，无新增组)
+
+主题：**撤销 `fs/f2fs` / `drivers/scsi/ufs` 两条 sibling 红线，换为注入顺序硬
+约束**。本批次 `scripts/*.py` 与 `tests/*` 一行未动 ⇒ `GROUP_COUNTS` 不变
+（core 66 / perf 24 / display 1）、无新 `PatchGroup`、无新 Kconfig，
+`ABK_MODULE_VERSION` 保持 **0.47.0** 不递增（按 `plan.md` 抬头惯例，只有真正
+落地 graft 的批次才 bump）。
+
+### 1. 问题与目标
+
+目标有两个，必须分开回答：**(a) 从小米 17 Pro 的内核分支
+`MiCode/Xiaomi_Kernel_OpenSource` 的 `popsicle-w-oss` 里，有没有可移植的
+**f2fs** 优化（用以改善 `/data` 读取）；(b) 能不能撤掉 `fs/f2fs` /
+`drivers/scsi/ufs` 的写入限制。
+
+### 2. popsicle-w-oss 复核实测：没有 f2fs 载体
+
+仓库既有的 `docs/survey_popsicle_w_611.md` 断言「`fs/` 整目录不在库内」。本次
+把它从推断升级为计数 —— GitHub API 拉整棵递归树（`?recursive=1`，返回
+`truncated: False`，非截断），结果：
+
+| 度量 | 实测值 |
+|---|---|
+| 全树条目（非截断） | **2686** |
+| `modules.bzl` 个数（kleaf 片段标记） | **141** |
+| `fs/` 条目 | **0** |
+| `block/` 条目 | **0** |
+| `crypto/` 条目 | **0** |
+| `mm/` 条目 | **2**（`modules.bzl`、`zsmalloc.c`） |
+| `drivers/scsi/` 条目 | **2**（`modules.bzl`、`sg.c`） |
+| 路径含 `f2fs` 的条目 | **0** |
+
+即这不是「f2fs 少几个文件」，而是**整棵 `fs/` 树不存在**；`blocks/`、`crypto/`
+同样为 0。合理解释：`popsicle-w-oss` 是 bazel/kleaf 的 out-of-tree 模块片段树
+（141 个 `modules.bzl`），GKI 公共内核的 `fs/`、`block/`、`crypto/`、`mm/` 主体
+由 AOSP 侧单独提供，小米仓库只放高通自研胶水。`git ls-remote --heads` 得 267
+个分支，其中相关的只有 `popsicle-w-oss` 与 `sunstone-u-oss`，**没有
+f2fs/common 源分支**。
+
+存储侧仅存三份文件，逐条判定：
+
+- `mm/zsmalloc.c`（57806 B）—— zram，不是 f2fs；链长与多算法本模块
+  Batch 4/6 已覆盖；
+- `drivers/ufs/host/ufs-qcom.c`（172220 B）、`ufs-qcom.h`、
+  `ufshcd-crypto-qti.c` —— 高通 SoC 专用胶水，**且没有 `ufshcd.c` 核心**
+  （核心在 AOSP GKI），AOSP GKI 上无锚点，与既有 survey 第 1/8 行结论一致。
+
+**结论 (a)：从该分支一个 f2fs 候选也取不到。** 「解除红线」没有「为了搬小米
+的 f2fs」这个收益支撑。
+
+### 3. f2fs 优化的正源
+
+`/data` 在 android13-5.15 上就是 f2fs，读性能的真实杠杆在**上游**：
+`docs/batch8_long_term.md` C 节原「属于 sibling suite」的三条随红线撤销变成本
+模块合法候选，来源一律取 android15-6.6 / 5.15.y stable，其中
+**`f2fs_lookup_mode_perf` 投入最小**（casefold 目录线性 fallback 回退 → 6.6 的
+`lookup_mode=perf` hash-only 路径），最值得先做；`f2fs_readonly_large_folio`
+需先有 `large_folio_mthp_substrate` 基建；`ufs_command_priority_rt` 依赖硬件。
+本模块范围内、不属 f2fs 的 `/data` 读路径杠杆（`mm/` readahead、
+`block/elevator.c`、`fs/erofs`）已由 Batch 9-1 / Batch 42 / Batch 40 覆盖，
+继续维持。
+
+### 4. 红线撤销后换成什么（本批次的实际改动）
+
+撤掉的不是一条边界，而是把它换成一条**顺序硬约束**。原因写死在
+`docs/porting_policy.md` 的三模块契约里：`ABK_F2FS_FIX_MODULE` 的四条 rollback
+子模块（`storage_ufs_rollback` / `storage_block_rollback` /
+`storage_f2fs_rollback` / `storage_common_fixups`）回滚靠
+`git apply --reverse --check`，patch context 钉在 `android13-5.15-2024-11_r14`；
+本模块一旦先改写 f2fs/ufs 或 `block/` 的 F2FS 区域，它的反打就失败。原先
+「Keep footprint disjoint（保持不相交）」因此改为「**必须能检测到重叠**」——
+重叠不再被政策阻止，就得靠审查。任何落在该重叠里的新组须同时满足：重查 suite
+的 patch context 可反打、在每个携带该 suite 的组合里都排在其后、
+`block/blk-mq.c` 的 hunk 继续留在 `blk_mq_hctx_notify_offline()`
+（那是历史上唯一真实共享文件，保持不清）。`implementation_audit.py` /
+`step_audit.py` 都不建模第二注入者，所以这是**人工审查项**。当前无组落在
+重叠里，故这是已记录的约束而非当前故障。
+
+改动清单（纯文档）：
+
+| 文件 | 改动 |
+|---|---|
+| `AGENTS.md` | Red lines 的 "Do not touch `fs/f2fs` or `drivers/scsi/ufs`" → "Storage lanes are open"，并写清新顺序约束；Composition order 补「Batch 43 把存储顺序从客气变成唯一可组合配置」 |
+| `docs/porting_policy.md` | 三模块顺序 item 1 展开约束；`Footprint disjointness` → `Footprint overlap`（含落地要求三条） |
+| `docs/survey_suite_absorption.md` | §5 第一条从「off limits」改为「Batch 43 起开放 + 顺序约束」 |
+| `docs/batch8_long_term.md` | C 节改题「存储路径候选（f2fs / UFS，Batch 43 起开放）」并注明来源是上游不是小米；执行顺序第 4 条重写并给出候选排序 |
+| `plan.md` | 禁区清单该行改为「Batch 43 撤销 + 换成什么」；新增 Batch 43 索引行 |
+| `docs/survey_popsicle_w_611.md` | 补「复核实测（2026-09-26）」一节，含上表与结论 (a) |
+| `scripts/stable_backport.sh` | 抬头 composition 注释 item 1 展开为「不是客气，是唯一可组合配置」 |
+
+`scripts/abk_common.py` 的 `F2FS_BLOCK_MONTHLY_SENTINEL` 注释与
+`public.md` 的注入说明仍然成立，未改。
+
+### 5. 验证
+
+- `py_compile` / `bash -n` 不涉及（无代码改动）；
+- 单元测试 `tests/stable_5_15_test.py` 不改也不应改 —— `GROUP_COUNTS` 与
+  `PRE_APPLIED` 均未变，矩阵与注册表仍一致；
+- 三道树级审计（`step_audit.py` / `implementation_audit.py` / `smoke.sh`）对
+  已嫁接树行为不变，因为没有 graft 变化；
+- 复核实测计数可由
+  `curl -s ".../git/trees/<sha>?recursive=1"` 复现（sha
+  `45705be1220b4cfa8100516ad86711656c0b634e`）。
+
+### 6. 未验证 / 未做
+
+- **ABK F2FS suite 与打开后的共存从未实测**：没有跑过「本模块含 f2fs 组 +
+  ABK_F2FS_FIX_MODULE」这一组合的 CI，因为现在还没有这样的组。§4 的三条要求
+  是设计约束，不是已验证行为；真落地第一条 f2fs 组时应同时跑该组合。
+- 没有注册任何 f2fs/UFS 组，因此 `/data` 读取性能**没有任何本批次带来的
+  变化**，也不主张任何提速。
+- `popsicle-w-oss` 只做了树结构与文件计数，未逐行审计那三份存储文件的内容
+  （判定「不可移植」依据的是载体不存在与 SoC 专用性，不是内容缺陷）。
+
 <a id="batch-42"></a>
 
 ## Batch 42(v0.47.0)

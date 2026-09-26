@@ -1,16 +1,18 @@
 # AGENTS.md
 
 ABK external `module_set` that grafts upstream kernel features / optimizations /
-structural refactors onto the `android13-5.15` GKI baselines 5.15.167 / .178 / .194
-(and audits the `android13-5.15-lts` rolling branch — its matrix row is keyed to
-the fetched tree's Makefile `SUBLEVEL`, currently .216). **This is not a kernel
+structural refactors onto the **`android13-5.15-lts` rolling branch** (its matrix
+row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .216 — see
+"Lts-only maintenance" below for what a roll means). Batch 44 dropped the
+`5.15.167 / .178 / .194` release baselines. **This is not a kernel
 source tree** — it is a Python registry that rewrites one.
 
 ## The one thing to internalize
 
-The Python registry **is** the patch set. There are **no `.patch` payloads**: the
-`patches/` and `files/` dirs are deliberately empty. Do not add a `.patch`; add a
-`PatchGroup` record to the correct child script. Every edit is a group of ordered
+The Python registry **is** the patch set. There are **no `.patch` payloads** and
+`patches/` is empty: add a `PatchGroup` record to the correct child script instead.
+The single exception to "no payload files" is `files/drivers/of/address.c` — see
+"File payloads" below. Every edit is otherwise a group of ordered
 `replace_once(ctx, old, new, required)` steps in `scripts/abk_stable_core.py`
 (fs/mm/cgroup), `scripts/abk_stable_perf.py` (sched/net/locking/block), or
 `scripts/abk_stable_display.py` (the single drm revert).
@@ -101,9 +103,11 @@ path twice plus rollback. Adding a group almost always means extending all three
 
 `tests/step_audit.py` and `tests/smoke.sh` read the tree's Makefile `SUBLEVEL` and
 look up expected statuses in `tests/sublevel_matrix.py`; override with
-`ABK_TEST_SUB_LEVEL`. **Keep `sublevel_matrix.py` in sync when you touch the
+`ABK_TEST_SUB_LEVEL`. Since Batch 44 there is exactly **one** supported
+sublevel, so a tree whose SUBLEVEL differs is refused by both scripts rather
+than quietly audited. **Keep `sublevel_matrix.py` in sync when you touch the
 registry**: `GROUP_COUNTS` must equal the number of `PatchGroup(...)` records in
-each child, and any group whose commit a baseline already carries goes in
+each child, and any group whose commit the baseline already carries goes in
 `PRE_APPLIED` (`stable_5_15_test.py` asserts the matrix matches the registry).
 
 Dry-run a single child (statuses only, no writes):
@@ -111,8 +115,30 @@ Dry-run a single child (statuses only, no writes):
 ```bash
 python3 scripts/abk_stable_perf.py --common-dir <tree> \
   --defconfig <tree>/arch/arm64/configs/gki_defconfig --report-dir /tmp/r \
-  --sub-level 167 --family android13-5.15 --dry-run
+  --sub-level 216 --family android13-5.15 --dry-run
 ```
+
+## Lts-only maintenance (the one rolling branch)
+
+The single matrix row is keyed to the fetched tree's Makefile `SUBLEVEL`, so an
+`android13-5.15-lts` roll **breaks the audits on purpose**:
+
+```
+no expectation recorded for sublevel '220'; supported sublevels: 216
+```
+
+That is the drift defence, not a bug. After every re-fetch:
+
+1. re-key the row and re-prove every `PRE_APPLIED` set **on the new tree**;
+2. re-run all four gates below;
+3. if a group flipped to `already_present` because the branch absorbed it, move
+   it into `PRE_APPLIED` — do not leave the old row claiming `applied`.
+
+Why the CI compile gate is no substitute: it treats `already_present` as a
+GOOD status and never consults the matrix. A roll that absorbs a commit whose
+group is missing from `PRE_APPLIED` therefore stays green on CI forever. The
+local `step_audit` / `implementation_audit` / `smoke` run is the only thing that
+catches it, so it is mandatory after every lts re-fetch — not optional hygiene.
 
 ## Step-authoring traps (hidden behind a green group status)
 
@@ -194,7 +220,17 @@ required strings.
 - **Family gate**: a non-`android13-5.15` lineage produces `report_only` for every
   group and reads/writes nothing; `--allow-unsupported` (shell
   `ABK_515_ALLOW_UNSUPPORTED=1`) is the explicit override.
-- **Do not touch `fs/f2fs` or `drivers/scsi/ufs`** — sibling-suite territory.
+- **Storage lanes are open** (Batch 43 retired the old "Do not touch
+  `fs/f2fs` or `drivers/scsi/ufs`" exclusion — sibling-suite territory). Both
+  paths are now legal graft targets. The exclusion is replaced by a **hard
+  ordering constraint** rather than by nothing: this module must be injected
+  **after** `ABK_F2FS_FIX_MODULE`'s rollbacks — or that module must not be
+  co-injected — because its rollback is `git apply --reverse --check` of
+  `android13-5.15-*-*.patch`, which fails on a tree this module already rewrote,
+  and its `.patch` contexts are keyed to `android13-5.15-2024-11_r14`. A storage
+  group therefore may not compose with an unmodified F2FS suite; no group
+  targets either path yet, so today this is a documented constraint, not a live
+  breakage.
 - **Composition order** (all `after_patch`): storage-rollback modules first, this
   module second. **ABK_ABI_PATCH_SUITE must NOT be co-injected with a Batch 15
   build** — it claims the same `sched_entity` 1–4 / `request_queue` 1 slots this
@@ -202,7 +238,8 @@ required strings.
   module only stopped *using* it), and a double-claimed slot is a hard KMI break.
   Batch 15 absorbed that suite's optimization inventory
   (see "Suite absorption" in `docs/porting_policy.md`), so inject this module
-  *instead of* it. Not a load
+  *instead of* it. Batch 43 (above) turned the storage ordering from a courtesy
+  into the only configuration in which an f2fs/ufs graft composes. Not a load
   order for the display child (drm-only, order-independent).
 
 ## Source-of-truth docs
@@ -213,7 +250,17 @@ required strings.
   KMI slots, device measurements) belongs in `CHANGELOG.md`, and the two READMEs
   point there rather than repeating it. Keep them that way when editing.
 - `CHANGELOG.md` — the technical record of every landed batch; the first place
-  to look for "why is this graft shaped like this".
+  to look for "why is this graft shaped like this". **Written for an outside
+  reader, not as a work diary**: state the goal, the evidence and the verdict;
+  never narrate who asked for it. Concretely — no `用户要求：…` /
+  `维护者要求：…` attributions, no first person (`我` / `我们` / `笔者`), no
+  "已与用户确认" / "未代用户删除". A requirement is a design fact, so write it as
+  one: "目标：只维护 `android13-5.15-lts`", not "用户要求只维护 lts". The same
+  rule applies to `plan.md`'s batch index lines, `docs/survey_*` and every doc
+  this repo publishes — including entries already landed (a whole-repo sweep was
+  done for Batch 45, so nothing predates it; new text must simply comply).
+  (「用户」 meaning *userspace* or *end user* is a technical term and is fine; so
+  is `自我 DoS`-style `自我` for self-.)
 - `docs/porting_policy.md` — scope, KMI red lines, shape registry, three-module
   composition, report contract.
 - `docs/group_recipe.md` — the add-a-group recipe and the traps above.
@@ -228,6 +275,14 @@ required strings.
   (compare tag reachability, never committer dates — subsystem trees commit
   weeks before Linus pulls) and, in its §4, a provenance correction: 5.15 has
   two `mmap_miss` decrements and the survey's first pass named the wrong one.
+- `docs/survey_erofs_upstream.md` — the EROFS candidate inventory. Records that
+  on the supported lts tree `decompressor.c`/`zdata.c`/`zdata.h` each carry a
+  5.15.y-only delta absent from the pre-lts release baselines (its §2 predates
+  Batch 44 and still shows the old four-baseline split; the shape conclusions
+  for the supported tree are unaffected), and, in §0, that **EROFS is read-only
+  system partitions and does not touch `/data`** (which is f2fs). Also lists the
+  `FETCH_FILES` paths a
+  group would have to add before its audits can run.
 
 ## How ABK runs this module (the external-module contract)
 
@@ -304,8 +359,21 @@ placeholders on purpose (still 12 fields, still parseable).
 
 Distribution assets live outside the graft: `tools/` (device-facing CLIs, shipped
 into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
-implementation) and `ksu/` (the KernelSU module source). `patches/` and `files/`
-stay empty.
+implementation) and `ksu/` (the KernelSU module source). `patches/` stays empty.
+
+### File payloads (the one exception)
+
+`files/drivers/of/address.c` is the **only** payload file, and it exists for a
+reason no anchor graft can express: it is a whole-file *revert* of the upstream
+`ranges` flags parser rework. `scripts/stable_backport.sh`'s
+`abk_stable_backport_overlay_of_address()` copies it over the tree **only** when
+the target still carries the 5.15.213 rework (`flag_cells` /
+`"default-flags"` text markers), so it is a no-op on a tree already in the
+pre-rework form. It restores the single contiguous MMIO window whose split left
+the Qualcomm SM8550 PCIe WLAN endpoint's 2 MB BAR0 unplaceable (dead `wlan0`).
+The rationale, the marker gate, and the `.abk-orig` snapshot/rollback convention
+are documented in `files/README.md`. Adding a second payload file needs the same
+justification — a shape an anchor can express belongs in a `PatchGroup`, not here.
 
 What the repo **publishes** is only what the module needs: the registry
 (`scripts/`), its tests (`tests/`), the docs, `setup.sh`, `module.conf`, `public.md`

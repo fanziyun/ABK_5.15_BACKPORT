@@ -45,3 +45,40 @@ diff 工件在同目录。要点:来源分支是 bazel 增量树(全树 2370 文
 - 来源 = 分支当前形态,非单一 commit(小米整包 squash,无法按 commit 引用)。
 - 本调研本身零代码改动;dynamic_readahead 的落地单独发生在 Batch 9-1
   (组 `dynamic_readahead_lowmem`,见 plan.md),不在本调研范围内。
+## 复核实测（2026-09-26）
+
+**目标**:从小米 17 Pro 内核分支找可移植的 f2fs 优化以改善 `/data` 读取。
+本节把上文的「`fs/` 不在库内」从推断变成**可复现的计数**, 方法是 GitHub API
+拉整棵递归树 (`?recursive=1`, 返回 `truncated: False`, 即未被截断):
+
+| 度量 | 实测值 |
+|---|---|
+| 全树条目（非截断） | **2686** |
+| `modules.bzl` 个数（kleaf 片段标记） | **141** |
+| `fs/` 条目 | **0** |
+| `block/` 条目 | **0** |
+| `crypto/` 条目 | **0** |
+| `mm/` 条目 | **2**（`modules.bzl`、`zsmalloc.c`） |
+| `drivers/scsi/` 条目 | **2**（`modules.bzl`、`sg.c`） |
+| 路径含 `f2fs` 的条目 | **0** |
+
+结论与上文一致且更强: 这不是「`fs/f2fs` 少几个文件」, 而是**整棵 `fs/`
+树不存在**。`block/` 与 `crypto/` 同样为 0。存储侧仅存三份文件:
+
+- `mm/zsmalloc.c`（57806 B）—— zram, 本模块 Batch 4/6 已覆盖链长与多算法;
+- `drivers/ufs/host/ufs-qcom.c`（172220 B）、`ufs-qcom.h`（20800 B）、
+  `ufshcd-crypto-qti.c`（6903 B）—— 高通 SoC 专用胶水, **没有 `ufshcd.c`
+  核心**（核心在 AOSP GKI）, AOSP GKI 上无锚点。
+
+`git ls-remote --heads` 得 267 个分支, 其中与本次目标相关的只有
+`popsicle-w-oss` 与 `sunstone-u-oss`, **没有 f2fs/common 源分支** —— 即
+MiCode 侧不存在 f2fs 定制可搬: `fs/`、`block/`、`crypto/` 归 AOSP GKI 公共
+内核, 小米仓库只放高通 out-of-tree 模块胶水层。
+
+**这条复核实测的用途**: 它是「解除 `fs/f2fs` / `drivers/scsi/ufs` 红线」时的
+判断依据 —— 两条红线的撤销**没有**「从小米搬 f2fs」这个收益支撑（该分支无
+载体）, 纯粹是路径本身按目标放开。f2fs 优化的正源是上游 android15-6.6 /
+5.15.y stable, 清单见 `docs/batch8_long_term.md` C 节
+（`f2fs_lookup_mode_perf` 投入最小）。红线撤销后新增的硬约束见
+`docs/porting_policy.md` "Footprint overlap", 与本仓库 Batch 43 的记录
+（`CHANGELOG.md#batch-43`、`plan.md` 的 Batch 43 索引行）。

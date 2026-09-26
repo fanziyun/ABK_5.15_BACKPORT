@@ -5873,5 +5873,22 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# Batch 46: the erofs readmore EOF bound (936aa701d82d).
+#
+# The module's second fs/erofs/ group.  One step in fs/erofs/zdata.c, a file
+# Batch 40 already brought into the fixture.  Registered last and independent
+# of everything: the three-line anchor is text none of that batch's seven steps
+# in the same file touches, so there is no ordering constraint and no trap-5
+# exposure.  Nothing is probed because there is nothing to probe -- one
+# upstream-shape step, and replace_once already checks the new block first.
+# See the batch file's docstring for the v6.5-vs-5.15 function diff that makes
+# upstream's reasoning transfer, and for the include chain that declares
+# i_size_read() in this TU.
+# ============================================================================
+import batch46_core_erofs_readmore_eof as _b46_erofs  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b46_erofs.build_groups(PatchGroup)
+
 if __name__ == "__main__":
     main()

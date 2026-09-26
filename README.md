@@ -29,7 +29,8 @@
 ### 文件系统与进程
 
 - 文件描述符分配、`close_range`、slab 分配/释放、缺页分配的热点路径优化；
-- erofs 读路径的临时 bounce 页改用 `GFP_NOWAIT`，预读不再进入直接回收；
+- erofs 读路径的临时 bounce 页改用 `GFP_NOWAIT`，预读不再进入直接回收；readmore
+  预读循环在 EOF 处收口，大页偏移的小文件读不再空转整个文件的页数；
 - arm64 LSE percpu 原子操作、TLB 刷新批量合并、页缓存影子项批量清理、FUSE 写路径
   预缺页移出关键路径。
 
@@ -44,15 +45,15 @@
 
 | child id | 内容 | 组数 |
 |---|---|---:|
-| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 66 |
+| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 67 |
 | `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 24 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **91 个移植组**，同一串注入可在
-5.15.167 / .178 / .194 上使用。
+共 **92 个移植组**，同一串注入在 `android13-5.15-lts` 上使用。
 
-支持基线：`5.15.167`（android13-5.15-2024-11）、`5.15.178`（-2025-03）、
-`5.15.194`（-2025-12） `android13-5.15-lts`
+支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 216）**。
+Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，
+不按版本号门控，因此撤档不改变任何组的形态。
 
 ---
 
@@ -104,10 +105,10 @@ set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_p
 python3 -m py_compile scripts/*.py tests/*.py                  # 语法门禁
 bash -n setup.sh scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh # shell 语法门禁
 python3 tests/stable_5_15_test.py                              # 单测（无需内核树）
-bash tests/fetch_sublevel_tree.sh android13-5.15-2025-12 /tmp/tree194   # 拉取参考树
-python3 tests/implementation_audit.py /tmp/tree194             # 内容审计
-python3 tests/step_audit.py /tmp/tree194                       # 逐步锚点审计
-bash tests/smoke.sh /tmp/tree194                               # 端到端 + 回滚
+bash tests/fetch_sublevel_tree.sh android13-5.15-lts build/abk-trees/216  # 拉取参考树
+python3 tests/implementation_audit.py build/abk-trees/216      # 内容审计
+python3 tests/step_audit.py build/abk-trees/216                # 逐步锚点审计
+bash tests/smoke.sh build/abk-trees/216                        # 端到端 + 回滚
 ```
 ---
 
