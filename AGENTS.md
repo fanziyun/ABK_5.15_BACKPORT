@@ -314,7 +314,10 @@ stages, each a separate run:
 (`ksu/abk_runtime_tunables/`, packed by `scripts/build_ksu_module.py` and bundled
 into the AnyKernel3 tree by `scripts/ak3_bundle_ksu_module.py`) that keeps the
 measured zram algorithm policy in force on device, drives the recompression
-sweeps, and records **who owns CPU frequency** at boot. The policy itself lives
+sweeps, re-asserts the MGLRU switch on a timer (since companion v0.18.0 — this
+ROM's init writes `lru_gen/enabled` back to 0 after post-fs-data from its
+`SmartCacheEnable` trigger, so the one-shot apply loses the write order), and
+records **who owns CPU frequency** at boot. The policy itself lives
 in the kernel since Batch 12 (`zram_algo_lock`: `zram.abk_comp_algo` /
 `zram.abk_lock_algo`, both `0444`, and both
 `comp_algorithm`/`recomp_algorithm` stores made reported no-ops), so the companion

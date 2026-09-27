@@ -351,6 +351,58 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-18-0"></a>
+
+## companion v0.18.0（MGLRU 每次开机都被 ROM 关回去：单次写入输掉写序）
+
+### 1. 起因：内核默认开、companion 也写了，运行时仍是 0x0000
+
+真机（vermeer，5.15.217-Sailboat-20260927）无线 adb 复勘：`CONFIG_LRU_GEN=y` +
+`CONFIG_LRU_GEN_ENABLED=y`，companion 日志在 post-fs-data 阶段明确记录
+`lru_gen.enabled=0x0003 (MGLRU on)`，但运行时实测 `/sys/kernel/mm/lru_gen/enabled` 恒为
+`0x0000` —— Batch 37 的六个 MGLRU 性能组因此仍然编译在内核里却全程不参与回收，与 Batch 38
+修掉的那类「静态分支恒假」是同一种空转，只是关门的手从 defconfig 换成了 ROM。
+
+写 0 的是 ROM 自己：`/product/etc/build.prop` 持久设置
+`persist.sys.stability.SmartCacheEnable=true`，`/system/etc/init/hw/init.rc` 的
+`on property:persist.sys.stability.SmartCacheEnable=true` 触发器据此执行
+`write /sys/kernel/mm/lru_gen/enabled 0`（MIUI Kernel_SmartCache 的配套逻辑），且该触发器的
+写入落在 post-fs-data 之后。讽刺的是这套触发器保护的 `/sys/kernel/smart_cache/` 节点在本内核
+上根本不存在（init.rc 里那串 chown 全部静默失败）——ROM 在为一套不存在的机制禁用 MGLRU。
+
+### 2. 修法：给这个开关和 zram 算法同等的重断言待遇
+
+`abk_apply_lru_gen()` 此前只在 post-fs-data 跑一次，`tunables.conf` 的注释甚至把
+「only ever writes」写成设计假设——对一个存在活跃写者的节点，单次写入必然输掉写序。
+zram 算法策略当年（Batch 12）最终把锁做进内核、companion 再带 60 秒 reassert 循环，正是同一类
+问题的答案。本版照此处理：
+
+- `common.sh` 新增 `abk_reassert_lru_gen()`：读当前值，掩码 bit 0（核心开关）为 0 才写 `y`
+  并记一条 WARN；已在目标状态则一个 tick 什么都不写、什么都不记。节点不存在（无 MGLRU 的
+  内核）或 `lru_gen.enable != 1` 时整体空转——`0` 仍是 no-op，不是 override，这条语义不变。
+- 新增 `abk_lru_gen_supervisor_main()`，由 `service.sh --supervise-lru-gen` 承载，每
+  `vm.reassert_interval_sec`（新键，默认 60，下限 5）重断言一次。挂在独立的 supervisor 而
+  不是搭 zram supervisor 的便车，是为了不被 `zram.recomp.enable=0` 连带停掉。
+- `service.sh` 在 `lru_gen.enable=1` 且节点存在时拉起该 supervisor；post-fs-data 的一次性
+  写入保留（supervisor 起来之前的早期覆盖）。
+
+### 3. 验证
+
+- 单测 `test_mglru_is_enabled_by_the_default_tier` 扩展 8 条断言：reassert 函数存在且只写
+  `y`、只在偶数掩码（bit 0 清零）时触发、service.sh 的拉起条件、tunables 键值与
+  `abk_cfg_lint` 已知键登记。本机全量单测的 60 条既有 FAIL（`test_batch10_daemon_script`
+  的 WSL bash interop 环境问题）在改动前后逐条相同。
+- 设备侧 mksh `sh -n` 通过；部署后手动拉起 supervisor，首轮 tick 即修复：
+  `lru_gen.enabled was 0x0000 (a writer turned MGLRU off); re-asserted: 0x0003`。
+- 模拟 ROM 写者（`echo 0 > lru_gen/enabled`）后 65 秒内读回 `0x0003`，日志留下修复记录——
+  此后该 ROM 触发器每次开火，至多一个 reassert 周期内被改回。
+
+未覆盖：ROM 若在更晚的时机（如 boot_completed 之后的系统服务）反复重设该属性，触发器会反复
+开火——重断言循环对此天然免疫，但 `enabled` 会在两个值之间抖动；真机长期观察即可从模块日志
+的 WARN 频率读出。
+
+---
+
 <a id="companion-v0-13-0"></a>
 
 ## companion v0.13.0（重压缩扫描的饥饿：被清掉的前缀每趟又被标回去）

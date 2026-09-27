@@ -207,8 +207,9 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override |
+| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override. Re-asserted on a timer, because this ROM's init writes the node back to 0 from its `SmartCacheEnable` trigger after post-fs-data |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
+| `vm.reassert_interval_sec` | `60` | seconds between lru_gen re-asserts (min 5); a repair is logged, a quiet tick writes nothing |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
 | *(cpufreq / scheduler keys)* | — | **moved to sailboat addon 2** (`ksu/sailboat_addon_2`): the governor held on every policy, the `abk_sf_*` floor and the `abk_sc_*` cap, with the measured reasons behind v0.16.0's `cap_pct=90` |
 | `readahead.dynamic_readahead` | *(empty)* | `0`/`1` |

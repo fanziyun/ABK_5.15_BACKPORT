@@ -2391,6 +2391,36 @@ def test_mglru_is_enabled_by_the_default_tier():
             check("abk_apply_lru_gen() writes y, never a bare 1",
                   'abk_write "$_lg_node" y' in body, "the write target changed")
 
+    # The ROM's init writes lru_gen/enabled 0 after post-fs-data
+    # (SmartCacheEnable trigger), so the companion re-asserts it on a timer.
+    check("common.sh ships the lru_gen reassert",
+          "abk_reassert_lru_gen()" in common_sh
+          and 'abk_write "$_rl_node" y' in common_sh,
+          "no reassert write in common.sh")
+    check("the reassert stays write-only (no n branch either)",
+          'abk_write "$_rl_node" n' not in common_sh, "reassert writes n")
+    rstart = next((i for i, l in enumerate(lines)
+                   if l.startswith("abk_reassert_lru_gen()")), None)
+    if rstart is not None:
+        rend = next((i for i in range(rstart + 1, len(lines))
+                     if lines[i] == "}"), None)
+        rbody = "\n".join(lines[rstart:rend + 1]) if rend is not None else ""
+        check("the reassert is gated on lru_gen.enable=1",
+              'abk_cfg lru_gen.enable 0' in rbody, rbody)
+        check("the reassert only fires on an even mask (bit 0 clear)",
+              "*0|*2|*4|*6|*8" in rbody, rbody)
+    service_sh = (ksu / "service.sh").read_text(encoding="utf-8")
+    check("service.sh spawns the lru_gen supervisor on enable=1",
+          "--supervise-lru-gen" in service_sh
+          and 'abk_cfg lru_gen.enable 0' in service_sh, service_sh[-800:])
+    check("tunables.conf ships the reassert interval key",
+          re.search(r"(?m)^vm\.reassert_interval_sec=60$", tunables) is not None,
+          [l for l in tunables.splitlines()
+           if l.startswith("vm.reassert_interval_sec")])
+    check("vm.reassert_interval_sec is a known config key",
+          re.search(r"(?m)^vm\.reassert_interval_sec$", common_sh) is not None,
+          "abk_cfg_lint would flag the key as unknown")
+
 
 def test_batch10_memcg_v1_reclaim():
     print("Batch 10-4 memcg_v1_reclaim")

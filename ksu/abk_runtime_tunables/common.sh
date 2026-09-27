@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.17.0"
+ABK_VERSION="v0.18.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -241,6 +241,7 @@ vm.swappiness
 vm.page_cluster
 vm.watermark_scale_factor
 vm.min_free_kbytes
+vm.reassert_interval_sec
 lru_gen.enable
 lru_gen.min_ttl_ms
 thp.mode
@@ -447,6 +448,35 @@ abk_apply_lru_gen() {
     fi
   fi
   return 0
+}
+
+# This ROM's init writes this node back to 0 after post-fs-data (SmartCacheEnable
+# trigger), so re-assert it on a timer, writing y only when bit 0 of the mask is clear.
+abk_reassert_lru_gen() {
+  _rl_node="$ABK_SYS_ROOT/kernel/mm/lru_gen/enabled"
+  [ -e "$_rl_node" ] || return 0
+  [ "$(abk_cfg lru_gen.enable 0)" = "1" ] || return 0
+  _rl_cur="$(abk_read "$_rl_node")"
+  case "$_rl_cur" in
+    *0|*2|*4|*6|*8|*a|*A|*c|*C|*e|*E)
+      if abk_write "$_rl_node" y; then
+        abk_warn "lru_gen.enabled was $_rl_cur (a writer turned MGLRU off); re-asserted: $(abk_read "$_rl_node")"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+abk_lru_gen_supervisor_main() {
+  abk_pid_write lru_gen "$$"
+  _ls_reassert="$(abk_cfg vm.reassert_interval_sec 60)"
+  abk_is_uint "$_ls_reassert" || _ls_reassert=60
+  [ "$_ls_reassert" -ge 5 ] || _ls_reassert=5
+  abk_log "lru_gen reassert supervisor up: interval=${_ls_reassert}s"
+  while :; do
+    abk_reassert_lru_gen || true
+    sleep "$_ls_reassert"
+  done
 }
 
 abk_apply_thp() {
