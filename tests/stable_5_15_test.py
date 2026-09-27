@@ -3044,10 +3044,8 @@ def test_batch47_zram_recomp_best_prio_skip():
             check("step %d new does not contain step %d new" % (i, j),
                   steps[j][2] not in new_i)
 
-    # Trap 7: the predicate is the only symbol this group adds, and it reads
-    # comps[] -- which exists unconditionally but whose meaning is only real
-    # under CONFIG_ZRAM_MULTI_COMP.  An unguarded static function would also be
-    # unused (a -Wunused-function error) on a build without the machinery.
+    # Trap 7: the predicate reads comps[], real only under
+    # CONFIG_ZRAM_MULTI_COMP; unguarded it would also be an unused static.
     check("the predicate is wrapped in CONFIG_ZRAM_MULTI_COMP",
           b47._HELP_NEW.count("#ifdef CONFIG_ZRAM_MULTI_COMP") == 1
           and b47._HELP_NEW.count("#endif") == 1)
@@ -3059,9 +3057,7 @@ def test_batch47_zram_recomp_best_prio_skip():
           "zram_get_priority(zram, index)" in b47._HELP_NEW
           and "prio > abk_cur && zram->comps[prio]" in b47._HELP_NEW)
 
-    # Trap 1: an old block that is a prefix of its own new block would let the
-    # idempotency check fire before the edit lands.  Both scan steps append to
-    # their anchor, so neither can be a prefix.
+    # Trap 1: old must not be a prefix of new, or idempotency fires early.
     for name, old, new in (("sync", b47._SYNC_OLD, b47._SYNC_NEW),
                            ("async", b47._ASYNC_OLD, b47._ASYNC_NEW)):
         check(f"the {name} step's old is not a prefix of its new",
@@ -3119,10 +3115,8 @@ def test_batch47_zram_recomp_best_prio_skip():
         check("both nodes carry the filter",
               text.count("if (abk_zram_recompress_pointless(zram, index, "
                          "prio, prio_max))") == 2)
-        # The whole point: the async filter has to sit in FRONT of
-        # `candidate = true`, or a job is still queued and the cap still spent.
-        # Scoped to the async function: the synchronous filter is the first
-        # match in the file and would otherwise compare across nodes.
+        # The async filter must precede `candidate = true`; scoped to the async
+        # function so the sync filter (first match in the file) is not compared.
         async_part = text[text.index("recompress_async_store"):]
         check("the async filter precedes candidate = true",
               async_part.index("if (abk_zram_recompress_pointless") <
@@ -3142,11 +3136,8 @@ def test_batch47_zram_recomp_best_prio_skip():
               status2 == "already_present" and ctx.read(b47.ZRAM_C) == snapshot,
               (status2, detail2))
 
-    # Dependency order: without max_pages the synchronous anchor does not
-    # exist.  It is deliberately not a separate probe -- the anchor *is* the
-    # dependency, since removing the decrement removes the text the filter is
-    # inserted in front of.  What matters is that such a tree is refused
-    # outright and nothing at all is written.
+    # Dependency order: without max_pages the sync anchor does not exist, and
+    # such a tree must be refused with nothing written.
     with tempfile.TemporaryDirectory() as tmp:
         bare = files[b47.ZRAM_C].replace(
             "\t\tnum_recomp_pages--;\n"
@@ -3430,14 +3421,8 @@ def test_runtime_tunables_module():
                                            "zram.compact.min_waste_mb",
                                            "zram.compact.waste_pct")))
 
-    # The recompression policy defaults appear in four places -- the shipped
-    # tunables.conf, the abk_cfg() fallback, the abk_is_uint() clamp that
-    # repairs a malformed value, and the companion README table -- and nothing
-    # but this check ties them together.  Editing one and not the others is
-    # exactly how v0.17.0's max_pages ended up as 16384 under a comment that
-    # said 512 MiB: every gate stayed green, because the policy was still
-    # coherent *within* each file, only wrong across them.  Raise this set when
-    # a recompression default is retuned, and retune it in all four.
+    # The recompression defaults live in four places (tunables.conf, abk_cfg
+    # fallback, the clamp, the README table); retune all four together.
     _zs_clamp = {
         "zram.recomp.idle_age_sec": "_zs_age",
         "zram.recomp.interval_sec": "_zs_interval",
@@ -3998,24 +3983,15 @@ echo "supervisor_gate_line=$(grep -o 'compact=[^ ]*' "$T/state/abk_runtime_tunab
 echo "supervisor_pid=$([ -s "$T/state/zram.pid" ] && echo set || echo unset)"
 printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
 
-# 7b. the mark clock is counted in SWEEPS, not ticks.  _zs_mark_tick is
-#     incremented inside the sweep block while _zs_wb_tick is incremented every
-#     tick, so the mark threshold must divide by the SWEEP interval.  Dividing by
-#     the reassert interval instead makes one mark period interval/reassert times
-#     too long: 1440 sweeps = 30 days instead of the configured 24 h, and because
-#     nothing is idle_age old that early the boot mark at the first sweep is
-#     empty -- so the next real mark is a month away, every sweep in between
-#     passes --no-mark against a device where no page was ever marked, and each
-#     one reports success.  This fixture is the only shape that shows it: the
-#     interval must differ from the reassert, and the supervisor must survive
-#     long enough to reach a SECOND mark.
+# 7b. the mark clock is counted in SWEEPS, not ticks: _zs_per_mark must divide
+#     by the sweep interval, and only a fixture whose interval differs from the
+#     reassert (with a second mark reached) can show it.
 reset_fixture
 printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
 printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
 printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
-# interval 60 s over a 20 s tick = one sweep every 3 ticks; a mark every 120 s is
-# therefore every SECOND sweep.  With the wrong divisor it is every 6th, so the
-# third run would still pass --no-mark.
+# one sweep every 3 ticks, a mark every second sweep; the wrong divisor would
+# still pass --no-mark on the third run.
 printf 'zram.recomp.enable=1\nzram.recomp.interval_sec=60\nzram.reassert_interval_sec=20\nzram.recomp.mark_interval_sec=120\n' > "$T/tunables.conf"
 : > "$T/runs"
 mkdir -p "$T/fakebin"

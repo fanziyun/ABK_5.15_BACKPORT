@@ -133,18 +133,9 @@ GROUP_COUNTS = {
     # performance change with a Fixes: tag but no Cc: stable -- and its single
     # three-line anchor is unique in fs/erofs/zdata.c, a file Batch 40 already
     # put in the fixture, and outside every one of that batch's steps there.
-    # Batch 47 adds one: zram_recomp_best_prio_skip.  It is not an upstream
-    # port at all -- there is no commit to name -- but the remedy for a
-    # behaviour the recompression series never had to solve: the companion's
-    # shorter mark clock re-hands pages a sweep already moved (their ac_time is
-    # never refreshed, because zram_recompress() reads through
-    # zram_read_from_zspool() rather than zram_accessed()), and the kernel's
-    # sweep spends its max_pages budget on attempts "whether or not they can
-    # improve anything".  It therefore also cannot arrive pre-applied: no
-    # baseline has a knob that re-marks at a different rate than it drains, so
-    # no upstream code makes the distinction this group encodes.  It is the
-    # module's third group that rewrites generated text, after Batch 24 and
-    # Batch 32, and registers after all three of its dependencies.
+    # Batch 47 adds one: zram_recomp_best_prio_skip -- not an upstream port (no
+    # commit to name, so it cannot arrive pre-applied), the module's third
+    # generated-text rewriter, registered after its three dependencies.
     "stable_backport_core": 68,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the

@@ -5508,28 +5508,9 @@ PATCH_GROUPS = PATCH_GROUPS + _b24_zmp.build_groups(PatchGroup)
 
 # ============================================================================
 # Batch 47: a recompression sweep skips entries that cannot be improved.
-# Steps live in scripts/batch47_core_zram_recomp_skip.py.
-#
-#   zram_recomp_best_prio_skip  the companion's shorter mark clock (v0.17.0)
-#                              re-marks the cold set, and a re-mark re-hands
-#                              every page whose age was never refreshed --
-#                              which is every page zram_recompress() moved,
-#                              because it reads through
-#                              zram_read_from_zspool() and not
-#                              zram_accessed().  The kernel's sweep restarts
-#                              at index 0 and spends its max_pages budget on
-#                              attempts whether or not they can improve
-#                              anything, so those re-handed entries starved
-#                              the genuinely new cold pages.  One cheap
-#                              predicate in front of each attempt restores
-#                              the sweep's reach; nothing upstream
-#                              corresponds to it.
-#
-# Registered after zram_recompress_max_pages because its synchronous step
-# anchors behind that group's `num_recomp_pages--` line, and after
-# zram_recompression / zram_async_recompress because both scans are text those
-# groups generate.  Same dependency order and the same trap-5 remedy as Batch
-# 24; see the notes in those groups.
+# Steps live in scripts/batch47_core_zram_recomp_skip.py.  Registered after
+# zram_recompression / zram_async_recompress / zram_recompress_max_pages:
+# both scans are text those groups generate (trap 5, same remedy as Batch 24).
 # ============================================================================
 import batch47_core_zram_recomp_skip as _b47_skip  # noqa: E402
 

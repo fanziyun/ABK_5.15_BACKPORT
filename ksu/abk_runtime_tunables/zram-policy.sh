@@ -678,33 +678,14 @@ abk_zram_writeback_sweep() {
 abk_zram_supervisor_main() {
   abk_pid_write zram "$$"
   _zs_tool="${ABK_RECOMP_TOOL:-$MODDIR/bin/zram_recompress_trigger.sh}"
-  # 900 s: a page nothing touched for a quarter of an hour is cold enough that
-  # recompressing it is worth the slower decompress, and short enough that the
-  # FIRST sweep -- which lands roughly half an hour after the supervisor
-  # starts, because _zs_per_sweep reassert ticks have to pass -- finds a real
-  # cold set.  A 3600 s cutoff never matched at that point, so the boot mark
-  # was always empty and the first day of every boot recompressed nothing.
+  # 900 s: short enough that the first sweep (~30 min after boot) still finds a
+  # cold set -- a 3600 s cutoff never matched that early.
   _zs_age="$(abk_cfg zram.recomp.idle_age_sec 900)"
   _zs_interval="$(abk_cfg zram.recomp.interval_sec 1800)"
   _zs_threshold="$(abk_cfg zram.recomp.threshold 0)"
-  # 131072 attempted entries = 512 MiB of pages per sweep at 4 KiB.  A bound is
-  # the point: an uncapped pass walks every idle entry in index order, which
-  # is what made a sweep on a full device cost tens of seconds of one core.
-  # A kernel without the max_pages graft ignores the parameter, so this is
-  # also the pre-Batch-24 behaviour -- no cap is imposed behind our back.
-  #
-  # Why this is four times the earlier 16384: the mark clock below re-marks the
-  # cold set several times a day instead of once, and mark_idle() re-hands every
-  # page whose age was never refreshed -- which a recompressed page's never is
-  # (zram_recompress() reads through zram_read_from_zspool(), not
-  # zram_accessed()).  On a device whose pages are already zstd, most of a cap
-  # is therefore spent on attempts that cannot improve anything, and only the
-  # remainder reaches genuinely new cold pages.  512 MiB per sweep keeps the
-  # new pages reachable at that waste rate: measured on the target device a
-  # 131072-attempt sweep costs 0.58 s to enqueue plus 4.2 s of worker, and the
-  # sweep runs every half hour.  A kernel that skips entries already at the top
-  # compressor priority would remove the waste entirely, but until one exists
-  # this is the compensating knob.
+  # 131072 attempts = 512 MiB/sweep: the cap bounds pass cost, and re-marks
+  # spend most of it on already-optimal pages, so this size keeps new cold
+  # pages reachable.  A kernel without the max_pages graft ignores the value.
   _zs_max_pages="$(abk_cfg zram.recomp.max_pages 131072)"
   _zs_mode="$(abk_cfg zram.recomp.mode async)"
   _zs_reassert="$(abk_cfg zram.reassert_interval_sec "$ABK_ZRAM_REASSERT_SECS")"
@@ -746,27 +727,13 @@ abk_zram_supervisor_main() {
   # the mark runs on its own, much longer clock and every sweep in between
   # passes --no-mark.
   #
-  # 10800 s, not the 86400 s this used to be.  A mark that lands once a day
-  # leaves a page cold at hour 1 waiting 23 hours for eligibility, and on a
-  # phone where the whole memory picture turns over every few hours that is
-  # most of the cold set never reached.  The re-mark penalty above is what
-  # forces the mark to be slower than the sweep, not slower than a day; with
-  # max_pages raised to 512 MiB per sweep, six sweeps between marks drain about
-  # 3 GiB per cycle, which is what the old single cycle was sized for, only
-  # refreshed eight times a day instead of once.
+  # 10800 s, not a day: a daily mark never reaches a cold set that turns over
+  # every few hours; six sweeps between marks still drain ~3 GiB per cycle.
   _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 10800)"
   abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=10800
   [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
-  # _zs_mark_tick is incremented ONCE PER SWEEP (inside the sweep block below),
-  # while _zs_wb_tick is incremented once per tick -- so _zs_per_mark must be
-  # divided by the SWEEP interval, not the reassert interval.  Dividing by
-  # _zs_reassert makes one mark period 86400/60 = 1440 sweeps = 30 days instead
-  # of the configured 1440 ticks = 24 h, and that is the bug this comment
-  # exists for: the boot mark fires at the first sweep tick by design, and
-  # because nothing is idle_age old that early it marks nothing, so the next
-  # real mark was a month away and every sweep in between passed --no-mark
-  # against a device where no page had ever been marked.  Recompression never
-  # ran, and each sweep still reported success.
+  # _zs_mark_tick counts sweeps, so _zs_per_mark divides by the SWEEP interval
+  # -- dividing by _zs_reassert once made a "24 h" mark land 30 days out.
   _zs_per_mark=$(( _zs_mark_interval / _zs_interval ))
   [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
 
