@@ -9,7 +9,7 @@
 #   bash tests/fetch_sublevel_tree.sh <branch> <outdir>
 #
 # Since Batch 44 the rolling branch is the only supported baseline:
-#   android13-5.15-lts                     SUBLEVEL rolls (216 as of 2026-09)
+#   android13-5.15-lts                     SUBLEVEL rolls (217 as of 2026-09)
 #
 # The three release baselines that used to be listed here
 # (deprecated/android13-5.15-2024-11 = .167, -2025-03 = .178,

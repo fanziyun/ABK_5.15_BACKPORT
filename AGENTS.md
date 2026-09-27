@@ -2,7 +2,7 @@
 
 ABK external `module_set` that grafts upstream kernel features / optimizations /
 structural refactors onto the **`android13-5.15-lts` rolling branch** (its matrix
-row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .216 — see
+row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .217 — see
 "Lts-only maintenance" below for what a roll means). Batch 44 dropped the
 `5.15.167 / .178 / .194` release baselines. **This is not a kernel
 source tree** — it is a Python registry that rewrites one.

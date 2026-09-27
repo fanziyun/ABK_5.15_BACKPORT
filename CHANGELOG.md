@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。91 个移植组（core 66 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。93 个移植组（core 68 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -553,6 +553,85 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 ---
 
 
+## companion v0.17.0（mark 时钟的单位错 30 倍：二压其实一次都没跑过）
+
+### 1. 起因：开机半小时后二压再无动静，而日志一直报成功
+
+真机（vermeer，5.15.217）无线 adb 复勘：`mm_stat` 的比值停在 lz4kd 单压的水平，companion
+日志里只有每分钟一行的 `zram mem_limit=`，`recompression sweep done` 要等很久才出现一次。
+
+先排除 compressor 本身：用 `zram-control/hot_add` 建一次性 zram 设备，写 64 MiB
+`/system/lib64/*.so`，只留一压得 2.16x（31,056,724 B），再跑一轮 async zstd idle pass 得
+2.77x（24,209,398 B），`huge_pages` 753 → 295。两者与 Batch 10-4 / Batch 11 记录的
+31.06 MB / 2.16x、24.21 MB / 2.77x 逐字节吻合——lz4kd 正常，二压链路也正常。
+
+然后在真机 zram0 上手动把标记补上、跑满几轮，比值 2.72x → 3.36x，约 210 MB 内存。这部分
+ savings 从来没被自动机制拿到手。
+
+### 2. 根因：`_zs_mark_tick` 按 sweep 计数，阈值却按 tick 除
+
+```sh
+_zs_per_mark=$(( _zs_mark_interval / _zs_reassert ))   # 错了
+```
+
+`_zs_mark_tick` 只在 sweep 分支里 +1，而写回那条 `_zs_per_wb` 用同一个除数是**对的**，因为
+`_zs_wb_tick` 每个 tick 都 +1。mark 这条把两个计数器的单位混了：默认值下
+`86400/60 = 1440` 落在 sweep 计数器上，是 **1440 趟 sweep = 30 天**，而不是配置声明的
+24 小时。
+
+连锁后果：
+
+- 第一次 sweep（约开机 36 min）按设计执行 mark，但 `idle_age_sec=3600` 要求页龄 ≥1 小时，
+  此刻全设备没有一页满足——**一个也标不上**；
+- `ZRAM_IDLE` 只有 `mark_idle()` 会置位（`zram_recompress()` 只清不置），所以此后每 30 min
+  一趟 `--no-mark` 全是在"从没有一页被标过"的设备上扫空；
+- 每趟都返回 0、都打 `recompression sweep done`。**失败与成功在日志里完全同形**，这是它
+  一直没被发现的原因；
+- 每天重启的手机上，净效果是二压从来没跑过。
+
+### 3. 修复
+
+- **除数改成 sweep 间隔**：`_zs_per_mark = mark_interval_sec / interval_sec`。旁边补了一段
+  注释，把「tick 计数器 vs sweep 计数器」的区别钉住，因为 `_zs_per_wb` 用的是同一种写法、
+  却因为计数器不同而正确。
+- `zram.recomp.idle_age_sec` 3600 → **900**：必须短于首次 sweep 的发生时间，否则开机那次
+  mark 永远是空集，而它正是收集初始冷集的那一次。二级算法的代价是 330 MB/s 解压，远高于
+  任何 UFS 读。
+- `zram.recomp.mark_interval_sec` 86400 → **10800**：一天一次的 mark 让 hour 1 变冷的页等
+  23 小时，而手机的内存图景几小时就翻一遍，多数冷集永远到不了。mark 必须慢于 sweep（重标
+  代价见 v0.13.0），但没有理由慢于一天。
+- `zram.recomp.max_pages` 16384 → **131072**：上面两条的**补偿旋钮**。重标会把 `ac_time`
+  未刷新的页重新交回来（`zram_recompress()` 走 `zram_read_from_zspool()`，不走
+  `zram_accessed()`），内核扫描又把预算花在"压不出改进的 attempt"上；在「跳过已在最高
+  优先级的 entry」这层内核改动落地之前，只有把上限放大到 512 MiB/sweep，新冷集才能在同一
+  趟里排得到。真机实测（vermeer）：131072 次 attempt = 入队 0.58 s + worker 4.2 s，
+  每 30 min 一趟，占空比 0.27%。
+- 容量口径不变：`10800/1800 × 131072 = 6 × 131072 = 3 GiB/周期`，与 v0.13.0 记的
+  `48 × 16384 = 3 GiB` 相同，只是从一天刷新一次变成一天八次。
+
+### 4. 回归测试：这个 bug 此前一条测试都没有
+
+原有 fixture 的 `interval_sec` 与 `reassert_interval_sec` 相等（都是 60），两个除数给出同
+一个值，所以单位错误完全不可见。新增 fixture 7b 把两者设成 60/20、并让 supervisor 活到第
+二次 mark：`_zs_per_mark=2` 时应为「mark / --no-mark / mark / --no-mark」。把除数改回
+buggy 形状，四条断言里三条立刻失败（含「第二次 sweep 之后又 mark 上」这条）。
+
+### 5. 验证
+
+- `python3 -m py_compile scripts/*.py tests/*.py` 与 `bash -n` 全部通过。
+- `python3 tests/stable_5_15_test.py` 全绿（**1323 ok / 0 FAIL**），含新增的 7b 四条断言、
+  更新后的 `--idle-age 900` 与 `mark=10800s`。
+- 本机没有 WSL，而 Windows 分支硬编码 `wsl bash -s`（无可用发行版）。本次以
+  `use_wsl = False` 走 Git Bash 复跑整份测试（临时副本，已删除），companion 的 shell
+  fixture 因此才真正被执行到；在此之前那些用例是被跳过的，不是通过的。
+- 真机 `/system/bin/sh`（即 mksh）`sh -n` 通过 `zram-policy.sh` 与 `tunables.conf`。
+- 真机核对时钟：`_zs_per_mark` 新值 6 sweep（10800 s）；旧除数在新 interval 下是
+  180 sweep（3.75 天），在旧 86400 下是 1440 sweep（30 天）。
+- 未做真机长窗口验证：新档位下二压的实际推进形态需要按 `mm_stat` 的 `compr_data_size`
+  做长窗口观察，本轮只有单次 sweep 的定时测量。
+
+---
+
 ## companion v0.16.0 + sailboat 附加模块（二）:调度侧拆成独立模块
 
 把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个
@@ -735,9 +814,120 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+## Batch 47(二压扫描跳过已无可改进的槽位,v0.50.0)
+
+### 1. 起因：companion v0.17.0 把 mark 时钟修对了，扫描却仍然够不着新冷页
+
+v0.17.0 修的是 `_zs_per_mark` 的单位（除以 sweep 间隔而不是 reassert 间隔），于是
+mark 从"每 30 天一次"恢复成配置声明的每 3 小时一次，`max_pages` 同时从 16384 抬到
+131072 作为补偿。**但补偿只是把预算放大，没有去掉浪费**：一个 mark 会把页龄未刷新的
+页重新标成 `ZRAM_IDLE`，而这个条件对"上一趟刚刚压过的页"恒成立——
+`zram_recompress()` 走 `zram_read_from_zspool()` 而不走 `zram_accessed()`，所以
+`ac_time` 保持旧值。一页一旦被压到最高优先级，它在以后的每一次 mark 里都"看起来很
+冷"。
+
+内核的 sweep 每趟都从 index 0 重走，并且（`zram_recompress_max_pages` 的注释自己
+承认）"spends its budget on attempts -- even on entries that cannot improve
+anything"。于是每次 mark 之后，前 `max_pages` 个 idle 条目都是已知最优的页，budget
+在碰到真正的新冷页之前就用完了。
+
+### 2. 根因：`zram_recompress()` 已经知道答案，但取证太贵
+
+它自己的优先级循环就是这样结束的：
+
+```c
+for (; prio < prio_max; prio++) {
+        if (!zram->comps[prio])
+                continue;
+        if (prio <= zram_get_priority(zram, index))
+                continue;
+        ...
+}
+if (!zstrm)
+        return 0;
+```
+
+对一页已在最高优先级的条目，循环直接走完、`zstrm` 为 NULL、返回 0 —— **什么都没
+做**。问题是走到这个"什么都不做"之前已经付过：slot lock、一次完整 decompress、
+一次 `ZRAM_IDLE` 清除；在异步节点上还多付一样——扫描已经把它排成一笔 job，抵掉了
+`max_pages` 的一格。
+
+所以便宜的那个"不"必须搬到 attempt 之前，放在调用点上。
+
+### 3. 落了什么（一组，core）
+
+`zram_recomp_best_prio_skip`，三步全 required：
+
+1. **谓词 `abk_zram_recompress_pointless()`**，挂在 `zram_recompression` 整块机制的
+   前边界上——即 `zram_bio_discard()` 那段注释（pristine，全文唯一）之后，Batch 4
+   的 `#ifdef CONFIG_ZRAM_MULTI_COMP` 之前。条件与 `zram_recompress()` 优先级循环
+   逐字同义：不存在 `prio > 当前优先级` 且 `comps[prio]` 非空的档位。自带
+   `#ifdef CONFIG_ZRAM_MULTI_COMP` 守卫——不是装饰：没有机制的构建里它是一个未被
+   使用的 static 函数，那是 `-Werror`，不是 warning。
+2. **同步节点的过滤器**，插在既有候选过滤器之后、`num_recomp_pages--;` 之前，所以
+   跳过的条目不占 cap。
+3. **异步节点的过滤器**，插在 `candidate = true;` 之前，所以不排 job、cap 只记真实
+   工作量。
+
+### 4. 不是上游移植
+
+没有对应的 upstream commit。上游从来不需要解决这个问题：它没有一个"重标的频率
+和排空的频率不同"的旋钮，所以上游代码里不存在这里要编码的那个区分。条件本身是本
+模块的 `zram_recompress()` 及其调用点私有的。
+
+### 5. 与 Batch 24/32 同一条 graft 边界纪律
+
+这是本模块第三个改写别的组生成文本的组。挂点全部是**块边界**而非别的组 replacement
+的内部（`batch11_core_zram_algo_lock` 的 docstring 已立此规矩），被依赖的三个组
+（`zram_recompression` / `zram_async_recompress` / `zram_recompress_max_pages`）都
+已带自身载荷探针，register 顺序排在其后。
+
+### 6. 审计基线：sublevel 216 → 217
+
+抓取时 Makefile `SUBLEVEL` 实测 **217**（rolling 分支又滚了一档，设备上跑的
+`5.15.217-Sailboat` 与此一致）。按 AGENTS.md"Lts-only maintenance"重键矩阵并全量
+重跑四道门禁。
+
+**抓取工具踩过的坑（如实记录）**：自写的补抓脚本用
+`base64.b64decode(validate=False)` 解码 gitiles 的 `?format=TEXT`，而
+`validate=False` 是**静默丢弃**非法字符而不是报错——于是 503 错误页被解成 843 字
+节、看起来像文本、且通过了 size 检查的垃圾。74/92 个文件被写成同样 843 字节，其中
+包括 `Makefile`、`mm/huge_memory.c`、`mm/vmscan.c` 等所有大文件。换成严格
+`validate=True` + 对 `Makefile` 单独断言 `SUBLEVEL`/`VERSION` 在场、对其余断言
+"≥4 KiB 且无 NUL 且无 DOCTYPE/Error 5"才落盘。**一个"看起来像文本"的检查不够**。
+
+### 7. 验证
+
+- `python3 -m py_compile scripts/*.py tests/*.py` 通过。
+- `bash -n scripts/*.sh tests/*.sh tools/*.sh ksu/*/*.sh` 通过。
+- `tests/stable_5_15_test.py`：新增 `test_batch47_zram_recomp_best_prio_skip()`
+  22 条断言（注册顺序对三个依赖全部成立、三步全 required、trap 2 无互相包含、
+  trap 7 的 `CONFIG_ZRAM_MULTI_COMP` 守卫、挂点是 pristine 而非 Batch 4 载荷、
+  trap 1 的 old 非 new 前缀、合成形状上三步全落、谓词只定义一次、两个节点各带一次
+  过滤器、异步过滤器在 `candidate = true` 之前、同步过滤器在 cap 递减之前且在候选
+  过滤器之后、二趟幂等、没有 max_pages 的形状被 `blocked_by_shape` 拒且不写盘、
+  空树降级）。全套 **1361 项全绿**。
+- `tests/implementation_audit.py`：新增 `REQUIRED_CONTENT` 5 条（谓词签名、
+  `zram_get_priority` 读法、`comps[]` 走法、provenance 标记、`sailboat_` 守卫块）
+  与 `REQUIRED_IN_FUNCTION` 两个节点各一条。后者只用 `must_not_have` 反着钉顺序——
+  该校验只查存在性，所以"过滤器不能落在它本该省掉的东西之后"必须写成禁用形状。
+- 本机无 WSL，Windows 分支硬编码 `wsl bash -s`；以 `use_wsl = False` 走 Git Bash
+  复跑（临时副本已删）。
+- **编译未验证**：本组引入 C，而文本级审计看不见 C 错误。`module_param` 那次
+  （Batch 12，`use of undeclared identifier`）与 zram writeback 引用了
+  `#ifdef` 内符号那次（Batch 17/23）都是全套本地门禁全绿、只有 ABK CI 编译挡下来。
+  本组的 C 是新增一个 static 函数加两个 if，风险面小得多，但**仍然只有编译能证明**。
+
+### 8. 未验证
+
+- 真机长窗口二压推进形态：谓词生效后 sweep 的实际推进需要按 `mm_stat` 的
+  `compr_data_size` 做长窗口观察。
+- 编译。
+
 <a id="batch-46"></a>
 
 ## Batch 46(erofs readmore EOF 收口,v0.49.0)
+
 
 主题：**把 erofs readmore 的预读循环在 EOF 处收口**。来源
 `docs/survey_erofs_upstream.md` §4.1 —— 该 survey 的 §7 建议是"先单独落地这
