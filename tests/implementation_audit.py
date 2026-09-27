@@ -35,6 +35,7 @@ import abk_stable_core  # noqa: E402
 import abk_stable_perf  # noqa: E402
 import abk_stable_display  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
+import sublevel_matrix  # noqa: E402
 
 MARKER = "ABK stable_515_backport:"
 
@@ -965,6 +966,15 @@ REQUIRED_CONTENT = {
         ["fs/erofs/zdata.c", "\t\t\t\t\t\tGFP_NOWAIT | __GFP_NORETRY"],
         ["fs/erofs/zdata.c", "\tpcl->besteffort = false;"],
     ],
+    "core:erofs_readmore_past_eof": [
+        # The whole graft is one loop condition, so what has to be pinned is the
+        # *conjunction*: dropping the extent test over-reads, dropping the EOF
+        # test leaves the group inert.  `already_present` only needs the new
+        # block in the file, so one conjunct alone would still read as applied.
+        ["fs/erofs/zdata.c",
+         "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n"],
+        ["fs/erofs/zdata.c", "cur < i_size_read(inode)"],
+    ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",
         "abk_kcompressd_store",
@@ -1310,6 +1320,12 @@ REQUIRED_ABSENT = {
         # the parameter would mean the group had edited a signature it need not
         # have touched.
         ["fs/erofs/zdata.c", "bool ra)"],
+    ],
+    "core:erofs_readmore_past_eof": [
+        # Upstream-shape graft: a marker would sit inside the block the
+        # already_present short-circuit compares against, so a tree carrying the
+        # upstream commit would be edited instead of left byte-identical.
+        ["fs/erofs/zdata.c", "ABK stable_515_backport:"],
     ],
     "core:memcg_stats_percpu_slim": [
         "vmstats_percpu->state[idx]",
@@ -1881,6 +1897,19 @@ REQUIRED_IN_FUNCTION = {
           "pcl->besteffort = false;"],
          []),
     ],
+    "core:erofs_readmore_past_eof": [
+        # 936aa701d82d.  `cur < i_size_read(inode)` anywhere in zdata.c is
+        # satisfied by a tree that left the un-guarded `while (cur >= end) {`
+        # standing in this same function, so the conjunction has to be pinned
+        # inside z_erofs_pcluster_readmore().  `||` is forbidden too: it is a
+        # superset of `cur >= end`, so the pathological loop would survive the
+        # fix while the guard still read as present.
+        ("fs/erofs/zdata.c", "z_erofs_pcluster_readmore",
+         ["\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n",
+          "cur = map->m_la + map->m_llen - 1;"],
+         ["\twhile (cur >= end) {\n",
+          "\twhile ((cur >= end) || (cur < i_size_read(inode))) {\n"]),
+    ],
     "core:mglru_rework_refault_detection": [
         # The windowed recency test must land in lru_gen_refault() itself;
         # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
@@ -2154,7 +2183,8 @@ def run_tree(source):
         for child, module in (("core", abk_stable_core),
                               ("perf", abk_stable_perf),
                               ("display", abk_stable_display)):
-            ctx = GraftContext(root, "167", "android13-5.15",
+            ctx = GraftContext(root, sublevel_matrix.DEFAULT_SUB_LEVEL,
+                               "android13-5.15",
                                defconfig=str(root /
                                              "arch/arm64/configs/gki_defconfig"))
             for group in module.PATCH_GROUPS:

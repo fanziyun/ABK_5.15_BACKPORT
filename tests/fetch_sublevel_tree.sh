@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch a minimal reference tree for one android13-5.15 GKI baseline.
+# Fetch a minimal reference tree for the one supported android13-5.15 baseline.
 #
 # Only the files the module's groups touch are downloaded (via gitiles, so no
 # clone of the ~4GB kernel history is needed).  The result is a directory that
@@ -8,10 +8,18 @@
 # Usage:
 #   bash tests/fetch_sublevel_tree.sh <branch> <outdir>
 #
-# Known android13-5.15 branches (see build.yml KNOWN_KERNEL_PAIRS):
-#   deprecated/android13-5.15-2024-11   SUBLEVEL 167  (os_patch_level 2024-11)
-#   deprecated/android13-5.15-2025-03   SUBLEVEL 178  (os_patch_level 2025-03)
-#   android13-5.15-2025-12              SUBLEVEL 194  (os_patch_level 2025-12)
+# Since Batch 44 the rolling branch is the only supported baseline:
+#   android13-5.15-lts                     SUBLEVEL rolls (216 as of 2026-09)
+#
+# The three release baselines that used to be listed here
+# (deprecated/android13-5.15-2024-11 = .167, -2025-03 = .178,
+# android13-5.15-2025-12 = .194) are no longer supported; nothing in the
+# registry depends on them, but the audits will refuse them -- see
+# tests/sublevel_matrix.py.
+#
+# Note this is a ROLLING branch: after re-fetching, re-key the lts row in
+# tests/sublevel_matrix.py to the new Makefile SUBLEVEL and re-prove every set,
+# or every audit fails with "no expectation recorded for sublevel ...".
 
 set -euo pipefail
 
@@ -19,7 +27,7 @@ BRANCH="${1:-}"
 OUTDIR="${2:-}"
 
 if [ -z "$BRANCH" ] || [ -z "$OUTDIR" ]; then
-  sed -n '2,17p' "$0" >&2
+  sed -n '2,23p' "$0" >&2
   exit 2
 fi
 

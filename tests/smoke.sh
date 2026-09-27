@@ -175,6 +175,24 @@ if [ -z "$SUB_LEVEL" ]; then
   echo "could not determine SUBLEVEL from $SOURCE_TREE/Makefile; set ABK_TEST_SUB_LEVEL" >&2
   exit 2
 fi
+
+# Reject an unsupported baseline BEFORE pass 1 rewrites the tree.  Without this
+# the graft runs, mutates every file, and only then dies inside the matrix
+# lookup -- two wasted minutes and a dirty tree.  Batch 44 dropped the
+# 5.15.167/.178/.194 release baselines, so only the rolling lts SUBLEVEL is
+# valid.  The failure is deliberately loud: a rolled lts has to be re-keyed and
+# re-proven, not silently audited against the old row.
+if ! "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import sublevel_matrix
+print("supported: " + ", ".join(sublevel_matrix.SUPPORTED))
+sys.exit(0 if sys.argv[2] in sublevel_matrix.SUPPORTED else 1)
+PY
+then
+  echo "unsupported baseline 5.15.$SUB_LEVEL; the lts row in tests/sublevel_matrix.py must be re-keyed and re-proven before this tree can be audited" >&2
+  exit 2
+fi
 echo "== target baseline: 5.15.$SUB_LEVEL =="
 
 echo "== pass 1: graft =="
@@ -792,6 +810,14 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/include/linux/mm.h" \
         "$KERNEL_ROOT/common/include/linux/mm.h" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for include/linux/mm.h"
+fi
+# Batch 40 is the module's first fs/erofs/ write (three steps in zdata.c) and
+# Batch 46 adds a fourth; both are marker-free upstream-shape rewrites, so the
+# applied file carries no trace of the graft and rollback has to be asserted.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/fs/erofs/zdata.c" \
+        "$KERNEL_ROOT/common/fs/erofs/zdata.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for fs/erofs/zdata.c"
 fi
 
 echo "SMOKE OK"

@@ -314,7 +314,7 @@ def test_replace_fd_errno_group():
 
     # Upstream .191-.194 shape: conventions already in, replace_fd not yet.
     with tempfile.TemporaryDirectory() as tmp:
-        ctx = make_ctx(tmp, {"fs/file.c": FD_UPSTREAM}, sub_level="194")
+        ctx = make_ctx(tmp, {"fs/file.c": FD_UPSTREAM}, sub_level="216")
         status, _ = core._fdtable_apply(ctx)
         check("conventions already_present on .194 shape",
               status == "already_present", status)
@@ -1169,17 +1169,36 @@ def test_sublevel_matrix():
             check(f"{child}@{sub_level} summary totals all groups",
                   sum(summary.values()) == len(groups), summary)
 
-    # Every sublevel must cover every child, and 167 must be all-applied for
-    # the forward-graft children.  The display child is a revert: on 167 the
-    # 5.15.185 valid-clones check never existed, so its group is legitimately
-    # already_present there (see sublevel_matrix.PRE_APPLIED).
+    # Every supported baseline must cover every child.  With Batch 44 there is
+    # exactly one, so the loop is a single iteration -- and the surviving check
+    # below is what replaced the old cross-baseline invariant.
     for sub_level in sublevel_matrix.SUPPORTED:
         check(f"{sub_level} covers every child",
               set(sublevel_matrix.PRE_APPLIED[sub_level]) == set(registries),
               set(sublevel_matrix.PRE_APPLIED[sub_level]))
-    check("167 is the all-applied baseline for forward grafts",
-          all(not sublevel_matrix.pre_applied("167", c)
-              for c in registries if c != "stable_display_fix"))
+    check("the default baseline is a supported one",
+          sublevel_matrix.DEFAULT_SUB_LEVEL in sublevel_matrix.SUPPORTED,
+          sublevel_matrix.DEFAULT_SUB_LEVEL)
+
+    # Batch 44 dropped 5.15.167/.178/.194, so the old "167 is the all-applied
+    # baseline for forward grafts" check has nothing left to compare against.
+    # The concern it guarded survives in a sharper form: with one baseline, a
+    # PRE_APPLIED row that quietly absorbs groups the module still needs makes
+    # every tree-level audit vacuous while all of them stay green.  Assert each
+    # forward-graft child still has groups that really rewrite the baseline.
+    only = sublevel_matrix.SUPPORTED[0]
+    for child, groups in registries.items():
+        if child == "stable_display_fix":
+            continue
+        keys = {g.key for g in groups}
+        leftover = keys - sublevel_matrix.pre_applied(only, child)
+        check(f"{child} still really grafts on {only}",
+              leftover, f"all {len(keys)} groups recorded pre-applied")
+    # The display child is a revert, so the invariant inverts: the rolling
+    # branch carries 5.15.185, and its group must really apply there.
+    check("display revert really applies on the rolling baseline",
+          not sublevel_matrix.pre_applied(only, "stable_display_fix"),
+          sublevel_matrix.pre_applied(only, "stable_display_fix"))
 
 
 def test_f2fs_shape_probe():
@@ -1262,7 +1281,7 @@ def test_defconfig_lane():
             "# CONFIG_B is not set\n"
             "CONFIG_C=n\n"
         )
-        ctx = GraftContext(str(root), "167", "android13-5.15",
+        ctx = GraftContext(str(root), "216", "android13-5.15",
                            defconfig=str(defconfig))
         status, detail = ctx.enable_configs([
             ("B", "y"), ("C", "y"), ("A", "y"), ("NEW", "y"),
@@ -1278,7 +1297,7 @@ def test_defconfig_lane():
               and text.count("ABK stable_515_backport: config_enablement") == 1,
               text)
 
-        ctx2 = GraftContext(str(root), "167", "android13-5.15",
+        ctx2 = GraftContext(str(root), "216", "android13-5.15",
                             defconfig=str(defconfig))
         status2, _d = ctx2.enable_configs([("B", "y")])
         check("defconfig idempotent", status2 == "already_present", status2)
@@ -1288,7 +1307,7 @@ def test_defconfig_lane():
         root.mkdir()
         outside = Path(tmp) / "gki_defconfig"
         outside.write_text("# bare\n")
-        ctx = GraftContext(str(root), "167", "android13-5.15",
+        ctx = GraftContext(str(root), "216", "android13-5.15",
                            defconfig=str(outside))
         status, detail = ctx.enable_configs([("A", "y")])
         check("defconfig outside KERNEL_ROOT refused",
@@ -2099,7 +2118,7 @@ def test_config_tiers():
 
         class Probe:
             family = "android13-5.15"
-            sub_level = "167"
+            sub_level = "216"
 
             def enable_configs(self, configs):
                 caught["configs"] = list(configs)
@@ -3069,7 +3088,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.47.0", "0.47.0"], _versions)
+          _versions == ["0.49.0", "0.49.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -4074,7 +4093,7 @@ def test_batch8_autofdo_tool():
         vmlinux = root / "vmlinux"
         vmlinux.write_bytes(b"fake vmlinux for the 5.15 build")
         (root / "Makefile").write_text(
-            "VERSION = 5\nPATCHLEVEL = 15\nSUBLEVEL = 167\nEXTRAVERSION =\n")
+            "VERSION = 5\nPATCHLEVEL = 15\nSUBLEVEL = 216\nEXTRAVERSION =\n")
 
         r = run_tool(["init", "--kernel-root", str(root),
                       "--output-dir", str(out), "--vmlinux", str(vmlinux),
@@ -4087,7 +4106,7 @@ def test_batch8_autofdo_tool():
         check("manifest declares the abk-autofdo-515 format",
               "format=abk-autofdo-515-v1" in mtext)
         check("manifest records the 5.15 kernel version",
-              "kernel_version=5.15.167" in mtext)
+              "kernel_version=5.15.216" in mtext)
         check("manifest records a vmlinux hash", "vmlinux_sha256=" in mtext)
 
         (out / "kernel.autofdo").write_text("branch-list payload")
@@ -4732,7 +4751,7 @@ def test_batch30_readahead_mmap_miss_race():
 # Minimal arm64/include/asm/pgtable.h shapes -- only what the Batch 31 group
 # anchors on.  The `pte_sw_dirty()` macro is the 5.15 spelling the fix relies
 # on (and it is why this is portable at all: the macro predates the commit).
-_BATCH31_PGTABLE_167 = (
+_BATCH31_PGTABLE_PRECOMMIT = (
     "#define pte_sw_dirty(pte)\t(!!(pte_val(pte) & PTE_DIRTY))\n"
     "\n"
     "static inline pte_t pte_mkwrite(pte_t pte)\n"
@@ -4789,7 +4808,7 @@ def test_batch31_arm64_pte_mkwrite_clean():
 
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
-            "arch/arm64/include/asm/pgtable.h": _BATCH31_PGTABLE_167,
+            "arch/arm64/include/asm/pgtable.h": _BATCH31_PGTABLE_PRECOMMIT,
         })
         status, detail = core._arm64_pte_mkwrite_clean_apply(ctx)
         check("guard applies on the 5.15.167 shape",
@@ -5736,6 +5755,137 @@ def test_batch40_erofs_readahead():
               bare.read(b40.COMPRESS_H) == "static int x;\n")
 
 
+def test_batch46_erofs_readmore_eof():
+    """Batch 46: the erofs readmore loop stops at the inode size."""
+    print("Batch 46: erofs_readmore_past_eof (readmore bounded by i_size)")
+    import abk_stable_core as core
+    import batch46_core_erofs_readmore_eof as b46
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "erofs_readmore_past_eof"), None)
+    check("erofs_readmore_past_eof group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly fs/erofs/zdata.c",
+          group.files == [b46.ZDATA_C], group.files)
+
+    steps = b46.build_steps()
+    check("one required step",
+          len(steps) == 1 and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    check("the step lands in fs/erofs/zdata.c", steps[0][0] == b46.ZDATA_C)
+
+    for rel, old, new, _req in steps:
+        check(f"the {rel} new block is not already in its old block",
+              new not in old)
+    # The anchor policy: an upstream-shape rewrite, so a baseline carrying the
+    # commit must stay byte-identical and report already_present.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        check("step %d adds no ABK marker" % i,
+              "ABK stable_515_backport" not in new_i)
+    # v6.5 rewrote the `backmost` branch above these lines, so an anchor that
+    # reached into it could match neither the 5.15 nor the upstream shape.
+    check("the anchor does not reach the backmost branch",
+          "backmost" not in steps[0][1] and "backmost" not in steps[0][2])
+    check("the anchor starts at the mapped-extent line",
+          steps[0][1].startswith("\tcur = map->m_la + map->m_llen - 1;\n"))
+    old_lines = steps[0][1].split("\n")
+    new_lines = steps[0][2].split("\n")
+    check("the anchor is three lines", len(old_lines) == 4, old_lines)
+    check("the replacement is the same three lines",
+          len(new_lines) == 4, new_lines)
+    differing = [i for i, (a, b) in enumerate(zip(old_lines, new_lines))
+                 if a != b]
+    check("exactly one line changed", differing == [1], differing)
+    check("the changed line is the while condition",
+          old_lines[1] == "\twhile (cur >= end) {"
+          and new_lines[1] == "\twhile ((cur >= end) && (cur < i_size_read(inode))) {",
+          (old_lines[1], new_lines[1]))
+
+    # The guard is the second conjunct, so `cur >= end` still terminates the
+    # loop on its own and the new condition can only narrow it.  A port that
+    # put the EOF test first, or replaced the extent test with it, would make
+    # the loop over-read.
+    check("the EOF test is the second conjunct",
+          b46.LOOP_CONDITION_NEW
+          == "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n",
+          b46.LOOP_CONDITION_NEW)
+    check("the extent test is still there",
+          "cur >= end" in b46.LOOP_CONDITION_NEW)
+    check("the EOF test names i_size_read(inode)",
+          b46.EOF_GUARD == "cur < i_size_read(inode)", b46.EOF_GUARD)
+
+    # Only the anchor, which is all the group owns; the real text is proven
+    # against a fetched tree by step_audit.py.
+    fixture = {
+        b46.ZDATA_C: (
+            "static void z_erofs_pcluster_readmore(void)\n{\n"
+            "\tstruct inode *inode = f->inode;\n"
+            "\n"
+            "\tif (backmost) {\n"
+            "\t\tmap->m_la = end;\n"
+            "\t\tend = round_up(end, PAGE_SIZE);\n"
+            "\t} else {\n"
+            "\t\tend = round_up(map->m_la, PAGE_SIZE);\n"
+            "\n"
+            "\t\tif (!map->m_llen)\n"
+            "\t\t\treturn;\n"
+            "\t}\n"
+            + b46._READMORE_OLD +
+            "\t\tstruct page *page;\n"
+            "\t\terr = z_erofs_do_read_page(f, page, pagepool);\n"
+            "skip:\n"
+            "\t\tcur = (index << PAGE_SHIFT) - 1;\n"
+            "\t}\n"
+            "}\n"),
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, fixture)
+        status, detail = group.apply_fn(ctx)
+        check("the step lands", status == "applied", (status, detail))
+        zd = ctx.read(b46.ZDATA_C)
+        check("the loop is bounded by the inode size",
+              b46.EOF_GUARD in zd and zd.count(b46.EOF_GUARD) == 1)
+        check("the loop still honours its extent bound", "cur >= end" in zd)
+        check("the anchor line itself is unchanged",
+              "\tcur = map->m_la + map->m_llen - 1;\n" in zd)
+
+        # replace_once checks the new block first, so a tree that carries the
+        # commit short-circuits with no probe of its own.
+        status2, detail2 = group.apply_fn(ctx)
+        check("second pass: already_present",
+              status2 == "already_present", (status2, detail2))
+        check("second pass: the tree is byte-identical",
+              ctx.read(b46.ZDATA_C) == zd)
+
+        # Upstream's own shape -- the signature lost `end` and `pagepool`, which
+        # this group never owned -- must report already_present, not degrade.
+        upstream = make_ctx(tmp + "/upstream", {
+            b46.ZDATA_C: (
+                "static void z_erofs_pcluster_readmore("
+                "struct z_erofs_decompress_frontend *f,\n"
+                "\t\tstruct readahead_control *rac, bool backmost)\n{\n"
+                "\tstruct inode *inode = f->inode;\n"
+                "\tcur = map->m_la + map->m_llen - 1;\n"
+                + b46._READMORE_NEW +
+                "\t\tstruct page *page;\n"
+                "\t}\n"
+                "}\n")})
+        status3, _d3 = group.apply_fn(upstream)
+        check("a tree already carrying the commit reports already_present",
+              status3 == "already_present", status3)
+        check("that tree is not rewritten",
+              upstream.read(b46.ZDATA_C).count(b46.EOF_GUARD) == 1)
+
+        bare = make_ctx(tmp + "/bare46", {b46.ZDATA_C: "static int x;\n"})
+        status4, _d4 = group.apply_fn(bare)
+        check("degrades on a missing anchor", status4 == "blocked_by_shape",
+              status4)
+        check("the missing-anchor tree is not written",
+              bare.read(b46.ZDATA_C) == "static int x;\n")
+
+
 def test_sched_tunables_module():
     """sailboat addon 2: the cpufreq/scheduler half, split out of addon 1.
 
@@ -6066,6 +6216,7 @@ def main():
     test_batch37_reclaim_paths()
     test_batch35_pagecache_pt()
     test_batch40_erofs_readahead()
+    test_batch46_erofs_readmore_eof()
     test_batch41_kcompressd_offload()
     test_batch42_schedutil_smart_cap()
 

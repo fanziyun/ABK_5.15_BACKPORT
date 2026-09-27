@@ -43,20 +43,22 @@ published, in `tools/`.)
 - `python3 tests/stable_5_15_test.py` (add fixture checks if the group
   introduces a new shape probe).
 - Dry-run against the reference tree:
-  `python3 scripts/abk_stable_perf.py --common-dir <tree> --defconfig <tree>/arch/arm64/configs/gki_defconfig --report-dir /tmp/r --sub-level 167 --family android13-5.15 --dry-run`
+  `python3 scripts/abk_stable_perf.py --common-dir <tree> --defconfig <tree>/arch/arm64/configs/gki_defconfig --report-dir /tmp/r --sub-level 216 --family android13-5.15 --dry-run`
   — every anchor must report `applied`/`already_present`, never
   `missing_anchor`.
-- Repeat the dry-run on every supported baseline (167/178/194 — see the
-  sublevel matrix in `docs/porting_policy.md`).  Fetch the ones you don't have
-  with `bash tests/fetch_sublevel_tree.sh <branch> <outdir>`.  If the group's
-  upstream commit is already in one of those baselines, record it in
+- Batch 44 left **one** supported baseline, the rolling `android13-5.15-lts`
+  (see the sublevel matrix in `docs/porting_policy.md`).  Fetch it with
+  `bash tests/fetch_sublevel_tree.sh android13-5.15-lts build/abk-trees/216`.
+  If the group's upstream commit is already in that baseline, record it in
   `tests/sublevel_matrix.py` `PRE_APPLIED` and bump `GROUP_COUNTS` — the unit
   test asserts the matrix matches the registry, and `step_audit.py` uses it to
-  decide whether a step is allowed to report `already_present`.
-- Per-step audit on each baseline:
+  decide whether a step is allowed to report `already_present`.  The branch is
+  **rolling**, so re-check the matrix key after any re-fetch
+  (`AGENTS.md` "Lts-only maintenance").
+- Per-step audit:
   `python3 tests/step_audit.py <tree>` (reads SUBLEVEL from the tree's
   Makefile; `ABK_TEST_SUB_LEVEL` overrides).
-- Implementation audit on each baseline:
+- Implementation audit:
   `python3 tests/implementation_audit.py <tree>`.  Add the group's
   behaviour-visible strings to `REQUIRED_CONTENT` — including any 5.15-specific
   calling convention (see the convention traps below), which is the only check

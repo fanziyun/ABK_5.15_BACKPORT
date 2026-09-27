@@ -121,8 +121,14 @@ trees before any porting: `common-5.15-2024-11` (5.15.167) vs `common-6.1-src`.
 
 Absorbing the ABK suite does **not** touch the other sibling boundaries:
 
-- `fs/f2fs` and `drivers/scsi/ufs` remain F2FS/UFS-suite territory and are still
-  off limits for this module.
+- **`fs/f2fs` and `drivers/scsi/ufs` are open since Batch 43** — the old "remain
+  F2FS/UFS-suite territory and off limits" rule is retired. What replaced it is
+  an ordering constraint, not an exclusion: this module must inject after
+  `ABK_F2FS_FIX_MODULE`'s rollbacks (or that module must be omitted), since the
+  rollback's `git apply --reverse --check` and its `android13-5.15-2024-11_r14`
+  patch contexts both break on a tree this module already rewrote. The concrete
+  requirement for any group in that overlap is spelled out under "Footprint
+  overlap" in `docs/porting_policy.md`; no group lands there today.
 - The suite's non-optimization children are out of scope: `security_backport`
   (security-only fixes are excluded by this module's own scope rule),
   `display_release_spoof` / `boot_image_logging` (anti-detection display

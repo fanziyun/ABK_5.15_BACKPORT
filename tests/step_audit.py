@@ -525,7 +525,16 @@ def audit_fdtable_on_suite_shape(module, source, work):
 
 
 def detect_sub_level(source):
-    """Read SUBLEVEL from the reference tree's Makefile; ABK_TEST_SUB_LEVEL wins."""
+    """Read SUBLEVEL from the reference tree's Makefile; ABK_TEST_SUB_LEVEL wins.
+
+    Raises rather than falling back.  The old behaviour returned
+    ``sublevel_matrix.DEFAULT_SUB_LEVEL`` when the Makefile was missing or
+    carried no SUBLEVEL line, which -- once the membership check below is
+    satisfied by that same default -- let an unrecognised tree be audited
+    against the lts expectations while the log claimed otherwise.  With Batch 44
+    leaving one baseline, that silent downgrade is the only way this audit could
+    ever look at the wrong tree, so it has to be an error instead.
+    """
     import os
 
     override = os.environ.get("ABK_TEST_SUB_LEVEL", "").strip()
@@ -537,7 +546,10 @@ def detect_sub_level(source):
             parts = line.split()
             if len(parts) >= 3 and parts[0] == "SUBLEVEL" and parts[1] == "=":
                 return parts[2]
-    return sublevel_matrix.DEFAULT_SUB_LEVEL
+    raise SystemExit(
+        f"could not read SUBLEVEL from {makefile}; "
+        f"set ABK_TEST_SUB_LEVEL=<sublevel> to audit anyway"
+    )
 
 
 def main():

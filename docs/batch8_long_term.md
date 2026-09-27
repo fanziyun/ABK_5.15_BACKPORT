@@ -107,35 +107,45 @@ bounded graft 定位。
 - https://source.android.com/docs/core/architecture/kernel/release-notes?authuser=108
 - https://origin.kernel.org/doc/html/latest/core-api/maple_tree.html
 
-## C. 值得做但属于 sibling suite
+## C. 存储路径候选（f2fs / UFS，Batch 43 起开放）
 
-### [~] `f2fs_readonly_large_folio` — P2（F2FS suite）
+**Batch 43 撤销了「不改写 `fs/f2fs`、`drivers/scsi/ufs`」的红线**，本节原
+「属于 sibling suite」的三条随之变成本模块的合法候选 —— 但来源一律取上游
+（android15-6.6 / 5.15.y stable），**不是小米**：`popsicle-w-oss` 分支全树不含
+`fs/`，f2fs 源码在那里根本不存在（实测见 `docs/survey_popsicle_w_611.md`）。
+三条共同的落地前提：必须排在 `ABK_F2FS_FIX_MODULE` 之后注入（或不同注该
+suite），否则其 `git apply --reverse --check` 会断；细则见
+`docs/porting_policy.md` 的 "Footprint overlap"。
+
+### [ ] `f2fs_readonly_large_folio` — P2
 
 F2FS 只读、不可变文件的大 folio 读路径有明确性能收益，但依赖 large-folio
-基础设施，且当前模块明确不改写 `fs/f2fs`。
+基础设施（`large_folio_mthp_substrate`，见 B 节）。前者的结论不变：先立基建，
+再落文件系统调用点。
 
 参考：https://www.kernel.org/doc./html/next/filesystems/f2fs.html
 
-### [ ] `f2fs_lookup_mode_perf` — P1/P2（F2FS suite）
+### [ ] `f2fs_lookup_mode_perf` — P1/P2
 
 casefold 目录查找发生线性 fallback 时可能产生严重性能回退；6.6 增加的
 `lookup_mode=perf` 使用 hash-only 路径，投入小于完整 large-folio 项目。适合有
-大量 casefold 目录的产品优先验证。
+大量 casefold 目录的产品优先验证。这是三条里投入最小、最值得先做的一条。
 
 参考：https://android.googlesource.com/kernel/common/%2B/refs/tags/android15-6.6-2025-07_r15
 
-### [ ] `ufs_command_priority_rt` — P2（UFS/storage suite）
+### [ ] `ufs_command_priority_rt` — P2（条件）
 
 UFS Command Priority 可让实时请求优先于普通请求执行，目标是降低前台应用 I/O
-latency；收益依赖 UFS 控制器和设备是否支持，当前模块不改写
-`drivers/scsi/ufs`。
+latency；收益依赖 UFS 控制器和设备是否支持。红线撤销后路径合法，但
+`drivers/scsi/ufs` 属受保护 KMI 文件集、收益依赖硬件，仍列为条件项。
 
-参考：https://android.googlesource.com/kernel/common/%2B/7eb4d8ceda46fab6d7c0537e9b9d7bc36c8fe9cd%5E%21/
+参考：https://android.googlesource.com/kernel/common/%2B/refs/tags/android15-6.6-2025-07_r15
 
-### [~] `erofs_large_folio_zstd` — P2/P3（EROFS suite，条件）
+### [~] `erofs_large_folio_zstd` — P2/P3（EROFS，条件；只读段已由 Batch 40 处理）
 
 large folio 适合 EROFS 只读读取；ZSTD 则是用 CPU 换压缩率，只有系统镜像实际
-使用 ZSTD 且 CPU 预算允许时才值得做。
+使用 ZSTD 且 CPU 预算允许时才值得做。`fs/erofs` 本来就在本模块范围内，Batch 40
+已落 `erofs_readahead` 一条。
 
 ## D. 暂不进入 Batch 8 实现池
 
@@ -157,7 +167,11 @@ large folio 适合 EROFS 只读读取；ZSTD 则是用 CPU 换压缩率，只有
 3. 另开独立 MM/VFS 分支推进 `mglru_612_refresh`，再评估
    `large_folio_mthp_substrate`、`maple_tree_per_vma_lock` —— 不在本模块做
    bounded anchor graft。
-4. F2FS/UFS/EROFS 项目留在各自 sibling suite，不注册到本模块。
+4. F2FS/UFS/EROFS 项目**Batch 43 起不再是「留给 sibling suite」**：`fs/f2fs`、
+   `drivers/scsi/ufs` 红线已撤销，可按 C 节顺序在本模块注册，但受
+   `ABK_F2FS_FIX_MODULE` 注入顺序约束（见 C 节抬头）。候选排序上，
+   `f2fs_lookup_mode_perf`（投入最小）先于 `f2fs_readonly_large_folio`
+   （需 large-folio 基建）先于 `ufs_command_priority_rt`（依赖硬件）。
 
 `pagealloc_fallback_reuse` 落地后递增 `ABK_MODULE_VERSION`；后续源码项目仍遵循
 `docs/group_recipe.md` 的 group、矩阵、幂等、回滚和 CI 编译要求。AutoFDO 工具

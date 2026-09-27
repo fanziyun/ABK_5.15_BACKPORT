@@ -232,44 +232,49 @@ suite-preference cross-check.
 The engine gates purely on **text anchors**; `ctx.sub_level` reaches the report
 and nothing else (it is never compared). A group whose upstream commit the
 target baseline already carries therefore reports `already_present` — that is a
-success, not a degradation. All three android13-5.15 combinations CI accepts
-(`build.yml` `KNOWN_KERNEL_PAIRS`) are supported by the same injection string:
+success, not a degradation.
+
+**Batch 44 made `android13-5.15-lts` the only supported baseline.** The
+`5.15.167 / .178 / .194` release baselines were dropped: nothing in the registry
+depended on them, the CI compile gate already built `lts` only
+(`sub_level: "X"`, `os_patch_level: "lts"` — see
+`.github/workflows/abk-kernel-compile.yml`), and carrying three more fixtures
+meant maintaining expectations for three trees ABK no longer offers. One baseline
+is also the honest statement of what is actually verified.
 
 | sublevel | AOSP branch | os_patch_level | core pass 1 | perf pass 1 |
 |---|---|---|---|---|
-| 167 | `deprecated/android13-5.15-2024-11` | 2024-11 | 46 applied | 23 applied |
-| 178 | `deprecated/android13-5.15-2025-03` | 2025-03 | 46 applied | 22 applied + 1 present |
-| 194 | `android13-5.15-2025-12` | 2025-12 | 43 applied + 3 present | 20 applied + 3 present |
-| 216 | `android13-5.15-lts` | rolling | 39 applied + 7 present | 15 applied + 8 present |
+| 216 (rolling) | `android13-5.15-lts` | rolling | 58 applied + 8 present | 16 applied + 8 present |
 
-(Re-measured on the **v0.38.0** registry against the four fetched reference
-trees -- the numbers Batch 33 left here were two batches stale. The counts move
-with every batch, so they are a snapshot, not an invariant.)
+(Re-measured on the current registry against the fetched reference tree. The
+counts move with every batch, so this is a snapshot, not an invariant — and the
+key 216 is a snapshot too: see "Lts-only maintenance" below.)
 
-The display child is the odd one out: its single revert group reports
-`already_present` on 167/178 (which never carried the 5.15.185 check) and
-`applied` on 194/216.
+The display child is a revert, so it inverts: the branch carries the 5.15.185
+valid-clones check, and its single group reports `applied`.
 
-A second pass is `already_present` for every group on all four, and since
-Batch 19 `KNOWN_DEBT` in `tests/sublevel_matrix.py` is **empty** — no group of
-any child degrades on any supported baseline.  Groups the baseline pre-empts:
+A second pass is `already_present` for every group, and `KNOWN_DEBT` in
+`tests/sublevel_matrix.py` is **empty** — no group of any child degrades on the
+supported baseline. Groups the baseline pre-empts (the `PRE_APPLIED` row, each
+version-tagged so a later roll is a deliberate diff):
 
-- **178** — `sched_nohz_idle_balance_series` (5.15.174).
-- **194** — the 178 set plus `fdtable_alloc_conventions` (5.15.191),
-  `pagealloc_cpuset_bailout` (5.15.191), `cgroup_destroy_wq_split` (5.15.194),
-  `sched_steal_time_excess_drop` (5.15.179) and `semaphore_wake_q` (5.15.180).
-- **216** — the 194 set plus `fdtable_replace_fd_errno` (5.15.195),
-  `arm64_pte_mkwrite_clean` (5.15.196, the module's first `arch/arm64` group),
-  `pagealloc_thisnode_thp_noreclaim` (5.15.202),
-  `pagealloc_high_fraction_lockfree` (5.15.200),
-  `release_sock_cond_resched` (5.15.197), `sched_rt_optimizations`
-  (5.15.202/.212), `sched_dst_group_allowed_stats` (5.15.212),
-  `blk_mq_suspend_wakeup_abort` (5.15.198) and
-  `blk_mq_quiesced_elevator_switch` (5.15.209).
+- `fdtable_alloc_conventions` (5.15.191) and `fdtable_replace_fd_errno`
+  (5.15.195);
+- `arm64_pte_mkwrite_clean` (5.15.196, the module's first `arch/arm64` group);
+- `release_sock_cond_resched` (5.15.197) and `blk_mq_suspend_wakeup_abort`
+  (5.15.198);
+- `pagealloc_high_fraction_lockfree` (5.15.200), `sched_rt_optimizations`
+  (5.15.202/.212) and `pagealloc_thisnode_thp_noreclaim` (5.15.202);
+- `sched_dst_group_allowed_stats` (5.15.212);
+- `blk_mq_quiesced_elevator_switch` (5.15.209);
+- `cgroup_destroy_wq_split` (5.15.194), `pagealloc_cpuset_bailout` (5.15.191),
+  `semaphore_wake_q` (5.15.180), `sched_steal_time_excess_drop` (5.15.179) and
+  `sched_nohz_idle_balance_series` (5.15.174);
+- `huge_memory_imap_split_uaf` (5.15.y backport `f87c08060818`, 2026-08-19).
 
 Batch 14's three zram writeback groups (`zram_wb_teardown`,
-`zram_writeback_bounds`, `zram_wb_limit_align`) apply on **all** of them and add
-no `PRE_APPLIED`/`KNOWN_DEBT` row. Note what they do *not* do: they deliberately
+`zram_writeback_bounds`, `zram_wb_limit_align`) apply and add no
+`PRE_APPLIED`/`KNOWN_DEBT` row. Note what they do *not* do: they deliberately
 leave `zram_reset_device()` alone, because the earlier `zram_recompression` group
 anchors on that function's whole pristine body — see
 `research/zram_writeback_plan.md` §10.5 and the `batch14_core_zram_writeback`
@@ -277,31 +282,51 @@ module docstring before editing either one.
 
 The expectations live in `tests/sublevel_matrix.py`, which both `tests/smoke.sh`
 and `tests/step_audit.py` read (keyed by the tree's Makefile `SUBLEVEL`, or
-`ABK_TEST_SUB_LEVEL`). Fetch a reference tree for any of them with
-`bash tests/fetch_sublevel_tree.sh <branch> <outdir>` — it pulls only the ~78
-files the groups touch, so no kernel clone is needed. Adding a baseline means
-adding a matrix entry; it does not mean adding version gating.
+`ABK_TEST_SUB_LEVEL`). Fetch the reference tree with
+`bash tests/fetch_sublevel_tree.sh android13-5.15-lts build/abk-trees/216` — it
+pulls only the files the groups touch, so no kernel clone is needed. Adding a
+baseline means adding a matrix entry; it does not mean adding version gating.
 
-The android13-5.15-lts tree (recorded at 5.15.211; the branch has since rolled
--- the matrix row is keyed to the fetched tree's Makefile `SUBLEVEL`, 216 as of
-the 2026-09 re-fetch, re-proven on that tree) is a fourth fixture with the same
-standing as the three release baselines: every group must land or be genuinely
-pre-applied there too.  The two `.211` blockers it used to carry are closed as
-of Batch 19 rather than recorded as debt — `randomize_kstack_pertask` grew the
-slot-1-taken KABI shape (AOSP owns slot 1 for `user_dumpable`, so the free
-RESERVE run is 2..8) and `blk_mq_suspend_wakeup_abort` now probes the payload
-instead of the `#ifndef __GENKSYMS__`-wrapped include, which is why it moved
-from `KNOWN_DEBT` to `PRE_APPLIED`.  lts is not a CI combination and nothing
-gates on it.  It is a rolling branch, so re-check its `PRE_APPLIED` row and
-re-key it when re-fetching the tree —
-`sched_rt_optimizations` (5.15.202) and `sched_dst_group_allowed_stats` (5.15.212)
-landed there earlier and moved from drift to pre-applied.
-
-Note that `fdtable_alloc_conventions` reporting `already_present` on 194 means
+Note that `fdtable_alloc_conventions` reporting `already_present` means
 `fs/file.c` carries **no** module marker there — the 5.15.195 `replace_fd()`
 hunk therefore lives in its own group (`fdtable_replace_fd_errno`) rather than
 as a step inside the conventions group, which short-circuits before its steps
 run on any tree at 5.15.191 or newer.
+
+## Lts-only maintenance (what a roll costs)
+
+The matrix row is keyed to the fetched Makefile `SUBLEVEL`, so a roll **fails
+loudly by design**:
+
+```
+no expectation recorded for sublevel '220'; supported sublevels: 216
+```
+
+Keeping that key rather than a stable `lts` label is deliberate: a stable label
+would keep answering for whatever the old row said, so stale expectations would
+pass silently. A hard failure forces a conscious re-key. The recipe after every
+`android13-5.15-lts` re-fetch:
+
+1. re-key the row in `tests/sublevel_matrix.py` to the new `SUBLEVEL`;
+2. re-prove every set on the new tree — a group can move in *either* direction;
+3. re-run all four gates (`step_audit.py`, `implementation_audit.py`,
+   `smoke.sh`, and `config_gate_audit.py` if a build exists);
+4. update the measured pass-1 table above and any `scripts/*` docstring that
+   names a sublevel.
+
+**The CI compile gate does not catch drift and must not be relied on.** It treats
+`already_present` as a GOOD status and never consults the matrix, so a roll that
+absorbs a commit whose group is missing from `PRE_APPLIED` stays green on CI
+indefinitely while the tree-level audits — the only real check — are never run.
+Running the local audits is mandatory after every lts re-fetch.
+`tools/fetch_all_trees.sh` now reports a key/directory mismatch at fetch time,
+but that is a hint, not a substitute for re-proving.
+
+Two safeguards landed with Batch 44 so a roll cannot be papered over:
+`tests/smoke.sh` refuses an unsupported SUBLEVEL **before** pass 1 rewrites the
+tree, and `tests/step_audit.py:detect_sub_level()` raises instead of silently
+falling back to `DEFAULT_SUB_LEVEL` when the Makefile carries no SUBLEVEL.
+
 
 ## Three-module composition (all after_patch)
 
@@ -310,8 +335,14 @@ CI executes injected modules in input order, so the canonical input is:
 1. `ABK_F2FS_FIX_MODULE` children (`storage_ufs_rollback`,
    `storage_block_rollback`, `storage_f2fs_rollback`,
    `storage_common_fixups`) — restore the storage baseline first; its
-   `git apply --reverse --check` breaks if anything rewrites block//f2fs
-   before it.
+   `git apply --reverse --check` breaks if anything rewrites block/f2fs/ufs
+   before it. **Batch 43 retired this module's f2fs/ufs exclusion**, so this
+   ordering stopped being a courtesy for those paths: a graft that touches
+   `fs/f2fs`, `drivers/scsi/ufs` or the F2FS-suite regions of `block/`
+   composes **only** when the suite's rollbacks have already run, or when that
+   module is omitted entirely. Its `.patch` payloads are keyed to
+   `android13-5.15-2024-11_r14`, so a forward rewrite by this module also skews
+   them at revert time.
 2. **This module** (`stable_backport_core`, `stable_perf_backport`,
    `stable_display_fix`) — forward grafts onto the settled baseline; the
    display child only touches `drivers/gpu/drm/drm_atomic_helper.c` and is
@@ -348,8 +379,10 @@ Batch 41's `vm_kcompressd_swapout` is the first group with a **group-local**
 text probe rather than an engine one, because the shape it has to separate is
 not a kernel symbol: `swap_writepage()`'s `frontswap_store()` block gained
 AOSP's `trace_android_vh_shrink_page_lock_owner_clear(page)` call on
-`android13-5.15-lts` only, and 167/178/194 have neither the call nor its
-`DECLARE_HOOK` in `include/trace/hooks/vmscan.h`. No `CONFIG_*` gate can
+`android13-5.15-lts` (the only supported baseline since Batch 44).  Neither the
+call nor its `DECLARE_HOOK` in `include/trace/hooks/vmscan.h` exists on the
+pre-lts release baselines, which is why the probe is written as a two-shape
+match rather than a one-way default.  No `CONFIG_*` gate can
 express that — there is nothing to gate on — so `_vm_kcompressd_swapout_apply`
 probes the two shapes of that block and emits the matching engine variant.
 `already_present` is not an available answer either (there is no upstream 5.15
@@ -366,20 +399,33 @@ possible CPUs. The option remains `default n`; only a device benchmark may justi
 enabling it in a product defconfig.
 
 The AOSP android13-5.15 line never took the upstream 5.15.171 Gorman rework:
-167, 178, 194 and the current `android13-5.15-lts` (.211) all still carry
-`ALLOC_HARDER 0x10` / `ALLOC_HIGH 0x20` in `mm/internal.h` and the
-single-argument `gfp_to_alloc_flags(gfp_t gfp_mask)`.  Both page_alloc groups
-therefore report `applied` on every supported sublevel; the "high version
+the supported `android13-5.15-lts` tree still carries `ALLOC_HARDER 0x10` /
+`ALLOC_HIGH 0x20` in `mm/internal.h` and the single-argument
+`gfp_to_alloc_flags(gfp_t gfp_mask)` — as did 167/178/194 before Batch 44
+dropped them.  Both page_alloc groups therefore report `applied` on the
+supported baseline; the "high version
 sensitivity" of that region applies to upstream vanilla trees, not to this
 baseline family.
 
-Footprint disjointness (verified against the F2FS suite script and its
-`android13-5.15-2024-11_r14` patches): the F2FS suite touches
-`drivers/scsi/ufs/`, `block/` (one hunk in `blk_mq_delay_run_hw_queues()`),
-`fs/f2fs/*`, `include/trace/events/f2fs.h`, plus optional `dm/` and
-`fs/crypto/`. This module's only shared file is `block/blk-mq.c`, and its
-hunks live in `blk_mq_hctx_notify_offline()` — disjoint from both the F2FS
-hunk and the ABI suite's blk-mq regions.
+Footprint overlap with the F2FS suite (verified against the suite script and its
+`android13-5.15-2024-11_r14` patches): the suite touches `drivers/scsi/ufs/`,
+`block/` (one hunk in `blk_mq_delay_run_hw_queues()`), `fs/f2fs/*`,
+`include/trace/events/f2fs.h`, plus optional `dm/` and `fs/crypto/`.
+Historically this module kept its footprint **disjoint** from that set by
+exclusion, and the only genuinely shared file was `block/blk-mq.c` (this module's
+hunks in `blk_mq_hctx_notify_offline()`, disjoint from both the F2FS hunk and the
+ABI suite's blk-mq regions).
+
+**Batch 43 retired that exclusion**: `fs/f2fs` and `drivers/scsi/ufs` are now
+legal targets for this module. The overlap is no longer prevented by policy, so
+it has to be **detected** instead: any new group in the overlap is a
+composition hazard against the F2FS suite's `git apply --reverse`, not merely a
+documentation note. Concretely, a group landing in `fs/f2fs` must (a) re-check
+the suite's patch contexts at revert time, (b) be registered **after** the suite
+in every composition that carries it, and (c) keep `block/blk-mq.c` hunks in
+`blk_mq_hctx_notify_offline()` so the one historical collision stays clear.
+`implementation_audit.py`/`step_audit.py` do not model a second injector, so
+this is a manual review item; no group currently targets the overlap.
 
 ## Runtime companion and the ROM-integration config tier
 

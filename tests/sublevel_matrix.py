@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Expected per-sublevel graft statuses for the android13-5.15 GKI baselines.
+"""Expected graft statuses for the one supported android13-5.15 baseline.
 
 The engine gates purely on text anchors -- ``ctx.sub_level`` never takes part
 in a comparison -- so a group whose upstream commit is already in the target
 baseline correctly reports ``already_present`` instead of ``applied``.  That
-makes "applied" the wrong universal assertion: on 5.15.194 the fd-table
-conventions (5.15.191) are already in the tree.
+makes "applied" the wrong universal assertion.
 
 This table records, per sublevel, which groups are expected to arrive
 pre-applied.  Anything not listed must report ``applied`` on a pristine tree;
 nothing may ever report ``blocked_by_shape``.
 
-The display child is a revert: on baselines that never carried the 5.15.185
-valid-clones check (167/178) the tree is already in the fixed form, so its
-group reports ``already_present`` there — recorded in PRE_APPLIED just like a
-forward graft whose upstream commit the baseline already carries.
+The display child is a revert: the supported baseline carries the 5.15.185
+valid-clones check, so its group reports ``applied`` and its PRE_APPLIED entry
+stays empty.
 
-Verified against the real AOSP branches:
-  167 -> deprecated/android13-5.15-2024-11
-  178 -> deprecated/android13-5.15-2025-03
-  194 -> android13-5.15-2025-12
+Since Batch 44 there is exactly **one** supported baseline, the rolling
+``android13-5.15-lts`` branch, and the row key is its **Makefile SUBLEVEL**:
+
+  216 -> android13-5.15-lts   (rolling; re-key on every re-fetch)
+
+The three release baselines that used to be listed here
+(167 -> deprecated/android13-5.15-2024-11, 178 -> -2025-03,
+194 -> android13-5.15-2025-12) were dropped in Batch 44.  See `pre_applied()`
+for why a roll fails loudly instead of silently reusing stale expectations, and
+`AGENTS.md` / `docs/porting_policy.md` "Lts-only maintenance" for the recipe.
 """
 
 from __future__ import annotations
@@ -124,7 +128,12 @@ GROUP_COUNTS = {
     # an undeclared vendor hook, so an unknown shape is blocked_by_shape here
     # rather than silently half-applied -- which is a third status the matrix
     # would need if any baseline ever matched neither shape.  None does.
-    "stable_backport_core": 66,
+    # Batch 46 adds one: erofs_readmore_past_eof (v6.5 936aa701d82d), the
+    # module's second fs/erofs/ group.  It cannot arrive pre-applied -- a v6.5
+    # performance change with a Fixes: tag but no Cc: stable -- and its single
+    # three-line anchor is unique in fs/erofs/zdata.c, a file Batch 40 already
+    # put in the fixture, and outside every one of that batch's steps there.
+    "stable_backport_core": 67,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
@@ -179,50 +188,28 @@ GROUP_COUNTS = {
 }
 
 # sublevel -> child id -> groups whose upstream commit the baseline already has
+#
+# Single-baseline world since Batch 44: the three release baselines (5.15.167 /
+# .178 / .194) were dropped and only the rolling android13-5.15-lts branch is
+# maintained.  See CHANGELOG.md#batch-44 -- the discard is deliberate, and the
+# CI compile gate already built lts only, so the matrix now matches reality
+# instead of claiming four-way coverage nothing checked.
 PRE_APPLIED = {
-    "167": {
-        "stable_backport_core": set(),
-        "stable_perf_backport": set(),
-        # The 5.15.185 valid-clones check never existed on 167: the tree is
-        # already in the fixed (pre-185) form.
-        "stable_display_fix": {"drm_valid_clones_revert"},
-    },
-    "178": {
-        "stable_backport_core": set(),
-        # 5.15.174 NOHZ series landed in the 2025-03 baseline.
-        "stable_perf_backport": {"sched_nohz_idle_balance_series"},
-        "stable_display_fix": {"drm_valid_clones_revert"},
-    },
-    "194": {
-        # 5.15.191 fd-table conventions, 5.15.191 cpuset bail-out and the
-        # 5.15.194 cgroup destroy-wq split are all in the 2025-12 baseline.
-        "stable_backport_core": {
-            "fdtable_alloc_conventions",
-            "pagealloc_cpuset_bailout",
-            "cgroup_destroy_wq_split",
-        },
-        # 5.15.174 NOHZ series, 5.15.179 excess steal time and 5.15.180
-        # semaphore wake_q.
-        "stable_perf_backport": {
-            "sched_nohz_idle_balance_series",
-            "sched_steal_time_excess_drop",
-            "semaphore_wake_q",
-        },
-        # The 2025-12 baseline carries the 5.15.185 valid-clones check: the
-        # revert really applies here.
-        "stable_display_fix": set(),
-    },
-    # android13-5.15-lts: not a CI combination yet, but tracked so the local
-    # tree (Makefile SUBLEVEL 216 as of the 2026-09 re-fetch; row recorded
-    # against 5.15.211, expectations re-proven on the .216 tree) can be
-    # audited and drift surfaces before the baseline ships.
-    # This is a rolling branch, so re-check these two sets -- and re-key this
-    # row to the new Makefile SUBLEVEL -- when re-fetching it.
-    # Both .211 blockers are closed on this row (CHANGELOG.md#batch-19, and the
-    # plan.md index line for Batch 5): the kstack KABI slot probe learned the
-    # slot-1-taken 2..8 RESERVE shape (so the group really applies here), and
-    # the blk-mq suspend path arrived upstream-first so it is recorded in
-    # PRE_APPLIED instead of KNOWN_DEBT.
+    # The one supported baseline.  Keyed to the fetched tree's Makefile
+    # SUBLEVEL, which is a **rolling** value: re-fetching a rolled lts tree
+    # re-keys this row, and every set below must be re-proven on that tree.
+    #
+    # That is intentional, and it is the whole drift defence.  A roll to a new
+    # SUBLEVEL makes every audit fail loudly here (see pre_applied()), which
+    # forces a conscious re-key instead of letting stale expectations ride.
+    #
+    # Why the CI compile gate does not substitute for it: the gate treats
+    # `already_present` as a GOOD status and never consults this matrix.  If the
+    # rolling branch absorbs a commit whose group is missing from this row, the
+    # group flips to already_present on CI and stays green.  The local
+    # step_audit / implementation_audit / smoke run is the only thing that
+    # catches that, so it has to be run after every lts re-fetch.  See
+    # docs/porting_policy.md "Lts-only maintenance".
     "216": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
@@ -271,22 +258,25 @@ PRE_APPLIED = {
 # sublevel -> child -> group key -> expected degraded status.
 # Disjoint from PRE_APPLIED: a group either arrives upstream-clean or is a
 # tracked debt; never both.
-# Empty for the three Batch-14 zram writeback groups: each one lands on a
-# pristine 167/178/194/216 tree.  zram_wb_teardown does not depend on the series
-# partner be48c412f6eb (zero-sized backing device rejection, 5.15.168+) -- that
-# hunk is not editable input to the fix -- and the leak is closed in
-# zram_remove() rather than by deleting zram_reset_device()'s early return, so
-# 5.15.167 is covered like the rest.
-# Empty since the 5.15.211+ lts row was closed: randomize_kstack_pertask now
-# really applies there (the KABI slot probe learned the slot-1-taken 2..8
-# RESERVE shape) and blk_mq_suspend_wakeup_abort reports already_present (the
-# branch carries 8fe7de5d1c7f upstream-first behind an __GENKSYMS__ include
-# guard, which the payload probe now recognises).  Every group of every child
-# therefore lands on every supported baseline.
+# Empty: every group of every child lands on the supported baseline.  The
+# three Batch-14 zram writeback groups are covered (zram_wb_teardown does not
+# depend on the series partner be48c412f6eb -- zero-sized backing device
+# rejection, 5.15.168+ -- which is not editable input to the fix, and the leak
+# is closed in zram_remove() rather than by deleting zram_reset_device()'s
+# early return).  The two .211 lts blockers are closed rather than tracked as
+# debt: randomize_kstack_pertask grew the slot-1-taken 2..8 RESERVE shape
+# (AOSP owns slot 1 for `user_dumpable`, so the free RESERVE run is 2..8) and
+# blk_mq_suspend_wakeup_abort now probes the payload instead of the
+# __GENKSYMS__-guarded include.
 KNOWN_DEBT = {}
 
 SUPPORTED = tuple(PRE_APPLIED)
-DEFAULT_SUB_LEVEL = "167"
+
+# The rolling branch is the only baseline, so there is no "oldest" fallback to
+# speak of: this is the SUBLEVEL the single matrix row is keyed to.  It is used
+# as the ABK_TEST_SUB_LEVEL / missing-Makefile default, and audit_tree() treats
+# a tree that disagrees with it as an error rather than a downgrade.
+DEFAULT_SUB_LEVEL = "216"
 
 
 def pre_applied(sub_level, child):
@@ -296,7 +286,14 @@ def pre_applied(sub_level, child):
     except KeyError:
         raise SystemExit(
             f"no expectation recorded for sublevel {sub_level!r} child {child!r}; "
-            f"supported sublevels: {', '.join(SUPPORTED)}"
+            f"supported sublevels: {', '.join(SUPPORTED)}.\n"
+            f"Batch 44 dropped the 5.15.167/.178/.194 release baselines, so the "
+            f"only row is the rolling android13-5.15-lts fixture, keyed to the "
+            f"Makefile SUBLEVEL it was proven against.\n"
+            f"If {sub_level!r} is a freshly fetched lts tree, the branch has "
+            f"rolled: re-key this row to {sub_level!r} and re-prove every set "
+            f"on that tree (docs/porting_policy.md 'Lts-only maintenance'). "
+            f"ABK_TEST_SUB_LEVEL does not override that requirement."
         ) from None
 
 
