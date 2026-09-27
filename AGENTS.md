@@ -26,9 +26,26 @@ degradation). Per-baseline expectations live in `tests/sublevel_matrix.py`.
 
 Idempotency rule (the anchor policy):
 - New module-introduced lines (new fields, helpers, vendor hooks, UAPI/config)
-  carry `/* ABK stable_515_backport: ... */`.
-- Upstream-shape rewrites are **their own target form** — no comment added, so a
-  baseline already carrying the commit is left byte-identical.
+  carry `/* sailboat_<group>: ... */`.
+- Upstream-shape rewrites used to carry nothing, so a baseline already carrying
+  the upstream commit stayed byte-identical.  **A grep marker is now allowed on
+  those too** -- that is the point: a graft has to be findable in a fetched tree,
+  in a running kernel's source, or in a bug report.  The cost is explicit and
+  worth stating: such a baseline is no longer byte-identical, its group reports
+  `applied` on a second pass instead of `already_present`, and the marker has to
+  be part of the match before the edit is skipped.
+
+One hard rule: the prefix for any **new** marker is `sailboat_` and nothing else.
+`sailboat_` is taken from the companion modules'
+`sailboat 附加模块（一）/（二）` display names, so the marker matches the
+user-visible product name.  Registry groups landed earlier still carry the old
+`ABK stable_515_backport` prefix, and `tests/implementation_audit.py` still pins
+it as `MARKER`, so a `grep` for one prefix misses the other -- search for both.
+Those old markers are **not** to be swapped: the marker text is anchor text, so
+re-writing it means re-proving the group on the supported tree, and a group
+whose `new` block another group edits must keep the exact bytes it was proved
+with.  Markers must likewise never be retro-added to a landed
+upstream-shape group.
 
 Every write snapshots `<file>.abk-orig` once; `scripts/abk_rollback.sh <common-dir>
 [--apply|--list]` restores. **Never write outside `KERNEL_ROOT`** — the defconfig
