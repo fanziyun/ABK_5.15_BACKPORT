@@ -149,10 +149,37 @@ abk_zram_writeback_mode() {
   esac
 }
 
+# Writeback auto-attach backoff (see ABK_ZRAM_WB_RETRY_SECS).  A failed auto
+# attach records a deadline; until it passes, "writeback wanted" answers no, so
+# the supervisor stops rebuilding the whole device every tick over an attach it
+# cannot make.  A successful attach clears the deadline immediately.
+abk_zram_wb_backoff_active() {
+  _wbo_until="$(abk_state_get zram_wb_retry_after)"
+  abk_is_uint "$_wbo_until" || return 1
+  _wbo_now="$(abk_now_secs)"
+  abk_is_uint "$_wbo_now" || return 1   # no clock -> never suppress an attach
+  # awk, not [ -gt ]: a deadline is wall-clock seconds, past 2^31 this ROM's
+  # mksh wraps (the abk_gt/abk_le trap documented in common.sh).
+  abk_gt "$_wbo_until" "$_wbo_now"
+}
+
+abk_zram_wb_backoff_arm() {
+  _wba_now="$(abk_now_secs)"
+  abk_is_uint "$_wba_now" || return 0   # no clock -> nothing to defer against
+  abk_state_set zram_wb_retry_after \
+    "$(awk -v n="$_wba_now" -v d="$ABK_ZRAM_WB_RETRY_SECS" \
+        'BEGIN { printf "%.0f\n", n + d }')"
+}
+
+abk_zram_wb_backoff_clear() {
+  rm -f "$(abk_state_path zram_wb_retry_after)" 2>/dev/null || true
+}
+
 abk_zram_writeback_wanted() {
   abk_zram_writeback_capable || return 1
   [ "$(abk_zram_writeback_mode)" = "auto" ] || return 1
   abk_zram_writeback_owned && return 1
+  abk_zram_wb_backoff_active && return 1
   return 0
 }
 
@@ -426,8 +453,12 @@ abk_zram_takeover() {
       abk_warn "writeback device $_to_wb_dev could not be re-attached"
     fi
   elif abk_zram_writeback_wanted; then
-    abk_zram_attach_writeback "" "" \
-      || abk_warn "writeback could not be set up; continuing without it"
+    if abk_zram_attach_writeback "" ""; then
+      abk_zram_wb_backoff_clear
+    else
+      abk_zram_wb_backoff_arm
+      abk_warn "writeback could not be set up; standing down auto-attach for ${ABK_ZRAM_WB_RETRY_SECS}s (continuing without it)"
+    fi
   fi
 
   if ! abk_zram_mount_swap "$_to_size" "$_to_prio"; then
@@ -609,15 +640,17 @@ abk_zram_writeback_sweep() {
     abk_warn "zram.writeback.budget_mb: '$_wb_val' is not a number in 1..65536, using 256"
     _wb_mb=256
   fi
-  # MiB -> 4 KiB blocks, the unit bd_wb_limit is counted in.
-  _wb_blocks=$(( _wb_mb * 256 ))
+  # MiB -> 4 KiB blocks, the unit bd_wb_limit is counted in.  awk, not shell
+  # arithmetic: a >1 TiB backing device's sector count passes 2^31, which this
+  # ROM's mksh wraps (the abk_mul_div / abk_gt / abk_le trap in common.sh).
+  _wb_blocks="$(abk_mul_div "$_wb_mb" 256 1)"
 
   # Never budget more than the backing device can hold: running it out of
   # space mid-sweep returns -ENOSPC after the flash has already been spent.
   _wb_sectors="$(abk_read "$ABK_SYS_ROOT/block/${_wb_bdev##*/}/size" | tr -d ' \n')"
-  if abk_is_uint "$_wb_sectors" && [ "$_wb_sectors" -gt 0 ]; then
-    _wb_cap=$(( _wb_sectors / 8 ))   # 512-byte sectors -> 4 KiB blocks
-    [ "$_wb_blocks" -le "$_wb_cap" ] || _wb_blocks="$_wb_cap"
+  if abk_is_uint "$_wb_sectors" && abk_gt "$_wb_sectors" 0; then
+    _wb_cap="$(abk_mul_div "$_wb_sectors" 1 8)"   # 512-byte sectors -> 4 KiB blocks
+    abk_le "$_wb_blocks" "$_wb_cap" || _wb_blocks="$_wb_cap"
   fi
 
   # idle has to be marked first, and only by age: "all" would move every page
