@@ -444,22 +444,34 @@ abk_zram_takeover() {
   fi
 
   # Writeback is attached before disksize: the node is -EBUSY afterwards.
+  # Unified attach handling.  `reset` above already dropped whatever was
+  # attached, so try the device we found first (a preserved ROM/prior
+  # attachment); if that re-attach fails, fall through to a fresh backing device
+  # in the SAME tick when the policy still wants one -- nobody owns it now.  The
+  # backoff is armed only when neither lands, so a genuinely unattachable path
+  # stops driving a full rewrite every tick (see ABK_ZRAM_WB_RETRY_SECS), while
+  # a found device that merely went stale is replaced at once instead of after
+  # the backoff.  Any success clears a prior backoff.
+  _to_wb_ok=0
   if [ -n "$_to_wb_dev" ]; then
     if abk_zram_attach_writeback "$_to_wb_dev" "$_to_wb_limit"; then
+      _to_wb_ok=1
       [ -z "$_to_wb_enable" ] || [ "$_to_wb_enable" = "1" ] \
         || abk_write "$ABK_ZRAM_DIR/writeback_limit_enable" "$_to_wb_enable" \
         || true
     else
-      abk_warn "writeback device $_to_wb_dev could not be re-attached"
+      abk_warn "writeback device $_to_wb_dev could not be re-attached; trying a fresh backing device"
     fi
-  elif abk_zram_writeback_wanted; then
+  fi
+  if [ "$_to_wb_ok" = 0 ] && abk_zram_writeback_wanted; then
     if abk_zram_attach_writeback "" ""; then
-      abk_zram_wb_backoff_clear
+      _to_wb_ok=1
     else
       abk_zram_wb_backoff_arm
       abk_warn "writeback could not be set up; standing down auto-attach for ${ABK_ZRAM_WB_RETRY_SECS}s (continuing without it)"
     fi
   fi
+  [ "$_to_wb_ok" = 0 ] || abk_zram_wb_backoff_clear
 
   if ! abk_zram_mount_swap "$_to_size" "$_to_prio"; then
     abk_warn "swap remount failed; retrying once"
