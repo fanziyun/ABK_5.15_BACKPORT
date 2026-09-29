@@ -5507,6 +5507,16 @@ import batch24_core_zram_max_pages as _b24_zmp  # noqa: E402
 PATCH_GROUPS = PATCH_GROUPS + _b24_zmp.build_groups(PatchGroup)
 
 # ============================================================================
+# Batch 47: a recompression sweep skips entries that cannot be improved.
+# Steps live in scripts/batch47_core_zram_recomp_skip.py.  Registered after
+# zram_recompression / zram_async_recompress / zram_recompress_max_pages:
+# both scans are text those groups generate (trap 5, same remedy as Batch 24).
+# ============================================================================
+import batch47_core_zram_recomp_skip as _b47_skip  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b47_skip.build_groups(PatchGroup)
+
+# ============================================================================
 # Batch 30: concurrent faults no longer double-decrement mmap_miss.
 # Steps live in scripts/batch30_core_mmap_miss_races.py.
 #

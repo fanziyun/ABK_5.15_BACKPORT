@@ -678,22 +678,22 @@ abk_zram_writeback_sweep() {
 abk_zram_supervisor_main() {
   abk_pid_write zram "$$"
   _zs_tool="${ABK_RECOMP_TOOL:-$MODDIR/bin/zram_recompress_trigger.sh}"
-  _zs_age="$(abk_cfg zram.recomp.idle_age_sec 3600)"
+  # 900 s: short enough that the first sweep (~30 min after boot) still finds a
+  # cold set -- a 3600 s cutoff never matched that early.
+  _zs_age="$(abk_cfg zram.recomp.idle_age_sec 900)"
   _zs_interval="$(abk_cfg zram.recomp.interval_sec 1800)"
   _zs_threshold="$(abk_cfg zram.recomp.threshold 0)"
-  # 16384 attempted entries = 64 MiB of pages per sweep at 4 KiB.  A bound is
-  # the point: an uncapped pass walks every idle entry in index order, which
-  # is what made a sweep on a full device cost tens of seconds of one core.
-  # A kernel without the max_pages graft ignores the parameter, so this is
-  # also the pre-Batch-24 behaviour -- no cap is imposed behind our back.
-  _zs_max_pages="$(abk_cfg zram.recomp.max_pages 16384)"
+  # 131072 attempts = 512 MiB/sweep: the cap bounds pass cost, and re-marks
+  # spend most of it on already-optimal pages, so this size keeps new cold
+  # pages reachable.  A kernel without the max_pages graft ignores the value.
+  _zs_max_pages="$(abk_cfg zram.recomp.max_pages 131072)"
   _zs_mode="$(abk_cfg zram.recomp.mode async)"
   _zs_reassert="$(abk_cfg zram.reassert_interval_sec "$ABK_ZRAM_REASSERT_SECS")"
 
-  abk_is_uint "$_zs_age" || _zs_age=3600
+  abk_is_uint "$_zs_age" || _zs_age=900
   abk_is_uint "$_zs_interval" || _zs_interval=1800
   abk_is_uint "$_zs_threshold" || _zs_threshold=0
-  abk_is_uint "$_zs_max_pages" || _zs_max_pages=16384
+  abk_is_uint "$_zs_max_pages" || _zs_max_pages=131072
   abk_is_uint "$_zs_reassert" || _zs_reassert="$ABK_ZRAM_REASSERT_SECS"
   case "$_zs_mode" in sync|async) ;; *) _zs_mode=async ;; esac
   [ "$_zs_interval" -ge 60 ] || _zs_interval=60
@@ -726,10 +726,15 @@ abk_zram_supervisor_main() {
   # drain advances only because a pass clears IDLE and nothing puts it back, so
   # the mark runs on its own, much longer clock and every sweep in between
   # passes --no-mark.
-  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 86400)"
-  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=86400
+  #
+  # 10800 s, not a day: a daily mark never reaches a cold set that turns over
+  # every few hours; six sweeps between marks still drain ~3 GiB per cycle.
+  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 10800)"
+  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=10800
   [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
-  _zs_per_mark=$(( _zs_mark_interval / _zs_reassert ))
+  # _zs_mark_tick counts sweeps, so _zs_per_mark divides by the SWEEP interval
+  # -- dividing by _zs_reassert once made a "24 h" mark land 30 days out.
+  _zs_per_mark=$(( _zs_mark_interval / _zs_interval ))
   [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
 
   if [ ! -f "$_zs_tool" ]; then

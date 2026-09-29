@@ -2,7 +2,7 @@
 
 ABK external `module_set` that grafts upstream kernel features / optimizations /
 structural refactors onto the **`android13-5.15-lts` rolling branch** (its matrix
-row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .216 — see
+row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .217 — see
 "Lts-only maintenance" below for what a roll means). Batch 44 dropped the
 `5.15.167 / .178 / .194` release baselines. **This is not a kernel
 source tree** — it is a Python registry that rewrites one.
@@ -314,7 +314,10 @@ stages, each a separate run:
 (`ksu/abk_runtime_tunables/`, packed by `scripts/build_ksu_module.py` and bundled
 into the AnyKernel3 tree by `scripts/ak3_bundle_ksu_module.py`) that keeps the
 measured zram algorithm policy in force on device, drives the recompression
-sweeps, and records **who owns CPU frequency** at boot. The policy itself lives
+sweeps, re-asserts the MGLRU switch on a timer (since companion v0.18.0 — this
+ROM's init writes `lru_gen/enabled` back to 0 after post-fs-data from its
+`SmartCacheEnable` trigger, so the one-shot apply loses the write order), and
+records **who owns CPU frequency** at boot. The policy itself lives
 in the kernel since Batch 12 (`zram_algo_lock`: `zram.abk_comp_algo` /
 `zram.abk_lock_algo`, both `0444`, and both
 `comp_algorithm`/`recomp_algorithm` stores made reported no-ops), so the companion

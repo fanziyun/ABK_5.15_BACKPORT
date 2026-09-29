@@ -654,6 +654,15 @@ REQUIRED_CONTENT = {
         "ABK stable_515_backport: 34efe1c3b688",
         "if (!mode)",
     ],
+    "core:zram_recomp_best_prio_skip": [
+        # No upstream commit to quote: pin the predicate, both call sites, and
+        # the CONFIG_ZRAM_MULTI_COMP guard (an unguarded static is -Werror).
+        "static bool abk_zram_recompress_pointless(struct zram *zram,",
+        "u32 abk_cur = zram_get_priority(zram, index);",
+        "if (prio > abk_cur && zram->comps[prio])",
+        "ABK stable_515_backport: Batch 47",
+        "#ifdef CONFIG_ZRAM_MULTI_COMP\n/*\n * sailboat_zram_recomp_skip:",
+    ],
     "core:arm64_pte_mkwrite_clean": [
         # 8a2375b0e9b8 / mainline 143937ca51cc.  The guard is the whole group,
         # and it is deliberately written without an ABK marker (upstream-shape
@@ -1673,6 +1682,20 @@ REQUIRED_IN_FUNCTION = {
           "if (!num_recomp_pages)\n\t\t\tbreak;\n\n\t\tzram_slot_lock(zram, index);",
           "num_recomp_pages--;\n\t\terr = abk_zram_recomp_enqueue("],
          ["zram_recompress(zram, index, page"]),
+    ],
+    "core:zram_recomp_best_prio_skip": [
+        # Presence is not enough: pin the ORDER -- the filter must precede the
+        # max_pages decrement (sync) and candidate = true (async).
+        ("drivers/block/zram/zram_drv.c", "recompress_store",
+         ["zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))",
+          "if (abk_zram_recompress_pointless(zram, index, prio, prio_max))",
+          "num_recomp_pages--;\n\t\terr = zram_recompress(zram, index, page,"],
+         ["num_recomp_pages--;\n\n\t\t/* ABK stable_515_backport: Batch 47."]),
+        ("drivers/block/zram/zram_drv.c", "recompress_async_store",
+         ["zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))",
+          "if (abk_zram_recompress_pointless(zram, index, prio, prio_max))",
+          "candidate = true;"],
+         ["candidate = true;\n\n\t\t/* ABK stable_515_backport: Batch 47."]),
     ],
     "core:readahead_mmap_miss_race": [
         # The guard belongs in do_async_mmap_readahead(), the function whose

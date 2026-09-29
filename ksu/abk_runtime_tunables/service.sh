@@ -15,6 +15,7 @@ case "${1:-}" in
   --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
   --supervise-cfr) abk_cfr_supervisor_main; exit 0 ;;
   --supervise-psi) abk_psi_supervisor_main; exit 0 ;;
+  --supervise-lru-gen) abk_lru_gen_supervisor_main; exit 0 ;;
 esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
@@ -83,6 +84,13 @@ if [ "$(abk_psi_mode)" = keep ]; then
   abk_log "psi.cgroup=keep: per-cgroup pressure accounting left as the kernel set it"
 else
   abk_spawn --supervise-psi psi
+fi
+
+# MGLRU: the ROM's init rewrites this node to 0 after post-fs-data, so give it
+# the same reassert supervisor the zram policy has (only on lru_gen.enable=1).
+if [ "$(abk_cfg lru_gen.enable 0)" = "1" ] \
+  && [ -e "$ABK_SYS_ROOT/kernel/mm/lru_gen/enabled" ]; then
+  abk_spawn --supervise-lru-gen lru_gen
 fi
 
 abk_log "service: done"

@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。91 个移植组（core 66 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。93 个移植组（core 68 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -351,6 +351,23 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-18-0"></a>
+
+## companion v0.18.0（MGLRU 每次开机都被 ROM 关回去：单次写入输掉写序）
+
+真机（vermeer，5.15.217-Sailboat-20260927）复勘：`CONFIG_LRU_GEN_ENABLED=y` 且 companion 在
+post-fs-data 写过 `0x0003`，运行时却恒为 `0x0000`——`/product/etc/build.prop` 持久设置
+`persist.sys.stability.SmartCacheEnable=true`，init.rc 触发器据此在 post-fs-data 之后把
+`lru_gen/enabled` 写回 0（其保护的 `/sys/kernel/smart_cache/` 在本内核根本不存在），单次写入
+每开机必输，Batch 37 的六个 MGLRU 组因此仍然空转。修复：新增 `abk_reassert_lru_gen()`（仅 bit 0
+被清时才写 `y` 并记 WARN，安静 tick 不写不记）与独立 supervisor（`vm.reassert_interval_sec`，
+默认 60 s，独立于 zram supervisor 以免被 `zram.recomp.enable=0` 连停），`service.sh` 在
+`lru_gen.enable=1` 且节点存在时拉起；`0` 仍是 no-op，不是 override。验证：单测新增 8 条断言；
+真机模拟 ROM 写 0 后 65 秒内修复；**完整重启实测**：日志拍下「ROM 触发器开火 → supervisor 首
+tick 修复」全序列，此后 MGLRU 稳定 `0x0003`。
+
+---
+
 <a id="companion-v0-13-0"></a>
 
 ## companion v0.13.0（重压缩扫描的饥饿：被清掉的前缀每趟又被标回去）
@@ -553,6 +570,23 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 ---
 
 
+## companion v0.17.0（mark 时钟的单位错 30 倍：二压其实一次都没跑过）
+
+真机复勘发现二压从未运行：`_zs_mark_tick` 按 sweep 计数，`_zs_per_mark` 却错按 reassert tick 除，
+默认值下 86400/60=1440 落在 sweep 计数器上 = **30 天**而非声明的 24 h；且 `idle_age_sec=3600` 使
+开机首次 mark 永远为空，此后每趟 `--no-mark` 扫空却仍报 `sweep done`（失败与成功日志同形，故一直
+没被发现）。compressor 本身经 hot_add 对照实验排除（2.16x/2.77x 与 Batch 10-4/11 逐字节吻合）；
+手动补标记跑满几轮后真机比值 2.72x → 3.36x（约 210 MB），即这笔 savings 从未被自动机制拿到。
+
+修复：除数改按 sweep 间隔；`idle_age_sec` 3600→900、`mark_interval_sec` 86400→10800、
+`max_pages` 16384→131072（补偿旋钮：重标会重新交回页龄未刷新的页；真机实测 131072 次 attempt =
+入队 0.58 s + worker 4.2 s，占空比 0.27%）；容量口径不变（6 × 131072 = 3 GiB/周期）。
+
+验证：新增 fixture 7b（interval 与 reassert 取不同值才能让该单位错误可见）后全套单测 1323 项
+全绿，真机 mksh `sh -n` 过。未做：新档位下二压推进形态的长窗口验证。
+
+---
+
 ## companion v0.16.0 + sailboat 附加模块（二）:调度侧拆成独立模块
 
 把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个
@@ -735,9 +769,34 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+## Batch 47(二压扫描跳过已无可改进的槽位,v0.50.0)
+
+v0.17.0 把 mark 时钟修对后，mark 每 3 小时把页龄未刷新的页重新标成 `ZRAM_IDLE`——该条件对
+「上一趟刚压过的页」恒成立（`zram_recompress()` 走 `zram_read_from_zspool()` 不走
+`zram_accessed()`），而内核 sweep 每趟从 index 0 重走、把 `max_pages` 预算花在"压不出改进的
+attempt"上，于是预算在碰到新冷页前就用完。`zram_recompress()` 的优先级循环对这类条目本就返回
+0，但走到那里之前已付过 slot lock、一次完整 decompress 和一次 `ZRAM_IDLE` 清除，异步节点还多
+排一笔 job。
+
+落地 1 组（core 67 → 68）：`zram_recomp_best_prio_skip`，三步全 required——谓词
+`abk_zram_recompress_pointless()`（挂在 `zram_recompression` 机制前边界，条件与优先级循环逐字
+同义，自带 `CONFIG_ZRAM_MULTI_COMP` 守卫，否则无机制的构建里未使用 static 是 `-Werror`）+ 同步
+节点过滤器（`num_recomp_pages--;` 之前，跳过不占 cap）+ 异步节点过滤器（`candidate = true;`
+之前，不排 job）。**不是上游移植**：上游没有「重标与排空频率不同」的旋钮，不存在这个区分。本
+模块第三个改写别组生成文本的组，挂点全部是块边界，register 排在三个被依赖组之后。
+
+另含审计基线重键 216 → 217（rolling 分支滚动，与设备 `5.15.217-Sailboat` 一致）。抓取工具
+教训：`base64.b64decode(validate=False)` 会把 503 错误页静默解成"像文本"的垃圾（74/92 文件
+中招），需 `validate=True` + Makefile 的 `SUBLEVEL`/`VERSION` 断言。
+
+验证：新增 22 条单测断言 + `implementation_audit.py` 的 5 条 `REQUIRED_CONTENT` 与 2 条
+`REQUIRED_IN_FUNCTION`（顺序用 `must_not_have` 反着钉），全套 1361 项全绿，四道门禁重跑。
+**未验证：编译（本组引入 C，只有 ABK CI 能证明）与真机长窗口推进形态。**
+
 <a id="batch-46"></a>
 
 ## Batch 46(erofs readmore EOF 收口,v0.49.0)
+
 
 主题：**把 erofs readmore 的预读循环在 EOF 处收口**。来源
 `docs/survey_erofs_upstream.md` §4.1 —— 该 survey 的 §7 建议是"先单独落地这

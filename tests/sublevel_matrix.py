@@ -17,7 +17,7 @@ stays empty.
 Since Batch 44 there is exactly **one** supported baseline, the rolling
 ``android13-5.15-lts`` branch, and the row key is its **Makefile SUBLEVEL**:
 
-  216 -> android13-5.15-lts   (rolling; re-key on every re-fetch)
+  217 -> android13-5.15-lts   (rolling; re-key on every re-fetch)
 
 The three release baselines that used to be listed here
 (167 -> deprecated/android13-5.15-2024-11, 178 -> -2025-03,
@@ -133,7 +133,10 @@ GROUP_COUNTS = {
     # performance change with a Fixes: tag but no Cc: stable -- and its single
     # three-line anchor is unique in fs/erofs/zdata.c, a file Batch 40 already
     # put in the fixture, and outside every one of that batch's steps there.
-    "stable_backport_core": 67,
+    # Batch 47 adds one: zram_recomp_best_prio_skip -- not an upstream port (no
+    # commit to name, so it cannot arrive pre-applied), the module's third
+    # generated-text rewriter, registered after its three dependencies.
+    "stable_backport_core": 68,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
@@ -210,7 +213,7 @@ PRE_APPLIED = {
     # step_audit / implementation_audit / smoke run is the only thing that
     # catches that, so it has to be run after every lts re-fetch.  See
     # docs/porting_policy.md "Lts-only maintenance".
-    "216": {
+    "217": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
             "fdtable_replace_fd_errno",
@@ -276,7 +279,7 @@ SUPPORTED = tuple(PRE_APPLIED)
 # speak of: this is the SUBLEVEL the single matrix row is keyed to.  It is used
 # as the ABK_TEST_SUB_LEVEL / missing-Makefile default, and audit_tree() treats
 # a tree that disagrees with it as an error rather than a downgrade.
-DEFAULT_SUB_LEVEL = "216"
+DEFAULT_SUB_LEVEL = "217"
 
 
 def pre_applied(sub_level, child):

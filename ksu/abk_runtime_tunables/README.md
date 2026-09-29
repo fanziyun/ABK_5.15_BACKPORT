@@ -187,11 +187,11 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | key | default | meaning |
 |---|---|---|
 | `zram.recomp.enable` | `1` | drive age-marked recompression sweeps (on by default, together with the compaction gate below -- both ride this clock) |
-| `zram.recomp.idle_age_sec` | `3600` | mark only pages untouched this long |
+| `zram.recomp.idle_age_sec` | `900` | mark only pages untouched this long. Must be shorter than the boot time of the first sweep (~30 min after the supervisor starts), or the boot mark that collects the initial cold set is empty |
 | `zram.recomp.interval_sec` | `1800` | seconds between sweeps |
-| `zram.recomp.mark_interval_sec` | `86400` | seconds between **mark** steps. Only a mark makes new cold pages eligible; the sweeps in between pass `--no-mark`, because a mark sets `ZRAM_IDLE` on every page older than the age cutoff and a recompressed page never has its age refreshed (`zram_recompress()` reads through `zram_read_from_zspool()`, not `zram_accessed()`), so marking before every pass would hand a capped sweep the same prefix forever. This is the knob that bounds what a capped sweep can reach: one cycle drains `mark_interval_sec / interval_sec` sweeps × `max_pages` entries -- 3 GiB of cold pages at the defaults. |
+| `zram.recomp.mark_interval_sec` | `10800` | seconds between **mark** steps. Only a mark makes new cold pages eligible; the sweeps in between pass `--no-mark`, because a mark sets `ZRAM_IDLE` on every page older than the age cutoff and a recompressed page never has its age refreshed (`zram_recompress()` reads through `zram_read_from_zspool()`, not `zram_accessed()`), so marking before every pass would hand a capped sweep the same prefix forever. This is the knob that bounds what a capped sweep can reach: one cycle drains `mark_interval_sec / interval_sec` sweeps × `max_pages` entries -- 3 GiB of cold pages at the defaults. |
 | `zram.recomp.threshold` | `0` | only recompress entries at least this large |
-| `zram.recomp.max_pages` | `16384` | how many entries **one** sweep may attempt (0 = no cap). An uncapped pass walks every idle entry in index order -- tens of seconds of one core on a full device; 16384 attempted entries is 64 MiB of pages. Requires the kernel's `max_pages` parameter (module Batch 24): on a kernel without it the parameter is ignored and the sweep stays unbounded, exactly as before that batch. |
+| `zram.recomp.max_pages` | `131072` | how many entries **one** sweep may attempt (0 = no cap). An uncapped pass walks every idle entry in index order -- tens of seconds of one core on a full device; 131072 attempted entries is 512 MiB of pages, measured at 0.58 s to enqueue plus 4.2 s of worker on the target device. Requires the kernel's `max_pages` parameter (module Batch 24): on a kernel without it the parameter is ignored and the sweep stays unbounded, exactly as before that batch. |
 | `zram.recomp.mode` | `async` | `async` (kernel worker) or `sync` |
 | `zram.compact.enable` | `1` | after each sweep tick, run one gated `compact` pass (rides the sweep clock, so `zram.recomp.enable=0` stops it too) |
 | `zram.compact.min_waste_mb` | `50` | only compact when `mem_used_total − compr_data_size` exceeds this many MiB; 1..1024 |
@@ -207,8 +207,9 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override |
+| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override. Re-asserted on a timer, because this ROM's init writes the node back to 0 from its `SmartCacheEnable` trigger after post-fs-data |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
+| `vm.reassert_interval_sec` | `60` | seconds between lru_gen re-asserts (min 5); a repair is logged, a quiet tick writes nothing |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
 | *(cpufreq / scheduler keys)* | — | **moved to sailboat addon 2** (`ksu/sailboat_addon_2`): the governor held on every policy, the `abk_sf_*` floor and the `abk_sc_*` cap, with the measured reasons behind v0.16.0's `cap_pct=90` |
 | `readahead.dynamic_readahead` | *(empty)* | `0`/`1` |

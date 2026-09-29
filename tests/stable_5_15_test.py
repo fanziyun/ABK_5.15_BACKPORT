@@ -2391,6 +2391,36 @@ def test_mglru_is_enabled_by_the_default_tier():
             check("abk_apply_lru_gen() writes y, never a bare 1",
                   'abk_write "$_lg_node" y' in body, "the write target changed")
 
+    # The ROM's init writes lru_gen/enabled 0 after post-fs-data
+    # (SmartCacheEnable trigger), so the companion re-asserts it on a timer.
+    check("common.sh ships the lru_gen reassert",
+          "abk_reassert_lru_gen()" in common_sh
+          and 'abk_write "$_rl_node" y' in common_sh,
+          "no reassert write in common.sh")
+    check("the reassert stays write-only (no n branch either)",
+          'abk_write "$_rl_node" n' not in common_sh, "reassert writes n")
+    rstart = next((i for i, l in enumerate(lines)
+                   if l.startswith("abk_reassert_lru_gen()")), None)
+    if rstart is not None:
+        rend = next((i for i in range(rstart + 1, len(lines))
+                     if lines[i] == "}"), None)
+        rbody = "\n".join(lines[rstart:rend + 1]) if rend is not None else ""
+        check("the reassert is gated on lru_gen.enable=1",
+              'abk_cfg lru_gen.enable 0' in rbody, rbody)
+        check("the reassert only fires on an even mask (bit 0 clear)",
+              "*0|*2|*4|*6|*8" in rbody, rbody)
+    service_sh = (ksu / "service.sh").read_text(encoding="utf-8")
+    check("service.sh spawns the lru_gen supervisor on enable=1",
+          "--supervise-lru-gen" in service_sh
+          and 'abk_cfg lru_gen.enable 0' in service_sh, service_sh[-800:])
+    check("tunables.conf ships the reassert interval key",
+          re.search(r"(?m)^vm\.reassert_interval_sec=60$", tunables) is not None,
+          [l for l in tunables.splitlines()
+           if l.startswith("vm.reassert_interval_sec")])
+    check("vm.reassert_interval_sec is a known config key",
+          re.search(r"(?m)^vm\.reassert_interval_sec$", common_sh) is not None,
+          "abk_cfg_lint would flag the key as unknown")
+
 
 def test_batch10_memcg_v1_reclaim():
     print("Batch 10-4 memcg_v1_reclaim")
@@ -2983,6 +3013,150 @@ rm -rf "$T"
           and got.get("RC_MARK_EACH_BAD") == "2", r.stdout)
 
 
+def test_batch47_zram_recomp_best_prio_skip():
+    """Batch 47: a sweep skips entries no higher priority can improve."""
+    print("Batch 47: zram_recomp_best_prio_skip (skip pointless recompressions)")
+
+    import abk_stable_core as core
+    import batch24_core_zram_max_pages as b24
+    import batch47_core_zram_recomp_skip as b47
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "zram_recomp_best_prio_skip"), None)
+    check("zram_recomp_best_prio_skip group registered", group is not None)
+    if group is None:
+        return
+    keys = [g.key for g in core.PATCH_GROUPS]
+    # Trap 5, third instance: this group rewrites generated text, so it must be
+    # ordered behind everything that produces it.
+    for dep in ("zram_recompression", "zram_async_recompress",
+                "zram_recompress_max_pages"):
+        check(f"registered after {dep} (it generates an anchor)",
+              keys.index("zram_recomp_best_prio_skip") > keys.index(dep))
+
+    steps = b47.build_steps()
+    check("three required steps: the predicate and one filter per node",
+          len(steps) == 3 and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j in range(i + 1, len(steps)):
+            check("step %d new does not contain step %d new" % (i, j),
+                  steps[j][2] not in new_i)
+
+    # Trap 7: the predicate reads comps[], real only under
+    # CONFIG_ZRAM_MULTI_COMP; unguarded it would also be an unused static.
+    check("the predicate is wrapped in CONFIG_ZRAM_MULTI_COMP",
+          b47._HELP_NEW.count("#ifdef CONFIG_ZRAM_MULTI_COMP") == 1
+          and b47._HELP_NEW.count("#endif") == 1)
+    check("the predicate is anchored on pristine text, not on Batch 4's payload",
+          "static void zram_bio_discard" not in b47._HELP_OLD
+          and b47._HELP_OLD in b47._HELP_NEW)
+    check("the predicate reads the priority and walks comps[] the way "
+          "zram_recompress() does",
+          "zram_get_priority(zram, index)" in b47._HELP_NEW
+          and "prio > abk_cur && zram->comps[prio]" in b47._HELP_NEW)
+
+    # Trap 1: old must not be a prefix of new, or idempotency fires early.
+    for name, old, new in (("sync", b47._SYNC_OLD, b47._SYNC_NEW),
+                           ("async", b47._ASYNC_OLD, b47._ASYNC_NEW)):
+        check(f"the {name} step's old is not a prefix of its new",
+              not new.startswith(old))
+
+    # The shape both scans have after zram_recompression, zram_async_recompress
+    # and zram_recompress_max_pages have all applied.
+    sync_body = (
+        "static void zram_bio_discard(struct zram *zram, u32 index,\n"
+        "\t\t\t\t    struct bio *bio)\n"
+        "{\n}\n\n"
+        + b47._HELP_OLD
+        + "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
+        + b47.RECOMPRESS_HELPER + " struct page *page,\n"
+        "\t\t\t   u32 threshold, u32 prio, u32 prio_max)\n"
+        "{\n\treturn 0;\n}\n\n"
+        "static ssize_t recompress_store(struct device *dev,\n"
+        "\t\t\t\tstruct device_attribute *attr,\n"
+        "\t\t\t\tconst char *buf, size_t len)\n"
+        "{\n"
+        + b24._SYNC_HEAD_NEW +
+        "\n\tif (threshold >= huge_class_size)\n\t\treturn -EINVAL;\n\n"
+        + b24._SYNC_LOOP_NEW +
+        "\n\tif (!zram_allocated(zram, index))\n\t\tgoto next;\n\n"
+        + b47._SYNC_OLD +
+        "next:\n\t\tzram_slot_unlock(zram, index);\n\t}\n}\n\n"
+        "#endif\n\n"
+    )
+    async_body = (
+        "static ssize_t recompress_async_store(struct device *dev,\n"
+        "\t\t\t\tstruct device_attribute *attr,\n"
+        "\t\t\t\tconst char *buf, size_t len)\n"
+        "{\n"
+        + b24._ASYNC_HEAD_NEW +
+        "\n\tif (threshold >= huge_class_size)\n\t\treturn -EINVAL;\n\n"
+        + b24._ASYNC_LOOP_NEW +
+        "\n\tif (!zram_allocated(zram, index))\n\t\tgoto abk_async_next;\n\n"
+        + b47._ASYNC_OLD +
+        "abk_async_next:\n\t\tzram_slot_unlock(zram, index);\n"
+        "\t\tif (!candidate)\n\t\t\tcontinue;\n\n"
+        + b24._ASYNC_ENQUEUE_NEW +
+        "\t\tif (err) {\n\t\t\tret = err;\n\t\t\tbreak;\n\t\t}\n\t}\n}\n"
+    )
+    files = {b47.ZRAM_C: sync_body + async_body}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, files)
+        status, detail = group.apply_fn(ctx)
+        check("all three steps land on the composed shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b47.ZRAM_C)
+
+        check("the predicate is defined exactly once",
+              text.count(b47.SKIP_PREDICATE) == 1)
+        check("both nodes carry the filter",
+              text.count("if (abk_zram_recompress_pointless(zram, index, "
+                         "prio, prio_max))") == 2)
+        # The async filter must precede `candidate = true`; scoped to the async
+        # function so the sync filter (first match in the file) is not compared.
+        async_part = text[text.index("recompress_async_store"):]
+        check("the async filter precedes candidate = true",
+              async_part.index("if (abk_zram_recompress_pointless") <
+              async_part.index("candidate = true;"),
+              [ln for ln in text.split(chr(10))
+               if "candidate = true" in ln or "pointless" in ln])
+        check("the sync filter precedes the attempt and its cap decrement",
+              text.index("if (abk_zram_recompress_pointless") <
+              text.index("num_recomp_pages--;"))
+        check("the sync filter follows the candidate filters",
+              text.index("if (abk_zram_recompress_pointless") >
+              text.index("zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))"))
+
+        snapshot = ctx.read(b47.ZRAM_C)
+        status2, detail2 = group.apply_fn(ctx)
+        check("a second pass is idempotent",
+              status2 == "already_present" and ctx.read(b47.ZRAM_C) == snapshot,
+              (status2, detail2))
+
+    # Dependency order: without max_pages the sync anchor does not exist, and
+    # such a tree must be refused with nothing written.
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = files[b47.ZRAM_C].replace(
+            "\t\tnum_recomp_pages--;\n"
+            "\t\terr = zram_recompress(zram, index, page, threshold, prio, prio_max);\n",
+            "\t\terr = zram_recompress(zram, index, page, threshold, prio, prio_max);\n")
+        ctx2 = make_ctx(tmp, {b47.ZRAM_C: bare})
+        st_b, d_b = group.apply_fn(ctx2)
+        check("a tree without the max_pages graft is refused, not half-patched",
+              st_b == "blocked_by_shape" and ctx2.pending_writes() == [],
+              (st_b, d_b))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx3 = make_ctx(tmp, {})
+        st_e, d_e = group.apply_fn(ctx3)
+        check("degrades on an empty tree",
+              st_e.startswith("blocked") and ctx3.pending_writes() == [],
+              (st_e, d_e))
+
+
 def test_runtime_tunables_module():
     """The KernelSU companion module, its fixed zram policy and its packagers.
 
@@ -3088,7 +3262,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.49.0", "0.49.0"], _versions)
+          _versions == ["0.50.0", "0.50.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3246,6 +3420,33 @@ def test_runtime_tunables_module():
           all(key in common_sh for key in ("zram.compact.enable",
                                            "zram.compact.min_waste_mb",
                                            "zram.compact.waste_pct")))
+
+    # The recompression defaults live in four places (tunables.conf, abk_cfg
+    # fallback, the clamp, the README table); retune all four together.
+    _zs_clamp = {
+        "zram.recomp.idle_age_sec": "_zs_age",
+        "zram.recomp.interval_sec": "_zs_interval",
+        "zram.recomp.mark_interval_sec": "_zs_mark_interval",
+        "zram.recomp.max_pages": "_zs_max_pages",
+    }
+    _zs_readme = (module_dir / "README.md").read_text(encoding="utf-8")
+    for _key, _value in (("zram.recomp.idle_age_sec", "900"),
+                         ("zram.recomp.interval_sec", "1800"),
+                         ("zram.recomp.mark_interval_sec", "10800"),
+                         ("zram.recomp.max_pages", "131072")):
+        check(f"tunables.conf ships {_key}={_value}",
+              re.search(rf"(?m)^{re.escape(_key)}={_value}\s*$", tunables)
+              is not None)
+        check(f"{_key} has the same abk_cfg fallback in the supervisor",
+              re.search(rf"abk_cfg {re.escape(_key)} {re.escape(_value)}\b",
+                        policy) is not None)
+        check(f"{_key} has the same abk_is_uint clamp in the supervisor",
+              re.search(rf"abk_is_uint \"\${_zs_clamp[_key]}\" \|\| "
+                        rf"{_zs_clamp[_key]}={re.escape(_value)}\b",
+                        policy) is not None)
+        check(f"the README documents {_key}={_value}",
+              f"{_key}` | `{_value}`" in _zs_readme)
+
 
     # Byte-count arithmetic has to leave the shell: /system/bin/sh is Android's
     # mksh and wraps at 2^31 on the target ROM (measured on device:
@@ -3782,6 +3983,36 @@ echo "supervisor_gate_line=$(grep -o 'compact=[^ ]*' "$T/state/abk_runtime_tunab
 echo "supervisor_pid=$([ -s "$T/state/zram.pid" ] && echo set || echo unset)"
 printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
 
+# 7b. the mark clock is counted in SWEEPS, not ticks: _zs_per_mark must divide
+#     by the sweep interval, and only a fixture whose interval differs from the
+#     reassert (with a second mark reached) can show it.
+reset_fixture
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+printf '1443160064 186810547 352772096 0 0 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+# one sweep every 3 ticks, a mark every second sweep; the wrong divisor would
+# still pass --no-mark on the third run.
+printf 'zram.recomp.enable=1\nzram.recomp.interval_sec=60\nzram.reassert_interval_sec=20\nzram.recomp.mark_interval_sec=120\n' > "$T/tunables.conf"
+: > "$T/runs"
+mkdir -p "$T/fakebin"
+cat > "$T/fakebin/tool.sh" <<EOF
+#!/bin/sh
+echo "run \$*" >> "$T/runs"
+exit 1
+EOF
+chmod +x "$T/fakebin/tool.sh"
+export ABK_RECOMP_TOOL="$T/fakebin/tool.sh"
+_n=0
+sleep() { _n=$((_n+1)); [ "$_n" -ge 20 ] && exit 0; return 0; }
+( abk_zram_supervisor_main > "$T/out7b" 2>&1 )
+sleep() { return 0; }
+echo "mark_run1=$(sed -n '1p' "$T/runs")"
+echo "mark_run2=$(sed -n '2p' "$T/runs")"
+echo "mark_run3=$(sed -n '3p' "$T/runs")"
+echo "mark_run4=$(sed -n '4p' "$T/runs")"
+echo "mark_runs=$(wc -l < "$T/runs" | tr -d ' ')"
+printf 'zram.recomp.enable=1\n' > "$T/tunables.conf"
+
 # 8. tunables.conf parsing: unknown keys warn, empty means "leave alone"
 reset_fixture
 printf 'zram.recomp.enable=1\nvm.swappiness=\nbogus.key=7\n' > "$T/tunables.conf"
@@ -3954,7 +4185,7 @@ rm -rf "$T"
           (got.get("supervisor_runs") or "0").isdigit()
           and int(got["supervisor_runs"]) >= 3, r.stdout)
     check("the supervisor drives an age-marked pass",
-          "--idle-age 3600" in got.get("supervisor_args", ""),
+          "--idle-age 900" in got.get("supervisor_args", ""),
           got.get("supervisor_args"))
     check("the supervisor tick runs the gated compaction on a fragmented device",
           got.get("supervisor_compact") == "100", r.stdout)
@@ -3969,9 +4200,24 @@ rm -rf "$T"
           and "--no-mark" in got.get("supervisor_args2", ""),
           (got.get("supervisor_args"), got.get("supervisor_args2")))
     check("the supervisor up line carries the mark cadence",
-          got.get("supervisor_mark") == "mark=86400s", r.stdout)
+          got.get("supervisor_mark") == "mark=10800s", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
+
+    # 7b assertions.  One mark per mark_interval / interval_sec sweeps: here
+    # every second sweep, so mark, drain, mark, drain.
+    check("the mark cadence survives long enough to reach a second mark",
+          (got.get("mark_runs") or "0").isdigit()
+          and int(got["mark_runs"]) >= 4, r.stdout)
+    check("the first sweep marks", "--no-mark" not in got.get("mark_run1", ""),
+          got.get("mark_run1"))
+    check("the sweep after it passes --no-mark",
+          "--no-mark" in got.get("mark_run2", ""), got.get("mark_run2"))
+    check("the SECOND sweep after a mark marks again, so the cold set is "
+          "refreshed once per mark_interval_sec / interval_sec sweeps",
+          "--no-mark" not in got.get("mark_run3", ""), got.get("mark_run3"))
+    check("the sweep after the second mark passes --no-mark",
+          "--no-mark" in got.get("mark_run4", ""), got.get("mark_run4"))
 
     # 11: the writeback sweep.  The kernel only moves a page when userspace
     # asks, so this is the whole trigger -- and it is the one place the module
@@ -6205,6 +6451,7 @@ def main():
     test_batch22_psi_oncpu_state_mask()
     test_batch23_zram_writeback_guard()
     test_batch24_zram_max_pages()
+    test_batch47_zram_recomp_best_prio_skip()
     test_batch32_zram_wb_slot_preserve()
     test_f2fs_shape_probe()
     test_kabi_slot_policy()
