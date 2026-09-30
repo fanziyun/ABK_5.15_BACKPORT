@@ -3,8 +3,9 @@
 #
 # Only the knobs that want to be in place before the first real memory
 # pressure are applied here: vm sysctls, MGLRU (opt-in), THP (opt-in), the
-# schedutil smart-freq parameters (opt-in), the dynamic-readahead switch
-# (opt-in) and the kernel-domain SELinux rule the zram writeback path needs.
+# dynamic-readahead switch (opt-in) and the kernel-domain SELinux rule the zram
+# writeback path needs.  (The schedutil smart-freq parameters this stage once
+# also carried moved to sailboat addon 2, ksu/sailboat_addon_2.)
 # The rule has to be in place *before* something attaches a backing device,
 # because from that moment on the denied side is a kernel thread; the zram work
 # itself belongs to service.sh, because on this ROM the zram device is

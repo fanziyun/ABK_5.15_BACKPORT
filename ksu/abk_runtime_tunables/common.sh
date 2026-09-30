@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.18.0"
+ABK_VERSION="v0.19.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -44,6 +44,15 @@ ABK_ZRAM_MEM_LIMIT_PCT=25   # cap on compressed zram memory, percent of RAM
 ABK_ZRAM_MIN_FREE_MB=256
 ABK_ZRAM_WAIT_SECS=45       # wait for the ROM's own zram bring-up before ours
 ABK_ZRAM_REASSERT_SECS=60   # how often the policy is re-checked once running
+# Writeback auto-attach backoff.  A backing device can only be attached in the
+# pre-`disksize` window, so establishing one means a full device rewrite
+# (swapoff -> reset -> ... -> swapon).  When that attach keeps failing -- no free
+# loop device, /data not writable, an AVC on the store -- "writeback wanted but
+# unowned" would otherwise re-arm that rewrite on every reassert tick, tearing
+# the swap area down and back up once a minute forever.  A failed auto-attach
+# therefore stands the auto path down for this long before it may drive another
+# rewrite; a successful attach clears it at once.
+ABK_ZRAM_WB_RETRY_SECS=3600
 
 # --- test / diagnostic seams ----------------------------------------------
 # Every device path and helper command can be redirected, so the policy can be
@@ -144,6 +153,12 @@ abk_warn() {
 
 abk_read() {
   cat "$1" 2>/dev/null || true
+}
+
+# Wall-clock seconds, or empty when the device has no usable clock.  Used only
+# by the writeback backoff, which treats "no clock" as "never suppress".
+abk_now_secs() {
+  date +%s 2>/dev/null
 }
 
 abk_is_uint() {
@@ -587,8 +602,14 @@ abk_psi_pass() {
   _pa_protect="$(abk_psi_protect)"
   _pa_out="$(sh "$_pa_tool" --apply --mode "$_pa_mode" --protect "$_pa_protect" --cgroot "$ABK_CGROOT" 2>&1)"
   _pa_rc=$?
+  # Reset each pass: the give-up rule reads the tool's summary line out of this
+  # variable, so a pass that writes none must not leave a previous one standing.
+  ABK_PSI_LAST_LINE=""
   while IFS= read -r _pa_line; do
     [ -n "$_pa_line" ] || continue
+    case "$_pa_line" in
+      "psi: mode="*) ABK_PSI_LAST_LINE="$_pa_line" ;;
+    esac
     # Steady state is a pass that disabled nothing: almost every group is
     # already off, so the line is bookkeeping.  Keep it in the module log but
     # out of logcat, which the supervisor would otherwise hit every interval.
@@ -603,14 +624,13 @@ EOF
   return $_pa_rc
 }
 
-# Read the last pass line back out of the log, so the give-up rule judges what
-# the tool actually reported instead of a private copy of its output format.
+# The tool's own summary line from the pass just run (captured verbatim in
+# abk_psi_pass), so the give-up rule judges what the tool actually reported.
+# Held in a variable rather than re-grepped from the persistent log: that log
+# survives reboots, so a pass that produced no line of its own would otherwise
+# hand the rule a verdict left over from a previous boot.
 abk_psi_state_line() {
-  _pl_log="$(abk_log_file)"
-  if [ -f "$_pl_log" ]; then
-    grep 'psi: mode=' "$_pl_log" 2>/dev/null | tail -n 1
-  fi
-  return 0
+  printf '%s\n' "${ABK_PSI_LAST_LINE:-}"
 }
 
 abk_psi_node_count() {
@@ -626,6 +646,13 @@ abk_psi_supervisor_main() {
   abk_pid_write psi "$$"
   _ps_interval="$(abk_psi_interval)"
   abk_log "per-cgroup PSI supervisor up: mode=$(abk_psi_mode) protect=$(abk_psi_protect) interval=${_ps_interval}s"
+  # auto only reaches groups holding no tasks, and a task-empty group never runs
+  # the per-state-change accounting that disabling it would save -- measured on
+  # the target as a no-op with extra steps (docs/psi_field_protocol.md).  Say so
+  # once at startup; aggressive is the mode that touches real work.
+  if [ "$(abk_psi_mode)" = auto ]; then
+    abk_warn "psi.cgroup=auto reaches only task-empty groups, which cost nothing to begin with (measured no-op); use aggressive to affect accounted groups"
+  fi
   _ps_first=1
   while :; do
     abk_psi_pass
