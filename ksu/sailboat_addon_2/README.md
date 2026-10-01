@@ -2,10 +2,12 @@
 
 The scheduling half, split out of the ABK runtime tunables module (sailboat addon 1). It owns two things and nothing else:
 
-* **the cpufreq governor** — every policy is held on `schedutil` (see below), because that is the one governor the two smart-freq payloads act under;
+* **the cpufreq governor** — it can hold every policy on `schedutil` (see below), the one governor the two smart-freq payloads act under;
 * **the smart-freq band** — `schedutil_smart_policy`'s floor and Batch 42's cap, which the ABK kernel module grafts into `kernel/sched/cpufreq_schedutil.c`.
 
 The grafts themselves stay in the kernel module: a KernelSU module is userspace and cannot carry compiled kernel code. What lives here is the userspace that arms the band, keeps the governor in force, and reports who owns the frequency range.
+
+**Shipped state since v0.2.0: all of it stands down.** `sched.abk_governor` ships empty — the ROM's own governor choice stands, no supervisor process runs, and the boot pass writes nothing to any `scaling_*` node — and both smart-freq enables ship `0`, re-stating the kernel payloads' own off at post-fs-data. The module installs as a reporter, not a taker-over: the DVFS ownership report, `action.sh status` and `bin/abk_fas_check.sh` all still work. Arming anything is a deliberate `tunables.conf` edit; the measured facts below are what to re-read first.
 
 Install it with the KernelSU manager, or `ksud module install sailboat_addon_2.zip`. It is bundled into the AnyKernel3 zip alongside addon 1, so flashing the kernel installs both.
 
@@ -35,13 +37,13 @@ The supervisor stops itself after three consecutive rounds in which **every** po
 
 | key | default | meaning |
 |---|---|---|
-| `sched.abk_governor` | `schedutil` | the governor held on every policy; **empty leaves the ROM's own choice alone** |
+| `sched.abk_governor` | *(empty)* | the governor held on every policy; **empty leaves the ROM's own choice alone** (shipped state) |
 | `sched.abk_governor_interval_sec` | `30` | how often the governor supervisor re-asserts (5..3600) |
-| `sched.abk_sf_enable` | `1` | the smart-freq floor |
+| `sched.abk_sf_enable` | `0` | the smart-freq floor; `1` arms it (shipped disarmed) |
 | `sched.abk_sf_floor_pct` | `85` | the floor end of the band; **must stay below `sched.abk_sc_cap_pct`** |
 | `sched.abk_sf_sustained_ms` | `300` | ms at ≥90% of capacity before a CPU starts boosting (1..60000) |
 | `sched.abk_sf_exit_ms` | `250` | ms below 70% before a boosting CPU clears (1..60000) |
-| `sched.abk_sc_enable` | `1` | the Batch 42 smart_freq cap; same ownership gates as the floor |
+| `sched.abk_sc_enable` | `0` | the Batch 42 smart_freq cap; same ownership gates as the floor; `1` arms it (shipped disarmed) |
 | `sched.abk_sc_cap_pct` | `90` | the ceiling end of the band; **must stay above `sched.abk_sf_floor_pct`**, and `100` is no clamp |
 | `sched.abk_sc_hold_ms` | `300` | ms the request must stay above the cap before it is released (1..60000) |
 | `sched.abk_sc_release_pct` | `70` | every CPU of the policy below it, for `release_ms`, re-asserts the cap |

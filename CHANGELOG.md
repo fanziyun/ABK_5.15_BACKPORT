@@ -587,6 +587,30 @@ dry-run 分支不得出现 `$_ABK_` 形状的笔误。
 
 ---
 
+<a id="addon2-v0-2-0"></a>
+
+## sailboat 附加模块（二）v0.2.0（调度半区出厂收兵：governor 与 smart-freq band 默认不再接管）
+
+**目标**：附加模块（二）随内核刷入即接管调度面（governor 全局钉 `schedutil` + smart-freq floor/cap 双双武装）改为出厂全部收兵——调度接管从此是装上之后需要显式编辑 `tunables.conf` 才会发生的事。**内核 graft 一行未动**：Batch 10-5 / Batch 42 两组 payload 本就默认 `abk_sf_enable=false` / `abk_sc_enable=false`，此前唯一的武装点就是伴随模块的 `tunables.conf`，故本批只动用户态这一份配置。
+
+**改的值**（`ksu/sailboat_addon_2/tunables.conf`）：
+
+| 键 | v0.1.0 | v0.2.0 | 效果 |
+|---|---|---|---|
+| `sched.abk_governor` | `schedutil` | *(空)* | ROM 自己的 governor 策略生效；`service.sh` 不再 spawn 监督者（空键连进程都不起，只落一行日志），boot pass 对任何 `scaling_governor` 节点零写入，`abk_gov_enforce()` 打 `disabled` |
+| `sched.abk_sf_enable` | `1` | `0` | floor 停用；post-fs-data 向内核节点写回 0——与内核默认相同，是显式重申而非新状态 |
+| `sched.abk_sc_enable` | `1` | `0` | Batch 42 cap 停用；同上 |
+
+其余键保持原值：`floor_pct=85`/`sustained_ms=300`/`exit_ms=250`/`hold_ms=300`/`release_pct=70`/`release_ms=250` 全是内核自身默认，`cap_pct` 保持实测的 90（内核默认 100）。enable=0 时这些值碰不到任何频率；留在文件里是给下次重新武装的人一个起点——cap_pct=90 的实测理由（vendor 把三个 policy 的 `scaling_max_freq` 钉在 `cpuinfo.max_freq` 的 92–94%，95 武装后从未运行过一次）与「cap_pct 不得压到 floor_pct 以下、否则即 Batch 10-4c 锁频」的不等式原样保留。governor 一节的实测记录（节点出厂 0444、chmod 0644 买到写权、vendor 事件驱动写回且写入者未确认）同样原样保留：那是重新命名 `sched.abk_governor` 时要面对的代价清单。
+
+**收兵后模块仍有行为的部分全部只读**：DVFS ownership 开机报告、`action.sh status`、`bin/abk_fas_check.sh`。
+
+**版本**：addon 2 `v0.1.0` → **v0.2.0**（versionCode 2），`common.sh` 的 `ABK_VERSION` 按惯例同步；`module.prop` 描述改为「ships stood down」。addon 1、`module.conf`、内核注册表与 `GROUP_COUNTS` 均不动。
+
+**测试**：`test_sched_tunables_module()` 两条出厂状态断言随值改写——「the module arms both the floor and the cap」改为钉两个 `=0`（出厂即收兵也要被钉住，默认漂移双向都得被抓），「the shipped governor is schedutil」改为钉空值并拒绝任何非空赋值；强制结构断言（11 个键、band 不等式、chmod 路径、监督者门控、CRLF 扫描）不变。全套单测 1368 项全绿，`bash -n` 四脚本过。**设备未刷入验证**：v0.1.0 尚未刷入过设备，本批不引入新的未验状态。
+
+---
+
 ## companion v0.16.0 + sailboat 附加模块（二）:调度侧拆成独立模块
 
 把调度相关的(`abk_sc_*` / `abk_sf_*`)从主模块完全分离,独立成另一个

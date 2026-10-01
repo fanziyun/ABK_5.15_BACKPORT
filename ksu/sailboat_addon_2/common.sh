@@ -10,7 +10,7 @@
 ABK_TAG="ABK-Sched"
 # Has to track module.prop: this banner is what the module manager shows, so a
 # drift between the two makes action.sh report a version the manager never lists.
-ABK_VERSION="v0.1.0"
+ABK_VERSION="v0.2.0"
 
 # Redirectable device paths (test seams), not user-facing knobs.
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"

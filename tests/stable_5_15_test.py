@@ -6298,9 +6298,9 @@ def test_sched_tunables_module():
                              sched_block).group(1))
     sc_cap = int(re.search(r"(?m)^sched\.abk_sc_cap_pct=(\d+)$",
                            sched_block).group(1))
-    check("the module arms both the floor and the cap",
-          re.search(r"(?m)^sched\.abk_sf_enable=1$", sched_block) is not None
-          and re.search(r"(?m)^sched\.abk_sc_enable=1$", sched_block) is not None,
+    check("the module ships the floor and the cap stood down (v0.2.0: =0)",
+          re.search(r"(?m)^sched\.abk_sf_enable=0$", sched_block) is not None
+          and re.search(r"(?m)^sched\.abk_sc_enable=0$", sched_block) is not None,
           [l for l in sched_block.splitlines() if l.startswith("sched.")])
     check("the cap stays above the floor (a crossed band is a frequency lock)",
           sc_cap - sf_floor >= 5 and sc_cap <= 100,
@@ -6365,9 +6365,12 @@ def test_sched_tunables_module():
         check(f"{key} is a known key", key in common_sh)
         check(f"{key} is assigned in the shipped tunables.conf",
               re.search(r"(?m)^" + re.escape(key) + r"=", tunables_conf) is not None)
-    check("the shipped governor is schedutil, not the ROM's walt default",
-          re.search(r"(?m)^sched\.abk_governor=schedutil$", tunables_conf)
-          is not None,
+    # v0.2.0 ships the scheduling half stood down: the governor key is assigned
+    # but empty, so the ROM's own choice stands and no supervisor spawns.  The
+    # enforcement machinery stays pinned above; this is the shipped *value*.
+    check("the shipped governor is the ROM's own choice (empty, not schedutil)",
+          re.search(r"(?m)^sched\.abk_governor=$", tunables_conf) is not None
+          and re.search(r"(?m)^sched\.abk_governor=\S+$", tunables_conf) is None,
           [l for l in tunables_code.splitlines() if l.startswith("sched.")])
     check("the DVFS report reads the governor but never writes it",
           "abk_gov_state_line" in dvfs and "abk_gov_enforce" not in dvfs)
