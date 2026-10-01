@@ -769,6 +769,21 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+<a id="companion-v0200"></a>
+
+## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
+
+调优依据:mark 的唯一职责是把新冷页放进二压候选池;消化速率由扫描班次 ×
+预算钉住(2 × 512 MiB/小时),与 mark 时钟无关——Batch 47 的跳过谓词让重打标
+交回的已最优页零预算成本,重打标在机制上已无历史代价。mark 必须慢于扫描
+(3600 > 1800,2 倍余量)仍是硬约束;45 分钟这类中间档位无法表达
+(`_zs_per_mark = mark_interval / interval_sec` 整数除法,2700 会静默坍缩成
+每 30 分钟一 mark)。收益:新冷页入选的最坏等待 3h → 1h,平均 ~1h45m →
+~45min;代价:每天 8 → 24 次 1–2 秒的整表 mark 扫描,无新增唤醒。默认值
+四处同步(tunables.conf / abk_cfg 回退 / abk_is_uint clamp / README 表格),
+单测钉子随动(默认值断言 + supervisor 日志断言)。设备未重新刷入验证——
+与 v0.17 实测走的是同一条执行路径,本次仅参数值与注释变化。
+
 <a id="batch-48"></a>
 
 ## Batch 48(内存审查修复:二压 OOM 空指针与 MGLRU may_swap 回归,v0.51.0,无新增组)
