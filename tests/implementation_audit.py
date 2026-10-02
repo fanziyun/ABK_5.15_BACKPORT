@@ -1054,6 +1054,58 @@ REQUIRED_CONTENT = {
         "current->flags |= PF_MEMALLOC | PF_KSWAPD;",
         "kfifo_out_locked(&kcd->fifo, &page, sizeof(page),",
     ],
+    # --- Batch 49 -------------------------------------------------------
+    # The MGLRU v7.2 reclaim-loop rework (0491e9f75c15 series).  The loop
+    # half is pinned on the shapes that replace the old coupling: the
+    # 4-arg pure predicate, the one-shot budget, the explicit aging step,
+    # the MIN_LRU_BATCH batch clamp and the exact isolation accounting.
+    "core:mglru_reclaim_loop_rework": [
+        "static unsigned long lruvec_evictable_size(struct lruvec *lruvec, int swappiness)",
+        "static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,\n"
+        "\t\t\t     struct scan_control *sc, int swappiness)",
+        "/* try to avoid aging, do gentle reclaim at the default priority */",
+        "nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);",
+        "while (nr_to_scan > 0) {",
+        "nr_batch = min_t(unsigned long, nr_to_scan, MIN_LRU_BATCH);",
+        "nr_to_scan -= delta;",
+        "if (root_reclaim(sc) && should_age)",
+        "static bool root_reclaim(struct scan_control *sc)",
+        "return !sc->target_mem_cgroup ||\n\t       mem_cgroup_is_root(sc->target_mem_cgroup);",
+        "bool should_age = false;",
+        "unsigned long remaining = nr_to_scan;",
+        "VM_WARN_ON_ONCE(nr_to_scan > MAX_LRU_BATCH);",
+        "\t*isolatedp = isolated;\n\treturn scanned;\n}",
+        "int total_scanned = 0;",
+        "\t\tif (!scanned)\n\t\t\ttype = !type;",
+        "/* In case page deletion left empty old gens, flush them */",
+        "/* Scanning may have emptied the oldest gen, flush it */",
+        "static void try_to_inc_min_seq(struct lruvec *lruvec, int swappiness)",
+        # The kswapd deferral deviation: lru_gen_age_node() keeps owning the
+        # node-wide aging and this loop stops the lruvec for it.
+        "if (current_is_kswapd())\n\t\t\t\tbreak;",
+        "nr_batch = min_t(unsigned long, nr_to_reclaim - sc->nr_reclaimed,",
+    ],
+    # The dirty/writeback half: the per-batch flusher wake is the mechanism
+    # behind the reported workingset_refault_file reduction, so the trigger
+    # and its bookkeeping retirement are pinned together.
+    "core:mglru_dirty_reclaim_rework": [
+        "if (stat.nr_unqueued_dirty == isolated) {\n"
+        "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n\t}",
+        "sailboat_mglru_dirty_reclaim_rework",
+        "static int page_inc_gen(struct lruvec *lruvec, struct page *page)",
+        "/* for shrink_page_list(); PG_reclaim is left to the common routine */",
+    ],
+    "core:mglru_prefault_accessed_placement": [
+        "sailboat_mglru_prefault_accessed_placement",
+        ["include/linux/mm_inline.h",
+         "else if (PageReferenced(page))\n\t\tseq = lrugen->min_seq[type] + 1;"],
+        ["mm/swap.c",
+         "} else if (!PageReferenced(page)) {\n\t\t\tmark_page_accessed(page);\n\t\t}"],
+        ["mm/swap.c", "if (PageWorkingset(page)) {"],
+        ["mm/workingset.c",
+         "if (lru_gen_in_fault())\n"
+         "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1371,6 +1423,47 @@ REQUIRED_ABSENT = {
         # The exact min_seq token match is the misattribution being fixed.
         ["mm/workingset.c",
          "if ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))"],
+    ],
+    "core:mglru_reclaim_loop_rework": [
+        # The coupling the restructure removes: the aging/size mashup in
+        # should_run_aging(), the 0-as-aging-signal protocol, the per-
+        # iteration budget recompute and the livelock-hack return must all be
+        # gone, not merely bypassed.
+        ["mm/vmscan.c", "return isolated || !remaining ? scanned : 0;"],
+        ["mm/vmscan.c", "*need_aging = should_run_aging(lruvec, max_seq, min_seq,"],
+        ["mm/vmscan.c", "scanned += try_to_inc_min_seq(lruvec, swappiness);"],
+        ["mm/vmscan.c",
+         "if (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)\n"
+         "\t\tscanned = 0;"],
+        ["mm/vmscan.c",
+         "\tint remaining = MAX_LRU_BATCH;\n"
+         "\tstruct lru_gen_struct *lrugen = &lruvec->lrugen;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);"],
+    ],
+    "core:mglru_dirty_reclaim_rework": [
+        # All five mglru_wake_flushers payloads and the PG_reclaim dance are
+        # retired content: the accounting feeds, the once-per-loop wake and
+        # the reclaiming bit must not survive anywhere in vmscan.c.
+        ["mm/vmscan.c", "\tbool dirty, writeback;"],
+        ["mm/vmscan.c", "sc->nr.file_taken += delta;"],
+        ["mm/vmscan.c", "sc->nr.file_taken += isolated;"],
+        ["mm/vmscan.c",
+         "\tsc->nr.unqueued_dirty += stat.nr_unqueued_dirty;\n"
+         "\tsc->nr_reclaimed += reclaimed;"],
+        ["mm/vmscan.c",
+         "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)"],
+        ["mm/vmscan.c", "page_inc_gen(lruvec, page, true)"],
+        ["mm/vmscan.c", "page_inc_gen(lruvec, page, false)"],
+        ["mm/vmscan.c", "\t/* for shrink_page_list() */\n\tClearPageReclaim(page);"],
+        ["mm/vmscan.c", "/* for end_page_writeback() */"],
+    ],
+    "core:mglru_prefault_accessed_placement": [
+        # The unconditional WORKINGSET_ACTIVATE count is exactly the metric
+        # bug 6cbdd9726fb5 fixes: non-workingset prefaults must stop counting
+        # as activations.
+        ["mm/workingset.c",
+         "atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);\n"
+         "\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
     ],
 }
 
@@ -2120,6 +2213,87 @@ REQUIRED_IN_FUNCTION = {
     #     the hook exists, via REQUIRED_CONTENT_OPTIONAL below.  A 4.15-style
     #     "add the hook everywhere" would fail to compile on three of the four
     #     baselines, and a "drop it everywhere" would break the lts contract.
+    #
+    # Batch 49 (MGLRU v7.2 reclaim-loop rework): function-scoped pins so a
+    # hunk landing in the neighbouring helper cannot satisfy them.  The loop
+    # half pins the restructured control flow where it lives; the dirty half
+    # pins the per-batch wake in evict_pages() and the absence of the divert
+    # in sort_page(); the placement half pins lru_cache_add()'s two-way
+    # dispatch INCLUDING the vendor hook it wraps (a rewrite that dropped
+    # trace_android_vh_lru_cache_add_page_activate() would break the hook
+    # contract silently).
+    "core:mglru_reclaim_loop_rework": [
+        ("mm/vmscan.c", "lru_gen_shrink_lruvec",
+         ["bool should_age = false;",
+          "nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);",
+          "while (nr_to_scan > 0) {",
+          "if (should_run_aging(lruvec, max_seq, sc, swappiness)) {",
+          "nr_batch = min_t(unsigned long, nr_to_scan, MIN_LRU_BATCH);",
+          "if (root_reclaim(sc) && should_age)",
+          "nr_to_scan -= delta;"],
+         ["goto done;", "while (true)", "*need_aging"]),
+        ("mm/vmscan.c", "get_nr_to_scan",
+         ["struct mem_cgroup *memcg, int swappiness)",
+          "evictable = lruvec_evictable_size(lruvec, swappiness);",
+          "if (!mem_cgroup_online(memcg))\n\t\treturn evictable;",
+          "return evictable >> sc->priority;"],
+         ["should_run_aging", "need_aging"]),
+        ("mm/vmscan.c", "should_run_aging",
+         ["struct scan_control *sc, int swappiness)",
+          "if (sc->priority == DEF_PRIORITY)\n\t\treturn false;",
+          "return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;"],
+         ["nr_to_scan", "for_each_evictable_type", "lruvec_memcg"]),
+        ("mm/vmscan.c", "scan_pages",
+         ["unsigned long remaining = nr_to_scan;",
+          "VM_WARN_ON_ONCE(nr_to_scan > MAX_LRU_BATCH);",
+          "\t*isolatedp = isolated;\n\treturn scanned;\n}"],
+         ["int remaining = MAX_LRU_BATCH;"]),
+        ("mm/vmscan.c", "isolate_pages",
+         ["int total_scanned = 0;",
+          "scanned = scan_pages(lruvec, sc, type, tier, nr_to_scan, list, isolated);",
+          "\t\tif (!scanned)\n\t\t\ttype = !type;"],
+         ["*type_scanned"]),
+        ("mm/vmscan.c", "evict_pages",
+         ["try_to_inc_min_seq(lruvec, swappiness);",
+          "\t/* Scanning may have emptied the oldest gen, flush it */\n"
+          "\tif (scanned)\n\t\ttry_to_inc_min_seq(lruvec, swappiness);",
+          "unsigned long nr_to_scan, bool *need_swapping)"],
+         ["scanned = 0;", "scanned += try_to_inc_min_seq"]),
+        ("mm/vmscan.c", "try_to_inc_min_seq",
+         [],
+         ["bool success", "return success;"]),
+        ("mm/vmscan.c", "age_lruvec",
+         ["need_aging = should_run_aging(lruvec, max_seq, sc, swappiness);",
+          "evictable = lruvec_evictable_size(lruvec, swappiness);"],
+         ["&nr_to_scan"]),
+    ],
+    "core:mglru_dirty_reclaim_rework": [
+        ("mm/vmscan.c", "evict_pages",
+         ["if (stat.nr_unqueued_dirty == isolated) {",
+          "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n\t}"],
+         ["sc->nr.unqueued_dirty", "sc->nr.file_taken"]),
+        ("mm/vmscan.c", "sort_page",
+         ["sailboat_mglru_dirty_reclaim_rework"],
+         ["waiting for writeback", "file_taken", "page_inc_gen(lruvec, page, true)"]),
+        ("mm/vmscan.c", "page_inc_gen",
+         ["new_flags |= (new_gen + 1UL) << LRU_GEN_PGOFF;"],
+         ["reclaiming", "BIT(PG_reclaim)"]),
+        ("mm/vmscan.c", "isolate_page",
+         ["\tClearPageReferenced(page);"],
+         ["ClearPageReclaim"]),
+    ],
+    "core:mglru_prefault_accessed_placement": [
+        ("mm/swap.c", "lru_cache_add",
+         ["if (PageWorkingset(page)) {",
+          "trace_android_vh_lru_cache_add_page_activate(page, &bypass);",
+          "mark_page_accessed(page);"],
+         []),
+        ("mm/workingset.c", "lru_gen_refault",
+         ["if (lru_gen_in_fault())\n"
+          "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);",
+          "SetPageWorkingset(page);"],
+         ["\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);\n\n"]),
+    ],
 }
 
 # Needles that only exist on some baselines, so they can only be asserted on a

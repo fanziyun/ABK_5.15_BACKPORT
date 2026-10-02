@@ -721,8 +721,9 @@ def build_groups(PatchGroup):
             "vmscan_tasks_rcu_qs",
             "shrink_lruvec()'s scan loop reports Tasks-RCU quiescent states "
             "instead of a bare cond_resched(), so a task in long reclaim stops "
-            "being an rcu_tasks holdout; no-op on this target's config "
-            "(Tasks-RCU off), no device benefit claimed",
+            "being an rcu_tasks holdout (the target runs CONFIG_TASKS_RCU=y, "
+            "so the classic holdout clear is compiled in); no speedup claimed "
+            "for the device because none was measured",
             [
                 "25f52e812168 (v7.2)",
                 "4cdc1bdf4094 (5.15.y backport, 2026-09-14) -- the grafted form",

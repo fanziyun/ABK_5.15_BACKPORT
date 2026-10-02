@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。93 个移植组（core 68 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。96 个移植组（core 71 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -768,6 +768,230 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 通过。`tunables.conf` 注释、README 行、以及"band 不等式"那款断言同步改为 90,并在
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
+
+<a id="companion-v0200"></a>
+
+## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
+
+调优依据:mark 的唯一职责是把新冷页放进二压候选池;消化速率由扫描班次 ×
+预算钉住(2 × 512 MiB/小时),与 mark 时钟无关——Batch 47 的跳过谓词让重打标
+交回的已最优页零预算成本,重打标在机制上已无历史代价。mark 必须慢于扫描
+(3600 > 1800,2 倍余量)仍是硬约束;45 分钟这类中间档位无法表达
+(`_zs_per_mark = mark_interval / interval_sec` 整数除法,2700 会静默坍缩成
+每 30 分钟一 mark)。收益:新冷页入选的最坏等待 3h → 1h,平均 ~1h45m →
+~45min;代价:每天 8 → 24 次 1–2 秒的整表 mark 扫描,无新增唤醒。默认值
+四处同步(tunables.conf / abk_cfg 回退 / abk_is_uint clamp / README 表格),
+单测钉子随动(默认值断言 + supervisor 日志断言)。设备未重新刷入验证——
+与 v0.17 实测走的是同一条执行路径,本次仅参数值与注释变化。
+
+<a id="batch-48"></a>
+
+## Batch 49(MGLRU v7.2 回收循环重写,v0.52.0,core 68 → 71 组)
+
+主题:**把 v7.2 的 12 条 MGLRU 回收循环重写系列按 survey §1 自己给出的
+"honest route" 落地**。来源是 Kairui Song(Tencent)的 "mm/mglru: improve
+reclaim loop and dirty folio" v7(cover `0491e9f75c15`,12 条,全部只触
+`mm/vmscan.c`——唯一例外 `6cbdd9726fb5` 还触 `mm/swap.c`/`mm/workingset.c`/
+`include/linux/mm_inline.h`)。`docs/survey_7_2_mm_reclaim.md` §1 初判
+"not portable as a graft":7.x 的分解(`scan_folios`/`isolate_folios`/
+`try_to_shrink_lruvec`、4 参 `should_run_aging`、3 参 `get_nr_to_scan`、
+`for_each_evictable_type`/`root_reclaim`)与本机 6.1-shape(基于 page 的
+`lru_gen_struct/lists`、`sort_page`/`scan_pages`/`isolate_pages`/`evict_pages`)
+五处结构性不同,直接嫁接不可行;该节同时给出的路线是「先按依赖序移植中间重构,
+再落回收循环」。本批采用该路线的收敛形态:不做 6.x folio 期的逐条中间态移植
+(那些中间态本身在 page 形态上无行为内容),而是把 12 条的**终态语义**重写到
+本机形态上,按 diff 链的自然段拆成三个原子组,每组独立审计、独立回退。
+
+12 条是一条线性 diff 链(index 衔接逐条核对,共 23 个 hunk,逐 hunk 记账在
+`research/upstream-5.15.y/hunks.txt`,`.patch` 原文归档在同目录 `patches/`;
+另取链末端 `32d87083ee97` 的 `mm/vmscan.c` 全文与 v7.2 终态作对照存档)。
+链内后条改写前条的 new 文本,因此拆分点选在链的自然段上:
+
+| 组 | 条目 | 终态语义 |
+|---|---|---|
+| `mglru_reclaim_loop_rework` | `790d3abeca09` `aa6ef5b159dc` `163bc3d68c9f` `6e9be217a3ce` `3a72e078b4a3` `16b475d2ac3c` `12316f7902f8` | `should_run_aging()` 成为 4 参纯谓词(evictable size 巡走抽成上游同名 `lruvec_evictable_size()`)、`get_nr_to_scan()` 只算预算(below-min/low 门 + 离线 memcg 整锅端 + `>> sc->priority`)、主循环预算入环一次算好、aging 显式化、批次钳 `MIN_LRU_BATCH`、`nr_to_scan -= delta` 递减;隔离侧 `scan_pages()` 出 `*isolatedp` 且删防活锁 hack、`isolate_pages()` 跨 type 累计 `total_scanned` 且回退只在 `!scanned` 时发生、`try_to_inc_min_seq()` 改 void 并隔离前后各 flush 一次、删 min-GENS `scanned = 0` hack |
+| `mglru_dirty_reclaim_rework` | `75d4c3f5fb98` `acd22fbb9f47` `f37d3708b676` `32d87083ee97` | `sort_page()` 不再 divert dirty/writeback/locked 页到下一带(改由公共 `shrink_page_list()` 像经典 LRU 一样重新激活)、`isolate_page()` 删 `ClearPageReclaim`、`page_inc_gen()` 删 `reclaiming` 参数与 PG_reclaim 置位、flusher 唤醒从「整轮一次」提前为**逐批**(`stat.nr_unqueued_dirty == isolated`,即本树经典路径 `shrink_inactive_list()` 自己的惯例) |
+| `mglru_prefault_accessed_placement` | `6cbdd9726fb5` | refault 工作集页仍 `SetPageActive`(进活跃带),prefault 文件页改 `mark_page_accessed()`(设 PG_referenced,落位公式将其放入第二老一带),`WORKINGSET_ACTIVATE` 记账只统计真正 activate 的工作集 refault(修指标虚高) |
+
+每条的逐条处置(携带/rename 折入/no-op/裁剪)在
+`scripts/batch49_core_mglru_reclaim_loop.py` 的模块 docstring 与
+`tests/implementation_audit.py` 的针脚注释里成表。其中三条要单独说明:
+
+- `acd22fbb9f47`(删冗余 swap 约束)在本机是 **no-op**:5.15 的
+  `isolate_page()` 携带 `sc->may_writepage && __GFP_IO` 合并守卫,是该检查的
+  更晚精化形态;删除它会把不可写的脏页放进 `shrink_page_list()` 空转。守卫保留。
+- `f37d3708b676` 的 `reclaim_throttle(VMSCAN_THROTTLE_WRITEBACK)` 尾段**裁剪**:
+  5.15 既无该函数也无 `VMSCAN_THROTTLE_*`(grep=0),与 `mglru_wake_flushers`
+  当年的裁法一致;逐批块本体即本树经典路径 2367 行的写法。
+- `16b475d2ac3c`/`12316f7902f8` 的 survey 判定("already present"/"largely
+  already present")**只对旧循环成立**:前者的效果原本由 `scan_pages()` 的
+  break-on-scanned 实现,后者由 `get_nr_to_scan()` 的内嵌 abort 实现;循环重构
+  把这两个机制都换掉了,两条在新形态上是真增量,必须落地。survey §1 已同步更正。
+
+5.15 形态偏差(全部有意,`implementation_audit` 双向钉住):
+
+- **kswapd aging 延后保留**:旧 `get_nr_to_scan()` 把 kswapd 的 aging 留给
+  `lru_gen_age_node()`(该函数在 5.15 拥有全 node 遍历与 min_ttl/OOM 政策),
+  7.x 是环内直接 `try_to_inc_max_seq()`。照搬会改变 kswapd 的 aging 面,
+  稳定性优先:新循环内 kswapd 命中 aging 调件即 break(保持旧行为),测量阶段
+  可凭数据翻案。
+- `need_rotate`/`MEMCG_LRU_YOUNG` 轮转丢弃:6.x 的 memcg-LRU 轮转在 5.15 无
+  载体,`lru_gen_shrink_lruvec()` 对调用方保持 void;`root_reclaim()` 谓词按
+  上游语义原样携带(含根 cgroup 回收),其 `should_age` break 只结束本轮。
+- `isolate_scanned`/`type_scanned` 不搬:上游把它们送进
+  `trace_mm_vmscan_lru_shrink_inactive()`,本树 `evict_pages()` 从未调用该
+  trace;`isolate_type` 携带(PGSTEAL 与 `need_swapping` 需要)。
+- `6cbdd9726fb5` 的 `lru_gen_set_refs()` hunk 无载体不搬:本树 aging 走
+  `page_update_gen()` 晋升,不存在 walk 侧 refs 设置点;唯一的 refs 阶梯是
+  `mark_page_accessed()` → `page_inc_refs()`(referenced→workingset→计数器),
+  其本身就是「第二次访问晋升」语义,swap.c 步骤已把调用导向正确分支。
+- `lru_cache_add()` 的 `trace_android_vh_lru_cache_add_page_activate()` 供应商
+  hook 保留在 activate 分支内:prefault 非工作集页不再 activate,故 hook 只在
+  它命名的动作被考虑时触发(hook 合同注记入档)。
+- 导出符号 `isolate_page()` 的名字与 `(lruvec, page, sc)` 签名冻结;全套函数
+  不采用上游 folio 期更名。
+
+trap-5 处置(本批最重的锚点工程):三组的新文本整链改写 `mglru_wake_flushers`
+生成的**全部五处**文本,并改写 `mglru_rework_aging_feedback`/
+`mglru_rework_type_selection` 的 `try_to_inc_min_seq()`/`evict_pages()`/
+`get_nr_to_scan()`/`should_run_aging()`/`isolate_pages()` 生成文本。按 Batch
+21/24/37 的既定疗法:被改写方各补**组级 shape probe**(探自身新增且被后继保留
+的符号——`evictable_min_seq` 宏、`get_type_to_scan()` 2 参签名、以及被
+`f37d3708b676` **搬移而非删除**的那句 flusher 注释),依赖序注册,第二遍一律
+短路 `already_present`。两遍实测(pass1 `62 applied + 9 already_present`,
+pass2 `71 already_present`)证明无二次追加。另有一处 trap-1 教训入档:纯删行
+步骤的 `new` 是纯净树的子串(`sort_page` 头部删除 `bool dirty, writeback;`),
+`step_audit` 的 trap-1 检查会判「replacement 已存在」——处置是把删行与改写
+合并为整函数单步(自带 marker),以及给循环尾删块的锚点带上 G1 生成的前缀行。
+
+### 顺带的滚动分支维护(lts-only maintenance)
+
+引擎在 5.15.220 参考树上复跑发现 `vmscan_tasks_rcu_qs` 翻为
+`already_present`——滚动分支吸收了 `4cdc1bdf4094`(linux-5.15.y,2026-09-14)。
+按 AGENTS 的 roll 规则:`tests/sublevel_matrix.py` 行键 `217` → **`220`**
+(`DEFAULT_SUB_LEVEL` 同步),该组从「预期 applied」迁入 `PRE_APPLIED` 并记录
+吸收事实;`fetch_sublevel_tree.sh`/`step_audit.py`/`smoke.sh` 三处文件清单补
+`include/linux/mm_inline.h`(Batch 49 的 `FETCH_FILES` 变更,旧树 gap-fill 重取;
+取树后做过同源核对——`Makefile` 仍 220、`mm/vmscan.c`/`mm_inline.h` 逐哈希一致)。
+
+### 验证与未验证
+
+本地门禁(AGENTS 精确顺序,参考树 `build/abk-trees/220-*`):`py_compile` 44 文件
+全过;`bash -n` 全过;`tests/stable_5_15_test.py` all checks passed;
+`tests/step_audit.py` **STEP AUDIT OK**(core 371 步逐条 applied、结构配平、
+二遍字节一致);`tests/implementation_audit.py` **IMPLEMENTATION AUDIT OK**
+(新增三组的 REQUIRED_CONTENT/REQUIRED_ABSENT/REQUIRED_IN_FUNCTION 全部针脚
+就位,含旧形态 forbidden needle);`tests/smoke.sh` **SMOKE OK**(两遍幂等 +
+rollback 字节还原,新增 Batch 49 断言块与 `mm_inline.h`/`mm/vmscan.c` 回滚核查)。
+`config_gate_audit.py` 待构建产物后跑(本批无新 CONFIG 门,预期零新增暗门)。
+
+**构建与真机进度**:`config_gate_audit` 已对该构建的 `.config` 通过(七门收口;
+顺带为 Batch 39 `pagealloc_batch_clear` 的 `!IS_ENABLED(CONFIG_HIGHMEM)` 取反
+守卫补 DARK_GATES 记录——审计的 IS_ENABLED 扫描不识别 `!` 极性,该守卫两个
+分支都真实编译,arm64 恒走新增的 memset 路径)。构建阶梯 R0–R3 全部完成:
+R1/R2/R3 各自 `REBUILD_EXIT=0`(ThinLTO 全链接),R3 构建日志见三组 `applied`,
+产物归档 `/mnt/d/Kernel/b49-r{1,2,3}/`。真机窗口完成 **R0 对照轮**(内核
+`5.15.220-20261002-Batch48`):探针套件四个判别签名全部在案(get_nr_to_scan/
+evict_pages/should_run_aging retprobe/wakeup_flusher_threads 计数与旧签名
+`nr=` 指针值,后者即新旧签名判别本身),匿名负载三轮校验和全对、swap 往返
+完整;refault/workingset_activate 指标管线的计量缺口已定位——`lru_gen_refault()`
+的 `memcg_id` 匹配门对**跨 memcg 重读静默丢计**(shadow 记驱逐方 memcg,替换页
+经 `mem_cgroup_charge()` 记当前进程 memcg,不等则 `goto unlock` 三项计数全零),
+旧负载 3 的重读在测试 cgroup 外 ⇒ 窗口恒零。计量规则定为「驱逐与重读同
+memcg」,harness 已修订(同 memcg 窗口 + T0–T3 采样 + `VERDICT` 分判行);
+修订后读数未上机,**不据此主张任何收益数字**。R0 压测第 3 轮中途设备从网络层整体失联(ICMP/adb/mdns 全
+灭)——发生在**对照内核**上,就本批代码而言不是回归信号,机制未判别(回收/
+写回死锁、zram 压力路径、或非内核原因,待 dmesg/pstore 归因);全程记录在
+`research/mglru_reclaim_loop_device_20261003/REPORT.md`。逐组 go/no-go 待
+R1–R3 开机窗口;ABK CI(GitHub 侧)未跑。
+
+### 收益口径
+
+上游数字(Kairui Song 系列自报,MongoDB/YCSB 服务器负载):整系列 "up to ~30%
+吞吐、file refault 大幅下降";收益主角 `f37d3708b676` 单条:吞吐 62485 → 80857
+ops/s(**+29%**)、平均延迟 500.97 → 386.65 us(**−23%**)、pgpgin 159.3M →
+112.2M(**−30%**)、workingset_refault_file 34.5M → 19.5M(**−43%**)。手机侧的
+机制映射:refault 下降 → 多任务切换的 /data 回读减少;逐批 flusher 唤醒 →
+dirty-tail 的 memcg OOM/长停顿风险进一步下降(与既有 `mglru_wake_flushers` 同
+一防线的粒度细化);`MIN_LRU_BATCH` 批次 → direct reclaim 单次持锁时间变短。
+**不主张任何设备侧提速数字**:无 Snapdragon 实测,且既有真机 MGLRU 微基准
+(`research/device_mglru_bench_20260917`)是纯匿名小样本负载(回收中位数 +3.45%、
+各 2 轮无显著性判断),不是本系列的目标负载,既不能证明收益也不能证明回归。
+目标负载(文件缓存压力下的切换/重启)的配对 A/B 与判读规则(≥15% refault 下降
+为明确改善,OOM/panic 信号即回退)在真机闸门一并执行,实测多少写多少。
+
+
+## Batch 48(内存审查修复:二压 OOM 空指针与 MGLRU may_swap 回归,v0.51.0,无新增组)
+
+主题:**修复审查抓出的两个 P1 与一处发布文本违规**。三处改动全部落在既有组的
+step/payload 或组描述内,core 68 组数量不变,`GROUP_COUNTS`/`PRE_APPLIED` 不变,
+`ABK_MODULE_VERSION` 0.50.0 → **0.51.0**。
+
+### 1. `zram_recompression`:zs_malloc 失败检测换回 5.15 合同
+
+移植自 android15-6.6 的 `zram_recompress()` 用 `IS_ERR_VALUE(handle_new)` 判断
+分配失败——那是 6.x 的合同(6.x 的 `zs_malloc` 失败返回 `ERR_PTR(-ENOMEM)`)。
+5.15 的 `zs_malloc`(`mm/zsmalloc.c`,lts 逐行核对)三条失败路径全部 `return 0`,
+`IS_ERR_VALUE(0)` 恒为假 ⇒ 检查是死代码,失败后继续 `zs_map_object(pool, 0, ...)`,
+而 5.15 的 `handle_to_obj()` 就是 `*(unsigned long *)handle` ⇒ 空指针解引用
+(`zs_map_object` 先行的 `pin_tag(handle)` 同样撞 NULL)。触发场景正是本模块的
+主打场景:companion 在内存压力下周期驱动二压扫描,`__GFP_NOWARN` 还压掉了分配
+失败警告。同树同文件 40 行外的原始写路径(`if (!handle)` + 双档 GFP 重试)即
+5.15 惯用法。修复为 `if (!handle_new) { zcomp_stream_put(...); return -ENOMEM; }`,
+与 CHANGELOG Batch 10-1 行记录的「两个 gfp 档都失败 ⇒ -ENOMEM」意图一致——代码
+此前交付不出这个合同。三道文本审计看不见这一类缺陷(C 语法正确、能编译、报告
+applied):它是逐行对照上游合同抓出来的,也是「移植组引用的每个 helper 都要对照
+**目标树**核对合同」这条既有规则(route 陷阱)的又一实证。
+
+### 2. `mglru_rework_aging_feedback`:补回 get_swappiness() 的 !may_swap 短路
+
+该组把 `shrink_lruvec()` 里 `if (sc->may_swap) ... else ... swappiness = 0`
+的三路 dance 换成无条件 `get_swappiness()`。上游敢这么写,是因为 v6.1+ 主线的
+`get_swappiness()` 以 `if (!sc->may_swap) return 0;` 开头(v6.11 实测核对);5.15
+基线的 `get_swappiness()` 没有这个 guard——被删的 dance 正是它在 MGLRU 路径上的
+唯一持有者——且 `410abb20acae`/`68cd9050d871`(batch37 reclaim 链)两份 patch 都
+不含 may_swap hunk(实测核对),原 docstring「guard 随 batch37 链落地」的声称是
+事实错误,已随本批更正。不补 guard 的后果链,每一环都在 lts 5.15.220 上核对过:
+memsw 限额路径(`reclaim_options &= ~MEMCG_RECLAIM_MAY_SWAP`)与
+`memory.reclaim` 的 `noswap=1`(`.may_swap = !noswap`)把 `sc.may_swap` 置 0;
+经典路径 `get_scan_count()` 的 `!sc->may_swap ||` 门 MGLRU 不经过;
+`shrink_page_list()` 的 `add_to_swap()` 块只受 `__GFP_IO`/DMA-pinned 门控,
+`add_to_swap()` 本身亦无 may_swap 检查 ⇒ may_swap=0 的 cgroup 回收以完整
+swappiness 隔离 anon 并换出到 swap——在 memory+swap 总额超限时继续往 swap 写,
+正是 may_swap=0 要防的事,对基线(file-only)与声称的上游终态都是行为回退。
+修复:同组新增一步,按上游形状给 `get_swappiness()` 补
+`if (!sc->may_swap) return 0;`。与 dance 删除放在同一组是有意的:组内步骤
+事务性,任一 required miss 两者都不写,保护不会只落一半。其余调用方不受影响:
+kswapd 路径 `age_lruvec()` 与 debugfs `run_cmd` 的 sc 均 `.may_swap = 1`,guard
+不触发;batch37 的 `_GET_SWAPPINESS_HOOK` 锚点起于 can_demote 块,与本次插入
+区域零重叠(引擎实测该组 18 hunk 照常落地)。
+
+### 3. `vmscan_tasks_rcu_qs` 的 PatchGroup 描述更正
+
+组描述仍写「no-op on this target's config (Tasks-RCU off), no device benefit
+claimed」,而同文件的设备核查记录早已推翻它(vermeer `CONFIG_TASKS_RCU=y`,
+classic holdout 清除确实编入,组在目标机上有真实作用)。描述改为与核查一致,
+「不主张提速」的原因写为「未测速」。这是 Batch 45 定下的「发布文本不得与既录
+事实矛盾」的违规残留。
+
+### 4. 验证与未验证
+
+- `py_compile` 全过;`stable_5_15_test.py` 全绿(组计数不变);
+- 参考树 android13-5.15-lts **实测 SUBLEVEL 220**(此前目录名 217-review 有误,
+  已改名为 `build/abk-trees/220-review`),引擎实跑两遍:第一遍 68 组全部成功
+  状态(59 applied + 9 already_present,零降级;`zram_recompression` 31 hunk、
+  `mglru_rework_aging_feedback` 34 hunk 全中——新增的 guard 步锚点逐字节命中);
+  第二遍 68 组全部 `already_present` 且树逐字节不变(幂等);
+- `abk_rollback.sh --apply` 还原后与原始树 `diff -r` 零差异;两处修复落点
+  `grep` 实证(`!handle_new` 在、`IS_ERR_VALUE` 计 0;guard 在、dance 计 0);
+- **树级三审计与 ABK CI 编译未跑**:lts 分支已滚到 5.15.220 而矩阵行仍钉 217,
+  审计按设计拒绝该树(drift defence);re-key 属 lts-only 维护流程,另行处理;
+- **真机已验证**(vermeer,`5.15.220-20261002-Batch48`,本地构建 + fastboot 刷入):
+  运行内核 `/proc/kallsyms` 含 286 个 `abk_*` 符号;zram 四节点齐全;同步/异步
+  二压扫描冒烟通过;may_swap 行为对照三组全中——`memory.limit_in_bytes` 限压组
+  换出 200 MiB(允许 swap 时 memcg 回收确实换出)、同形状组
+  `memory.reclaim 100M noswap=1` 换出 **0 字节**(guard 生效)、不带 noswap 的
+  对照组换出恰好 100 MiB(装置有效性对照)。不主张任何性能数字。
 
 ## Batch 47(二压扫描跳过已无可改进的槽位,v0.50.0)
 
