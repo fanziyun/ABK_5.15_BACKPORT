@@ -903,7 +903,11 @@ memcg」,harness 已修订(同 memcg 窗口 + T0–T3 采样 + `VERDICT` 分判�
 灭)——发生在**对照内核**上,就本批代码而言不是回归信号,机制未判别(回收/
 写回死锁、zram 压力路径、或非内核原因,待 dmesg/pstore 归因);全程记录在
 `research/mglru_reclaim_loop_device_20261003/REPORT.md`。逐组 go/no-go 待
-R1–R3 开机窗口;ABK CI(GitHub 侧)未跑。
+R1–R3 开机窗口。**ABK CI 编译门禁已过**:PR #37(commit `30fb6364`)经
+`.github/workflows/abk-kernel-compile.yml` 派发 `fan221153-blip/ABK` 的
+`kernel-custom.yml`(run `37074017039`,`success`,27m46s),门禁取证 head_sha/
+pinned_ref/模块版本三重自证全对、**96 组自报全部落地**(PR #36 门禁时 93 组,
+Batch 49 +3 对账吻合)。
 
 ### 收益口径
 
