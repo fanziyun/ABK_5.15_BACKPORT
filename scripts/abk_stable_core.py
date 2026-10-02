@@ -1517,6 +1517,18 @@ def _mglru_optimize_deactivation_apply(ctx):
     return status, detail
 
 
+# Batch 49 trap-5 probes (docs/group_recipe.md): the batch-49 chain rewrites
+# text these three groups generate, so each probes one of its own added
+# symbols that its successors keep -- a second pass then reports
+# already_present instead of re-appending through stale anchors (the Batch
+# 21/24/37 remedy).  Registered content and step bytes stay untouched.
+_MGLRU_AGING_FEEDBACK_PROBE = "#define evictable_min_seq(min_seq, swappiness)"
+_MGLRU_TYPE_SELECTION_PROBE = "static int get_type_to_scan(struct lruvec *lruvec, int swappiness)"
+_MGLRU_WAKE_FLUSHERS_PROBE = (
+    " * If too many file cache in the coldest generation can't be evicted"
+)
+
+
 def _mglru_rework_aging_feedback_apply(ctx):
     """v6.14 798c0330c2ca (rework aging feedback), int-swappiness port.
 
@@ -1541,6 +1553,12 @@ def _mglru_rework_aging_feedback_apply(ctx):
     its way past a memory+swap limit.  The guard is upstream's own shape:
     mainline get_swappiness() opens with it (verified on v6.11).
     """
+    try:
+        _probe = ctx.read("mm/vmscan.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _MGLRU_AGING_FEEDBACK_PROBE in _probe:
+        return "already_present", "the aging-feedback rework is already applied"
     steps = [
         # -- include/linux/mmzone.h: min_seq[] semantics, protected[] tier 0,
         #    walk swappiness --
@@ -2235,6 +2253,12 @@ def _mglru_rework_type_selection_apply(ctx):
     mglru_rework_aging_feedback, whose evictable_min_seq/for_each_evictable_type
     macros and reindexed protected[] this group's new code requires.
     """
+    try:
+        _probe = ctx.read("mm/vmscan.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _MGLRU_TYPE_SELECTION_PROBE in _probe:
+        return "already_present", "the type-selection rework is already applied"
     steps = [
         ("mm/vmscan.c",
          "static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,\n"
@@ -2471,6 +2495,12 @@ def _mglru_wake_flushers_apply(ctx):
     hunk's shrink_node memset is unnecessary here: this baseline's
     shrink_node() already memsets sc->nr on every iteration.
     """
+    try:
+        _probe = ctx.read("mm/vmscan.c")
+    except FileNotFoundError:
+        _probe = ""
+    if _MGLRU_WAKE_FLUSHERS_PROBE in _probe:
+        return "already_present", "the wake-flushers graft is already in vmscan.c"
     steps = [
         ("mm/vmscan.c",
          "static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc,\n"
@@ -5933,6 +5963,27 @@ PATCH_GROUPS = PATCH_GROUPS + [
 import batch46_core_erofs_readmore_eof as _b46_erofs  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b46_erofs.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 49: the MGLRU v7.2 reclaim-loop rework (Kairui Song's 0491e9f75c15
+# series, 12 commits) -- the "honest route" docs/survey_7_2_mm_reclaim.md §1
+# named instead of grafting the series onto the 6.1-shape loop.
+#
+# Registered last: every step of these three groups rewrites text the inline
+# MGLRU groups generate (mglru_rework_aging_feedback's try_to_inc_min_seq()/
+# evict_pages()/get_nr_to_scan()/lru_gen_shrink_lruvec(),
+# mglru_rework_type_selection's isolate_pages(), and -- mglru_dirty_reclaim_
+# rework in particular -- ALL FIVE steps of mglru_wake_flushers).  Dependency
+# order plus per-group shape probes is what keeps pass two idempotent
+# (docs/group_recipe.md trap 5, Batch 21/24/37 remedy): the probes live on
+# symbols the successors keep (lruvec_evictable_size(), the moved flusher
+# comment, the placement marker), and the superseded groups carry probes of
+# their own now.  See the batch file's docstring for the 12-commit mapping,
+# the 5.15-shape deviations and the per-hunk provenance.
+# ============================================================================
+import batch49_core_mglru_reclaim_loop as _b49_mglru  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b49_mglru.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()

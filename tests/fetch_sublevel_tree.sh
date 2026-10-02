@@ -54,6 +54,9 @@ FETCH_FILES=(
   # groups anchor in these.
   mm/workingset.c
   mm/swap.c
+  # Batch 49 (MGLRU v7.2 reclaim-loop rework): the prefault placement group
+  # (6cbdd9726fb5) rewrites lru_gen_add_page()'s generation formula here.
+  include/linux/mm_inline.h
   mm/zsmalloc.c
   include/linux/swap.h
   include/linux/cgroup-defs.h
