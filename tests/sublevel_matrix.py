@@ -136,7 +136,17 @@ GROUP_COUNTS = {
     # Batch 47 adds one: zram_recomp_best_prio_skip -- not an upstream port (no
     # commit to name, so it cannot arrive pre-applied), the module's third
     # generated-text rewriter, registered after its three dependencies.
-    "stable_backport_core": 68,
+    # Batch 49 adds three: the MGLRU v7.2 reclaim-loop rework chain
+    # (mglru_reclaim_loop_rework, mglru_dirty_reclaim_rework,
+    # mglru_prefault_accessed_placement -- Kairui Song's 0491e9f75c15 series,
+    # 12 commits landed as three atomic groups).  All three land on the rolling
+    # baseline: every one of the twelve is a 2026 v7.2 change with no
+    # Cc: stable and no 5.15.y backport, and the 6.1-shape MGLRU none of them
+    # edits exists only through this module's own earlier groups.  The three
+    # are a rewrite chain over the same lines, registered after the inline
+    # MGLRU groups whose generated text they consume (trap 5: per-group shape
+    # probes on both sides).
+    "stable_backport_core": 71,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.
@@ -213,7 +223,7 @@ PRE_APPLIED = {
     # step_audit / implementation_audit / smoke run is the only thing that
     # catches that, so it has to be run after every lts re-fetch.  See
     # docs/porting_policy.md "Lts-only maintenance".
-    "217": {
+    "220": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
             "fdtable_replace_fd_errno",
@@ -231,6 +241,13 @@ PRE_APPLIED = {
             # early i_mmap_unlock_read() and the `mapping = NULL` call site,
             # so the group writes nothing here and reports already_present.
             "huge_memory_imap_split_uaf",
+            # 5.15.220 absorbed the Tasks-RCU quiescent-state report in
+            # shrink_lruvec() (mainline 25f52e812168, linux-5.15.y 4cdc1bdf4094,
+            # 2026-09-14): the 217 row proved this group as `applied`, the
+            # rolled tree flipped it to already_present (engine re-run), so
+            # per the roll rule it moves here rather than leaving the row
+            # claiming `applied`.
+            "vmscan_tasks_rcu_qs",
         },
         "stable_perf_backport": {
             "sched_nohz_idle_balance_series",
@@ -279,7 +296,7 @@ SUPPORTED = tuple(PRE_APPLIED)
 # speak of: this is the SUBLEVEL the single matrix row is keyed to.  It is used
 # as the ABK_TEST_SUB_LEVEL / missing-Makefile default, and audit_tree() treats
 # a tree that disagrees with it as an error rather than a downgrade.
-DEFAULT_SUB_LEVEL = "217"
+DEFAULT_SUB_LEVEL = "220"
 
 
 def pre_applied(sub_level, child):

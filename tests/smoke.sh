@@ -44,6 +44,9 @@ SMOKE_FILES=(
   # Batch 37 (MGLRU v4): the workingset and deactivation groups anchor here.
   mm/workingset.c
   mm/swap.c
+  # Batch 49: the prefault placement group rewrites lru_gen_add_page()'s
+  # generation formula in this header.
+  include/linux/mm_inline.h
   include/linux/swap.h
   include/linux/cgroup-defs.h
   include/linux/cpuset.h
@@ -526,6 +529,40 @@ grep -q "Swappiness value to reclaim with" \
   "$KERNEL_ROOT/common/Documentation/admin-guide/cgroup-v2.rst" \
   || fail "the memory.reclaim swappiness= key is undocumented"
 
+# Batch 49: the MGLRU v7.2 reclaim-loop rework (0491e9f75c15 series).  The
+# loop half is pinned on the shapes that replace the old aging/sizing
+# coupling, and the dirty half on the per-batch flusher wake that replaces
+# the once-per-loop one -- the negative below is the regression f37d3708b676
+# exists to prevent (a wake that rarely fired while dirty pages kept
+# reappearing at the LRU tail).  Superseded-group statuses cannot show any
+# of this: every superseded group stops on its own probe.
+grep -q "nr_batch = min_t(unsigned long, nr_to_scan, MIN_LRU_BATCH);" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the MGLRU reclaim loop does not clamp batches to MIN_LRU_BATCH"
+grep -q "nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the MGLRU scan budget is not computed once at loop entry"
+if grep -q "\*need_aging = should_run_aging" "$KERNEL_ROOT/common/mm/vmscan.c"; then
+  fail "should_run_aging() still computes nr_to_scan (163bc3d68c9f missing)"
+fi
+grep -q "if (stat.nr_unqueued_dirty == isolated) {" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the MGLRU eviction does not wake flushers per batch"
+if grep -q "sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken" \
+     "$KERNEL_ROOT/common/mm/vmscan.c"; then
+  fail "the once-per-loop flusher wake survived (f37d3708b676 missing)"
+fi
+grep -q "page_inc_gen(lruvec, page);" "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "page_inc_gen() did not lose its reclaiming argument"
+if grep -q "page_inc_gen(lruvec, page, true)" "$KERNEL_ROOT/common/mm/vmscan.c"; then
+  fail "sort_page() still diverts dirty/writeback pages (75d4c3f5fb98 missing)"
+fi
+grep -q "else if (PageReferenced(page))" \
+  "$KERNEL_ROOT/common/include/linux/mm_inline.h" \
+  || fail "prefaulted file pages are not placed a generation up (6cbdd9726fb5 missing)"
+grep -q "mark_page_accessed(page);" "$KERNEL_ROOT/common/mm/swap.c" \
+  || fail "lru_cache_add() does not mark prefaulted file pages accessed"
+
 # Batch 35: the write source buffer is prefaulted where the copy made no
 # progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves
 # are load-bearing and neither is visible in a pass-1 status: without the first
@@ -798,6 +835,18 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/mm/page_io.c" \
         "$KERNEL_ROOT/common/mm/page_io.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for mm/page_io.c"
+fi
+# Batch 49 is the module's first include/linux/mm_inline.h write, and the loop
+# rework rewrites the MGLRU core of mm/vmscan.c: both have to roll back too.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/include/linux/mm_inline.h" \
+        "$KERNEL_ROOT/common/include/linux/mm_inline.h" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for include/linux/mm_inline.h"
+fi
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/mm/vmscan.c" \
+        "$KERNEL_ROOT/common/mm/vmscan.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for mm/vmscan.c"
 fi
 # Batch 35 is the first group to write mm/truncate.c and the first to touch
 # include/linux/mm.h; both have to come back byte-identical too.

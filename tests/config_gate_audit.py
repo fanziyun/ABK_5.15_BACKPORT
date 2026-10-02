@@ -125,6 +125,15 @@ DARK_GATES = {
         "the two symbols: its Kconfig step makes ZRAM_MEMORY_TRACKING select "
         "ZRAM_TRACK_ENTRY_ACTIME so age tracking no longer requires debugfs"
     ),
+    "CONFIG_HIGHMEM": (
+        "negated guard (Batch 39 pagealloc_batch_clear): the added line is "
+        "inside ``if (!IS_ENABLED(CONFIG_HIGHMEM))`` -- the batch memset is "
+        "precisely the HIGHMEM=n path arm64 always compiles (HIGHMEM does not "
+        "exist on arm64), while the HIGHMEM=y branch keeps the pristine "
+        "per-page loop byte for byte.  The audit's IS_ENABLED scan cannot see "
+        "the ``!`` polarity; both branches compile, and the one that runs is "
+        "the added one"
+    ),
 }
 
 

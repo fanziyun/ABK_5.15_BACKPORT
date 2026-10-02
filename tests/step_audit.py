@@ -81,6 +81,9 @@ AUDIT_FILES = [
     # anchor in these.
     "mm/workingset.c",
     "mm/swap.c",
+    # Batch 49 (MGLRU v7.2 loop rework): the prefault placement group
+    # rewrites lru_gen_add_page()'s generation formula here.
+    "include/linux/mm_inline.h",
     "include/linux/swap.h",
     "include/linux/cgroup-defs.h",
     "include/linux/cpuset.h",

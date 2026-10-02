@@ -15,7 +15,7 @@
 | **kcompressd 卸载** | 压缩与换出移出 kswapd 至每节点独立线程，回收时延不含压缩耗时 |
 | **低内存快速失败** | 内存压力下 THP 类高阶分配一次尝试即回退调用方，不阻塞 direct reclaim |
 | **动态预读** | 后台任务预读窗口减半，低内存机型节省内存 |
-| **MGLRU** | 多代 LRU 的老化反馈、refault 判定与工作集清理采用上游 v6.14 版本 |
+| **MGLRU** | 多代 LRU 的老化反馈、refault 判定与工作集清理采用上游 v6.14 版本，回收循环与 dirty 写回采用上游 v7.2 重写 |
 | **页面分配 / cgroup / 缺页路径** | cpuset 异常配置提前退出、percpu freelist 无锁读、per-memcg 主动回收、巨页缺页快速路径等 |
 
 ### 调度与响应
@@ -45,13 +45,13 @@
 
 | child id | 内容 | 组数 |
 |---|---|---:|
-| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 67 |
+| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 71 |
 | `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 24 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **92 个移植组**，同一串注入在 `android13-5.15-lts` 上使用。
+共 **96 个移植组**，同一串注入在 `android13-5.15-lts` 上使用。
 
-支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 216）**。
+支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 220）**。
 Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，
 不按版本号门控，因此撤档不改变任何组的形态。
 
