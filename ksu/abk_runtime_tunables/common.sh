@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.19.0"
+ABK_VERSION="v0.20.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
