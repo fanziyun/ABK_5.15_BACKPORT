@@ -1528,18 +1528,11 @@ def _mglru_rework_aging_feedback_apply(ctx):
     Re-authored for the 6.1-shape functions (lru_gen_struct/lists, sort_page,
     evict_pages, age_lruvec, get_nr_to_scan with need_aging); the per-memcg
     swappiness read stays on the baseline's mem_cgroup_swappiness().
-    MIN_SWAPPINESS/MAX_SWAPPINESS are NOT added here: upstream
-    410abb20acae/68cd9050d871 own them and this module lands that series as
-    the batch37 reclaim chain, registered after this group -- adding them
-    twice would duplicate the defines and pull the anchor out from under the
-    swappiness-argument group.  get_swappiness()'s !may_swap short-circuit,
-    however, IS added here: neither of those commits carries it and the
-    baseline get_swappiness() lacks it (the may_swap dance removed above was
-    the baseline's only holder), so landing the unconditional call without
-    the guard would let a may_swap=0 cgroup reclaim (memsw limit,
-    memory.reclaim noswap=1) run with the full swappiness and add_to_swap()
-    its way past a memory+swap limit.  The guard is upstream's own shape:
-    mainline get_swappiness() opens with it (verified on v6.11).
+    MIN/MAX_SWAPPINESS and get_swappiness()'s !may_swap short-circuit are NOT
+    added here: upstream 410abb20acae/68cd9050d871 own them and this module
+    lands that series as the batch37 reclaim chain, registered after this
+    group -- adding them twice would both duplicate the defines and pull the
+    anchor out from under the swappiness-argument group.
     """
     steps = [
         # -- include/linux/mmzone.h: min_seq[] semantics, protected[] tier 0,
@@ -2148,33 +2141,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\tunsigned long nr_to_scan;\n"
          "\n"
          "\t\tnr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);\n",
-         T),
-        # -- get_swappiness(): the !may_swap short-circuit.  The dance removed
-        #    above was the baseline's only may_swap gate, and the unconditional
-        #    call upstream pairs with this rework is only safe because its
-        #    get_swappiness() opens with this guard (v6.11+, verified).  The
-        #    baseline function lacks it, and neither 410abb20acae nor
-        #    68cd9050d871 adds it, so without this step a may_swap=0 cgroup
-        #    reclaim (memsw limit, memory.reclaim noswap=1) would run with the
-        #    full swappiness and add_to_swap() its way past a memory+swap
-        #    limit.  Same group as the dance removal on purpose: one required
-        #    miss aborts both, so the protection can never land half-way.
-        ("mm/vmscan.c",
-         "static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)\n"
-         "{\n"
-         "\tint swappiness;\n"
-         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
-         "\tstruct pglist_data *pgdat = lruvec_pgdat(lruvec);\n"
-         "\n",
-         "static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)\n"
-         "{\n"
-         "\tint swappiness;\n"
-         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
-         "\tstruct pglist_data *pgdat = lruvec_pgdat(lruvec);\n"
-         "\n"
-         "\tif (!sc->may_swap)\n"
-         "\t\treturn 0;\n"
-         "\n",
          T),
         # -- run_aging()/run_cmd(): debugfs paths follow the same rules --
         ("mm/vmscan.c",
@@ -3062,9 +3028,9 @@ def _zram_recompression_apply(ctx):
          "\thandle_new = zs_malloc(zram->mem_pool, comp_len_new,\n"
          "\t\t\t       __GFP_KSWAPD_RECLAIM | __GFP_NOWARN |\n"
          "\t\t\t       __GFP_HIGHMEM | __GFP_MOVABLE);\n"
-         "\tif (!handle_new) {\n"
+         "\tif (IS_ERR_VALUE(handle_new)) {\n"
          "\t\tzcomp_stream_put(zram->comps[prio]);\n"
-         "\t\treturn -ENOMEM;\n"
+         "\t\treturn PTR_ERR((void *)handle_new);\n"
          "\t}\n\n"
          "\tdst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);\n"
          "\tmemcpy(dst, zstrm->buffer, comp_len_new);\n"
