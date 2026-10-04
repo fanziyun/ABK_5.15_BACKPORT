@@ -3262,7 +3262,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.51.0", "0.51.0"], _versions)
+          _versions == ["0.50.0", "0.50.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3432,7 +3432,7 @@ def test_runtime_tunables_module():
     _zs_readme = (module_dir / "README.md").read_text(encoding="utf-8")
     for _key, _value in (("zram.recomp.idle_age_sec", "900"),
                          ("zram.recomp.interval_sec", "1800"),
-                         ("zram.recomp.mark_interval_sec", "3600"),
+                         ("zram.recomp.mark_interval_sec", "10800"),
                          ("zram.recomp.max_pages", "131072")):
         check(f"tunables.conf ships {_key}={_value}",
               re.search(rf"(?m)^{re.escape(_key)}={_value}\s*$", tunables)
@@ -4200,7 +4200,7 @@ rm -rf "$T"
           and "--no-mark" in got.get("supervisor_args2", ""),
           (got.get("supervisor_args"), got.get("supervisor_args2")))
     check("the supervisor up line carries the mark cadence",
-          got.get("supervisor_mark") == "mark=3600s", r.stdout)
+          got.get("supervisor_mark") == "mark=10800s", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
 
