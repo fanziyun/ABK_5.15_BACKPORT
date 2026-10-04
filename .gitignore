@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 tests/out/
 build/
+tmp/
 *.ko
 *.img
 *.bin

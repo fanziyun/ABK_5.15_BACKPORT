@@ -15,7 +15,7 @@
 | **kcompressd offload** | Compress-and-swap-out moves off kswapd onto a per-node kthread, so reclaim latency excludes compression cost |
 | **Low-memory fast fail** | Under pressure, THP-class high-order allocations fall back to their caller after one try instead of blocking in direct reclaim |
 | **Dynamic readahead** | Halved readahead windows for background tasks, saving memory on low-RAM devices |
-| **MGLRU** | Aging feedback, refault detection and workingset cleanup at the upstream v6.14 versions |
+| **MGLRU** | Aging feedback, refault detection and workingset cleanup at the upstream v6.14 versions; the reclaim loop and dirty/writeback handling at the upstream v7.2 rewrite |
 | **Page alloc / cgroup / fault paths** | Cpuset insane-config bail-out, lock-free percpu freelist reads, per-memcg proactive reclaim, hugepage fault fast path |
 
 ### Scheduler and responsiveness
@@ -51,14 +51,14 @@
 
 | child id | content | groups |
 |---|---|---:|
-| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 67 |
+| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 71 |
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 24 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**92 graft groups** in total; one injection string covers `android13-5.15-lts`.
+**96 graft groups** in total; one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
-keyed to the tree's current Makefile `SUBLEVEL`, 216 as of 2026-09). Batch 44
+keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44
 dropped the `5.15.167` / `.178` / `.194` release baselines. This registry never
 version-gated anything -- it gates on text anchors only -- so the discard does
 not change any group's shape.

@@ -14,6 +14,22 @@ below. **Item 1 (the MGLRU series) is recorded here as *not portable*** — the
 first pass rated it strongly recommended on a wrong premise about how closely
 5.15's MGLRU matches 7.2's; §1 now carries the revision and its evidence.
 
+> **Verdict superseded by Batch 49** (`CHANGELOG.md#batch-49`, v0.52.0): the
+> "honest route" named below was taken.  The series' **end state** landed as
+> three atomic groups (`mglru_reclaim_loop_rework`, `mglru_dirty_reclaim_rework`,
+> `mglru_prefault_accessed_placement`) re-authored onto the 6.1-shape loop,
+> each independently auditable and revertable.  Two per-commit verdicts in the
+> table below were shape-dependent and reverse against the *restructured*
+> loop: `16b475d2ac3c` ("already present" via `scan_pages()`'s break-on-scanned)
+> and `12316f7902f8` ("largely already present" via `get_nr_to_scan()`'s
+> inlined abort) both lose their carrier when the loop is restructured, so
+> both are real deltas there and both landed.  `acd22fbb9f47` stays a no-op
+> (5.15's `may_writepage && __GFP_IO` guard is the later refinement and is
+> kept), and `f37d3708b676`'s `reclaim_throttle(VMSCAN_THROTTLE_WRITEBACK)`
+> payload is dropped (no such symbol on 5.15).  The difficulty assessment
+> below stands: it was the reason the port is three re-authored groups with
+> per-group shape probes and a device go/no-go gate rather than a graft.
+
 ## Method — and why a committer-date window does not work
 
 **A committer date does not delimit a kernel release.** Subsystem trees commit
