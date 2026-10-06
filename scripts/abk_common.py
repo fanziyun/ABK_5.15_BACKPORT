@@ -3,6 +3,12 @@
 Conventions:
 - Every write snapshots the original file to ``<file>.abk-orig`` exactly once;
   ``scripts/abk_rollback.sh`` restores from those snapshots.
+- A file this module *creates* has no original: the overlay leaves a zero-byte
+  ``<file>.abk-new`` marker, ``abk_rollback.sh`` deletes the target, and
+  ``<file>.abk-orig`` is a deliberately **empty** diff base that
+  ``tests/config_gate_audit.py`` attributes the created file's CONFIG gates
+  against.  ``write_text()`` therefore does not snapshot a target that carries
+  the creation marker.
 - All graft content carries a distinctive ``ABK stable_515_backport`` marker
   that doubles as the idempotency anchor and keeps this module's edits
   distinguishable from any other module's edits in the same tree.
@@ -21,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BACKUP_SUFFIX = ".abk-orig"
+# Marks a file the overlay created rather than rewrote; see the module docstring.
+NEW_SUFFIX = ".abk-new"
 
 MODULE_ID = "abk_5_15_backport"
 MODULE_MARKER = "ABK stable_515_backport:"
@@ -44,14 +52,23 @@ def write_text(path, text, eol=None, backup=True):
     """Write ``text`` verbatim (callers keep the file's own EOL style).
 
     Snapshots the original bytes to ``<path>.abk-orig`` on first write so the
-    rollback script can restore the pre-module state.
+    rollback script can restore the pre-module state.  A file the overlay
+    *created* carries ``<path>.abk-new`` instead: it has no original, so no
+    snapshot is taken and its deliberately empty diff base is preserved.
     """
     target = Path(path)
     if backup and not target.exists():
         raise FileNotFoundError(path)
     if backup:
         backup_path = Path(str(target) + BACKUP_SUFFIX)
-        if not backup_path.exists():
+        marker = Path(str(target) + NEW_SUFFIX)
+        # A created file has no original to restore, and its base has to stay
+        # empty: snapshotting the current bytes here would fill the diff base
+        # with the pre-adaptation payload, so tests/config_gate_audit.py would
+        # see only the adaptation as added code and stop auditing the
+        # whole-file gates inside it (Batch 57 -- sched_ext_payload_adapt is the
+        # first group to write a file the overlay created).
+        if not backup_path.exists() and not marker.exists():
             backup_path.write_bytes(target.read_bytes())
     target.write_bytes(text.encode("utf-8"))
 

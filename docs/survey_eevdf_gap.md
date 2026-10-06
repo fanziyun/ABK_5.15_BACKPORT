@@ -804,3 +804,56 @@ state (`Image` sha256 `581bc3df…`), verified by readback before the reboot —
 earlier build with the pre-rename comments was flashed first, and although its
 emitted C differs only in comments, it was replaced rather than described as
 equivalent.
+
+## 10. Tier D/E verdict — both items are closed (Batch 69)
+
+The plan carried two device-gated candidates:
+
+    - [~] `latency_nice` (6.1) / `protect_slice` (6.12): only if a real scheduling
+      effect can be shown, and only on the claimed `sched_entity` slots 1-4
+
+Neither needs a device: one is already implemented, the other does not exist.
+Both are closed here, so the line records evidence instead of staying open.
+
+### 10.1 `protect_slice` (6.12) is already in the tree — it is `PREEMPT_SHORT`
+
+"Protect the slice" is not a per-task attribute upstream; it is the EEVDF
+preemption rule of `85e511df3cec` (v6.12, `sched/eevdf: Allow shorter slices to
+wakeup-preempt`), and this tree carries it:
+
+| Evidence | Where |
+|---|---|
+| upstream commit id | `85e511df3cec` — the v6.12 entry in §2's timeline and in §A3 |
+| the switch | `kernel/sched/features.h`: `SCHED_FEAT(PREEMPT_SHORT, true)` |
+| the rule | `kernel/sched/fair.c`: `abk_eevdf_preempt_short()` in the wakeup preemption decision |
+| the registry side | `scripts/batch15_perf_eevdf.py` carries both strings, so `step_audit` proves they land |
+| the field condition | it reads only `se->slice` / `se->deadline` / `se->vlag` — all inside the four claimed slots |
+
+Nothing is left to port. What remains is the **measurement**, and §8's
+classification already says what to expect: meaningful for latency-critical
+short-slice threads, and it has needed three upstream corrections — i.e. it is
+measured by the existing EEVDF A/B, not by a new knob.
+
+### 10.2 `latency_nice` has no upstream implementation to port
+
+Searched for the symbol rather than for a description:
+
+| Source | Query | Hits |
+|---|---|---|
+| upstream `include/linux/sched.h`, `kernel/sched/fair.c`, `kernel/sched/sysctl.c`, `include/uapi/linux/sched/types.h` | `latency_nice` | v6.1, v6.2, v6.6, v6.7, v6.12, v6.13, v6.14, v6.15: **0** |
+| AOSP `kernel_common` `include/linux/sched.h` | `latency_nice` | android13-5.15, android14-6.1, android15-6.6: **0** |
+| this module's grafted 5.15 tree | `latency_nice` under `include/`, `kernel/sched/` | **0** |
+
+The `(6.1)` attribution in the plan was therefore wrong — §2's v6.1 timeline has
+no such commit either. Building it from scratch would mean inventing an ABI (a
+per-task attribute plus a `sched_setattr()` extension), and the KMI budget is the
+binding constraint (§5): `sched_entity` slots 1-4 are spent, `task_struct` slots 7
+and 8 belong to the SCX payload, and slot 5 is kept as the SysVIPC-conflict
+fallback. A new `task_struct` field with no reserve slot left is exactly what the
+red line forbids.
+
+**Verdict:** `protect_slice` — covered by the landed EEVDF payload, nothing to do
+beyond the existing A/B; `latency_nice` — excluded (no upstream implementation, and
+a from-scratch ABI would break the KMI budget). Neither is blocked on a device, so
+Tier D/E is closed.
+

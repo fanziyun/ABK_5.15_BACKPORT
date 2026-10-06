@@ -56,6 +56,7 @@ sys.path.insert(0, str(MODULE_DIR / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import abk_common as common  # noqa: E402
+import audit_fixture  # noqa: E402
 import sublevel_matrix  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
 import abk_stable_core  # noqa: E402
@@ -92,6 +93,42 @@ AUDIT_FILES = [
     "include/linux/memcontrol.h",
     "include/linux/randomize_kstack.h",
     "include/linux/sched.h",
+    # Batch 58 (sched_ext S2b-2b): the sched_cgroup_fork()/sched_cancel_fork()
+    # prototypes the fork-hook groups change.
+    "include/linux/sched/task.h",
+    # Batch 50 (Tier A1): sched_sis_util adds sched_domain_shared::nr_idle_scan.
+    "include/linux/sched/topology.h",
+    # sched_ext (S1/S1b): the arm64 BPF trampoline + bpf_arch_text_poke() and the
+    # btf_kfunc_id_set allow-list API.
+    "arch/arm64/net/bpf_jit_comp.c",
+    "arch/arm64/net/bpf_jit.h",
+    "arch/arm64/include/asm/insn.h",
+    "arch/arm64/lib/insn.c",
+    "include/linux/bpf.h",
+    "kernel/bpf/trampoline.c",
+    "include/linux/btf.h",
+    "include/linux/btf_ids.h",
+    "kernel/bpf/btf.c",
+    "kernel/bpf/verifier.c",
+    # Batch 55 (sched_ext S2b-1): the build wiring.  Kconfig.preempt carries
+    # CONFIG_SCHED_CLASS_EXT, include/uapi/linux/sched.h SCHED_EXT, the sched
+    # Makefile the glue object rule, and vmlinux.lds.h the SCHED_DATA slot.
+    "kernel/Kconfig.preempt",
+    "include/uapi/linux/sched.h",
+    "kernel/sched/Makefile",
+    "include/asm-generic/vmlinux.lds.h",
+    # Batch 60 (sched_ext S2b-2b): the reachability batch.  bpf_struct_ops_types.h
+    # is 5.15's struct_ops type registry (the sched_ext_ops value type), and
+    # debug.c registers the engine's debugfs dump.
+    "kernel/bpf/bpf_struct_ops_types.h",
+    "kernel/sched/debug.c",
+    # Batch 57 (sched_ext S2b-2): sched_ext_payload_adapt edits the payload the
+    # overlay creates, so this path has no source in the fetched tree --
+    # tests/audit_fixture.py supplies it from files/.
+    "kernel/sched/ext.c",
+    # Batch 59 (sched_ext S2b-2b): sched_ext_active_class rewrites the
+    # active-class walk in the same overlaid payload.
+    "kernel/sched/ext.h",
     "include/linux/psi_types.h",
     "include/linux/psi.h",
     "include/trace/hooks/dtask.h",
@@ -211,8 +248,11 @@ def fail(msg):
 def make_tree(source, work):
     root = work / "common"
     for rel in AUDIT_FILES:
-        src = source / rel
-        if not src.is_file():
+        # A file the module creates has no source in the fetched tree; the
+        # fixture takes it from the archived payload instead, the same bytes
+        # abk_stable_backport_overlay_sched_ext() would have put in the tree.
+        src = audit_fixture.resolve(source, rel, MODULE_DIR)
+        if src is None:
             fail(f"reference tree is missing {rel}")
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)

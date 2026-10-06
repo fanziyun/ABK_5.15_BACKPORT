@@ -196,7 +196,48 @@ GROUP_COUNTS = {
     # trees.  Registered immediately after schedutil_smart_policy because
     # registration order IS execution order for android_vh probes and the cap
     # has to clamp before the floor raises; see abk_stable_perf.py.
-    "stable_perf_backport": 24,
+    # 25 = the Batch-1..50 registry + the two sched_ext S1 infra groups added
+    # at the head of that series (arm64_insn_load_literal, arm64_bpf_text_poke).
+    # Batch 52 adds the third and last S1 group, arm64_bpf_trampoline (efc9909fdce0
+    # re-authored onto 5.15's bpf_tramp_progs interface) -- it is registered after
+    # the other two because it is their only consumer, and it consumes only
+    # generated text, so nothing can arrive pre-applied here either.
+    # Batch 53 adds the three S1b groups -- btf_kfunc_id_set_api (the allow-list
+    # registry in kernel/bpf/btf.c), struct_ops_kfunc_allow (the verifier gate
+    # that consults it) and arm64_jit_kfunc_call (bpf_jit_supports_kfunc_call()
+    # on arm64, without which add_kfunc_call() refuses every kfunc call there).
+    # None of them can be pre-applied on any baseline: btf_kfunc_id_set does not
+    # exist before v5.18, the empty bpf_struct_ops_verifier_ops is this tree's
+    # own shape, and the arch override never reached linux-5.15.y.
+    # Batch 55 adds the seven S2b-1 build-wiring groups: sched_ext_kconfig,
+    # sched_ext_uapi, sched_ext_task_slot, sched_ext_rq_state,
+    # sched_ext_class_order, sched_ext_build and sched_ext_init.  Every one of
+    # them anchors on text that exists only because this module added it
+    # (sched_ext_task_slot on the Batch-16 kstack run) or on 5.15 text that no
+    # upstream release carries in this shape, so nothing arrives pre-applied.
+    # Batch 57 adds the three S2b-2a adaptation groups
+    # (sched_ext_core_visibility, sched_ext_change_guard,
+    # sched_ext_payload_adapt).  The first two anchor on 5.15 text that no
+    # upstream release carries in this shape; the third edits the tree copy of
+    # the overlaid kernel/sched/ext.c, which the overlay creates.
+    # Batch 58 adds the five S2b-2b task-lifecycle groups
+    # (sched_ext_fork_hooks, sched_ext_fork_failure_path,
+    # sched_ext_task_teardown, sched_ext_setscheduler_hooks,
+    # sched_ext_payload_task_guard).  The first four anchor on 5.15 text no
+    # release carries in this shape; the fifth edits the same overlaid ext.c,
+    # so it too can never arrive pre-applied.
+    # Batch 59 adds the four S2b-2b scheduling-core groups
+    # (sched_ext_active_class, sched_ext_pick_path, sched_ext_tick_watchdog,
+    # sched_ext_idle_hook).  The first edits the overlaid kernel/sched/ext.h;
+    # the other three anchor on 5.15 core.c/idle.c text that no upstream release
+    # carries in this shape (the 6.6 call sites).  None can be pre-applied.
+    # Batch 60 adds the four reachability groups (sched_ext_policy_valid,
+    # sched_ext_priority_range, sched_ext_struct_ops_type,
+    # sched_ext_debugfs).  The first three close gates that exist only on this
+    # baseline (5.15's fair_policy(), the two priority-range syscalls and the
+    # struct_ops type registry), and the debugfs call site is 6.6's; none can
+    # arrive pre-applied.
+    "stable_perf_backport": 54,
     "stable_display_fix": 1,
 }
 

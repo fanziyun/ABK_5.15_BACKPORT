@@ -12,7 +12,7 @@ copyright stays with the individual author — or with their employer, where a
 work-for-hire arrangement applies — which is why upstream ships a `CREDITS` file
 rather than naming a single holder. The table below lists every upstream commit
 this module grafts for which a `.patch` is archived under `research/`
-(**91 commits**, **49 distinct authors**). Each row's author is
+(**92 commits**, **50 distinct authors**). Each row's author is
 that patch's own `From:` header, and the patch stays in-tree as the evidence.
 
 ## Corporate and organisational holders
@@ -53,6 +53,7 @@ Every distinct `From:` address in the graft set, by number of grafted commits:
 | 2 | Huang Ying <ying.huang@linux.alibaba.com> |
 | 2 | Jan Kara <jack@suse.cz> |
 | 2 | Kairui Song <kasong@tencent.com> |
+| 1 | Chen Yu <yu.c.chen@intel.com> |
 | 1 | "JP Kobryn (Meta)" <jp.kobryn@linux.dev> |
 | 1 | "T.J. Mercier" <tjmercier@google.com> |
 | 1 | Aboorva Devarajan <aboorvad@linux.ibm.com> |
@@ -254,6 +255,38 @@ own upstream attribution:
   mainline v6.18/v6.6/v7.x source snapshots.
 - `research/popsicle_w_oss/` — the popsicle-w-oss branch extraction, including the
   Qualcomm WALT files quoted above.
+- `research/mainline-v6.1/` — the arm64 BPF trampoline series grafted as Batch 51
+  and Batch 52 (`b2ad54e1533e` text_poke, `efc9909fdce0` trampoline, and the five
+  follow-ups `aada47665546`, `33f32e5072b6`, `339ed900b307`, `19f68ed6dc90`,
+  `eb707dde264a`; authors Xu Kuohai, Nathan Chancellor, Yonghong Song, all
+  GPL-2.0).  Two of the follow-ups are recorded as deliberately not carried
+  (`19f68ed6dc90` in Batch 51, `eb707dde264a` in Batch 52) — see
+  `CHANGELOG.md#batch-51` / `#batch-52`.  The same directory holds the v6.1
+  generic trampoline interface (`trampoline.c`, `bpf.h`) the port was re-authored
+  against; `research/mainline-v5.18/` holds the kfunc registration API measured
+  there for S1b (`dee872e124e8`, the registry and the hook, and `b202d8442222`,
+  the callback removal that was deliberately NOT carried), and
+  `research/mainline-v5.19/` the three commits that decide the shape Batch 53
+  actually uses: `ab21d6063c01` (the 8-byte set and `BTF_ID_FLAGS`),
+  `a4703e318432` (the single `.set` member and the flag semantics that are not
+  carried) and `b5e975d256db` (arm64 `bpf_jit_supports_kfunc_call()`, carried
+  verbatim).
+- `OnePlusOSS/android_kernel_common_oneplus_sm8750`, branch
+  `oneplus/sm8750_b_16.0.0_oneplus_13` (6.6) — the sched_ext payload shipped as
+  Batch 54 (`files/include/linux/sched/ext.h`, `files/kernel/sched/ext.h`,
+  `files/kernel/sched/ext.c`; 143,044 B, sha256 pinned in
+  `tests/stable_5_15_test.py`).  Batch 55 added a fourth file in that path,
+  `files/kernel/sched/sched_ext_glue.c`, which is **this module's own work, not
+  vendor code**: `ext.c` carries no include block (the 6.6 tree textually
+  includes it from `kernel/sched/build_policy.c`, which 5.15 does not have), so
+  the glue unit supplies the headers and includes `ext.c`.  The code is upstream sched_ext
+  (`Copyright (c) 2022 Meta Platforms, Inc. and affiliates`, Tejun Heo, David
+  Vernet; GPL-2.0) carried through the vendor tree, which is used here as a
+  **reference**: the module ships the files with their headers intact.  The
+  vendor tree adds two commented-out `slim_walt` lines, listed in
+  `files/README.md` so they are not mistaken for upstream text.  The payload
+  choice (against mainline 6.12's 219,742 B variant) and the measured dependency
+  closure are recorded in `docs/survey_sched_ext_gap.md`.
 - `research/zsmalloc_lockfree/`, `research/zram/`, `research/upstream-zram/`,
   `research/proactive_reclaim/` — further snapshots.
 

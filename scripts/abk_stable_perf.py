@@ -399,7 +399,14 @@ def _verify_kstack_member(ctx):
 def _kstack_pertask_apply(ctx):
     text = ctx.read("include/linux/sched.h")
     steps = []
-    if "kstack_offset;" not in text:
+    # Shape probe on this group's own added member, not on the reserve run it
+    # consumed: a later group (Batch 55's sched_ext_task_slot) claims the next
+    # free slot and therefore rewrites that run, which would otherwise leave
+    # this step anchoring on text no longer present on the second pass --
+    # group_recipe trap 5.  The member reads "kstack_offset);" (the macro call
+    # closes with a parenthesis), which is why the older probe spelling with a
+    # bare semicolon never fired.
+    if "kstack_offset);" not in text:
         steps.append(_sched_h_kstack_step(text))
     steps.extend([
         ("include/linux/randomize_kstack.h",
@@ -2547,6 +2554,1530 @@ PATCH_GROUPS = PATCH_GROUPS + _b15_eevdf.build_groups(PatchGroup)
 # blk_mq_init_allocated_queue() and blk_mq_update_nr_requests()), so their
 # relative order does not matter.
 PATCH_GROUPS = PATCH_GROUPS + _b15_blkdepth.build_groups(PatchGroup)
+
+
+# ---------------------------------------------------------------------------
+# Batch 50 (Tier A1): sched_sis_util.  Source: 70fb5ccf2ebb "sched/fair:
+# Introduce SIS_UTIL to search idle CPU based on sum of util_avg" (mainline
+# v6.0; shipped on android15-6.6).  Registered after the Batch 15 appends on
+# purpose: batch15_perf_sched_refinements rewrites select_idle_cpu() in place,
+# so every anchor below is the post-Batch-15 text.
+# ---------------------------------------------------------------------------
+
+_SIS_UTIL_SCAN_FN = (
+    "/* sailboat_sched_sis_util: derive the LLC idle-scan depth from sum_util. */\n"
+    "static void update_idle_cpu_scan(struct lb_env *env,\n"
+    "\t\t\t\t unsigned long sum_util)\n"
+    "{\n"
+    "\tstruct sched_domain_shared *sd_share;\n"
+    "\tint llc_weight, pct;\n"
+    "\tu64 x, y, tmp;\n"
+    "\t/*\n"
+    "\t * Update the number of CPUs to scan in LLC domain, which could\n"
+    "\t * be used as a hint in select_idle_cpu(). The update of sd_share\n"
+    "\t * could be expensive because it is within a shared cache line.\n"
+    "\t * So the write of this hint only occurs during periodic load\n"
+    "\t * balancing, rather than CPU_NEWLY_IDLE, because the latter\n"
+    "\t * can fire way more frequently than the former.\n"
+    "\t */\n"
+    "\tif (!sched_feat(SIS_UTIL) || env->idle == CPU_NEWLY_IDLE)\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tllc_weight = per_cpu(sd_llc_size, env->dst_cpu);\n"
+    "\tif (env->sd->span_weight != llc_weight)\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, env->dst_cpu));\n"
+    "\tif (!sd_share)\n"
+    "\t\treturn;\n"
+    "\n"
+    "\t/*\n"
+    "\t * The number of CPUs to search drops as sum_util increases, when\n"
+    "\t * sum_util hits 85% or above, the scan stops.\n"
+    "\t * The reason to choose 85% as the threshold is because this is the\n"
+    "\t * imbalance_pct(117) when a LLC sched group is overloaded.\n"
+    "\t *\n"
+    "\t * let y = SCHED_CAPACITY_SCALE - p * x^2                       [1]\n"
+    "\t * and y'= y / SCHED_CAPACITY_SCALE\n"
+    "\t *\n"
+    "\t * x is the ratio of sum_util compared to the CPU capacity:\n"
+    "\t * x = sum_util / (llc_weight * SCHED_CAPACITY_SCALE)\n"
+    "\t * y' is the ratio of CPUs to be scanned in the LLC domain,\n"
+    "\t * and the number of CPUs to scan is calculated by:\n"
+    "\t *\n"
+    "\t * nr_scan = llc_weight * y'                                    [2]\n"
+    "\t *\n"
+    "\t * When x hits the threshold of overloaded, AKA, when\n"
+    "\t * x = 100 / pct, y drops to 0. According to [1],\n"
+    "\t * p should be SCHED_CAPACITY_SCALE * pct^2 / 10000\n"
+    "\t *\n"
+    "\t * Scale x by SCHED_CAPACITY_SCALE:\n"
+    "\t * x' = sum_util / llc_weight;                                  [3]\n"
+    "\t *\n"
+    "\t * and finally [1] becomes:\n"
+    "\t * y = SCHED_CAPACITY_SCALE -\n"
+    "\t *     x'^2 * pct^2 / (10000 * SCHED_CAPACITY_SCALE)            [4]\n"
+    "\t *\n"
+    "\t */\n"
+    "\t/* equation [3] */\n"
+    "\tx = sum_util;\n"
+    "\tdo_div(x, llc_weight);\n"
+    "\n"
+    "\t/* equation [4] */\n"
+    "\tpct = env->sd->imbalance_pct;\n"
+    "\ttmp = x * x * pct * pct;\n"
+    "\tdo_div(tmp, 10000 * SCHED_CAPACITY_SCALE);\n"
+    "\ttmp = min_t(long, tmp, SCHED_CAPACITY_SCALE);\n"
+    "\ty = SCHED_CAPACITY_SCALE - tmp;\n"
+    "\n"
+    "\t/* equation [2] */\n"
+    "\ty *= llc_weight;\n"
+    "\tdo_div(y, SCHED_CAPACITY_SCALE);\n"
+    "\tif ((int)y != sd_share->nr_idle_scan)\n"
+    "\t\tWRITE_ONCE(sd_share->nr_idle_scan, (int)y);\n"
+    "}\n"
+    "\n"
+)
+
+def _sis_util_apply(ctx):
+    """SIS_UTIL: bound the LLC idle-CPU scan from the load balancer's hint.
+
+    The upstream commit also disables the SIS_PROP arms; the android15-6.6 line
+    ships exactly that shape (SIS_PROP=false, SIS_UTIL=true) and running both
+    would compute nr twice per wakeup.  batch15_perf_sched_refinements'
+    avg_idle_preemption_mode is therefore superseded on this knob -- its field
+    retirement (rq->wake_avg_idle / rq->wake_stamp) remains in force.
+    """
+    status, _results, detail = apply_steps(ctx, [
+        # struct sched_domain_shared::nr_idle_scan.  android14-6.1 places it
+        # before ANDROID_VENDOR_DATA(1); mirrored so the vendor slot keeps its
+        # offset.
+        ("include/linux/sched/topology.h",
+         "\tatomic_t\tnr_busy_cpus;\n"
+         "\tint\t\thas_idle_cores;\n",
+         "\tatomic_t\tnr_busy_cpus;\n"
+         "\tint\t\thas_idle_cores;\n"
+         "\tint\t\tnr_idle_scan;\t/* sailboat_sched_sis_util: SIS_UTIL scan-depth hint */\n",
+         T),
+        # SIS_PROP off, SIS_UTIL on -- the upstream pair.
+        ("kernel/sched/features.h",
+         "SCHED_FEAT(SIS_PROP, true)\n",
+         "SCHED_FEAT(SIS_PROP, false)\n"
+         "SCHED_FEAT(SIS_UTIL, true)\t/* sailboat_sched_sis_util */\n",
+         T),
+        # select_idle_cpu(): the shared-domain hint pointer.
+        ("kernel/sched/fair.c",
+         "\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n"
+         "\tstruct rq *this_rq = this_rq();\n",
+         "\tint i, cpu, idle_cpu = -1, nr = INT_MAX;\n"
+         "\tstruct sched_domain_shared *sd_share;\t/* sailboat_sched_sis_util */\n"
+         "\tstruct rq *this_rq = this_rq();\n",
+         T),
+        # select_idle_cpu(): SIS_UTIL bound, after the SIS_PROP arm.
+        ("kernel/sched/fair.c",
+         "\t\ttime = cpu_clock(this);\n"
+         "\t}\n"
+         "\n"
+         "\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n",
+         "\t\ttime = cpu_clock(this);\n"
+         "\t}\n"
+         "\n"
+         "\t/*\n"
+         "\t * sailboat_sched_sis_util: SIS_UTIL scan bound.  The hint is\n"
+         "\t * written by update_idle_cpu_scan() during periodic load balance;\n"
+         "\t * a zero hint means no idle search on this LLC.\n"
+         "\t */\n"
+         "\tif (sched_feat(SIS_UTIL)) {\n"
+         "\t\tsd_share = rcu_dereference(per_cpu(sd_llc_shared, target));\n"
+         "\t\tif (sd_share) {\n"
+         "\t\t\t/* because !--nr is the condition to stop scan */\n"
+         "\t\t\tnr = READ_ONCE(sd_share->nr_idle_scan) + 1;\n"
+         "\t\t\t/* overloaded LLC is unlikely to have idle cpu/core */\n"
+         "\t\t\tif (nr == 1)\n"
+         "\t\t\t\treturn -1;\n"
+         "\t\t}\n"
+         "\t}\n"
+         "\n"
+         "\tfor_each_cpu_wrap(cpu, cpus, target + 1) {\n",
+         T),
+        # the hint writer, immediately before update_sd_lb_stats()
+        ("kernel/sched/fair.c",
+         "\n/**\n * update_sd_lb_stats - Update sched_domain's statistics for load balancing.\n",
+         "\n" + _SIS_UTIL_SCAN_FN +
+         "\n/**\n * update_sd_lb_stats - Update sched_domain's statistics for load balancing.\n",
+         T),
+        # update_sd_lb_stats(): sum_util accumulator
+        ("kernel/sched/fair.c",
+         "\tstruct sg_lb_stats tmp_sgs;\n"
+         "\tint sg_status = 0;\n",
+         "\tstruct sg_lb_stats tmp_sgs;\n"
+         "\tunsigned long sum_util = 0;\t/* sailboat_sched_sis_util */\n"
+         "\tint sg_status = 0;\n",
+         T),
+        # accumulate each group's utilisation
+        ("kernel/sched/fair.c",
+         "\t\tsds->total_load += sgs->group_load;\n"
+         "\t\tsds->total_capacity += sgs->group_capacity;\n"
+         "\n"
+         "\t\tsg = sg->next;\n",
+         "\t\tsds->total_load += sgs->group_load;\n"
+         "\t\tsds->total_capacity += sgs->group_capacity;\n"
+         "\n"
+         "\t\tsum_util += sgs->group_util;\t/* sailboat_sched_sis_util */\n"
+         "\t\tsg = sg->next;\n",
+         T),
+        # publish the hint
+        ("kernel/sched/fair.c",
+         "\t} else if (sg_status & SG_OVERUTILIZED) {\n"
+         "\t\tset_rd_overutilized_status(env->dst_rq->rd, SG_OVERUTILIZED);\n"
+         "\t}\n"
+         "}\n",
+         "\t} else if (sg_status & SG_OVERUTILIZED) {\n"
+         "\t\tset_rd_overutilized_status(env->dst_rq->rd, SG_OVERUTILIZED);\n"
+         "\t}\n"
+         "\n"
+         "\tupdate_idle_cpu_scan(env, sum_util);\t/* sailboat_sched_sis_util */\n"
+         "}\n",
+         T),
+    ])
+    return status, detail
+
+
+
+# ---------------------------------------------------------------------------
+# sched_ext (S1a): the aarch64 instruction generators and A64 macros the arm64
+# BPF plt is built on.
+#
+# Source: the arm64 BPF-trampoline set that landed in mainline v6.1 --
+# b2ad54e1533e "bpf, arm64: Implement bpf_arch_text_poke() for arm64" (which
+# introduces struct bpf_plt and therefore A64_LDR*LIT), efc9909fdce0 "bpf,
+# arm64: Add bpf trampoline for arm64" (the first user of A64_STR64I /
+# A64_LDR64I) and the instruction-encoder commit both of them depend on.  This
+# group carries only what those two need.
+#
+# 5.15 shapes, measured on the supported tree rather than assumed:
+#   * the encoder lives in arch/arm64/lib/insn.c -- arch/arm64/kernel/insn.c is
+#     a 404 on android13-5.15-lts (checked against the branch's own directory
+#     listing), so an upstream patch path of kernel/insn.c has to be
+#     re-pointed, not copied;
+#   * there is no aarch64_insn_ldst_size[] array (v6.1's refactor), so the size
+#     shift stays the switch the generator below uses;
+#   * the offset range check is still branch_imm_common(); the upstream
+#     label_imm_common() rename is not carried, because nothing in this tree
+#     else calls the renamed helper.
+# ---------------------------------------------------------------------------
+
+_ARM64_INSN_LITERAL_IMPL = (
+    "/* sailboat_arm64_insn_load_literal: imm-offset and literal load/store. */\n"
+    "u32 aarch64_insn_gen_load_store_imm(enum aarch64_insn_register reg,\n"
+    "\t\t\t\t    enum aarch64_insn_register base,\n"
+    "\t\t\t\t    unsigned int imm,\n"
+    "\t\t\t\t    enum aarch64_insn_size_type size,\n"
+    "\t\t\t\t    enum aarch64_insn_ldst_type type)\n"
+    "{\n"
+    "\tu32 insn;\n"
+    "\tu32 shift;\n"
+    "\n"
+    "\tif (size < AARCH64_INSN_SIZE_8 || size > AARCH64_INSN_SIZE_64) {\n"
+    "\t\tpr_err(\"%s: unknown size encoding %d\\n\", __func__, type);\n"
+    "\t\treturn AARCH64_BREAK_FAULT;\n"
+    "\t}\n"
+    "\n"
+    "\tswitch (size) {\n"
+    "\tcase AARCH64_INSN_SIZE_8:\n"
+    "\t\tshift = 0;\n"
+    "\t\tbreak;\n"
+    "\tcase AARCH64_INSN_SIZE_16:\n"
+    "\t\tshift = 1;\n"
+    "\t\tbreak;\n"
+    "\tcase AARCH64_INSN_SIZE_32:\n"
+    "\t\tshift = 2;\n"
+    "\t\tbreak;\n"
+    "\tdefault:\n"
+    "\t\tshift = 3;\n"
+    "\t\tbreak;\n"
+    "\t}\n"
+    "\tif (imm & ~(BIT(12 + shift) - BIT(shift))) {\n"
+    "\t\tpr_err(\"%s: invalid imm: %d\\n\", __func__, imm);\n"
+    "\t\treturn AARCH64_BREAK_FAULT;\n"
+    "\t}\n"
+    "\n"
+    "\timm >>= shift;\n"
+    "\n"
+    "\tswitch (type) {\n"
+    "\tcase AARCH64_INSN_LDST_LOAD_IMM_OFFSET:\n"
+    "\t\tinsn = aarch64_insn_get_load_imm_value();\n"
+    "\t\tbreak;\n"
+    "\tcase AARCH64_INSN_LDST_STORE_IMM_OFFSET:\n"
+    "\t\tinsn = aarch64_insn_get_store_imm_value();\n"
+    "\t\tbreak;\n"
+    "\tdefault:\n"
+    "\t\tpr_err(\"%s: unknown load/store encoding %d\\n\", __func__, type);\n"
+    "\t\treturn AARCH64_BREAK_FAULT;\n"
+    "\t}\n"
+    "\n"
+    "\tinsn = aarch64_insn_encode_ldst_size(size, insn);\n"
+    "\n"
+    "\tinsn = aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RT, insn, reg);\n"
+    "\n"
+    "\tinsn = aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RN, insn,\n"
+    "\t\t\t\t\t    base);\n"
+    "\n"
+    "\treturn aarch64_insn_encode_immediate(AARCH64_INSN_IMM_12, insn, imm);\n"
+    "}\n"
+    "\n"
+    "u32 aarch64_insn_gen_load_literal(unsigned long pc, unsigned long addr,\n"
+    "\t\t\t\t  enum aarch64_insn_register reg,\n"
+    "\t\t\t\t  bool is64bit)\n"
+    "{\n"
+    "\tu32 insn;\n"
+    "\tlong offset;\n"
+    "\n"
+    "\toffset = branch_imm_common(pc, addr, SZ_1M);\n"
+    "\tif (offset >= SZ_1M)\n"
+    "\t\treturn AARCH64_BREAK_FAULT;\n"
+    "\n"
+    "\tinsn = aarch64_insn_get_ldr_lit_value();\n"
+    "\n"
+    "\tif (is64bit)\n"
+    "\t\tinsn |= BIT(30);\n"
+    "\n"
+    "\tinsn = aarch64_insn_encode_register(AARCH64_INSN_REGTYPE_RT, insn, reg);\n"
+    "\n"
+    "\treturn aarch64_insn_encode_immediate(AARCH64_INSN_IMM_19, insn,\n"
+    "\t\t\t\t\t     offset >> 2);\n"
+    "}\n"
+    "\n"
+)
+
+def _arm64_insn_load_literal_apply(ctx):
+    """aarch64_insn_gen_load_literal() + the A64 macros built on it.
+
+    Dead code on its own: the only callers in this module are the arm64 BPF
+    text_poke and trampoline groups, and upstream ships the same three pieces
+    as one dependency of the same series.
+    """
+    status, _results, detail = apply_steps(ctx, [
+        # enum aarch64_insn_ldst_type: the two unsigned-immediate forms.
+        ("arch/arm64/include/asm/insn.h",
+         "\tAARCH64_INSN_LDST_LOAD_REG_OFFSET,\n"
+         "\tAARCH64_INSN_LDST_STORE_REG_OFFSET,\n"
+         "\tAARCH64_INSN_LDST_LOAD_PAIR_PRE_INDEX,\n",
+         "\tAARCH64_INSN_LDST_LOAD_REG_OFFSET,\n"
+         "\tAARCH64_INSN_LDST_STORE_REG_OFFSET,\n"
+         "\t/* sailboat_arm64_insn_load_literal: unsigned-immediate forms */\n"
+         "\tAARCH64_INSN_LDST_LOAD_IMM_OFFSET,\n"
+         "\tAARCH64_INSN_LDST_STORE_IMM_OFFSET,\n"
+         "\tAARCH64_INSN_LDST_LOAD_PAIR_PRE_INDEX,\n",
+         T),
+        # NB: no opcode matcher is added here.  v6.1's
+        # aarch64_insn_gen_load_store_imm() looks up
+        # aarch64_insn_get_{ldr,str}_imm_value(), but v6.1 insn.h *also* still
+        # carries aarch64_insn_get_{load,store}_imm_value() with the identical
+        # mask/value pair, and 5.15 has only that older pair -- so the generator
+        # below is written against the pair this tree already has instead of
+        # adding two byte-identical duplicates.
+        # Declarations, immediately before the pair generator they sit next to
+        # upstream.
+        ("arch/arm64/include/asm/insn.h",
+         "u32 aarch64_insn_gen_load_store_pair(enum aarch64_insn_register reg1,\n",
+         "/* sailboat_arm64_insn_load_literal */\n"
+         "u32 aarch64_insn_gen_load_store_imm(enum aarch64_insn_register reg,\n"
+         "\t\t\t\t    enum aarch64_insn_register base,\n"
+         "\t\t\t\t    unsigned int imm,\n"
+         "\t\t\t\t    enum aarch64_insn_size_type size,\n"
+         "\t\t\t\t    enum aarch64_insn_ldst_type type);\n"
+         "u32 aarch64_insn_gen_load_literal(unsigned long pc, unsigned long addr,\n"
+         "\t\t\t\t  enum aarch64_insn_register reg,\n"
+         "\t\t\t\t  bool is64bit);\n"
+         "u32 aarch64_insn_gen_load_store_pair(enum aarch64_insn_register reg1,\n",
+         T),
+        # Implementations, between aarch64_insn_gen_load_store_reg() and the
+        # pair generator.
+        ("arch/arm64/lib/insn.c",
+         "u32 aarch64_insn_gen_load_store_pair(enum aarch64_insn_register reg1,\n",
+         _ARM64_INSN_LITERAL_IMPL +
+         "u32 aarch64_insn_gen_load_store_pair(enum aarch64_insn_register reg1,\n",
+         T),
+        # bpf_jit.h: the A64 load/store-immediate family.  bpf_jit.h has no
+        # immediate-offset form on 5.15 at all, so A64_STR64I()/A64_LDR64I()
+        # arrive here rather than in the trampoline group that uses them.
+        ("arch/arm64/net/bpf_jit.h",
+         "#define A64_LDR64(Xt, Xn, Xm) A64_LS_REG(Xt, Xn, Xm, 64, LOAD)\n"
+         "\n"
+         "/* Load/store register pair */\n",
+         "#define A64_LDR64(Xt, Xn, Xm) A64_LS_REG(Xt, Xn, Xm, 64, LOAD)\n"
+         "\n"
+         "/* sailboat_arm64_insn_load_literal: register (immediate offset) */\n"
+         "#define A64_LS_IMM(Rt, Rn, imm, size, type) \\\n"
+         "\taarch64_insn_gen_load_store_imm(Rt, Rn, imm, \\\n"
+         "\t\tAARCH64_INSN_SIZE_##size, \\\n"
+         "\t\tAARCH64_INSN_LDST_##type##_IMM_OFFSET)\n"
+         "#define A64_STRBI(Wt, Xn, imm)  A64_LS_IMM(Wt, Xn, imm, 8, STORE)\n"
+         "#define A64_LDRBI(Wt, Xn, imm)  A64_LS_IMM(Wt, Xn, imm, 8, LOAD)\n"
+         "#define A64_STRHI(Wt, Xn, imm)  A64_LS_IMM(Wt, Xn, imm, 16, STORE)\n"
+         "#define A64_LDRHI(Wt, Xn, imm)  A64_LS_IMM(Wt, Xn, imm, 16, LOAD)\n"
+         "#define A64_STR32I(Wt, Xn, imm) A64_LS_IMM(Wt, Xn, imm, 32, STORE)\n"
+         "#define A64_LDR32I(Wt, Xn, imm) A64_LS_IMM(Wt, Xn, imm, 32, LOAD)\n"
+         "#define A64_STR64I(Xt, Xn, imm) A64_LS_IMM(Xt, Xn, imm, 64, STORE)\n"
+         "#define A64_LDR64I(Xt, Xn, imm) A64_LS_IMM(Xt, Xn, imm, 64, LOAD)\n"
+         "\n"
+         "/* sailboat_arm64_insn_load_literal: LDR (literal) */\n"
+         "#define A64_LDR32LIT(Wt, offset) \\\n"
+         "\taarch64_insn_gen_load_literal(0, offset, Wt, false)\n"
+         "#define A64_LDR64LIT(Xt, offset) \\\n"
+         "\taarch64_insn_gen_load_literal(0, offset, Xt, true)\n"
+         "\n"
+         "/* Load/store register pair */\n",
+         T),
+        # bpf_jit.h: the nop the patchsite and the plt alignment are made of.
+        ("arch/arm64/net/bpf_jit.h",
+         "#define A64_BTI_JC A64_HINT(AARCH64_INSN_HINT_BTIJC)\n"
+         "\n"
+         "#endif /* _BPF_JIT_H */\n",
+         "#define A64_BTI_JC A64_HINT(AARCH64_INSN_HINT_BTIJC)\n"
+         "#define A64_NOP    A64_HINT(AARCH64_INSN_HINT_NOP)"
+         "\t/* sailboat_arm64_insn_load_literal */\n"
+         "\n"
+         "#endif /* _BPF_JIT_H */\n",
+         T),
+    ])
+    return status, detail
+
+
+# ---------------------------------------------------------------------------
+# sched_ext (S1b): bpf_arch_text_poke() for arm64.
+#
+# Source: b2ad54e1533e "bpf, arm64: Implement bpf_arch_text_poke() for arm64"
+# (mainline v6.1), with 33f32e5072b6 (.global dummy_tramp) and 339ed900b307
+# (x30 instead of lr in the same asm) folded in -- both fix the very patch this
+# group carries, and shipping the broken intermediate would be a build failure
+# on clang+CFI and on assemblers that do not accept "lr".
+#
+# Written for 5.15's interfaces rather than copied:
+#   * 5.15's arm64 BPF prologue has no paciasp, so BTI_INSNS + 2 + 7 is the new
+#     PROLOGUE_OFFSET (8/7 on the pristine file) and POKE_OFFSET is
+#     BTI_INSNS + 1;
+#   * linux/sizes.h is reachable through filter.h -> skbuff.h ->
+#     dma-mapping.h, so SZ_128M needs no include of its own;
+#   * 19f68ed6dc90 (kvcalloc for ctx.offset) is deliberately NOT carried:
+#     kvcalloc()/kvfree() are declared in linux/mm.h, which this translation
+#     unit does not include on 5.15, and pulling mm.h in for one allocation
+#     helper is a divergence with no bearing on the trampoline.
+#
+# Depends on arm64_insn_load_literal for A64_LDR64LIT / A64_NOP / A64_STR64I.
+# ---------------------------------------------------------------------------
+
+_ARM64_BPF_TRAMPOLINE_FN = (
+    "\n"
+    "/* sailboat_arm64_bpf_trampoline: the arm64 BPF trampoline.\n"
+    " *\n"
+    " * Ported from the mainline v6.1 arm64 series (efc9909fdce0, with the\n"
+    " * endianness fix aada47665546 folded in) onto this tree's trampoline\n"
+    " * interface: kernel/bpf/trampoline.c here hands the arch builder a\n"
+    " * struct bpf_tramp_progs, and __bpf_prog_enter()/__bpf_prog_exit() take\n"
+    " * (prog) / (prog, start) with no run context, so a program carries no\n"
+    " * cookie slot and the trampoline stack has no run-context frame.  This is\n"
+    " * what makes struct_ops -- and therefore sched_ext -- attachable on\n"
+    " * arm64.\n"
+    " *\n"
+    " * The struct-argument guard from the v6.1 follow-up is deliberately NOT\n"
+    " * carried: this tree's struct btf_func_model has no per-argument flags\n"
+    " * and no struct-argument marker exists, because trampoline struct\n"
+    " * arguments were only introduced upstream after 5.15.  There is nothing\n"
+    " * to reject, and adding the guard would not compile.\n"
+    " */\n"
+    "\n"
+    "/* invoke one bpf prog from the trampoline: enter, call, exit. */\n"
+    "static void invoke_bpf_prog(struct jit_ctx *ctx, struct bpf_prog *p,\n"
+    "\t\t\t    int args_off, int retval_off, bool save_ret)\n"
+    "{\n"
+    "\t__le32 *branch;\n"
+    "\tu64 enter_prog;\n"
+    "\tu64 exit_prog;\n"
+    "\n"
+    "\tif (p->aux->sleepable) {\n"
+    "\t\tenter_prog = (u64)__bpf_prog_enter_sleepable;\n"
+    "\t\texit_prog = (u64)__bpf_prog_exit_sleepable;\n"
+    "\t} else {\n"
+    "\t\tenter_prog = (u64)__bpf_prog_enter;\n"
+    "\t\texit_prog = (u64)__bpf_prog_exit;\n"
+    "\t}\n"
+    "\n"
+    "\t/* save p to callee saved register x19 to avoid loading p with mov_i64\n"
+    "\t * each time.\n"
+    "\t */\n"
+    "\temit_addr_mov_i64(A64_R(19), (const u64)p, ctx);\n"
+    "\n"
+    "\t/* arg1: prog */\n"
+    "\temit(A64_MOV(1, A64_R(0), A64_R(19)), ctx);\n"
+    "\n"
+    "\temit_call(enter_prog, ctx);\n"
+    "\n"
+    "\t/* save return value to callee saved register x20.  The save has to\n"
+    "\t * precede the branch: skip_exec_of_prog lands on the exit call, so a\n"
+    "\t * later store would leave x20 holding whatever the caller had, and\n"
+    "\t * __bpf_prog_exit() would charge that value as the program's start\n"
+    "\t * time whenever bpf stats are on (this tree's update_prog_stats()\n"
+    "\t * only rejects a start <= NO_START_TIME).  The 5.15 x86 trampoline,\n"
+    "\t * which is written against this same interface, saves first for the\n"
+    "\t * same reason; the v6.1 arm64 order saves after the placeholder.\n"
+    "\t */\n"
+    "\temit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);\n"
+    "\n"
+    "\t/* if (__bpf_prog_enter(prog) == 0)\n"
+    "\t *         goto skip_exec_of_prog;\n"
+    "\t */\n"
+    "\tbranch = ctx->image + ctx->idx;\n"
+    "\temit(A64_NOP, ctx);\n"
+    "\n"
+    "\temit(A64_ADD_I(1, A64_R(0), A64_SP, args_off), ctx);\n"
+    "\tif (!p->jited)\n"
+    "\t\temit_addr_mov_i64(A64_R(1), (const u64)p->insnsi, ctx);\n"
+    "\n"
+    "\temit_call((const u64)p->bpf_func, ctx);\n"
+    "\n"
+    "\tif (save_ret)\n"
+    "\t\temit(A64_STR64I(A64_R(0), A64_SP, retval_off), ctx);\n"
+    "\n"
+    "\tif (ctx->image) {\n"
+    "\t\tint offset = &ctx->image[ctx->idx] - branch;\n"
+    "\t\t*branch = cpu_to_le32(A64_CBZ(1, A64_R(0), offset));\n"
+    "\t}\n"
+    "\n"
+    "\t/* arg1: prog */\n"
+    "\temit(A64_MOV(1, A64_R(0), A64_R(19)), ctx);\n"
+    "\t/* arg2: start time */\n"
+    "\temit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);\n"
+    "\n"
+    "\temit_call(exit_prog, ctx);\n"
+    "}\n"
+    "\n"
+    "static void invoke_bpf_mod_ret(struct jit_ctx *ctx, struct bpf_tramp_progs *tp,\n"
+    "\t\t\t       int args_off, int retval_off, __le32 **branches)\n"
+    "{\n"
+    "\tint i;\n"
+    "\n"
+    "\t/* The first fmod_ret program will receive a garbage return value.\n"
+    "\t * Set this to 0 to avoid confusing the program.\n"
+    "\t */\n"
+    "\temit(A64_STR64I(A64_ZR, A64_SP, retval_off), ctx);\n"
+    "\tfor (i = 0; i < tp->nr_progs; i++) {\n"
+    "\t\tinvoke_bpf_prog(ctx, tp->progs[i], args_off, retval_off, true);\n"
+    "\t\t/* if (*(u64 *)(sp + retval_off) !=  0)\n"
+    "\t\t *\tgoto do_fexit;\n"
+    "\t\t */\n"
+    "\t\temit(A64_LDR64I(A64_R(10), A64_SP, retval_off), ctx);\n"
+    "\t\t/* Save the location of branch, and generate a nop.\n"
+    "\t\t * This nop will be replaced with a cbnz later.\n"
+    "\t\t */\n"
+    "\t\tbranches[i] = ctx->image + ctx->idx;\n"
+    "\t\temit(A64_NOP, ctx);\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "static void save_args(struct jit_ctx *ctx, int args_off, int nargs)\n"
+    "{\n"
+    "\tint i;\n"
+    "\n"
+    "\tfor (i = 0; i < nargs; i++) {\n"
+    "\t\temit(A64_STR64I(i, A64_SP, args_off), ctx);\n"
+    "\t\targs_off += 8;\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "static void restore_args(struct jit_ctx *ctx, int args_off, int nargs)\n"
+    "{\n"
+    "\tint i;\n"
+    "\n"
+    "\tfor (i = 0; i < nargs; i++) {\n"
+    "\t\temit(A64_LDR64I(i, A64_SP, args_off), ctx);\n"
+    "\t\targs_off += 8;\n"
+    "\t}\n"
+    "}\n"
+    "\n"
+    "/* Based on the x86's implementation of arch_prepare_bpf_trampoline().\n"
+    " *\n"
+    " * bpf prog and function entry before bpf trampoline hooked:\n"
+    " *   mov x9, lr\n"
+    " *   nop\n"
+    " *\n"
+    " * bpf prog and function entry after bpf trampoline hooked:\n"
+    " *   mov x9, lr\n"
+    " *   bl  <bpf_trampoline or plt>\n"
+    " *\n"
+    " */\n"
+    "static int prepare_trampoline(struct jit_ctx *ctx, struct bpf_tramp_image *im,\n"
+    "\t\t\t      struct bpf_tramp_progs *tprogs, void *orig_call,\n"
+    "\t\t\t      int nargs, u32 flags)\n"
+    "{\n"
+    "\tint i;\n"
+    "\tint stack_size;\n"
+    "\tint retaddr_off;\n"
+    "\tint regs_off;\n"
+    "\tint retval_off;\n"
+    "\tint args_off;\n"
+    "\tint nargs_off;\n"
+    "\tint ip_off;\n"
+    "\tstruct bpf_tramp_progs *fentry = &tprogs[BPF_TRAMP_FENTRY];\n"
+    "\tstruct bpf_tramp_progs *fexit = &tprogs[BPF_TRAMP_FEXIT];\n"
+    "\tstruct bpf_tramp_progs *fmod_ret = &tprogs[BPF_TRAMP_MODIFY_RETURN];\n"
+    "\tbool save_ret;\n"
+    "\t__le32 **branches = NULL;\n"
+    "\n"
+    "\t/* trampoline stack layout.  This tree passes no run context, so\n"
+    "\t * the stack starts at the IP argument:\n"
+    "\t *\n"
+    "\t *                  [ parent ip         ]\n"
+    "\t *                  [ FP                ]\n"
+    "\t * SP + retaddr_off [ self ip           ]\n"
+    "\t *                  [ FP                ]\n"
+    "\t *\n"
+    "\t *                  [ padding           ] align SP to multiples of 16\n"
+    "\t *\n"
+    "\t *                  [ x20               ] callee saved reg x20\n"
+    "\t * SP + regs_off    [ x19               ] callee saved reg x19\n"
+    "\t *\n"
+    "\t * SP + retval_off  [ return value      ] BPF_TRAMP_F_CALL_ORIG or\n"
+    "\t *                                        BPF_TRAMP_F_RET_FENTRY_RET\n"
+    "\t *\n"
+    "\t *                  [ argN              ]\n"
+    "\t *                  [ ...               ]\n"
+    "\t * SP + args_off    [ arg1              ]\n"
+    "\t *\n"
+    "\t * SP + nargs_off   [ args count        ]\n"
+    "\t *\n"
+    "\t * SP + ip_off      [ traced function   ] BPF_TRAMP_F_IP_ARG flag\n"
+    "\t */\n"
+    "\n"
+    "\tstack_size = 0;\n"
+    "\n"
+    "\tip_off = stack_size;\n"
+    "\t/* room for IP address argument */\n"
+    "\tif (flags & BPF_TRAMP_F_IP_ARG)\n"
+    "\t\tstack_size += 8;\n"
+    "\n"
+    "\tnargs_off = stack_size;\n"
+    "\t/* room for args count */\n"
+    "\tstack_size += 8;\n"
+    "\n"
+    "\targs_off = stack_size;\n"
+    "\t/* room for args */\n"
+    "\tstack_size += nargs * 8;\n"
+    "\n"
+    "\t/* room for return value */\n"
+    "\tretval_off = stack_size;\n"
+    "\tsave_ret = flags & (BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_RET_FENTRY_RET);\n"
+    "\tif (save_ret)\n"
+    "\t\tstack_size += 8;\n"
+    "\n"
+    "\t/* room for callee saved registers, currently x19 and x20 are used */\n"
+    "\tregs_off = stack_size;\n"
+    "\tstack_size += 16;\n"
+    "\n"
+    "\t/* round up to multiples of 16 to avoid SPAlignmentFault */\n"
+    "\tstack_size = round_up(stack_size, 16);\n"
+    "\n"
+    "\t/* return address locates above FP */\n"
+    "\tretaddr_off = stack_size + 8;\n"
+    "\n"
+    "\t/* bpf trampoline may be invoked by 3 instruction types:\n"
+    "\t * 1. bl, attached to bpf prog or kernel function via short jump\n"
+    "\t * 2. br, attached to bpf prog or kernel function via long jump\n"
+    "\t * 3. blr, working as a function pointer, used by struct_ops.\n"
+    "\t * So BTI_JC should used here to support both br and blr.\n"
+    "\t */\n"
+    "\temit_bti(A64_BTI_JC, ctx);\n"
+    "\n"
+    "\t/* frame for parent function */\n"
+    "\temit(A64_PUSH(A64_FP, A64_R(9), A64_SP), ctx);\n"
+    "\temit(A64_MOV(1, A64_FP, A64_SP), ctx);\n"
+    "\n"
+    "\t/* frame for patched function */\n"
+    "\temit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);\n"
+    "\temit(A64_MOV(1, A64_FP, A64_SP), ctx);\n"
+    "\n"
+    "\t/* allocate stack space */\n"
+    "\temit(A64_SUB_I(1, A64_SP, A64_SP, stack_size), ctx);\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_IP_ARG) {\n"
+    "\t\t/* save ip address of the traced function */\n"
+    "\t\temit_addr_mov_i64(A64_R(10), (const u64)orig_call, ctx);\n"
+    "\t\temit(A64_STR64I(A64_R(10), A64_SP, ip_off), ctx);\n"
+    "\t}\n"
+    "\n"
+    "\t/* save args count*/\n"
+    "\temit(A64_MOVZ(1, A64_R(10), nargs, 0), ctx);\n"
+    "\temit(A64_STR64I(A64_R(10), A64_SP, nargs_off), ctx);\n"
+    "\n"
+    "\t/* save args */\n"
+    "\tsave_args(ctx, args_off, nargs);\n"
+    "\n"
+    "\t/* save callee saved registers */\n"
+    "\temit(A64_STR64I(A64_R(19), A64_SP, regs_off), ctx);\n"
+    "\temit(A64_STR64I(A64_R(20), A64_SP, regs_off + 8), ctx);\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_CALL_ORIG) {\n"
+    "\t\temit_addr_mov_i64(A64_R(0), (const u64)im, ctx);\n"
+    "\t\temit_call((const u64)__bpf_tramp_enter, ctx);\n"
+    "\t}\n"
+    "\n"
+    "\tfor (i = 0; i < fentry->nr_progs; i++)\n"
+    "\t\tinvoke_bpf_prog(ctx, fentry->progs[i], args_off,\n"
+    "\t\t\t\tretval_off,\n"
+    "\t\t\t\tflags & BPF_TRAMP_F_RET_FENTRY_RET);\n"
+    "\n"
+    "\tif (fmod_ret->nr_progs) {\n"
+    "\t\tbranches = kcalloc(fmod_ret->nr_progs, sizeof(__le32 *),\n"
+    "\t\t\t\t   GFP_KERNEL);\n"
+    "\t\tif (!branches)\n"
+    "\t\t\treturn -ENOMEM;\n"
+    "\n"
+    "\t\tinvoke_bpf_mod_ret(ctx, fmod_ret, args_off, retval_off,\n"
+    "\t\t\t\t   branches);\n"
+    "\t}\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_CALL_ORIG) {\n"
+    "\t\trestore_args(ctx, args_off, nargs);\n"
+    "\t\t/* call original func */\n"
+    "\t\temit(A64_LDR64I(A64_R(10), A64_SP, retaddr_off), ctx);\n"
+    "\t\temit(A64_BLR(A64_R(10)), ctx);\n"
+    "\t\t/* store return value */\n"
+    "\t\temit(A64_STR64I(A64_R(0), A64_SP, retval_off), ctx);\n"
+    "\t\t/* reserve a nop for bpf_tramp_image_put */\n"
+    "\t\tim->ip_after_call = ctx->image + ctx->idx;\n"
+    "\t\temit(A64_NOP, ctx);\n"
+    "\t}\n"
+    "\n"
+    "\t/* update the branches saved in invoke_bpf_mod_ret with cbnz */\n"
+    "\tfor (i = 0; i < fmod_ret->nr_progs && ctx->image != NULL; i++) {\n"
+    "\t\tint offset = &ctx->image[ctx->idx] - branches[i];\n"
+    "\t\t*branches[i] = cpu_to_le32(A64_CBNZ(1, A64_R(10), offset));\n"
+    "\t}\n"
+    "\n"
+    "\tfor (i = 0; i < fexit->nr_progs; i++)\n"
+    "\t\tinvoke_bpf_prog(ctx, fexit->progs[i], args_off, retval_off,\n"
+    "\t\t\t\tfalse);\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_CALL_ORIG) {\n"
+    "\t\tim->ip_epilogue = ctx->image + ctx->idx;\n"
+    "\t\temit_addr_mov_i64(A64_R(0), (const u64)im, ctx);\n"
+    "\t\temit_call((const u64)__bpf_tramp_exit, ctx);\n"
+    "\t}\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_RESTORE_REGS)\n"
+    "\t\trestore_args(ctx, args_off, nargs);\n"
+    "\n"
+    "\t/* restore callee saved register x19 and x20 */\n"
+    "\temit(A64_LDR64I(A64_R(19), A64_SP, regs_off), ctx);\n"
+    "\temit(A64_LDR64I(A64_R(20), A64_SP, regs_off + 8), ctx);\n"
+    "\n"
+    "\tif (save_ret)\n"
+    "\t\temit(A64_LDR64I(A64_R(0), A64_SP, retval_off), ctx);\n"
+    "\n"
+    "\t/* reset SP  */\n"
+    "\temit(A64_MOV(1, A64_SP, A64_FP), ctx);\n"
+    "\n"
+    "\t/* pop frames  */\n"
+    "\temit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);\n"
+    "\temit(A64_POP(A64_FP, A64_R(9), A64_SP), ctx);\n"
+    "\n"
+    "\tif (flags & BPF_TRAMP_F_SKIP_FRAME) {\n"
+    "\t\t/* skip patched function, return to parent */\n"
+    "\t\temit(A64_MOV(1, A64_LR, A64_R(9)), ctx);\n"
+    "\t\temit(A64_RET(A64_R(9)), ctx);\n"
+    "\t} else {\n"
+    "\t\t/* return to patched function */\n"
+    "\t\temit(A64_MOV(1, A64_R(10), A64_LR), ctx);\n"
+    "\t\temit(A64_MOV(1, A64_LR, A64_R(9)), ctx);\n"
+    "\t\temit(A64_RET(A64_R(10)), ctx);\n"
+    "\t}\n"
+    "\n"
+    "\tif (ctx->image)\n"
+    "\t\tbpf_flush_icache(ctx->image, ctx->image + ctx->idx);\n"
+    "\n"
+    "\tkfree(branches);\n"
+    "\n"
+    "\treturn ctx->idx;\n"
+    "}\n"
+    "\n"
+    "int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,\n"
+    "\t\t\t\tvoid *image_end, const struct btf_func_model *m,\n"
+    "\t\t\t\tu32 flags, struct bpf_tramp_progs *tprogs,\n"
+    "\t\t\t\tvoid *orig_call)\n"
+    "{\n"
+    "\tint ret;\n"
+    "\tint nargs = m->nr_args;\n"
+    "\tint max_insns = ((long)image_end - (long)image) / AARCH64_INSN_SIZE;\n"
+    "\tstruct jit_ctx ctx = {\n"
+    "\t\t.image = NULL,\n"
+    "\t\t.idx = 0,\n"
+    "\t};\n"
+    "\n"
+    "\t/* the first 8 arguments are passed by registers */\n"
+    "\tif (nargs > 8)\n"
+    "\t\treturn -ENOTSUPP;\n"
+    "\n"
+    "\tret = prepare_trampoline(&ctx, im, tprogs, orig_call, nargs, flags);\n"
+    "\tif (ret < 0)\n"
+    "\t\treturn ret;\n"
+    "\n"
+    "\tif (ret > max_insns)\n"
+    "\t\treturn -EFBIG;\n"
+    "\n"
+    "\tctx.image = image;\n"
+    "\tctx.idx = 0;\n"
+    "\n"
+    "\tjit_fill_hole(image, (unsigned int)(image_end - image));\n"
+    "\tret = prepare_trampoline(&ctx, im, tprogs, orig_call, nargs, flags);\n"
+    "\n"
+    "\tif (ret > 0 && validate_code(&ctx) < 0)\n"
+    "\t\tret = -EINVAL;\n"
+    "\n"
+    "\tif (ret > 0)\n"
+    "\t\tret *= AARCH64_INSN_SIZE;\n"
+    "\n"
+    "\treturn ret;\n"
+    "}\n"
+)
+
+_ARM64_BPF_DUMMY_TRAMP = (
+    "/* sailboat_arm64_bpf_text_poke: a legal, harmless long-jump destination. */\n"
+    "void dummy_tramp(void);\n"
+    "\n"
+    "asm (\n"
+    "\"\t.pushsection .text, \\\"ax\\\", @progbits\\n\"\n"
+    "\"\t.global dummy_tramp\\n\"\n"
+    "\"\t.type dummy_tramp, %function\\n\"\n"
+    "\"dummy_tramp:\"\n"
+    "#if IS_ENABLED(CONFIG_ARM64_BTI_KERNEL)\n"
+    "\"\tbti j\\n\" /* dummy_tramp is called via \"br x10\" */\n"
+    "#endif\n"
+    "\"\tmov x10, x30\\n\"\n"
+    "\"\tmov x30, x9\\n\"\n"
+    "\"\tret x10\\n\"\n"
+    "\"\t.size dummy_tramp, .-dummy_tramp\\n\"\n"
+    "\"\t.popsection\\n\"\n"
+    ");\n"
+    "\n"
+    "/* build a plt initialized like this:\n"
+    " *\n"
+    " * plt:\n"
+    " *\tldr tmp, target\n"
+    " *\tbr tmp\n"
+    " * target:\n"
+    " *\t.quad dummy_tramp\n"
+    " *\n"
+    " * when a long jump trampoline is attached, target is filled with the\n"
+    " * trampoline address, and when the trampoline is removed, target is\n"
+    " * restored to dummy_tramp address.\n"
+    " */\n"
+    "static void build_plt(struct jit_ctx *ctx)\n"
+    "{\n"
+    "\tconst u8 tmp = bpf2a64[TMP_REG_1];\n"
+    "\tstruct bpf_plt *plt = NULL;\n"
+    "\n"
+    "\t/* make sure target is 64-bit aligned */\n"
+    "\tif ((ctx->idx + PLT_TARGET_OFFSET / AARCH64_INSN_SIZE) % 2)\n"
+    "\t\temit(A64_NOP, ctx);\n"
+    "\n"
+    "\tplt = (struct bpf_plt *)(ctx->image + ctx->idx);\n"
+    "\t/* plt is called via bl, no BTI needed here */\n"
+    "\temit(A64_LDR64LIT(tmp, 2 * AARCH64_INSN_SIZE), ctx);\n"
+    "\temit(A64_BR(tmp), ctx);\n"
+    "\n"
+    "\tif (ctx->image)\n"
+    "\t\tplt->target = (u64)&dummy_tramp;\n"
+    "}\n"
+    "\n"
+)
+
+_ARM64_BPF_TEXT_POKE_FN = (
+    "/* sailboat_arm64_bpf_text_poke: how a bpf prog's patchsite is patched. */\n"
+    "static bool is_long_jump(void *ip, void *target)\n"
+    "{\n"
+    "\tlong offset;\n"
+    "\n"
+    "\t/* NULL target means this is a NOP */\n"
+    "\tif (!target)\n"
+    "\t\treturn false;\n"
+    "\n"
+    "\toffset = (long)target - (long)ip;\n"
+    "\treturn offset < -SZ_128M || offset >= SZ_128M;\n"
+    "}\n"
+    "\n"
+    "static int gen_branch_or_nop(enum aarch64_insn_branch_type type, void *ip,\n"
+    "\t\t\t     void *addr, void *plt, u32 *insn)\n"
+    "{\n"
+    "\tvoid *target;\n"
+    "\n"
+    "\tif (!addr) {\n"
+    "\t\t*insn = aarch64_insn_gen_nop();\n"
+    "\t\treturn 0;\n"
+    "\t}\n"
+    "\n"
+    "\tif (is_long_jump(ip, addr))\n"
+    "\t\ttarget = plt;\n"
+    "\telse\n"
+    "\t\ttarget = addr;\n"
+    "\n"
+    "\t*insn = aarch64_insn_gen_branch_imm((unsigned long)ip,\n"
+    "\t\t\t\t\t    (unsigned long)target,\n"
+    "\t\t\t\t\t    type);\n"
+    "\n"
+    "\treturn *insn != AARCH64_BREAK_FAULT ? 0 : -EFAULT;\n"
+    "}\n"
+    "\n"
+    "/* Replace the branch instruction from @ip to @old_addr in a bpf prog or a bpf\n"
+    " * trampoline with the branch instruction from @ip to @new_addr. If @old_addr\n"
+    " * or @new_addr is NULL, the old or new instruction is NOP.\n"
+    " *\n"
+    " * When @ip is the bpf prog entry, a bpf trampoline is being attached or\n"
+    " * detached. Since bpf trampoline and bpf prog are allocated separately with\n"
+    " * vmalloc, the address distance may exceed 128MB, the maximum branch range.\n"
+    " * So long jump should be handled.\n"
+    " *\n"
+    " * When a bpf prog is constructed, a plt pointing to empty trampoline\n"
+    " * dummy_tramp is placed at the end:\n"
+    " *\n"
+    " *\tbpf_prog:\n"
+    " *\t\tmov x9, lr\n"
+    " *\t\tnop // patchsite\n"
+    " *\t\t...\n"
+    " *\t\tret\n"
+    " *\n"
+    " *\tplt:\n"
+    " *\t\tldr x10, target\n"
+    " *\t\tbr x10\n"
+    " *\ttarget:\n"
+    " *\t\t.quad dummy_tramp // plt target\n"
+    " *\n"
+    " * This is also the state when no trampoline is attached.\n"
+    " *\n"
+    " * When a short-jump bpf trampoline is attached, the patchsite is patched to\n"
+    " * a bl instruction to the trampoline directly:\n"
+    " *\n"
+    " *\tbpf_prog:\n"
+    " *\t\tmov x9, lr\n"
+    " *\t\tbl <short-jump bpf trampoline address> // patchsite\n"
+    " *\t\t...\n"
+    " *\t\tret\n"
+    " *\n"
+    " *\tplt:\n"
+    " *\t\tldr x10, target\n"
+    " *\t\tbr x10\n"
+    " *\ttarget:\n"
+    " *\t\t.quad dummy_tramp // plt target\n"
+    " *\n"
+    " * When a long-jump bpf trampoline is attached, the plt target is filled with\n"
+    " * the trampoline address and the patchsite is patched to a bl instruction to\n"
+    " * the plt:\n"
+    " *\n"
+    " *\tbpf_prog:\n"
+    " *\t\tmov x9, lr\n"
+    " *\t\tbl plt // patchsite\n"
+    " *\t\t...\n"
+    " *\t\tret\n"
+    " *\n"
+    " *\tplt:\n"
+    " *\t\tldr x10, target\n"
+    " *\t\tbr x10\n"
+    " *\ttarget:\n"
+    " *\t\t.quad <long-jump bpf trampoline address> // plt target\n"
+    " *\n"
+    " * The dummy_tramp is used to prevent another CPU from jumping to unknown\n"
+    " * locations during the patching process, making the patching process easier.\n"
+    " */\n"
+    "int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type poke_type,\n"
+    "\t\t       void *old_addr, void *new_addr)\n"
+    "{\n"
+    "\tint ret;\n"
+    "\tu32 old_insn;\n"
+    "\tu32 new_insn;\n"
+    "\tu32 replaced;\n"
+    "\tstruct bpf_plt *plt = NULL;\n"
+    "\tunsigned long size = 0UL;\n"
+    "\tunsigned long offset = ~0UL;\n"
+    "\tenum aarch64_insn_branch_type branch_type;\n"
+    "\tchar namebuf[KSYM_NAME_LEN];\n"
+    "\tvoid *image = NULL;\n"
+    "\tu64 plt_target = 0ULL;\n"
+    "\tbool poking_bpf_entry;\n"
+    "\n"
+    "\tif (!__bpf_address_lookup((unsigned long)ip, &size, &offset, namebuf))\n"
+    "\t\t/* Only poking bpf text is supported. Since kernel function\n"
+    "\t\t * entry is set up by ftrace, we reply on ftrace to poke kernel\n"
+    "\t\t * functions.\n"
+    "\t\t */\n"
+    "\t\treturn -ENOTSUPP;\n"
+    "\n"
+    "\timage = ip - offset;\n"
+    "\t/* zero offset means we're poking bpf prog entry */\n"
+    "\tpoking_bpf_entry = (offset == 0UL);\n"
+    "\n"
+    "\t/* bpf prog entry, find plt and the real patchsite */\n"
+    "\tif (poking_bpf_entry) {\n"
+    "\t\t/* plt locates at the end of bpf prog */\n"
+    "\t\tplt = image + size - PLT_TARGET_OFFSET;\n"
+    "\n"
+    "\t\t/* skip to the nop instruction in bpf prog entry:\n"
+    "\t\t * bti c // if BTI enabled\n"
+    "\t\t * mov x9, x30\n"
+    "\t\t * nop\n"
+    "\t\t */\n"
+    "\t\tip = image + POKE_OFFSET * AARCH64_INSN_SIZE;\n"
+    "\t}\n"
+    "\n"
+    "\t/* long jump is only possible at bpf prog entry */\n"
+    "\tif (WARN_ON((is_long_jump(ip, new_addr) || is_long_jump(ip, old_addr)) &&\n"
+    "\t\t    !poking_bpf_entry))\n"
+    "\t\treturn -EINVAL;\n"
+    "\n"
+    "\tif (poke_type == BPF_MOD_CALL)\n"
+    "\t\tbranch_type = AARCH64_INSN_BRANCH_LINK;\n"
+    "\telse\n"
+    "\t\tbranch_type = AARCH64_INSN_BRANCH_NOLINK;\n"
+    "\n"
+    "\tif (gen_branch_or_nop(branch_type, ip, old_addr, plt, &old_insn) < 0)\n"
+    "\t\treturn -EFAULT;\n"
+    "\n"
+    "\tif (gen_branch_or_nop(branch_type, ip, new_addr, plt, &new_insn) < 0)\n"
+    "\t\treturn -EFAULT;\n"
+    "\n"
+    "\tif (is_long_jump(ip, new_addr))\n"
+    "\t\tplt_target = (u64)new_addr;\n"
+    "\telse if (is_long_jump(ip, old_addr))\n"
+    "\t\t/* if the old target is a long jump and the new target is not,\n"
+    "\t\t * restore the plt target to dummy_tramp, so there is always a\n"
+    "\t\t * legal and harmless address stored in plt target, and we'll\n"
+    "\t\t * never jump from plt to an unknown place.\n"
+    "\t\t */\n"
+    "\t\tplt_target = (u64)&dummy_tramp;\n"
+    "\n"
+    "\tif (plt_target) {\n"
+    "\t\t/* non-zero plt_target indicates we're patching a bpf prog,\n"
+    "\t\t * which is read only.\n"
+    "\t\t */\n"
+    "\t\tif (set_memory_rw(PAGE_MASK & ((uintptr_t)&plt->target), 1))\n"
+    "\t\t\treturn -EFAULT;\n"
+    "\t\tWRITE_ONCE(plt->target, plt_target);\n"
+    "\t\tset_memory_ro(PAGE_MASK & ((uintptr_t)&plt->target), 1);\n"
+    "\t\t/* since plt target points to either the new trampoline\n"
+    "\t\t * or dummy_tramp, even if another CPU reads the old plt\n"
+    "\t\t * target value before fetching the bl instruction to plt,\n"
+    "\t\t * it will be brought back by dummy_tramp, so no barrier is\n"
+    "\t\t * required here.\n"
+    "\t\t */\n"
+    "\t}\n"
+    "\n"
+    "\t/* if the old target and the new target are both long jumps, no\n"
+    "\t * patching is required\n"
+    "\t */\n"
+    "\tif (old_insn == new_insn)\n"
+    "\t\treturn 0;\n"
+    "\n"
+    "\tmutex_lock(&text_mutex);\n"
+    "\tif (aarch64_insn_read(ip, &replaced)) {\n"
+    "\t\tret = -EFAULT;\n"
+    "\t\tgoto out;\n"
+    "\t}\n"
+    "\n"
+    "\tif (replaced != old_insn) {\n"
+    "\t\tret = -EFAULT;\n"
+    "\t\tgoto out;\n"
+    "\t}\n"
+    "\n"
+    "\t/* We call aarch64_insn_patch_text_nosync() to replace instruction\n"
+    "\t * atomically, so no other CPUs will fetch a half-new and half-old\n"
+    "\t * instruction. But there is chance that another CPU executes the\n"
+    "\t * old instruction after the patching operation finishes (e.g.,\n"
+    "\t * pipeline not flushed, or icache not synchronized yet).\n"
+    "\t *\n"
+    "\t * 1. when a new trampoline is attached, it is not a problem for\n"
+    "\t *    different CPUs to jump to different trampolines temporarily.\n"
+    "\t *\n"
+    "\t * 2. when an old trampoline is freed, we should wait for all other\n"
+    "\t *    CPUs to exit the trampoline and make sure the trampoline is no\n"
+    "\t *    longer reachable, since bpf_tramp_image_put() function already\n"
+    "\t *    uses percpu_ref and task-based rcu to do the sync, no need to call\n"
+    "\t *    the sync version here, see bpf_tramp_image_put() for details.\n"
+    "\t */\n"
+    "\tret = aarch64_insn_patch_text_nosync(ip, new_insn);\n"
+    "out:\n"
+    "\tmutex_unlock(&text_mutex);\n"
+    "\n"
+    "\treturn ret;\n"
+    "}\n"
+)
+
+def _arm64_bpf_text_poke_apply(ctx):
+    """bpf_arch_text_poke() for arm64 (the patchsite + the long-jump plt)."""
+    status, _results, detail = apply_steps(ctx, [
+        # linux/memory.h carries text_mutex; asm/patching.h the two insn
+        # accessors.  Both are what upstream added for this commit.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "#include <linux/filter.h>\n"
+         "#include <linux/printk.h>\n"
+         "#include <linux/slab.h>\n"
+         "\n"
+         "#include <asm/byteorder.h>\n"
+         "#include <asm/cacheflush.h>\n"
+         "#include <asm/cpufeature.h>\n"
+         "#include <asm/debug-monitors.h>\n"
+         "#include <asm/insn.h>\n"
+         "#include <asm/set_memory.h>\n",
+         "#include <linux/filter.h>\n"
+         "#include <linux/memory.h>\t"
+         "/* sailboat_arm64_bpf_text_poke: text_mutex */\n"
+         "#include <linux/printk.h>\n"
+         "#include <linux/slab.h>\n"
+         "\n"
+         "#include <asm/byteorder.h>\n"
+         "#include <asm/cacheflush.h>\n"
+         "#include <asm/cpufeature.h>\n"
+         "#include <asm/debug-monitors.h>\n"
+         "#include <asm/insn.h>\n"
+         "#include <asm/patching.h>\t"
+         "/* sailboat_arm64_bpf_text_poke: aarch64_insn_patch_text_nosync() */\n"
+         "#include <asm/set_memory.h>\n",
+         T),
+        # struct bpf_plt + the two offsets the plt is addressed by.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t__le32 *image;\n"
+         "\tu32 stack_size;\n"
+         "};\n"
+         "\n"
+         "static inline void emit(const u32 insn, struct jit_ctx *ctx)\n",
+         "\t__le32 *image;\n"
+         "\tu32 stack_size;\n"
+         "};\n"
+         "\n"
+         "/* sailboat_arm64_bpf_text_poke: the plt a bpf prog carries at its end. */\n"
+         "struct bpf_plt {\n"
+         "\tu32 insn_ldr; /* load target */\n"
+         "\tu32 insn_br;  /* branch to target */\n"
+         "\tu64 target;   /* target value */\n"
+         "};\n"
+         "\n"
+         "#define PLT_TARGET_SIZE   sizeof_field(struct bpf_plt, target)\n"
+         "#define PLT_TARGET_OFFSET offsetof(struct bpf_plt, target)\n"
+         "\n"
+         "static inline void emit(const u32 insn, struct jit_ctx *ctx)\n",
+         T),
+        # emit_bti(): the trampoline group emits it too, and it has to be
+        # unconditional here because the bpf prog's own landing pad moves.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t\tshift -= 16;\n"
+         "\t}\n"
+         "}\n"
+         "\n"
+         "/*\n"
+         " * Kernel addresses in the vmalloc space use at most 48 bits, and the\n",
+         "\t\tshift -= 16;\n"
+         "\t}\n"
+         "}\n"
+         "\n"
+         "static inline void emit_bti(u32 insn, struct jit_ctx *ctx)\n"
+         "{\n"
+         "\tif (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))\n"
+         "\t\temit(insn, ctx);\n"
+         "}\n"
+         "\n"
+         "/*\n"
+         " * Kernel addresses in the vmalloc space use at most 48 bits, and the\n",
+         T),
+        # The prologue grows by the poked mov/nop pair.  5.15's arm64 prologue
+        # has no paciasp, so the fixed tail is 7 instructions, not v6.1's 8.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "/* Tail call offset to jump into */\n"
+         "#if IS_ENABLED(CONFIG_ARM64_BTI_KERNEL)\n"
+         "#define PROLOGUE_OFFSET 8\n"
+         "#else\n"
+         "#define PROLOGUE_OFFSET 7\n"
+         "#endif\n",
+         "/* Tail call offset to jump into */\n"
+         "#define BTI_INSNS (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL) ? 1 : 0)\n"
+         "\n"
+         "/* Offset of nop instruction in bpf prog entry to be poked */\n"
+         "#define POKE_OFFSET (BTI_INSNS + 1)\n"
+         "\n"
+         "/* bti landing pad + the poked mov/nop pair + the 7 fixed instructions\n"
+         " * of this tree's prologue (no paciasp here, unlike v6.1).\n"
+         " */\n"
+         "#define PROLOGUE_OFFSET (BTI_INSNS + 2 + 7)\n",
+         T),
+        # build_prologue(): the landing pad, the patchsite.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t/* BTI landing pad */\n"
+         "\tif (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))\n"
+         "\t\temit(A64_BTI_C, ctx);\n"
+         "\n"
+         "\t/* Save FP and LR registers to stay align with ARM64 AAPCS */\n",
+         "\temit_bti(A64_BTI_C, ctx);\n"
+         "\n"
+         "\t/* sailboat_arm64_bpf_text_poke: the patchsite.  mov x9, lr keeps the\n"
+         "\t * return address reachable when a long-jump trampoline is attached\n"
+         "\t * (dummy_tramp restores it); the nop becomes the bl that\n"
+         "\t * bpf_arch_text_poke() writes.\n"
+         "\t */\n"
+         "\temit(A64_MOV(1, A64_R(9), A64_LR), ctx);\n"
+         "\temit(A64_NOP, ctx);\n"
+         "\n"
+         "\t/* Save FP and LR registers to stay align with ARM64 AAPCS */\n",
+         T),
+        # build_prologue(): the tail-call landing pad uses the same wrapper.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t\t/* BTI landing pad for the tail call, done with a BR */\n"
+         "\t\tif (IS_ENABLED(CONFIG_ARM64_BTI_KERNEL))\n"
+         "\t\t\temit(A64_BTI_J, ctx);\n",
+         "\t\t/* BTI landing pad for the tail call, done with a BR */\n"
+         "\t\temit_bti(A64_BTI_J, ctx);\n",
+         T),
+        # dummy_tramp + build_plt go in front of the epilogue builder.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "static void build_epilogue(struct jit_ctx *ctx, bool was_classic)\n",
+         _ARM64_BPF_DUMMY_TRAMP +
+         "static void build_epilogue(struct jit_ctx *ctx, bool was_classic)\n",
+         T),
+        # validate_code() loses the prog-specific tail so a trampoline image
+        # (which has no ctx->prog) can be validated with it.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t\tif (a64_insn == AARCH64_BREAK_FAULT)\n"
+         "\t\t\treturn -1;\n"
+         "\t}\n"
+         "\n"
+         "\tif (WARN_ON_ONCE(ctx->exentry_idx != ctx->prog->aux->num_exentries))\n"
+         "\t\treturn -1;\n"
+         "\n"
+         "\treturn 0;\n"
+         "}\n",
+         "\t\tif (a64_insn == AARCH64_BREAK_FAULT)\n"
+         "\t\t\treturn -1;\n"
+         "\t}\n"
+         "\n"
+         "\treturn 0;\n"
+         "}\n"
+         "\n"
+         "/* sailboat_arm64_bpf_text_poke: keep the prog-specific checks out of\n"
+         " * validate_code(), which the trampoline generator also calls.\n"
+         " */\n"
+         "static int validate_ctx(struct jit_ctx *ctx)\n"
+         "{\n"
+         "\tif (validate_code(ctx))\n"
+         "\t\treturn -1;\n"
+         "\n"
+         "\tif (WARN_ON_ONCE(ctx->exentry_idx != ctx->prog->aux->num_exentries))\n"
+         "\t\treturn -1;\n"
+         "\n"
+         "\treturn 0;\n"
+         "}\n",
+         T),
+        # bpf_int_jit_compile(): the plt needs its own room behind the image,
+        # and the extable has to move past it.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\tint image_size, prog_size, extable_size;\n",
+         "\tint image_size, prog_size, extable_size, extable_align, extable_offset;\n",
+         T),
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\tctx.epilogue_offset = ctx.idx;\n"
+         "\tbuild_epilogue(&ctx, was_classic);\n"
+         "\n"
+         "\textable_size = prog->aux->num_exentries *\n"
+         "\t\tsizeof(struct exception_table_entry);\n"
+         "\n"
+         "\t/* Now we know the actual image size. */\n"
+         "\tprog_size = sizeof(u32) * ctx.idx;\n"
+         "\timage_size = prog_size + extable_size;\n",
+         "\tctx.epilogue_offset = ctx.idx;\n"
+         "\tbuild_epilogue(&ctx, was_classic);\n"
+         "\tbuild_plt(&ctx);\n"
+         "\n"
+         "\textable_align = __alignof__(struct exception_table_entry);\n"
+         "\textable_size = prog->aux->num_exentries *\n"
+         "\t\tsizeof(struct exception_table_entry);\n"
+         "\n"
+         "\t/* Now we know the actual image size. */\n"
+         "\tprog_size = sizeof(u32) * ctx.idx;\n"
+         "\t/* also allocate space for plt target */\n"
+         "\textable_offset = round_up(prog_size + PLT_TARGET_SIZE, extable_align);\n"
+         "\timage_size = extable_offset + extable_size;\n",
+         T),
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\tif (extable_size)\n"
+         "\t\tprog->aux->extable = (void *)image_ptr + prog_size;\n",
+         "\tif (extable_size)\n"
+         "\t\tprog->aux->extable = (void *)image_ptr + extable_offset;\n",
+         T),
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\tbuild_epilogue(&ctx, was_classic);\n"
+         "\n"
+         "\t/* 3. Extra pass to validate JITed code. */\n"
+         "\tif (validate_code(&ctx)) {\n",
+         "\tbuild_epilogue(&ctx, was_classic);\n"
+         "\tbuild_plt(&ctx);\n"
+         "\n"
+         "\t/* 3. Extra pass to validate JITed code. */\n"
+         "\tif (validate_ctx(&ctx)) {\n",
+         T),
+        # The poking side itself, appended to the translation unit.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "void bpf_jit_free_exec(void *addr)\n"
+         "{\n"
+         "\treturn vfree(addr);\n"
+         "}\n",
+         "void bpf_jit_free_exec(void *addr)\n"
+         "{\n"
+         "\treturn vfree(addr);\n"
+         "}\n"
+         "\n" +
+         _ARM64_BPF_TEXT_POKE_FN,
+         T),
+    ])
+    return status, detail
+
+
+def _arm64_bpf_trampoline_apply(ctx):
+    """The arm64 BPF trampoline itself (fentry/fexit/fmod_ret/struct_ops)."""
+    status, _results, detail = apply_steps(ctx, [
+        # emit_call(): load an address and blr it.  The trampoline calls
+        # __bpf_prog_enter/exit, the bpf program and the original function
+        # through it, so it has to sit above build_insn().
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "static inline void emit_addr_mov_i64(const int reg, const u64 val,\n"
+         "\t\t\t\t     struct jit_ctx *ctx)\n"
+         "{\n"
+         "\tu64 tmp = val;\n"
+         "\tint shift = 0;\n"
+         "\n"
+         "\temit(A64_MOVN(1, reg, ~tmp & 0xffff, shift), ctx);\n"
+         "\twhile (shift < 32) {\n"
+         "\t\ttmp >>= 16;\n"
+         "\t\tshift += 16;\n"
+         "\t\temit(A64_MOVK(1, reg, tmp & 0xffff, shift), ctx);\n"
+         "\t}\n"
+         "}\n"
+         "\n"
+         "static inline int bpf2a64_offset(int bpf_insn, int off,\n",
+         "static inline void emit_addr_mov_i64(const int reg, const u64 val,\n"
+         "\t\t\t\t     struct jit_ctx *ctx)\n"
+         "{\n"
+         "\tu64 tmp = val;\n"
+         "\tint shift = 0;\n"
+         "\n"
+         "\temit(A64_MOVN(1, reg, ~tmp & 0xffff, shift), ctx);\n"
+         "\twhile (shift < 32) {\n"
+         "\t\ttmp >>= 16;\n"
+         "\t\tshift += 16;\n"
+         "\t\temit(A64_MOVK(1, reg, tmp & 0xffff, shift), ctx);\n"
+         "\t}\n"
+         "}\n"
+         "\n"
+         "/* sailboat_arm64_bpf_trampoline: load an address and call it. */\n"
+         "static inline void emit_call(u64 target, struct jit_ctx *ctx)\n"
+         "{\n"
+         "\tu8 tmp = bpf2a64[TMP_REG_1];\n"
+         "\n"
+         "\temit_addr_mov_i64(tmp, target, ctx);\n"
+         "\temit(A64_BLR(tmp), ctx);\n"
+         "}\n"
+         "\n"
+         "static inline int bpf2a64_offset(int bpf_insn, int off,\n",
+         T),
+        # The one existing helper-call site goes through the new emitter.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "\t\temit_addr_mov_i64(tmp, func_addr, ctx);\n"
+         "\t\temit(A64_BLR(tmp), ctx);\n"
+         "\t\temit(A64_MOV(1, r0, A64_R(0)), ctx);\n",
+         "\t\temit_call(func_addr, ctx);\n"
+         "\t\temit(A64_MOV(1, r0, A64_R(0)), ctx);\n",
+         T),
+        # The trampoline generator itself, appended after bpf_arch_text_poke()
+        # rather than before is_long_jump(): arm64_bpf_text_poke's payload is
+        # one contiguous block, so inserting into its middle would stop that
+        # group's `new` block from matching on the second pass while its `old`
+        # anchor still did -- appending a second copy of the whole poking side
+        # (group_recipe trap 5).  No C ordering depends on the placement:
+        # every helper the trampoline uses is defined above, and
+        # arch_prepare_bpf_trampoline() is called from another TU.
+        ("arch/arm64/net/bpf_jit_comp.c",
+         "out:\n"
+         "\tmutex_unlock(&text_mutex);\n"
+         "\n"
+         "\treturn ret;\n"
+         "}\n",
+         "out:\n"
+         "\tmutex_unlock(&text_mutex);\n"
+         "\n"
+         "\treturn ret;\n"
+         "}\n" +
+         _ARM64_BPF_TRAMPOLINE_FN,
+         T),
+    ])
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "sched_sis_util",
+        "SIS_UTIL: bound the LLC idle-CPU scan with the hint the periodic load"
+        " balancer derives from sum_util, and disable the avg_idle-prediction"
+        " budget it supersedes (mainline v6.0 70fb5ccf2ebb; the android15-6.6"
+        " line ships SIS_PROP=false + SIS_UTIL=true).  Supersedes"
+        " batch15_perf_sched_refinements' avg_idle_preemption_mode on the scan"
+        " budget only; that group's rq->wake_avg_idle/wake_stamp retirement"
+        " remains in force.  struct sched_domain_shared grows nr_idle_scan"
+        " before ANDROID_VENDOR_DATA(1), mirroring android14-6.1.",
+        ["70fb5ccf2ebb (mainline v6.0; present on android15-6.6)"],
+        ["include/linux/sched/topology.h", "kernel/sched/features.h", "kernel/sched/fair.c"],
+        _sis_util_apply,
+    ),
+    PatchGroup(
+        "arm64_insn_load_literal",
+        "aarch64_insn_gen_load_literal() (plus the unsigned-immediate load/store"
+        " generator it shares an encoding with) and the A64_LS_IMM / A64_LDR*LIT"
+        " / A64_NOP macros built on them.  Both arm64 bpf groups below need"
+        " them: struct bpf_plt emits A64_LDR64LIT and the trampoline saves"
+        " arguments with A64_STR64I/A64_LDR64I, neither of which exists on"
+        " 5.15.  Dead code until arm64_bpf_text_poke runs.  Carried from the"
+        " mainline v6.1 arm64 BPF-trampoline series, adapted to this tree:"
+        " the file is arch/arm64/lib/insn.c here (kernel/insn.c is a 404 on"
+        " android13-5.15-lts), there is no aarch64_insn_ldst_size[] array,"
+        " and the offset check is still branch_imm_common().",
+        ["b2ad54e1533e / efc9909fdce0 dependency (mainline v6.1)",
+         "A64_LS_IMM + A64_LDR*LIT + A64_NOP"],
+        ["arch/arm64/include/asm/insn.h", "arch/arm64/lib/insn.c",
+         "arch/arm64/net/bpf_jit.h"],
+        _arm64_insn_load_literal_apply,
+    ),
+    PatchGroup(
+        "arm64_bpf_text_poke",
+        "bpf_arch_text_poke() for arm64: the bpf prog entry gains an"
+        " ftrace-style patchsite (mov x9, lr; nop), the prog tail grows a plt"
+        " that points at dummy_tramp until a long-jump trampoline replaces it,"
+        " and kernel functions are left to ftrace (-ENOTSUPP).  This is what"
+        " lets a bpf trampoline attach on arm64 at all.  Written for 5.15, not"
+        " copied: this tree's prologue has no paciasp, so PROLOGUE_OFFSET is"
+        " BTI_INSNS + 2 + 7 and POKE_OFFSET is BTI_INSNS + 1; linux/sizes.h"
+        " already arrives through filter.h -> skbuff.h -> dma-mapping.h, so"
+        " SZ_128M needs no include.  19f68ed6dc90 (kvcalloc for ctx.offset) is"
+        " deliberately NOT carried -- kvcalloc()/kvfree() live in"
+        " linux/mm.h, which this TU does not include on 5.15, and pulling mm.h"
+        " in for one allocation helper has nothing to do with the trampoline.",
+        ["b2ad54e1533e (mainline v6.1)",
+         "33f32e5072b6 + 339ed900b307 (dummy_tramp .global / x30, folded in)"],
+        ["arch/arm64/net/bpf_jit_comp.c"],
+        _arm64_bpf_text_poke_apply,
+    ),
+    PatchGroup(
+        "arm64_bpf_trampoline",
+        "The arm64 BPF trampoline: native ABI -> bpf ABI conversion for"
+        " fentry/fexit/fmod_ret and struct_ops.  This group is what makes"
+        " struct_ops -- and therefore sched_ext -- attachable on arm64; the"
+        " two groups above are its prerequisites (the instruction macros and"
+        " the poking side), and it is registered last because it is their"
+        " only consumer.  Re-authored onto this tree's interface, not copied:"
+        " kernel/bpf/trampoline.c here passes struct bpf_tramp_progs and"
+        " __bpf_prog_enter(prog)/__bpf_prog_exit(prog, start) take no"
+        " bpf_tramp_run_ctx, so a program carries no cookie slot and the"
+        " trampoline stack has no run-ctx frame; a verbatim v6.1 copy"
+        " references bpf_tramp_links/bpf_tramp_run_ctx and does not compile."
+        " aada47665546 (__le32 branch targets + cpu_to_le32) is folded in --"
+        " this tree's ctx->image is already __le32 *, so the sparse warning"
+        " that commit fixes is a compile error here.  eb707dde264a (reject"
+        " struct arguments) is deliberately NOT carried: struct"
+        " btf_func_model has no arg_flags[] on 5.15 and"
+        " BTF_FMODEL_STRUCT_ARG does not exist, because trampoline struct"
+        " arguments only landed upstream after 5.15 -- the guard would not"
+        " compile and there is nothing for it to reject."
+        " Sized but not attach-verified on device: arm64 selects no"
+        " HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS on 5.15 either, so fentry on"
+        " an ftrace-managed target stays -ENOTSUPP; struct_ops, which takes"
+        " the bpf_arch_text_poke() path, is what this group unblocks.",
+        ["efc9909fdce0 (mainline v6.1, the trampoline)",
+         "aada47665546 (folded in: __le32 branch targets)",
+         "eb707dde264a (measured inapplicable on 5.15, see above)"],
+        ["arch/arm64/net/bpf_jit_comp.c"],
+        _arm64_bpf_trampoline_apply,
+    ),
+]
+
+
+# ============================================================================
+# Batch 53 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
+# consults it, and the arm64 override that lets a kfunc be called at all.
+# Registered after every arm64 group on purpose: arm64_bpf_text_poke appends a
+# whole poking payload after bpf_jit_free_exec() and arm64_bpf_trampoline
+# appends the trampoline inside that payload, so a new block inserted into
+# either of them would stop their own `new` block from matching on the second
+# pass while their `old` anchor still did -- group_recipe trap 5, the earlier
+# group appends its payload again.  arm64_jit_kfunc_call therefore anchors well
+# above them, on bpf_jit_alloc_exec_limit(), which neither group touches.
+# ============================================================================
+import batch53_perf_btf_kfunc as _b53_kfunc  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b53_kfunc.build_groups(PatchGroup)
+
+
+# ============================================================================
+# Batch 55 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
+# a compiled subsystem.  Registered last on purpose: sched_ext_task_slot claims
+# task_struct KABI slot 7 and anchors on the post-randomize_kstack_pertask run
+# (which appended to slot 8), so the two must run in that order.
+# ============================================================================
+import batch55_perf_sched_ext_wiring as _b55_scx  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b55_scx.build_groups(PatchGroup)
+
+
+# ============================================================================
+# Batch 57 (sched_ext S2b-2a): the 5.15 adaptation layer for the Batch-54
+# payload.  Registered after Batch 55 on purpose: sched_ext_task_slot anchors on
+# the post-randomize_kstack_pertask run and sched_ext_rq_state appends to
+# kernel/sched/sched.h, while these two groups edit kernel/sched/core.c,
+# kernel/sched/sched.h and the overlaid payload -- and the overlay runs before
+# this child (scripts/stable_backport.sh), because sched_ext_payload_adapt edits
+# kernel/sched/ext.c, which the overlay is what creates.
+# ============================================================================
+import batch57_perf_sched_ext_adapt as _b57_adapt  # noqa: E402  (three groups)
+
+PATCH_GROUPS = PATCH_GROUPS + _b57_adapt.build_groups(PatchGroup)
+
+
+# ============================================================================
+# Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  Registered
+# last, and after Batch 57 in particular: sched_ext_setscheduler_hooks edits the
+# __setscheduler_prio() body sched_ext_core_visibility generates (that group
+# therefore probes for its own marker first), and these groups edit
+# kernel/sched/ext.c, which the overlay creates before this child runs.
+# ============================================================================
+import batch58_perf_sched_ext_hooks as _b58_hooks  # noqa: E402  (five groups)
+
+PATCH_GROUPS = PATCH_GROUPS + _b58_hooks.build_groups(PatchGroup)
+
+
+# ============================================================================
+# Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+# Registered after Batch 58 for the same reason: the consumers of
+# for_each_active_class() must see the materialised payload, and
+# sched_ext_active_class rewrites that macro in the tree copy of
+# kernel/sched/ext.h, which the overlay creates before this child runs.
+# ============================================================================
+import batch59_perf_sched_ext_pick as _b59_pick  # noqa: E402  (four groups)
+
+PATCH_GROUPS = PATCH_GROUPS + _b59_pick.build_groups(PatchGroup)
+
+
+# ============================================================================
+# Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.  Registered
+# last: sched_ext_policy_valid opens the syscall gate the earlier batches' hooks
+# sit behind, and the struct_ops type entry is what lets a BPF scheduler bind at
+# all.  Two files enter the fixture lists here (kernel/bpf/
+# bpf_struct_ops_types.h and kernel/sched/debug.c), so the reference trees were
+# re-fetched before the audits were run.
+# ============================================================================
+import batch60_perf_sched_ext_reach as _b60_reach  # noqa: E402  (four groups)
+
+PATCH_GROUPS = PATCH_GROUPS + _b60_reach.build_groups(PatchGroup)
 
 
 def main():

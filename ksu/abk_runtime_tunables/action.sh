@@ -15,6 +15,8 @@ set -u
 MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/common.sh"
 . "$MODDIR/zram-policy.sh"
+. "$MODDIR/scx-policy.sh"
+. "$MODDIR/uclamp-policy.sh"
 
 ABK_STDOUT=1
 
@@ -234,11 +236,17 @@ case "${1:-status}" in
   unlock)
     abk_action_unlock
     ;;
+  scx)
+    abk_scx_status
+    ;;
+  uclamp)
+    abk_uclamp_status
+    ;;
   launch)
     abk_action_launch "$@"
     ;;
   *)
-    echo "usage: action.sh [status|pass|takeover|unlock|launch [warm|drop] [iters]]" >&2
+    echo "usage: action.sh [status|pass|takeover|unlock|scx|uclamp|launch [warm|drop] [iters]]" >&2
     exit 2
     ;;
 esac

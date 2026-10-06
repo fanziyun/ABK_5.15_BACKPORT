@@ -7,6 +7,7 @@ Runs fully self-contained on synthetic fixtures; no kernel tree required.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -3181,7 +3182,11 @@ def test_runtime_tunables_module():
 
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
                 "service.sh", "action.sh", "tunables.conf", "embed.conf",
-                "sepolicy.rule", "README.md")
+                "sepolicy.rule", "README.md",
+                # Batch 63: the sched_ext half of the policy (off by default).
+                "scx-policy.sh",
+                # Batch 67: the uclamp floor (off by default).
+                "uclamp-policy.sh")
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
@@ -3262,7 +3267,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.52.0", "0.52.0"], _versions)
+          _versions == ["0.72.0", "0.72.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3634,12 +3639,15 @@ def test_runtime_tunables_module():
             check("embedded reclaim tool is byte-identical to tools/",
                   archive.read("bin/cached_freeze_reclaim.sh")
                   == (repo / "tools" / "cached_freeze_reclaim.sh").read_bytes())
-            check("embed.conf contributes exactly the five device tools",
+            check("embed.conf contributes the device tools and the SCX trio",
                   sorted(name for name in names if name.startswith("bin/"))
                   == ["bin/abk_launch_bench.sh",
                       "bin/abk_psi_bench.sh",
                       "bin/abk_psi_policy.sh",
+                      "bin/abk_scx_check.sh",
+                      "bin/abk_scx_min.bpf.o",
                       "bin/cached_freeze_reclaim.sh",
+                      "bin/scx_loader",
                       "bin/zram_recompress_trigger.sh"],
                   sorted(name for name in names if name.startswith("bin/")))
             check("embedded launch bench is byte-identical to tools/",
@@ -3740,8 +3748,11 @@ def test_runtime_tunables_module():
                   "_diff / (_on_tot / 1000)" in _psi_bench_code
                   and "* 10000 / _on_tot" not in _psi_bench_code)
             # Installed under bin/, these are module code as much as service.sh
-            # is, so the same two invariants apply to them.
-            for _bin in sorted(n for n in names if n.startswith("bin/")):
+            # is, so the same two invariants apply to them.  The sched_ext pair
+            # is ELF, not script (Batch 65), so the text invariants cover the
+            # .sh entries and the pair's presence is asserted on its own.
+            for _bin in sorted(n for n in names
+                               if n.startswith("bin/") and n.endswith(".sh")):
                 _bin_code = "\n".join(
                     line.split("#", 1)[0]
                     for line in archive.read(_bin).decode("utf-8").splitlines())
@@ -3752,6 +3763,8 @@ def test_runtime_tunables_module():
                 check(f"{_bin} never relaxes SELinux",
                       "setenforce" not in _bin_code
                       and "permissive" not in _bin_code.lower())
+            check("the sched_ext pair ships in bin/",
+                  "bin/scx_loader" in names and "bin/abk_scx_min.bpf.o" in names)
             modes = {info.filename: (info.external_attr >> 16) & 0o777
                      for info in archive.infolist()}
             check("every module script is 0755",
@@ -6466,6 +6479,22 @@ def main():
     test_batch46_erofs_readmore_eof()
     test_batch41_kcompressd_offload()
     test_batch42_schedutil_smart_cap()
+    test_sched_ext_payload()
+    test_sched_ext_wiring()
+    test_batch56_compile_gate()
+    test_batch57_payload_adapt()
+    test_batch58_sched_ext_hooks()
+    test_batch59_sched_ext_pick()
+    test_batch60_sched_ext_reach()
+    test_batch61_scx_scheduler()
+    test_batch62_scx_loader()
+    test_batch63_scx_companion()
+    test_batch64_libelf_shim()
+    test_batch65_scx_prebuilt()
+    test_batch66_scx_check_tool()
+    test_batch67_uclamp_policy()
+    test_batch68_arm64_selftest()
+    test_batch69_tier_de_verdict()
 
     print()
     if FAILURES:
@@ -6731,6 +6760,1478 @@ def test_batch42_schedutil_smart_cap():
         check("an unrecognised include shape reports blocked_by_shape",
               st_o == "blocked_by_shape" and ctx3.pending_writes() == [],
               (st_o, d_o, ctx3.pending_writes()))
+
+def test_sched_ext_payload():
+    """Batch 54 (sched_ext S2a): the payload, its overlay and its rollback.
+
+    This batch registers no PatchGroup, so nothing here is visible in a graft
+    status and the test is the only thing holding the three structural facts:
+
+    * the payload is the file the survey measured, not "some ext.c".  The
+      sha256 of all three files is pinned, so a re-fetch from a changed vendor
+      branch fails here instead of shipping silently;
+    * the overlay's file list and the shipped list cannot drift apart.  A file
+      the overlay copies but the module does not ship -- or a shipped file no
+      overlay path creates -- is a missing-file abort at graft time;
+    * a *created* file needs both snapshot markers: the empty .abk-orig is the
+      diff base tests/config_gate_audit.py attributes the new file's CONFIG
+      gates against, and .abk-new is what tells the rollback to delete the
+      target rather than restore a zero-byte file over it.
+    """
+    print("Batch 54: sched_ext S2a payload + overlay + created-file rollback")
+    repo = Path(__file__).resolve().parent.parent
+
+    payloads = {
+        "files/include/linux/sched/ext.h":
+            "d0601a9ba8f58d4f221db8bfa557ffb601055366e9b90ffe7d8da42fe81d7a94",
+        "files/kernel/sched/ext.h":
+            "459c86fdd6f2fb69cff24fa26c9974cb7c5650204942025329a6ebbd612ace1a",
+        "files/kernel/sched/ext.c":
+            "98860acf42098c5c05886dc3c3fc097264224e05ed1731a90f08196c0ef93801",
+    }
+    total = 0
+    for rel, want in payloads.items():
+        path = repo / rel
+        check(f"{rel} is shipped", path.is_file())
+        if not path.is_file():
+            continue
+        blob = path.read_bytes()
+        total += len(blob)
+        check(f"{rel} is LF, not CRLF", b"\r\n" not in blob, blob.count(b"\r\n"))
+        check(f"{rel} sha256 matches the measured payload",
+              hashlib.sha256(blob).hexdigest() == want,
+              hashlib.sha256(blob).hexdigest())
+    check("the payload is 143,044 bytes across three files", total == 143044, total)
+
+    # The fourth file is module-authored, not upstream, so it has no sha256 to
+    # pin; what it must be is a *compilation unit for the engine* and nothing
+    # else.  In particular it may not include kernel/sched/ext.h (no include
+    # guard -- a second inclusion redefines its enums) and may not pull in the
+    # policy .c files OPPO's build_policy.c includes, whose objects 5.15
+    # already builds.
+    glue = repo / "files/kernel/sched/sched_ext_glue.c"
+    check("the module-authored glue unit is shipped", glue.is_file())
+    glue_text = glue.read_text(encoding="utf-8") if glue.is_file() else ""
+    check("the glue unit is LF, not CRLF",
+          glue.is_file() and b"\r\n" not in glue.read_bytes())
+    check("the glue unit includes the payload engine",
+          '#include "ext.c"' in glue_text)
+    check("the glue unit supplies sched.h itself",
+          '#include "sched.h"' in glue_text)
+    check("the glue unit does not double-include kernel/sched/ext.h",
+          '#include "ext.h"' not in glue_text)
+    for _name in ("idle.c", "rt.c", "cpudeadline.c", "pelt.c", "cputime.c",
+                  "deadline.c"):
+        check(f"the glue unit does not pull in {_name}",
+              f'#include "{_name}"' not in glue_text)
+
+    ext_c = (repo / "files/kernel/sched/ext.c").read_text(encoding="utf-8")
+    check("the upstream copyright header survived",
+          "Copyright (c) 2022 Meta Platforms, Inc. and affiliates." in ext_c
+          and "Copyright (c) 2022 Tejun Heo <tj@kernel.org>" in ext_c
+          and "Copyright (c) 2022 David Vernet <dvernet@meta.com>" in ext_c)
+    # The two vendor traces are comments, and they are kept so the file stays
+    # byte-reproducible from its URL; files/README.md has to say so, because
+    # otherwise they read as upstream text.
+    check("the two OPPO slim_walt traces are still the only vendor residue",
+          '//#include "./slim_walt.c"' in ext_c
+          and "//slim_walt_enable(true);" in ext_c
+          and ext_c.count("slim_walt") == 2,
+          ext_c.count("slim_walt"))
+
+    dispatcher = (repo / "scripts/stable_backport.sh").read_text(encoding="utf-8")
+    check("the overlay function is defined",
+          "abk_stable_backport_overlay_sched_ext() {" in dispatcher)
+    check("the overlay rides the perf child's dispatch path",
+          'if [ "$child_id" = "stable_perf_backport" ]; then\n'
+          "      abk_stable_backport_overlay_sched_ext\n    fi" in dispatcher)
+    check("the overlay also runs in the all-children path",
+          dispatcher.rstrip().endswith(
+              "abk_stable_backport_overlay_sched_ext\n}"))
+    # Defined once, called four times: each dispatch mode materialises the
+    # payload before the perf child (the child's sched_ext_payload_adapt edits
+    # the overlaid ext.c) and re-runs the overlay after it (that second call is
+    # what writes the empty .abk-orig diff base, since the Makefile entry only
+    # exists once the child has run).
+    check("the overlay is defined once and called twice per dispatch mode",
+          dispatcher.count("abk_stable_backport_overlay_sched_ext") == 5,
+          dispatcher.count("abk_stable_backport_overlay_sched_ext"))
+    _pre = ('if [ "$child_id" = "stable_perf_backport" ]; then\n'
+            "      abk_stable_backport_overlay_sched_ext\n    fi\n"
+            '    abk_stable_backport_apply_child "$child_id"')
+    check("the per-child path overlays before it applies the child",
+          _pre in dispatcher)
+
+    body = dispatcher.split("abk_stable_backport_overlay_sched_ext() {", 1)[1]
+    body = body.split("\n}\n", 1)[0]
+    overlay_paths = list(payloads) + ["files/kernel/sched/sched_ext_glue.c"]
+    for rel in overlay_paths:
+        target = rel[len("files/"):]
+        check(f"the overlay copies {target}", target in body)
+    check("the overlay marks a created file",
+          ': > "$target.abk-new"' in body)
+    # The diff-base snapshot has to be conditional on the build wiring: an empty
+    # .abk-orig on an inert payload makes config_gate_audit flag every internal
+    # gate in ext.c as "added code that never compiles".
+    check("the overlay writes the empty diff base only once wired",
+          'abk_stable_backport_sched_ext_wired' in dispatcher
+          and '[ "$wired" -eq 0 ] || : > "$target.abk-orig"' in body)
+    check("the wiring probe reads the Makefile entry",
+          'grep -q \'CONFIG_SCHED_CLASS_EXT\' "$makefile"' in dispatcher)
+    check("the overlay refuses to clobber a foreign payload",
+          "left untouched" in body and 'cmp -s "$overlay" "$target"' in body)
+
+    rollback = (repo / "scripts/abk_rollback.sh").read_text(encoding="utf-8")
+    check("rollback deletes created files and both markers",
+          "-name '*.abk-new'" in rollback
+          and 'rm -f "$target" "$marker" "$target.abk-orig"' in rollback)
+    check("rollback still restores existing files",
+          "-name '*.abk-orig'" in rollback
+          and 'cp -a "$backup" "$original"' in rollback)
+
+    readme = (repo / "files/README.md").read_text(encoding="utf-8")
+    for needle in ("abk_stable_backport_overlay_sched_ext()",
+                   "include/linux/sched/ext.h", "kernel/sched/ext.h",
+                   "kernel/sched/ext.c", "slim_walt.c",
+                   "//slim_walt_enable(true);", ".abk-new",
+                   "abk_stable_backport_sched_ext_wired()"):
+        check(f"files/README.md documents {needle!r}", needle in readme)
+
+    smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
+    check("smoke asserts the created payload",
+          "kernel/sched/ext.c" in smoke and ".abk-new" in smoke)
+    check("smoke asserts the fourth created file and its diff base",
+          "kernel/sched/sched_ext_glue.c" in smoke
+          and "has no diff base although the build is wired" in smoke)
+
+    import abk_stable_core as core_mod
+    import abk_stable_display as display_mod
+    import abk_stable_perf as perf_mod
+
+    registered = {rel for module in (core_mod, perf_mod, display_mod)
+                  for group in module.PATCH_GROUPS for rel in group.files}
+    # Batch 57 made kernel/sched/ext.c an edit target, but only through the
+    # adaptation group, and only after the wiring; Batch 58's payload guard is
+    # the second, and it is registered after the first.  Batch 59 makes
+    # kernel/sched/ext.h the third edit target, also after both.  The
+    # arch-independent header must still be untouched by every group, and each
+    # edited payload file only by the groups named here, in that order -- two
+    # groups editing the same bytes without the earlier one probing for its own
+    # marker would be the trap-5 double-append the marker policy exists to
+    # prevent.
+    check("no group targets the arch-independent payload header",
+          "include/linux/sched/ext.h" not in registered,
+          sorted(registered & {"include/linux/sched/ext.h"}))
+    hdr_owners = [g.key for module in (core_mod, perf_mod, display_mod)
+                  for g in module.PATCH_GROUPS
+                  if "kernel/sched/ext.h" in g.files]
+    check("exactly one group edits the kernel payload header",
+          hdr_owners == ["sched_ext_active_class"], hdr_owners)
+    owners = [g.key for module in (core_mod, perf_mod, display_mod)
+              for g in module.PATCH_GROUPS
+              if "kernel/sched/ext.c" in g.files]
+    check("exactly the two adaptation groups edit the engine file, in order",
+          owners == ["sched_ext_payload_adapt", "sched_ext_payload_task_guard"],
+          owners)
+
+
+def test_batch57_payload_adapt():
+    """Batch 57 (sched_ext S2b-2a): the 5.15 adaptation that makes it compile.
+
+    Batch 56 proved the archived payload does not compile; this batch is the
+    adaptation, and the facts worth pinning mechanically are the ones a later
+    batch could quietly undo:
+
+    * the glue unit carries the five preprocessor-level shims and none of the
+      ones that belong elsewhere -- in particular SCHED_CHANGE_BLOCK must stay
+      out of it, because its for-init declaration is what -std=gnu89 rejects;
+    * __diag_ignore_all maps onto __diag_clang_11, not the 6.6 form's _13:
+      this baseline's compiler-clang.h defines _11 and _23 only, so the
+      "obvious" mapping is an undefined-macro error;
+    * the guard's body calls core.c's static-inline dequeue_task()/enqueue_task()
+      (they carry the vendor trace hooks), so it must live in core.c, and the
+      payload's three sites must be open-coded onto it;
+    * the adaptation is applied by a registry group that runs after the overlay
+      created the file -- which is only true because the overlay now runs before
+      the perf child;
+    * the audits can see the payload: tests/audit_fixture.py supplies the created
+      files, and the group counts match the registry.
+    """
+    print("Batch 57: sched_ext S2b-2a payload 5.15 adaptation")
+    repo = Path(__file__).resolve().parent.parent
+
+    import abk_stable_perf as perf_mod
+    import audit_fixture
+    import batch57_perf_sched_ext_adapt as w57
+
+    keys = [g.key for g in perf_mod.PATCH_GROUPS]
+    for key in ("sched_ext_core_visibility", "sched_ext_change_guard",
+                "sched_ext_payload_adapt"):
+        check(f"perf registers {key}", key in keys)
+    adapt = ["sched_ext_core_visibility", "sched_ext_change_guard",
+             "sched_ext_payload_adapt"]
+    start = keys.index(adapt[0])
+    check("the three adaptation groups run as one block",
+          keys[start:start + 3] == adapt, keys[start:start + 3])
+    check("Batch 58's hook groups follow the adaptation groups",
+          keys[start + 3:start + 8] == [
+              "sched_ext_fork_hooks", "sched_ext_fork_failure_path",
+              "sched_ext_task_teardown", "sched_ext_setscheduler_hooks",
+              "sched_ext_payload_task_guard"], keys[start + 3:start + 8])
+    # They must run after the wiring: the payload they adapt is created by the
+    # overlay that rides this child, and sched_ext_task_slot anchors on the
+    # Batch-16 kstack run, so insertion anywhere earlier re-breaks trap 5.
+    check("the wiring still runs before the adaptation",
+          keys.index("sched_ext_task_slot") < keys.index("sched_ext_core_visibility"))
+
+    guard = next(g for g in perf_mod.PATCH_GROUPS
+                 if g.key == "sched_ext_change_guard")
+    check("the guard group edits core.c and sched.h only",
+          set(guard.files) == {"kernel/sched/core.c", "kernel/sched/sched.h"},
+          guard.files)
+    adapt = next(g for g in perf_mod.PATCH_GROUPS
+                 if g.key == "sched_ext_payload_adapt")
+    check("the adaptation group edits the overlaid payload",
+          adapt.files == ["kernel/sched/ext.c"], adapt.files)
+    # The guard body has to stay in core.c: those two wrappers are static inline
+    # there and carry the vendor trace hooks.
+    check("the guard is built from the tree's own dequeue/enqueue wrappers",
+          "dequeue_task(rq, p, flags)" in w57._GUARD_IMPL_NEW
+          and "enqueue_task(cg->rq, cg->p, flags | ENQUEUE_NOCLOCK)"
+          in w57._GUARD_IMPL_NEW)
+    check("SCHED_CHANGE_BLOCK is open-coded, not re-declared",
+          "SCHED_CHANGE_BLOCK(" not in w57._EXT_GUARD2_NEW
+          and "sched_change_guard_init(rq, p" in w57._EXT_GUARD2_NEW)
+    for step in (w57._EXT_GUARD1_OLD, w57._EXT_GUARD2_OLD, w57._EXT_GUARD3_OLD):
+        check("every open-coded site starts from the 6.2 block macro",
+              "SCHED_CHANGE_BLOCK(" in step)
+    # And the 6.6 shapes the four signature edits remove must be gone from the
+    # replacement text too.
+    check("the affinity_context shape is replaced, not commented out",
+          "struct affinity_context *ctx)" not in w57._EXT_CPUS_NEW)
+    check("the vendor sched_prop write is dropped",
+          "p->sched_prop = 0;" not in w57._EXT_PROP_NEW)
+
+    glue = (repo / "files/kernel/sched/sched_ext_glue.c").read_text(
+        encoding="utf-8")
+    for needle in ("sched_weight_to_cgroup", "sailboat_cpumask_next_andnot",
+                   "for_each_cpu_andnot", "#define __btf_member_bit_offset",
+                   "__diag_ignore_all"):
+        check(f"the glue unit carries the {needle} shim", needle in glue)
+    check("the glue unit maps __diag_ignore_all onto _11, not the 6.6 _13",
+          "__diag_ignore(clang, 11, option, comment)" in glue
+          and "__diag_clang_13" not in glue)
+    check("the glue unit does not carry the 6.2 for-init macro",
+          "#define SCHED_CHANGE_BLOCK" not in glue
+          and "SCHED_CHANGE_BLOCK(__rq" not in glue)
+    check("the glue unit explains why the guard is elsewhere",
+          "sched_ext_change_guard" in glue and "gnu89" in glue)
+
+    check("the audit fixture supplies the created payload",
+          "kernel/sched/ext.c" in audit_fixture.PAYLOAD_FILES,
+          audit_fixture.PAYLOAD_FILES)
+    check("the payload is a subset of the paths the overlay creates",
+          set(audit_fixture.PAYLOAD_FILES)
+          == {"include/linux/sched/ext.h", "kernel/sched/ext.h",
+              "kernel/sched/ext.c", "kernel/sched/sched_ext_glue.c"})
+    step_audit = (repo / "tests/step_audit.py").read_text(encoding="utf-8")
+    check("step_audit routes the payload through the fixture",
+          "audit_fixture.resolve(source, rel, MODULE_DIR)" in step_audit
+          and '"kernel/sched/ext.c"' in step_audit)
+
+    dispatcher = (repo / "scripts/stable_backport.sh").read_text(encoding="utf-8")
+    body = dispatcher.split("abk_stable_backport_overlay_sched_ext() {", 1)[1]
+    body = body.split("\n}\n", 1)[0]
+    check("the overlay treats a marked adaptation as installed",
+          "sailboat_sched_ext_payload_adapt" in body
+          and 'cmp -s "$overlay" "$target"' in body)
+
+    # The adaptation is the first group to write a file the overlay *created*, so
+    # the engine's snapshot rule has to know the creation marker: a snapshot here
+    # would fill the empty diff base with the pre-adaptation payload and
+    # config_gate_audit would stop auditing the whole-file gates inside ext.c.
+    import tempfile
+    import abk_common
+    with tempfile.TemporaryDirectory() as _td:
+        _created = Path(_td) / "created.c"
+        _created.write_text("original\n")
+        (Path(_td) / "created.c.abk-new").write_text("")
+        abk_common.write_text(_created, "modified\n")
+        check("a created file keeps its empty diff base",
+              not (Path(_td) / "created.c.abk-orig").exists())
+        _plain = Path(_td) / "plain.c"
+        _plain.write_text("original\n")
+        abk_common.write_text(_plain, "modified\n")
+        check("a rewritten file is still snapshotted exactly once",
+              (Path(_td) / "plain.c.abk-orig").read_text() == "original\n")
+        abk_common.write_text(_plain, "modified twice\n")
+        check("the snapshot is never overwritten",
+              (Path(_td) / "plain.c.abk-orig").read_text() == "original\n")
+    smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
+    check("smoke asserts the adaptation instead of the raw bytes",
+          "sailboat_sched_ext_payload_adapt" in smoke
+          and "still uses the 6.2 SCHED_CHANGE_BLOCK" in smoke)
+
+    import sublevel_matrix
+    check("the matrix counts the two new perf groups",
+          sublevel_matrix.GROUP_COUNTS["stable_perf_backport"]
+          == len(perf_mod.PATCH_GROUPS),
+          (sublevel_matrix.GROUP_COUNTS["stable_perf_backport"],
+           len(perf_mod.PATCH_GROUPS)))
+    for key in ("sched_ext_core_visibility", "sched_ext_change_guard",
+                "sched_ext_payload_adapt"):
+        check(f"{key} is not claimed pre-applied",
+              key not in sublevel_matrix.PRE_APPLIED["220"]
+              ["stable_perf_backport"])
+
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    check("the survey records the adaptation batch",
+          "Batch 57" in survey and "sched_ext_change_guard" in survey)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("the changelog records Batch 57", '<a id="batch-57"></a>' in changelog)
+
+
+def test_batch58_sched_ext_hooks():
+    """Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.
+
+    Batch 57 made the payload compile; this batch is the first thing that can
+    actually put a task on the BPF class or take it off.  What is worth pinning
+    mechanically:
+
+    * the fork hooks are wired at 5.15's own bodies -- sched_fork() needs a new
+      out_cancel because its DL rejection sits after scx_pre_fork() -- and the
+      prototype change in include/linux/sched/task.h travels with them;
+    * copy_process()'s two unwind edges point at the new label, because a
+      rejected fork otherwise leaks the fork reader lock;
+    * __setscheduler_prio() is the function sched_ext_core_visibility
+      de-static'ed, so that group must now probe for its own marker (the trap-5
+      remedy) or its second pass fails on both anchors;
+    * the payload guard edits the archived engine file and only there, keeping
+      files/kernel/sched/ext.c byte-for-byte;
+    * the class is still unreachable: valid_policy() is untouched, so
+      SCHED_EXT is still refused and this batch cannot be mistaken for the one
+      that turns SCX on.
+    """
+    print("Batch 58: sched_ext S2b-2b task-lifecycle hooks")
+    repo = Path(__file__).resolve().parent.parent
+
+    import abk_stable_perf as perf_mod
+    import batch57_perf_sched_ext_adapt as w57
+    import batch58_perf_sched_ext_hooks as w58
+
+    keys = [g.key for g in perf_mod.PATCH_GROUPS]
+    hooks = ["sched_ext_fork_hooks", "sched_ext_fork_failure_path",
+             "sched_ext_task_teardown", "sched_ext_setscheduler_hooks",
+             "sched_ext_payload_task_guard"]
+    for key in hooks:
+        check(f"perf registers {key}", key in keys)
+    check("the five hook groups run as one block, in order",
+          keys[keys.index(hooks[0]):keys.index(hooks[0]) + 5] == hooks,
+          keys[keys.index(hooks[0]):keys.index(hooks[0]) + 5])
+
+    fork = next(g for g in perf_mod.PATCH_GROUPS
+                if g.key == "sched_ext_fork_hooks")
+    check("the fork group spans core.c and the task.h prototypes",
+          sorted(fork.files) == ["include/linux/sched/task.h",
+                                 "kernel/sched/core.c"], fork.files)
+    check("the fork hooks call the four SCX entry points",
+          "scx_pre_fork(p);" in w58._FORK_CLASS_NEW
+          and "task_on_scx(p)" in w58._FORK_CLASS_NEW
+          and "scx_cancel_fork(p);" in w58._FORK_TAIL_NEW
+          and "return scx_fork(p);" in w58._CGROUP_TAIL_NEW
+          and "scx_post_fork(p);" in w58._POST_FORK_NEW
+          and "void sched_cancel_fork(struct task_struct *p)" in w58._POST_FORK_NEW)
+    check("the DL rejection unwinds instead of returning",
+          "return -EAGAIN;" not in w58._FORK_CLASS_NEW
+          and "goto out_cancel;" in w58._FORK_CLASS_NEW
+          and "int ret;" in w58._FORK_RET_NEW)
+    check("sched_cgroup_fork returns the verdict",
+          "int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)\n"
+          in w58._FORK_TAIL_NEW
+          and "extern int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs);\n"
+          in w58._TASK_H_NEW
+          and "extern void sched_cancel_fork(struct task_struct *p);\n"
+          in w58._TASK_H_NEW)
+
+    check("the perf failure edge routes to the new label",
+          "goto bad_fork_sched_cancel_fork;" in w58._PERF_FAIL_NEW
+          and "bad_fork_sched_cancel_fork:\n" in w58._CANCEL_LABEL_NEW
+          and "sched_cancel_fork(p);\n" in w58._CANCEL_LABEL_NEW)
+    check("the fork verdict routes through bad_fork_cancel_cgroup",
+          "retval = sched_cgroup_fork(p, args);" in w58._CGROUP_CALL_NEW
+          and "goto bad_fork_cancel_cgroup;" in w58._CGROUP_CALL_NEW)
+    check("__put_task_struct detaches the task from SCX",
+          "sched_ext_free(tsk);" in w58._TEARDOWN_NEW)
+
+    check("the priority selection keeps the BPF class",
+          "else if (task_on_scx(p))" in w58._PRIO_NEW
+          and "&ext_sched_class" in w58._PRIO_NEW)
+    check("sched_setscheduler consults the SCX guard",
+          "retval = scx_check_setscheduler(p, policy);" in w58._STOP_GUARD_NEW)
+    check("the guard lands after the rq->stop rejection",
+          w58._STOP_GUARD_NEW.index("p == rq->stop")
+          < w58._STOP_GUARD_NEW.index("scx_check_setscheduler"))
+
+    # The trap-5 remedy: batch57's group generates the body batch58 edits.
+    check("sched_ext_core_visibility probes its own marker first",
+          "sailboat_sched_ext_core_visibility:" in w57._SCHED_EXT_CORE_VISIBILITY_PROBE
+          and "if _SCHED_EXT_CORE_VISIBILITY_PROBE in probe:" in
+          (repo / "scripts/batch57_perf_sched_ext_adapt.py").read_text(
+              encoding="utf-8"))
+
+    # The payload guard: every dereference the fork hooks newly reach is
+    # covered, and the missing free is added.
+    check("the entity's list node is initialised",
+          "INIT_LIST_HEAD(&p->scx->tasks_node);" in w58._PRE_FORK_INIT_NEW)
+    check("task_on_scx refuses a task without state",
+          "if (!p->scx)\n\t\treturn false;" in w58._TASK_ON_SCX_NEW)
+    check("the fork hooks check the state before dereferencing it",
+          "if (scx_enabled() && p->scx)" in w58._SCX_FORK_NEW
+          and "if (scx_enabled() && p->scx) {" in w58._SCX_POST_NEW
+          and "if (scx_enabled() && p->scx)" in w58._SCX_CANCEL_NEW)
+    check("scx_post_fork links the task only when it has state",
+          "\tif (p->scx) {\n" in w58._SCX_POST_NEW)
+    check("sched_ext_free frees the entity",
+          "if (!p->scx)\n\t\treturn;" in w58._FREE_NEW
+          and "kfree(p->scx);" in w58._FREE_NEW)
+
+    # files/kernel/sched/ext.c stays the archive: the guard edits the tree copy.
+    ext_archive = (repo / "files/kernel/sched/ext.c").read_text(encoding="utf-8")
+    check("the archived payload keeps the unguarded shape",
+          "kfree(p->scx);" not in ext_archive
+          and "INIT_LIST_HEAD(&p->scx->tasks_node);" not in ext_archive)
+    guard = next(g for g in perf_mod.PATCH_GROUPS
+                 if g.key == "sched_ext_payload_task_guard")
+    check("the guard group edits the engine file on the way into the tree",
+          guard.files == ["kernel/sched/ext.c"], guard.files)
+
+    # Reachability is unchanged: kernel/sched/sched.h's valid_policy() still
+    # refuses SCHED_EXT (it accepts idle/fair/rt/dl only), and that header is
+    # what the next batch has to touch.  Neither of these groups may.
+    hook_text = "".join(v for k, v in vars(w58).items()
+                        if k.endswith("_NEW") and isinstance(v, str))
+    check("no hook group rewrites valid_policy()",
+          "valid_policy" not in hook_text)
+    check("the hook groups leave the policy validator alone",
+          all("kernel/sched/sched.h" not in g.files
+              for g in perf_mod.PATCH_GROUPS if g.key in hooks))
+
+    import sublevel_matrix
+    check("the matrix counts the five new perf groups",
+          sublevel_matrix.GROUP_COUNTS["stable_perf_backport"]
+          == len(perf_mod.PATCH_GROUPS),
+          (sublevel_matrix.GROUP_COUNTS["stable_perf_backport"],
+           len(perf_mod.PATCH_GROUPS)))
+    for key in hooks:
+        check(f"{key} is not claimed pre-applied",
+              key not in sublevel_matrix.PRE_APPLIED["220"]
+              ["stable_perf_backport"])
+
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    check("the survey records the hook batch",
+          "Batch 58" in survey and "sched_ext_fork_hooks" in survey)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("the changelog records Batch 58", '<a id="batch-58"></a>' in changelog)
+    smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
+    check("smoke asserts the fork hooks and the guard",
+          "sched_ext_payload_task_guard" in smoke
+          and "sailboat_sched_ext_fork_hooks" in smoke)
+
+
+def test_batch59_sched_ext_pick():
+    """Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+
+    Batch 58 made a task enter and leave the BPF class; this batch is what picks
+    such a task once it is on the class.  What is worth pinning mechanically:
+
+    * the payload's active-class walk must step *down* 5.15's SCHED_DATA array
+      and use its bound names -- the archived 6.6 form counts up between two
+      names this baseline does not define, so a tree that kept it does not
+      compile, and one that defined the names to match would walk off the end;
+    * the fair-class shortcut in __pick_next_task() has to be bypassed while a
+      BPF scheduler is loaded, and the pick has to be reported -- that report is
+      the ops.cpu_release() handshake's only producer;
+    * the balance walk must start at ext when @prev is above it, or balance_scx()
+      never runs for the higher classes;
+    * the tick watchdog and the idle transition have to be reachable from
+      scheduler_tick() / the idle class rather than merely declared;
+    * files/kernel/sched/ext.h stays the archive: the adaptation exists only in
+      the materialised tree copy, like sched_ext_payload_adapt's ext.c edits;
+    * the class is still unreachable -- valid_policy() is untouched and this
+      batch may not touch kernel/sched/sched.h.
+    """
+    print("Batch 59: sched_ext S2b-2b scheduling-core hooks")
+    repo = Path(__file__).resolve().parent.parent
+
+    import abk_stable_perf as perf_mod
+    import batch59_perf_sched_ext_pick as w59
+
+    keys = [g.key for g in perf_mod.PATCH_GROUPS]
+    groups = ["sched_ext_active_class", "sched_ext_pick_path",
+              "sched_ext_tick_watchdog", "sched_ext_idle_hook"]
+    for key in groups:
+        check(f"perf registers {key}", key in keys)
+    check("the four core groups run as one block, in order",
+          keys[keys.index(groups[0]):keys.index(groups[0]) + 4] == groups,
+          keys[keys.index(groups[0]):keys.index(groups[0]) + 4])
+
+    # The payload walk: downward, and bounded by 5.15's own names.
+    check("the active-class walk steps down the SCHED_DATA array",
+          "class--;" in w59._NEXT_ACTIVE_NEW
+          and "class++;" not in w59._NEXT_ACTIVE_NEW)
+    check("the walk uses 5.15's class-table bounds",
+          "sched_class_highest, sched_class_lowest" in w59._ACTIVE_CLASS_RANGE_NEW
+          and "__sched_class_highest" not in w59._ACTIVE_CLASS_RANGE_NEW)
+    active = next(g for g in perf_mod.PATCH_GROUPS
+                  if g.key == "sched_ext_active_class")
+    check("the walk group edits the materialised payload header",
+          active.files == ["kernel/sched/ext.h"], active.files)
+
+    # The pick path.
+    check("the pick bypass precedes the fair-class shortcut",
+          "if (scx_enabled())\n\t\tgoto restart;\n" in w59._PICK_HEAD_NEW
+          and w59._PICK_HEAD_NEW.index("scx_enabled()")
+          < w59._PICK_HEAD_NEW.index("Optimization"))
+    check("the pick loop walks the active classes and reports the pick",
+          "for_each_active_class(class) {" in w59._PICK_LOOP_NEW
+          and "scx_notify_pick_next_task(rq, p, class);" in w59._PICK_LOOP_NEW
+          and "for_each_class(class) {" not in w59._PICK_LOOP_NEW)
+    check("the balance walk reaches balance_scx() below a higher class",
+          "for_balance_class_range(class, prev->sched_class, &idle_sched_class) {"
+          in w59._BALANCE_WALK_NEW)
+
+    # The watchdog and the idle transition.
+    check("the tick watchdog is armed from scheduler_tick()",
+          "scx_notify_sched_tick();" in w59._TICK_NEW
+          and w59._TICK_NEW.index("scx_notify_sched_tick();")
+          < w59._TICK_NEW.index("perf_event_task_tick();"))
+    check("the idle class reports both directions",
+          "scx_update_idle(rq, false);" in w59._IDLE_PUT_NEW
+          and "scx_update_idle(rq, true);" in w59._IDLE_SET_NEW)
+    idle = next(g for g in perf_mod.PATCH_GROUPS
+                if g.key == "sched_ext_idle_hook")
+    check("the idle group edits idle.c", idle.files == ["kernel/sched/idle.c"],
+          idle.files)
+
+    # The archived header stays byte-for-byte; only the tree copy is adapted.
+    hdr_archive = (repo / "files/kernel/sched/ext.h").read_text(encoding="utf-8")
+    check("the archived header keeps the 6.6 walk",
+          "class++;" in hdr_archive and "__sched_class_highest" in hdr_archive)
+
+    # Reachability is unchanged: that is the next batch.
+    core_text = "".join(v for k, v in vars(w59).items()
+                        if k.endswith("_NEW") and isinstance(v, str))
+    check("no core group rewrites valid_policy()", "valid_policy" not in core_text)
+    check("the core groups leave the policy validator alone",
+          all("kernel/sched/sched.h" not in g.files
+              for g in perf_mod.PATCH_GROUPS if g.key in groups))
+
+    import sublevel_matrix
+    check("the matrix counts the four new perf groups",
+          sublevel_matrix.GROUP_COUNTS["stable_perf_backport"]
+          == len(perf_mod.PATCH_GROUPS),
+          (sublevel_matrix.GROUP_COUNTS["stable_perf_backport"],
+           len(perf_mod.PATCH_GROUPS)))
+    for key in groups:
+        check(f"{key} is not claimed pre-applied",
+              key not in sublevel_matrix.PRE_APPLIED["220"]
+              ["stable_perf_backport"])
+
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    check("the survey records the core-hook batch",
+          "Batch 59" in survey and "sched_ext_pick_path" in survey)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("the changelog records Batch 59", '<a id="batch-59"></a>' in changelog)
+    smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
+    check("smoke asserts the core hooks and the payload walk",
+          "sailboat_sched_ext_active_class" in smoke
+          and "scx_notify_sched_tick();" in smoke)
+    # The overlay's "already installed" test is a marker allow-list: a payload
+    # file edited by a group it does not list is treated as foreign on the second
+    # call and never gets its empty .abk-orig diff base.
+    overlay = (repo / "scripts/stable_backport.sh").read_text(encoding="utf-8")
+    check("the overlay accepts the core-hook marker as installed",
+          "sailboat_sched_ext_active_class" in overlay)
+
+
+def test_batch60_sched_ext_reach():
+    """Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.
+
+    Batch 59 made an *enabled* scheduler able to pick tasks; this batch opens
+    the gates that kept one from ever being enabled or the policy from being
+    set.  What is worth pinning mechanically:
+
+    * SCHED_EXT is accepted as a "normal" policy through the ext-aware
+      normal_policy(), which is what makes __setscheduler_params() give an SCX
+      task its static priority and load weight -- and 5.15's own fair_policy()
+      body must be gone rather than shadowed;
+    * both priority-range syscalls answer for SCHED_EXT;
+    * the BPF struct_ops registry carries the sched_ext_ops value type, without
+      which no scheduler can be loaded at all;
+    * sched_init_debug() registers the engine's dump;
+    * both new files entered the three fixture lists, which is why the
+      reference trees were re-fetched before this batch's audits were run.
+    """
+    print("Batch 60: sched_ext reachability")
+    repo = Path(__file__).resolve().parent.parent
+
+    import abk_stable_perf as perf_mod
+    import batch60_perf_sched_ext_reach as w60
+
+    keys = [g.key for g in perf_mod.PATCH_GROUPS]
+    groups = ["sched_ext_policy_valid", "sched_ext_priority_range",
+              "sched_ext_struct_ops_type", "sched_ext_debugfs"]
+    for key in groups:
+        check(f"perf registers {key}", key in keys)
+    start = keys.index(groups[0])
+    check("the four reachability groups run as one block, in order",
+          keys[start:start + 4] == groups, keys[start:start + 4])
+
+    # The policy gate.
+    check("SCHED_EXT is a normal policy under the class's own config",
+          "if (policy == SCHED_EXT)\n\t\treturn true;\n" in w60._FAIR_POLICY_NEW
+          and "#ifdef CONFIG_SCHED_CLASS_EXT" in w60._FAIR_POLICY_NEW)
+    check("fair_policy() builds on normal_policy()",
+          "return normal_policy(policy) || policy == SCHED_BATCH;"
+          in w60._FAIR_POLICY_NEW)
+    check("5.15's fair_policy() body is replaced, not shadowed",
+          "return policy == SCHED_NORMAL || policy == SCHED_BATCH;"
+          not in w60._FAIR_POLICY_NEW)
+
+    # Both priority-range syscalls.
+    check("sched_get_priority_max/min answer for SCHED_EXT",
+          "case SCHED_EXT:" in w60._PRIO_MAX_NEW
+          and "case SCHED_EXT:" in w60._PRIO_MIN_NEW)
+
+    # The struct_ops value type.
+    check("the struct_ops registry carries sched_ext_ops",
+          "BPF_STRUCT_OPS_TYPE(sched_ext_ops)" in w60._STRUCT_OPS_TYPES_NEW
+          and "BPF_STRUCT_OPS_TYPE(tcp_congestion_ops)"
+          in w60._STRUCT_OPS_TYPES_NEW)
+    check("the registry entry rides the class's config",
+          "#ifdef CONFIG_SCHED_CLASS_EXT" in w60._STRUCT_OPS_TYPES_NEW)
+    types_h = next(g for g in perf_mod.PATCH_GROUPS
+                   if g.key == "sched_ext_struct_ops_type")
+    check("the registry group edits the BPF header only",
+          types_h.files == ["kernel/bpf/bpf_struct_ops_types.h"], types_h.files)
+
+    # The debugfs dump.
+    check("the ext dump is registered from sched_init_debug()",
+          'debugfs_create_file("ext", 0444, debugfs_sched, NULL, &sched_ext_fops);'
+          in w60._DEBUGFS_NEW
+          and "late_initcall(sched_init_debug);" in w60._DEBUGFS_NEW)
+    dbg = next(g for g in perf_mod.PATCH_GROUPS if g.key == "sched_ext_debugfs")
+    check("the debugfs group edits debug.c only",
+          dbg.files == ["kernel/sched/debug.c"], dbg.files)
+
+    # Two new files, so all three fixture lists had to grow.
+    fetch = (repo / "tests/fetch_sublevel_tree.sh").read_text(encoding="utf-8")
+    audit = (repo / "tests/step_audit.py").read_text(encoding="utf-8")
+    smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
+    for rel in ("kernel/bpf/bpf_struct_ops_types.h", "kernel/sched/debug.c"):
+        check(f"FETCH_FILES carries {rel}", rel in fetch)
+        check(f"AUDIT_FILES carries {rel}", rel in audit)
+        check(f"SMOKE_FILES carries {rel}", rel in smoke)
+
+    import sublevel_matrix
+    check("the matrix counts the four new perf groups",
+          sublevel_matrix.GROUP_COUNTS["stable_perf_backport"]
+          == len(perf_mod.PATCH_GROUPS),
+          (sublevel_matrix.GROUP_COUNTS["stable_perf_backport"],
+           len(perf_mod.PATCH_GROUPS)))
+    for key in groups:
+        check(f"{key} is not claimed pre-applied",
+              key not in sublevel_matrix.PRE_APPLIED["220"]
+              ["stable_perf_backport"])
+
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    check("the survey records the reachability batch",
+          "Batch 60" in survey and "sched_ext_policy_valid" in survey)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("the changelog records Batch 60", '<a id="batch-60"></a>' in changelog)
+    smoke_txt = smoke
+    check("smoke asserts the four reachability gates",
+          "BPF_STRUCT_OPS_TYPE(sched_ext_ops)" in smoke_txt
+          and "normal_policy" in smoke_txt)
+
+
+def test_batch61_scx_scheduler():
+    """Batch 61 (S3a): the minimal SCX scheduler and the kfunc set it may use.
+
+    The userspace half of S3 starts with the BPF side, because that is where the
+    kernel-side dependency is: whatever kfuncs a scheduler calls must already be
+    registered by the landed payload.  What is worth pinning mechanically:
+
+    * every scx_bpf_* extern the scheduler's compat header declares is in the
+      payload's BTF_ID_FLAGS(func, ...) set -- a scheduler compiled against a
+      kfunc this kernel does not have would load and then fail at attach;
+    * the constants copied into the header match the payload's own definitions,
+      so the BPF side and the kernel cannot drift apart silently;
+    * the scheduler stays partial: it must never call scx_bpf_switch_all(), and
+      its DSQ id has to be a user id, not a builtin one;
+    * the artefact builder is a build-host helper like tools/compile_probe.sh --
+      in the repo, absent from the companion's embed.conf, never copied into the
+      module zip;
+    * the loader has no business shipping before it exists: nothing in the
+      companion may reference a loader binary yet.
+    """
+    print("Batch 61: S3a minimal SCX scheduler and its kfunc surface")
+    repo = Path(__file__).resolve().parent.parent
+
+    def strip_c_comments(text):
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        return re.sub(r"//[^\n]*", "", text)
+
+    compat = (repo / "tools/scx/abk_scx_compat.h").read_text(encoding="utf-8")
+    sched = (repo / "tools/scx/abk_scx_min.bpf.c").read_text(encoding="utf-8")
+    payload = (repo / "files/kernel/sched/ext.c").read_text(encoding="utf-8")
+    ext_h = (repo / "files/include/linux/sched/ext.h").read_text(
+        encoding="utf-8")
+    builder = (repo / "tools/build_scx_artifacts.sh").read_text(encoding="utf-8")
+    embed = (repo / "ksu/abk_runtime_tunables/embed.conf").read_text(
+        encoding="utf-8")
+
+    registered = set(re.findall(r"BTF_ID_FLAGS\(func,\s*(scx_bpf_\w+)\)",
+                                payload))
+    check("the payload registers kfuncs at all", len(registered) >= 10,
+          len(registered))
+    declared = set(re.findall(r"extern [^;]*?\b(scx_bpf_\w+)\(", compat))
+    called = set(re.findall(r"\b(scx_bpf_\w+)\(", strip_c_comments(sched)))
+    check("the scheduler calls exactly the kfuncs its header declares",
+          declared == called, (sorted(declared - called), sorted(called - declared)))
+    check("every kfunc the scheduler calls is registered by the payload",
+          declared <= registered, sorted(declared - registered))
+    check("the scheduler calls a real subset, not the whole surface",
+          0 < len(declared) < len(registered), len(declared))
+
+    # Partial by construction: no switch_all, and a user DSQ id.
+    check("the scheduler never takes the whole machine",
+          "scx_bpf_switch_all" not in strip_c_comments(sched)
+          and "scx_bpf_switch_all" not in strip_c_comments(compat))
+    ids = re.findall(r"#define ABK_SCX_DSQ_ID\s+(\d+)", compat)
+    check("the DSQ id is a plain user id",
+          len(ids) == 1 and 0 < int(ids[0]) < (1 << 63), ids)
+
+    # The copied constant must equal the payload's definition.
+    payload_slice = re.search(r"SCX_SLICE_DFL\s*=\s*([^,\n]+)", ext_h)
+    check("the payload still defines SCX_SLICE_DFL as 20 ms",
+          payload_slice is not None
+          and "20 * NSEC_PER_MSEC" in payload_slice.group(1),
+          payload_slice.group(1) if payload_slice else None)
+    check("the BPF side copies that value",
+          "#define ABK_SCX_SLICE_DFL\t(20ULL * 1000ULL * 1000ULL)" in compat)
+
+    # The ops map and its name.
+    check("the scheduler defines one struct_ops map",
+          sched.count('SEC(".struct_ops")') == 1
+          and '.name\t\t= "abk_scx_min",' in sched)
+    for op in ("select_cpu", "enqueue", "dispatch", "init", "exit"):
+        check(f"the ops map wires {op}",
+              f".{op}" in sched and f"abk_scx_min_{op}" in sched,
+              op)
+    check("ops.init is a sleepable program (create_dsq needs SCX_KF_INIT)",
+          'SEC("struct_ops.s/abk_scx_min_init")' in sched)
+
+    # The artefact builder: build-host helper, and it gates on the graft's BTF.
+    check("the builder compiles for the BPF target",
+          "-target bpf" in builder)
+    check("the builder refuses a kernel built without the graft",
+          "has no struct sched_ext_ops" in builder)
+    check("the builder is not shipped to the device",
+          "build_scx_artifacts" not in embed)
+    check("only the built artefacts ship, never the sources",
+          "prebuilt/scx_loader" in embed
+          and "scx_loader.c" not in embed
+          and "abk_scx_min.bpf.c" not in embed)
+
+    # Nothing in the companion may invoke a scheduler that is not packaged.
+    common = (repo / "ksu/abk_runtime_tunables/common.sh").read_text(
+        encoding="utf-8")
+    service = (repo / "ksu/abk_runtime_tunables/service.sh").read_text(
+        encoding="utf-8")
+    check("no companion script loads a scheduler yet",
+          "scx_loader" not in common and "scx_loader" not in service)
+    check("the packaging ships the built object, not the scheduler source",
+          "abk_scx_min.bpf.c" not in embed
+          and "abk_scx_min.bpf.o" in embed)
+
+
+def test_batch62_scx_loader():
+    """Batch 62 (S3b-1): the loader source and its build contract.
+
+    The scheduler compiled in Batch 61 is inert without something that binds it
+    to the class; this batch adds that program and the host-side gate that makes
+    it more than a source file (build libbpf, link, then parse the .bpf.o with
+    libbpf and describe it).  What is worth pinning mechanically:
+
+    * the loader is explicit-only: no subcommand prints usage and exits 2, so
+      nothing attaches a scheduler by accident, and the companion does not call
+      it at all yet;
+    * the attach path is the standard libbpf one (bpf_map__attach_struct_ops on
+      the struct_ops map), and the pids it marks are handed back to
+      SCHED_NORMAL on exit;
+    * SCHED_EXT is defined locally when the libc does not know it -- bionic does
+      not, and the value has to match include/uapi/linux/sched.h's 7;
+    * the artefact builder grows a real host loader step (libbpf + link +
+      selftest) guarded by BUILD_HOST_LOADER, and still refuses to fake the
+      aarch64-android binary (NDK has no libelf).
+    """
+    print("Batch 62: S3b-1 the scx_loader and its host gate")
+    repo = Path(__file__).resolve().parent.parent
+
+    def strip_c_comments(text):
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        return re.sub(r"//[^\n]*", "", text)
+
+    loader = (repo / "tools/scx/scx_loader.c").read_text(encoding="utf-8")
+    builder = (repo / "tools/build_scx_artifacts.sh").read_text(encoding="utf-8")
+    embed = (repo / "ksu/abk_runtime_tunables/embed.conf").read_text(
+        encoding="utf-8")
+
+    for sub in ("selftest", "status", "run", "mark", "unmark"):
+        check(f"the loader has a {sub} subcommand",
+              f'"{sub}"' in loader, sub)
+    check("no subcommand means usage and a non-zero exit",
+          "usage(argv[0]);\n\t\treturn 2;" in loader
+          and "argc < 2" in loader)
+    check("the attach goes through libbpf's struct_ops API",
+          "bpf_map__attach_struct_ops(ops)" in loader
+          and "BPF_MAP_TYPE_STRUCT_OPS" in loader)
+    check("a marked pid is handed back on exit",
+          "set_policy(pids[i], SCHED_NORMAL);" in loader
+          and "bpf_link__destroy(link);" in loader)
+    check("SIGINT/SIGTERM drop the attach",
+          "on_signal" in loader and "SIGTERM" in loader
+          and "while (!stop)" in loader)
+    check("SCHED_EXT is defined when the libc does not know it",
+          "#ifndef SCHED_EXT\n#define SCHED_EXT 7\n#endif" in loader)
+    check("only the pids on the command line are marked",
+          "--pid" in loader and "sched_setscheduler(pid, policy, &param)"
+          in loader)
+    check("the loader never asks for the whole machine",
+          "switch_all" not in strip_c_comments(loader))
+
+    check("the builder links the loader against a real libbpf",
+          "tools/lib/bpf/libbpf.a" in builder and "-lelf" in builder)
+    check("the host loader step is opt-in",
+          "BUILD_HOST_LOADER" in builder and "-Werror" in builder)
+    check("the builder selftests the object it just built",
+          'selftest "$OUTDIR/abk_scx_min.bpf.o"' in builder)
+    check("the builder still refuses to fake the device binary",
+          "aarch64-linux-android still needs the NDK" in builder
+          or "BUILD_SHIM_LOADER=1" in builder)
+
+    check("the loader ships through the prebuilt mapping",
+          "tools/scx/prebuilt/scx_loader=bin/scx_loader" in embed)
+    for name in ("common.sh", "service.sh", "action.sh", "post-fs-data.sh"):
+        text = (repo / "ksu/abk_runtime_tunables" / name).read_text(
+            encoding="utf-8")
+        check(f"{name} does not invoke the loader yet",
+              "scx_loader" not in text, name)
+
+
+def test_batch63_scx_companion():
+    """Batch 63 (S3b-2a): the companion-side SCX policy, off by default.
+
+    The kernel side is complete (Batches 54-60) and the loader exists (Batch
+    61/62), but nothing may start a scheduler on its own.  This batch adds the
+    policy half and pins the properties that make "nothing happened" a stated
+    outcome rather than a silent one:
+
+    * the tunable ships 0, and the policy refuses to start at anything else;
+    * the three preconditions are separate (tunable, kernel class, build-host
+      artefacts) and each missing one logs its own reason;
+    * the scheduler stays partial: only scx.mark_pids are moved and the
+      whole-machine kfunc is never requested anywhere in the module;
+    * the module ships no loader or .bpf.o yet -- the policy checks for them, so
+      a tree without them is a no-op with a reason, not a crash;
+    * the new keys are in abk_known_keys(), or abk_cfg_lint would report the
+      documented knobs as unknown.
+    """
+    print("Batch 63: S3b-2a companion SCX policy")
+    repo = Path(__file__).resolve().parent.parent
+    mod = repo / "ksu/abk_runtime_tunables"
+
+    policy = (mod / "scx-policy.sh").read_text(encoding="utf-8")
+    tunables = (mod / "tunables.conf").read_text(encoding="utf-8")
+    common = (mod / "common.sh").read_text(encoding="utf-8")
+    service = (mod / "service.sh").read_text(encoding="utf-8")
+    action = (mod / "action.sh").read_text(encoding="utf-8")
+    readme = (mod / "README.md").read_text(encoding="utf-8")
+    embed = (mod / "embed.conf").read_text(encoding="utf-8")
+
+    check("the tunable ships off", "scx.enabled=0" in tunables)
+    check("the policy refuses to start at scx.enabled=0",
+          'if [ "$(abk_cfg scx.enabled 0)" != "1" ]' in policy)
+    for fn in ("abk_scx_kernel_ready", "abk_scx_artifacts_ready",
+               "abk_scx_reason", "abk_scx_supervisor_main", "abk_scx_apply"):
+        check(f"the policy implements {fn}", f"{fn}()" in policy)
+    check("each missing precondition names itself",
+          "not started -- " in policy
+          and "has no sched_ext class" in policy
+          and "is missing (built on a host" in policy)
+    policy_code = re.sub(r"/\*.*?\*/", "", policy, flags=re.S)
+    policy_code = re.sub(r"(?m)^\s*#.*$", "", policy_code)
+    check("the whole-machine kfunc is never requested",
+          "switch_all" not in policy_code)
+    check("only the listed pids are moved",
+          "abk_scx_pid_args" in policy and '"--pid"' not in policy
+          and "--pid $_sp_id" in policy)
+    check("a stale loader is cleared before attaching",
+          "pkill -f" in policy and "supervisor" in policy)
+
+    check("service.sh sources the policy", '. "$MODDIR/scx-policy.sh"' in service)
+    check("service.sh has the supervisor re-entry",
+          "--supervise-scx) abk_scx_supervisor_main" in service)
+    check("service.sh applies the policy before its final log line",
+          "abk_scx_apply" in service
+          and service.index("abk_scx_apply")
+          < service.index('abk_log "service: done"'))
+    check("action.sh exposes the scx subcommand",
+          "abk_scx_status" in action and "scx|" in action)
+    check("the three keys are known to the linter",
+          all(key in common for key in ("scx.enabled", "scx.mark_pids",
+                                        "scx.reassert_interval_sec")))
+    check("the module README documents the switch", "scx.enabled" in readme)
+
+    check("the artefacts ship through embed.conf, not the module tree",
+          not (mod / "bin/scx_loader").exists()
+          and not (mod / "bin/abk_scx_min.bpf.o").exists()
+          and "tools/scx/prebuilt/scx_loader=bin/scx_loader" in embed
+          and "tools/scx/prebuilt/abk_scx_min.bpf.o=bin/abk_scx_min.bpf.o" in embed)
+
+    # mksh-safe: the module's shell has no bashisms beyond this list.
+    for bad in ("[[", "local ", "${!"):
+        check(f"the policy avoids {bad!r}", bad not in policy)
+
+
+def test_batch64_libelf_shim():
+    """Batch 64 (S3b-2b): the read-only libelf shim and its measured proof.
+
+    The Android NDK ships no libelf, so the loader cannot be cross-compiled
+    against it.  This batch provides the slice of the API libbpf actually uses
+    and proves it the only way that matters: the same "selftest" runs through a
+    real-libelf loader and a shim-linked one and the outputs must be identical.
+    What is pinned mechanically:
+
+    * the declared surface is exactly the seventeen functions libbpf calls --
+      a shim that quietly grows is a shim whose scope nobody re-measured;
+    * every declared function is defined, and the two behaviours the first
+      attempt got wrong stay fixed: gelf_getshdr returns a pointer, and
+      elf_nextscn(elf, NULL) starts at section 1 (libbpf's index counter
+      assumes it);
+    * the read-only entry points still fail rather than pretend;
+    * the builder's shim path skips libbpf's linker.c (its static ELF writer,
+      the one file needing the write side), never links -lelf, and diffs the
+      two selftest outputs instead of trusting the shim.
+    """
+    print("Batch 64: S3b-2b the read-only libelf shim")
+    repo = Path(__file__).resolve().parent.parent
+    shim = repo / "tools/scx/libelf-shim"
+
+    libelf_h = (shim / "libelf.h").read_text(encoding="utf-8")
+    gelf_h = (shim / "gelf.h").read_text(encoding="utf-8")
+    impl = (shim / "elf_shim.c").read_text(encoding="utf-8")
+    builder = (repo / "tools/build_scx_artifacts.sh").read_text(encoding="utf-8")
+    readme = (repo / "tools/scx/README.md").read_text(encoding="utf-8")
+
+    declared = sorted(name for name in set(
+        re.findall(r"\b(g?elf_[a-z0-9_]+)\s*\(", libelf_h + gelf_h))
+        if name not in ("elf_shim", "elf_shim_scn"))
+    # The seventeen functions kernel/tools/lib/bpf/*.c actually calls, plus the
+    # five extra declarations the shim keeps for the linker: elf_kind, the three
+    # write-side stubs, and gelf_getrela.
+    used = {"elf_begin", "elf_end", "elf_errmsg", "elf_getdata", "elf_getscn",
+            "elf_getshdrstrndx", "elf_memory", "elf_ndxscn", "elf_nextscn",
+            "elf_rawdata", "elf_strptr", "elf_version", "gelf_getclass",
+            "gelf_getehdr", "gelf_getrel", "gelf_getshdr", "gelf_getsym"}
+    extra = {"elf_kind", "elf_newscn", "elf_newdata", "elf_update",
+             "gelf_getrela"}
+    check("the shim declares the libbpf-used surface and nothing else",
+          set(declared) == used | extra,
+          sorted(set(declared) ^ (used | extra)))
+    for name in declared:
+        check(f"the shim defines {name}", f"{name}(" in impl, name)
+
+    check("gelf_getshdr returns the header pointer, as libelf does",
+          "GElf_Shdr *gelf_getshdr" in gelf_h
+          and "GElf_Shdr *gelf_getshdr" in impl)
+    check("elf_nextscn starts at section 1, not 0",
+          "return &elf->scns[1];" in impl
+          and "starts at section 1" in impl)
+    check("the shim refuses non-ELF64-LE objects",
+          "ELFCLASS64" in impl and "ELFDATA2LSB" in impl)
+    check("the write side fails instead of pretending",
+          impl.count("the libelf shim is read-only") >= 3)
+    check("the shim keeps libelf's Elf_Data layout (libbpf dereferences it)",
+          "Elf_Type d_type;" in libelf_h and "size_t d_size;" in libelf_h
+          and "int64_t d_off;" in libelf_h)
+
+    check("the builder has the shim path", "BUILD_SHIM_LOADER" in builder)
+    check("the shim path skips libbpf's ELF writer",
+          "linker.c) continue" in builder)
+    check("the shim path proves equality instead of trusting the shim",
+          "selftest-real.txt" in builder and "selftest-shim.txt" in builder
+          and "diff -u" in builder)
+    check("the shim path does not link the real libelf",
+          "-lelf" not in builder.split("build_shim_loader()")[1]
+          .split("elif")[0])
+
+    check("the userspace README documents the shim and its proof",
+          "libelf-shim" in readme and "identical" in readme)
+    check("the README records both measured fixes",
+          "gelf_getshdr" in readme and "section **1**" in readme)
+
+
+def test_batch65_scx_prebuilt():
+    """Batch 65 (S3b-2b): the Android loader, built and shipped.
+
+    Batch 64 proved the libelf shim parses objects identically to libelf; this
+    batch is the cross build itself (tools/scx/build_android_loader.sh, NDK
+    clang, aarch64-linux-android) and the two artefacts it produces, committed
+    under tools/scx/prebuilt/ and shipped into the module's bin/ by embed.conf.
+    What is pinned mechanically:
+
+    * both files are present and are the right *kind* of ELF -- AArch64 PIE for
+      the loader, e_machine BPF for the scheduler object -- so a stray archive
+      or a host binary cannot be committed by accident;
+    * the loader's dynamic dependencies are bionic's (libc/libdl/libz), not
+      libelf: the shim is what removes that dependency;
+    * the module's policy is the only consumer, it looks in bin/, and its
+      default is still off (Batch 63) -- shipping the artefacts does not arm
+      anything;
+    * the build recipe is published and documents the NDK, the compat headers
+      and the TUs it skips.
+    """
+    print("Batch 65: S3b-2b the aarch64 loader and the shipped artefacts")
+    repo = Path(__file__).resolve().parent.parent
+    pre = repo / "tools/scx/prebuilt"
+    loader = pre / "scx_loader"
+    obj = pre / "abk_scx_min.bpf.o"
+
+    check("the loader artefact is committed", loader.is_file())
+    check("the scheduler object is committed", obj.is_file(),
+          obj.stat().st_size if obj.is_file() else None)
+    if loader.is_file() and obj.is_file():
+        lelf = loader.read_bytes()[:64]
+        oelf = obj.read_bytes()[:64]
+        check("the loader is ELF64 little-endian",
+              lelf[:4] == b"\x7fELF" and lelf[4] == 2 and lelf[5] == 1)
+        check("the loader is AArch64 (e_machine 183)",
+              int.from_bytes(lelf[18:20], "little") == 183,
+              int.from_bytes(lelf[18:20], "little"))
+        check("the loader is a PIE (e_type 3)",
+              int.from_bytes(lelf[16:18], "little") == 3)
+        check("the scheduler object is an ELF64 BPF object",
+              oelf[:4] == b"\x7fELF" and int.from_bytes(oelf[18:20], "little") == 247,
+              int.from_bytes(oelf[18:20], "little"))
+        check("the scheduler object carries its map and sections",
+              b"abk_scx_min_ops" in obj.read_bytes()
+              and b"select_cpu" in obj.read_bytes())
+
+    embed = (repo / "ksu/abk_runtime_tunables/embed.conf").read_text(
+        encoding="utf-8")
+    check("the packager maps both artefacts into bin/",
+          "tools/scx/prebuilt/scx_loader=bin/scx_loader" in embed
+          and "tools/scx/prebuilt/abk_scx_min.bpf.o=bin/abk_scx_min.bpf.o" in embed)
+    policy = (repo / "ksu/abk_runtime_tunables/scx-policy.sh").read_text(
+        encoding="utf-8")
+    check("the policy is the consumer and still ships off",
+          'ABK_SCX_LOADER_NAME="scx_loader"' in policy
+          and 'ABK_SCX_OBJ_NAME="abk_scx_min.bpf.o"' in policy)
+    tunables = (repo / "ksu/abk_runtime_tunables/tunables.conf").read_text(
+        encoding="utf-8")
+    check("shipping the artefacts does not arm the scheduler",
+          "scx.enabled=0" in tunables)
+
+    build = (repo / "tools/scx/build_android_loader.sh").read_text(
+        encoding="utf-8")
+    check("the Android recipe is published",
+          "aarch64-linux-android" in build and "NDK" in build)
+    check("the recipe documents what it skips and why",
+          "linker.c|netlink.c|nlattr.c|xsk.c|ringbuf.c|usdt.c" in build)
+    check("the recipe uses the shim and the compat headers",
+          "libelf-shim" in build and "android-compat" in build)
+    readme = (repo / "tools/scx/README.md").read_text(encoding="utf-8")
+    check("the README documents the cross build",
+          "build_android_loader.sh" in readme
+          and "aarch64-linux-android" in readme)
+
+
+def test_batch66_scx_check_tool():
+    """Batch 66 (S3c): the on-device verdict tool for the SCX switch.
+
+    The kernel side, the loader and the packaging are all in place; what is left
+    is the device session, and that needs a tool that can tell the four states
+    apart (switch off / switch on but not attached / attached but moving
+    nothing / attached and moving tasks).  What is pinned mechanically:
+
+    * the tool is a POSIX-sh, read-only device CLI that is also shipped (it is
+      in embed.conf, so the same file is the module's bin/ copy);
+    * it reads the attach verdict from the engine's own debugfs dump rather
+      than guessing from the switch;
+    * the SCHED_EXT scan uses /proc/<pid>/stat's policy field and documents why
+      the parse starts after the last ')' (comm can contain spaces and ')');
+    * the exit codes are the interface a script uses, so they are asserted.
+    """
+    print("Batch 66: S3c the sched_ext on-device check tool")
+    repo = Path(__file__).resolve().parent.parent
+    tool = repo / "tools/abk_scx_check.sh"
+    text = tool.read_text(encoding="utf-8")
+
+    check("the tool exists and runs on sh", text.startswith("#!/bin/sh\n"))
+    check("the tool is shipped through embed.conf",
+          "tools/abk_scx_check.sh=bin/abk_scx_check.sh" in
+          (repo / "ksu/abk_runtime_tunables/embed.conf").read_text(
+              encoding="utf-8"))
+    check("the tool has a help path", "-h|--help" in text)
+    check("the tool writes nothing",
+          not re.search(r"(?m)^\s*(>|chmod|setprop|echo .*>|mkdir|rm )", text))
+    check("the attach verdict comes from the engine dump",
+          "/sys/kernel/debug/sched/ext" in text and "enabled=yes" in text)
+    check("the task scan uses the policy field",
+          "-f39" in text and "field 41" in text)
+    check("the scan explains the comm parse",
+          "last \") \"" in text or "last ')' " in text)
+    check("the four exit codes are the documented interface",
+          all(code in text for code in ("flag 2", "flag 3", "flag 4"))
+          and "flag 0" not in text)
+    check("mksh-safe: no bashisms this tool would trip on",
+          not any(bad in text for bad in ("[[", "${!", "local ", "function ")))
+
+
+def test_batch67_uclamp_policy():
+    """Batch 67 (Tier B, landed off): the uclamp floor.
+
+    cpu.uclamp.min is a cgroup v2 file the baseline already exposes, so a
+    render-boost-by-uclamp costs no kernel change -- but the value format has to
+    be the kernel's and a rejected write has to be refused *before* it happens,
+    because a write into uclamp that the kernel dislikes changes nothing
+    silently (the Batch 42 cap_pct failure mode).  What is pinned:
+
+    * both knobs ship empty and the applier writes nothing when either is;
+    * the accepted values are the kernel's -- "max" or a decimal percent --
+      and anything above 100 is refused before the write;
+    * the format's provenance is recorded in the file (capacity_from_percent);
+    * the target is /sys/fs/cgroup/<group>/cpu.uclamp.min and the supervisor
+      re-asserts on a timer, because cgroup managers rewrite these nodes;
+    * the toolchain side: the three keys are known to the linter, the service
+      only spawns the supervisor when both halves are set, and action.sh shows
+      the state.
+    """
+    print("Batch 67: Tier B uclamp floor (off by default)")
+    repo = Path(__file__).resolve().parent.parent
+    mod = repo / "ksu/abk_runtime_tunables"
+    policy = (mod / "uclamp-policy.sh").read_text(encoding="utf-8")
+    tunables = (mod / "tunables.conf").read_text(encoding="utf-8")
+    common = (mod / "common.sh").read_text(encoding="utf-8")
+    service = (mod / "service.sh").read_text(encoding="utf-8")
+    action = (mod / "action.sh").read_text(encoding="utf-8")
+    readme = (mod / "README.md").read_text(encoding="utf-8")
+
+    check("the policy is a device script", policy.startswith("#!/system/bin/sh\n"))
+    check("both knobs ship empty",
+          "boost.uclamp_min=\n" in tunables and "boost.groups=\n" in tunables)
+    check("the applier needs both halves",
+          "if [ -z \"$_ua_val\" ] || [ -z \"$_ua_grps\" ]; then" in policy
+          and "boost: off (set both" in policy)
+    check("the value format is the kernel's",
+          '"max"' in policy and "capacity_from_percent" in policy)
+    check("a malformed value is refused before the write",
+          policy.index("abk_uclamp_valid")
+          < policy.index("printf '%s\\n' \"$_ua_val\" > \"$_ua_path\""))
+    check("the valid range is asserted", "($0 + 0) <= 100" in policy)
+    check("the write target is the cgroup node",
+          "fs/cgroup/%s/cpu.uclamp.min" in policy)
+    check("the supervisor re-asserts on a timer",
+          "abk_uclamp_supervisor_main" in policy
+          and "abk_clamp_uint" in policy and "sleep" in policy)
+    check("the write is logged with its read-back", "now $(abk_read" in policy)
+    bashisms = ("[[", "local ", "function ", "$" + "{!")
+    check("mksh-safe: no bashisms",
+          not any(bad in policy for bad in bashisms))
+
+    check("the three keys are known to the linter",
+          all(k in common for k in ("boost.uclamp_min", "boost.groups",
+                                    "boost.interval_sec")))
+    check("the service only spawns the supervisor when armed",
+          'if [ -n "$(abk_uclamp_value)" ] && [ -n "$(abk_uclamp_groups)" ]; then'
+          in service and "--supervise-uclamp) abk_uclamp_supervisor_main" in service)
+    check("action.sh exposes the state",
+          "abk_uclamp_status" in action and "uclamp|" in action)
+    check("the module README documents the switch", "boost.uclamp_min" in readme)
+
+
+def test_batch68_arm64_selftest():
+    """Batch 68 (S3d): the arm64 loader actually runs, and proves its parse.
+
+    "The artefact is an AArch64 ELF" (Batch 65) is not "this code path works".
+    This batch links a static aarch64 build of the same sources, runs it under
+    qemu-user and diffs its selftest against the host x86_64 build.  What is
+    pinned mechanically:
+
+    * the recipe exists and states the two constraints that make it possible:
+      it must run where wslpath exists (WSL) and it finds the NDK in either
+      mount style;
+    * it links *static* (the committed binary is dynamic bionic and cannot run
+      on a host) and runs qemu-aarch64-static;
+    * it refuses to pass unless the two architectures agree, the usage path
+      exits 2, and a load on a kernel without sched_ext fails;
+    * the measured output is recorded in the survey, so the claim is auditable.
+    """
+    print("Batch 68: S3d arm64 loader under qemu-user")
+    repo = Path(__file__).resolve().parent.parent
+    script = (repo / "tools/scx/run_arm64_selftest.sh").read_text(encoding="utf-8")
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    readme = (repo / "tools/scx/README.md").read_text(encoding="utf-8")
+
+    check("the recipe is a build-host script",
+          script.startswith("#!/usr/bin/env bash\n"))
+    check("it needs wslpath and says so",
+          "command -v wslpath" in script and "run this under WSL" in script)
+    check("it finds the NDK in either mount style",
+          "/mnt/c/Users/Administrator/AppData/Local/Android/Sdk/ndk/" in script
+          and "/c/Users/Administrator/AppData/Local/Android/Sdk/ndk/" in script)
+    check("it links a static aarch64 binary",
+          "-static" in script and "aarch64-linux-android30" in script)
+    check("it runs qemu-user",
+          "qemu-aarch64-static" in script)
+    check("it diffs against the host build",
+          "BUILD_HOST_LOADER=1" in script and "diff -u" in script)
+    check("it requires the usage path to exit 2", "_rc_usage\" -eq 2" in script)
+    check("it requires a load without sched_ext to fail", "_rc_run\" -ne 0" in script)
+    check("the verdict is a single greppable line",
+          "SELFTEST IDENTICAL ACROSS ARCH" in script)
+
+    check("the survey records the measured output",
+          "## 2p." in survey
+          and "SELFTEST IDENTICAL ACROSS ARCH" in survey
+          and "statically linked" in survey
+          and "Function not implemented" in survey)
+    check("the userspace README points at the check",
+          "run_arm64_selftest.sh" in readme)
+
+
+def test_batch69_tier_de_verdict():
+    """Batch 69 (Tier D/E): both candidates closed, with evidence.
+
+    The plan's last two non-device items were "only if a real scheduling effect
+    can be shown".  One is already implemented (as PREEMPT_SHORT) and the other
+    does not exist upstream under that name, so neither needs a device -- and
+    leaving them open would keep a device round blocked on work already
+    finished.  What is pinned:
+
+    * the "already implemented" claim is checkable inside this repository: the
+      EEVDF payload script carries both the upstream commit id and the feature
+      switch, and the rule reads only the four claimed sched_entity fields;
+    * the "does not exist" claim records *what was searched* (upstream
+      releases, AOSP kernel_common branches, this tree), not just a conclusion;
+    * the plan line is closed rather than left pending.
+    """
+    print("Batch 69: Tier D/E verdict")
+    repo = Path(__file__).resolve().parent.parent
+    eevdf = (repo / "scripts/batch15_perf_eevdf.py").read_text(encoding="utf-8")
+    survey = (repo / "docs/survey_eevdf_gap.md").read_text(encoding="utf-8")
+    plan = (repo / "plan.md").read_text(encoding="utf-8")
+    bt = chr(96)  # a backtick, kept out of this source file's own literals
+
+    check("the EEVDF payload really carries PREEMPT_SHORT",
+          "SCHED_FEAT(PREEMPT_SHORT, true)" in eevdf
+          and "abk_eevdf_preempt_short" in eevdf)
+    check("it cites the upstream commit it ports", "85e511df3cec" in eevdf)
+    check("the rule only reads the claimed fields",
+          "se->slice" in eevdf and "exhausts the" in eevdf)
+
+    check("the survey records the verdict section",
+          "## 10. Tier D/E verdict" in survey)
+    check("it names PREEMPT_SHORT as the 'protect the slice' mechanism",
+          "Allow shorter slices to wakeup-preempt" in survey
+          and "already in the tree" in survey)
+    check("it lists what was searched for latency_nice",
+          all(tag in survey for tag in ("v6.1", "v6.2", "v6.6", "v6.7", "v6.12",
+                                        "v6.13", "v6.14", "v6.15"))
+          and all(br in survey for br in ("android13-5.15", "android14-6.1",
+                                          "android15-6.6")))
+    check("it records the KMI reason for excluding a from-scratch ABI",
+          "slot 5" in survey and "SysVIPC" in survey)
+    check("it corrects the mis-attribution in the plan",
+          "attribution in the plan was therefore wrong" in survey)
+
+    check("the plan line is closed, not pending",
+          ("- [~] " + bt + "latency_nice" + bt) not in plan
+          and ("- [-] " + bt + "latency_nice" + bt) in plan
+          and "Batch 69 \u5df2\u88c1\u51b3" in plan)
+    check("the device plan now scopes 'measure and decide' to Tier B",
+          "Tier D/E \u5df2\u4e8e Batch 69 \u6536\u53e3" in plan)
+
+
+def test_batch56_compile_gate():
+    """Batch 56 (sched_ext S2b-2 prerequisite): the compile gate and its finding.
+
+    The seven repository gates are all text gates, so what this test pins is the
+    *eighth* one existing and being pointed at the payload it probes.  Three
+    facts:
+
+    * `tools/compile_probe.sh` is published, is a build-host helper (absent from
+      the companion embed.conf, so it never ships to a device) and defaults to
+      the SCX translation unit plus the objects this module rewrites for SCX;
+    * the glue unit fix stays fixed: `autogroup.h` and `stats.h` are the two
+      headers 5.15 sched.h already includes, and re-listing them measured as 20
+      redefinition errors;
+    * the measurement is recorded in survey SS2c, so a later batch cannot quietly
+      re-assert "the payload compiles", and the two docs that did claim it are
+      checked to have been corrected.
+    """
+    print("Batch 56: the local compile gate and the payload 5.15 gap")
+    repo = Path(__file__).resolve().parent.parent
+
+    probe = repo / "tools/compile_probe.sh"
+    check("the compile probe is published", probe.is_file())
+    probe_text = probe.read_text(encoding="utf-8") if probe.is_file() else ""
+    check("the compile probe is LF, not CRLF",
+          probe.is_file() and b"\r\n" not in probe.read_bytes())
+    check("the compile probe defaults to the module own toolchain",
+          "LLVM=1" in probe_text and "arm64" in probe_text)
+    check("the compile probe compiles the SCX translation unit",
+          "kernel/sched/sched_ext_glue.o" in probe_text)
+    for obj in ("core.o", "fair.o", "idle.o", "debug.o", "fork.o"):
+        check(f"the compile probe covers {obj}", obj in probe_text)
+    check("the compile probe requires the class to be enabled",
+          "CONFIG_SCHED_CLASS_EXT=y" in probe_text)
+    embed = (repo / "ksu/abk_runtime_tunables/embed.conf").read_text(encoding="utf-8")
+    check("the compile probe is not shipped to a device",
+          "compile_probe" not in embed)
+
+    glue = (repo / "files/kernel/sched/sched_ext_glue.c").read_text(encoding="utf-8")
+    for header in ("autogroup.h", "stats.h"):
+        check(f"the glue unit does not re-include {header} (sched.h already has "
+              "it and neither header has a guard)",
+              f'#include "{header}"' not in glue)
+
+    survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
+    check("the survey records the compile measurement",
+          "## 2c." in survey and "tools/compile_probe.sh" in survey)
+    for needle in ("struct affinity_context", "sched_prop", "SCHED_CHANGE_BLOCK",
+                   "__setscheduler_prio", "check_class_changed",
+                   "btf_struct_access", "__btf_member_bit_offset",
+                   "check_member", "for_each_cpu_andnot", "__diag_ignore_all",
+                   "sched_weight_to_cgroup", "set_cpus_allowed_common"):
+        check(f"the survey names {needle}", needle in survey)
+    check("the survey says the payload must be edited, not only shimmed",
+          "\u5fc5\u987b\u7f16\u8f91 `ext.c`" in survey)
+
+    agents = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    check("AGENTS.md no longer claims the payload compiles",
+          "so the payload compiles in every build" not in agents)
+    check("AGENTS.md points at the compile probe",
+          "tools/compile_probe.sh" in agents)
+
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    check("the changelog records Batch 56",
+          '<a id="batch-56"></a>' in changelog
+          and "Batch 56\uff08S2b-2 " in changelog)
+
+
+def test_sched_ext_wiring():
+    """Batch 55 (sched_ext S2b-1): the seven build-wiring groups.
+
+    The local tree audits prove the anchors land; this test pins the facts that
+    are decisions rather than mechanics:
+
+    * the payload is compiled at all -- the Kconfig symbol exists, the module
+      tier turns it on, and _INTRODUCED_KCONFIG records that, so the Batch-8
+      "grafted but compiled out" failure cannot repeat here;
+    * the class is placed where 5.15's walk expects it and the comparison
+      polarity matches that walk (the 6.6 spelling is the mirror image);
+    * the engine is built through the glue translation unit, not ext.o;
+    * the task pointer takes slot 7 beside the Batch-16 slot-8 member, and the
+      earlier group's shape probe was repaired so the pair stays idempotent;
+    * SCHED_EXT is defined but not accepted: valid_policy()/normal_policy() and
+      __sched_setscheduler's scx gate are the next batch, and landing them here
+      would make a class with no fork hooks reachable.
+    """
+    print("Batch 55: sched_ext S2b-1 build wiring")
+    repo = Path(__file__).resolve().parent.parent
+
+    import abk_stable_core as core_mod
+    import abk_stable_perf as perf_mod
+
+    keys = [g.key for g in perf_mod.PATCH_GROUPS]
+    wiring = ["sched_ext_kconfig", "sched_ext_uapi", "sched_ext_task_slot",
+              "sched_ext_rq_state", "sched_ext_class_order",
+              "sched_ext_build", "sched_ext_init"]
+    for key in wiring:
+        check(f"perf registers {key}", key in keys)
+    # sched_ext_task_slot claims task_struct slot 7 and anchors on the free run
+    # the Batch-16 kstack group leaves behind, so it has to run after it.
+    check("sched_ext_task_slot is registered after randomize_kstack_pertask",
+          "randomize_kstack_pertask" in keys
+          and keys.index("sched_ext_task_slot")
+          > keys.index("randomize_kstack_pertask"))
+    # The adaptation (Batch 57), task-lifecycle (Batch 58) and scheduling-core
+    # (Batch 59) groups follow immediately: they adapt the payload this wiring
+    # creates, so they have to run after it.
+    start = keys.index(wiring[0])
+    check("the seven wiring groups open the sched_ext run",
+          keys[start:start + len(wiring)] == wiring,
+          keys[start:start + len(wiring)])
+    after_wiring = ["sched_ext_core_visibility", "sched_ext_change_guard",
+                    "sched_ext_payload_adapt",
+                    "sched_ext_fork_hooks", "sched_ext_fork_failure_path",
+                    "sched_ext_task_teardown",
+                    "sched_ext_setscheduler_hooks",
+                    "sched_ext_payload_task_guard",
+                    "sched_ext_active_class", "sched_ext_pick_path",
+                    "sched_ext_tick_watchdog", "sched_ext_idle_hook"]
+    tail = keys[start + len(wiring):]
+    check("the adaptation, hook and core groups follow the wiring in order",
+          tail[:len(after_wiring)] == after_wiring, tail[:len(after_wiring)])
+
+    check("SCHED_CLASS_EXT is recorded as a module-tier symbol",
+          core_mod._INTRODUCED_KCONFIG.get("SCHED_CLASS_EXT") == "module",
+          core_mod._INTRODUCED_KCONFIG.get("SCHED_CLASS_EXT"))
+    check("the module tier enables SCHED_CLASS_EXT",
+          ("SCHED_CLASS_EXT", "y") in core_mod._MODULE_CONFIGS)
+
+    perf_src = (repo / "scripts/abk_stable_perf.py").read_text(
+        encoding="utf-8")
+    check("the kstack slot group probes its own added member",
+          'kstack_offset);" not in text' in perf_src
+          and 'kstack_offset;" not in text' not in perf_src)
+
+    import batch55_perf_sched_ext_wiring as w55
+
+    check("sched_class_above matches 5.15's downward walk",
+          "sched_class_above(_a, _b)" in w55._KSCHED_H_FOREACH_NEW
+          and "((_a) > (_b))" in w55._KSCHED_H_FOREACH_NEW)
+    # 5.15 walks the class array downwards from __end_sched_classes - 1, so the
+    # new rung goes between the idle and fair entries.
+    _lds = w55._LDS_NEW
+    check("the class slot goes between idle and fair",
+          _lds.index("*(__idle_sched_class)")
+          < _lds.index("*(__ext_sched_class)")
+          < _lds.index("*(__fair_sched_class)"))
+    check("the Makefile builds the glue object",
+          "obj-$(CONFIG_SCHED_CLASS_EXT) += sched_ext_glue.o" in w55._MAKEFILE_NEW)
+    check("the engine is not built as ext.o",
+          "+= ext.o" not in w55._MAKEFILE_NEW)
+
+    audit_src = (repo / "tests/config_gate_audit.py").read_text(
+        encoding="utf-8")
+    for symbol in ("CONFIG_SCHED_CLASS_EXT", "CONFIG_SCHED_CORE",
+                   "CONFIG_SCHED_SMT", "CONFIG_CPUMASK_OFFSTACK",
+                   "CONFIG_EXT_GROUP_SCHED"):
+        check(f"the payload's dark gate {symbol} is recorded",
+              f'"{symbol}": (' in audit_src)
+
+    readme = (repo / "files/README.md").read_text(encoding="utf-8")
+    check("files/README.md documents the glue unit",
+          "kernel/sched/sched_ext_glue.c" in readme)
+
+    fetch = (repo / "tests/fetch_sublevel_tree.sh").read_text(encoding="utf-8")
+    for rel in ("kernel/Kconfig.preempt", "include/uapi/linux/sched.h",
+                "kernel/sched/Makefile", "include/asm-generic/vmlinux.lds.h"):
+        check(f"FETCH_FILES carries {rel}", rel in fetch)
 
 
 if __name__ == "__main__":

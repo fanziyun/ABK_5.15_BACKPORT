@@ -52,10 +52,10 @@
 | child id | content | groups |
 |---|---|---:|
 | `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 71 |
-| `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 24 |
+| `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 54 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**96 graft groups** in total; one injection string covers `android13-5.15-lts`.
+**126 graft groups** in total (the perf child counts 54, including Batch 57's three sched_ext payload-adaptation groups, Batch 58's five task-lifecycle hook groups, Batch 59's four scheduling-core hook groups and Batch 60's four reachability groups); one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
 keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44
@@ -134,7 +134,7 @@ bash tests/smoke.sh build/abk-trees/216                        # end-to-end + ro
 | `scripts/` | **the graft logic itself**: anchor engine + the three children's group registry |
 | `tests/` | unit tests, reference-tree fetcher |
 | `docs/` | project documentation, attribution |
-| `tools/` | 5 device-facing CLIs |
+| `tools/` | 6 device-facing CLIs + build-host helpers + the `scx/` scheduler source |
 | `ksu/` | KernelSU module sources |
 | `plan.md` | implementation checklist |
 | `CHANGELOG.md` | per-batch reports |
