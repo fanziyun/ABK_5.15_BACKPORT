@@ -143,6 +143,127 @@ abk_stable_backport_overlay_of_address() {
   abk_log "of/address.c: overlaid pre-rework ranges parser (reverts the 5.15.213 rework; WLAN BAR0 fix)"
 }
 
+# sched_ext (SCX) payload: the second, and by far the largest, whole-file overlay.
+#
+# Four files, none of which exists on the supported baseline, so unlike the
+# of/address.c revert there is no anchor shape that could express them:
+#
+#   include/linux/sched/ext.h       struct sched_ext_ops / struct sched_ext_entity
+#   kernel/sched/ext.h              __bpf_kfunc, the enqueue/dequeue flag enums
+#                                   and the fork / cgroup / tick hook prototypes
+#   kernel/sched/ext.c              the engine (3,978 lines)
+#   kernel/sched/sched_ext_glue.c   the module-authored compilation unit that
+#                                   supplies the include block ext.c does not
+#                                   carry (5.15 has no build_policy.c to include
+#                                   it from); kernel/sched/Makefile builds it
+#
+# Provenance: OnePlusOSS/android_kernel_common_oneplus_sm8750, branch
+# oneplus/sm8750_b_16.0.0_oneplus_13 (kernel/sched/ext.c = 113,324 B).  The
+# files are copied byte-for-byte as fetched -- the sha256 of all three is pinned
+# in tests/stable_5_15_test.py -- and their upstream copyright headers are
+# intact.  The two commented-out `slim_walt` lines ext.c still carries are
+# OPPO's, not upstream's and not this module's; files/README.md lists them so
+# they are not mistaken for upstream text.
+#
+# Batch 54 shipped the three engine files inert: nothing included them, so a
+# tree carrying them built exactly as before.  Batch 55 lands the wiring
+# (Kconfig symbol, Makefile object rule, sched.h state, task_struct slot,
+# SCHED_DATA slot and the sched_init() call), which is what makes the probe
+# below fire and the empty diff base get written.  Splitting the two was
+# deliberate: a 113 KB engine in the same batch as its wiring would make both
+# the wiring diff and this overlay's rollback unreviewable.  The glue file is
+# module-authored (no upstream bytes), because ext.c has no include block and
+# 5.15 has no build_policy.c to include it from.
+#
+# New-file snapshot convention (of/address.c only ever rewrites an existing
+# file, so this is the first created-file case): a target this overlay creates
+# carries a zero-byte <file>.abk-new marker, which is what tells
+# scripts/abk_rollback.sh to delete the target instead of restoring it --
+# there is no original content to restore.  Once the build wiring exists the
+# target also gets an empty <file>.abk-orig: that is the diff base
+# tests/config_gate_audit.py attributes a module-added file's CONFIG gates
+# against, and for a created file the base is empty.  The base is deliberately
+# withheld while the payload is inert (see the probe below), because an empty
+# base makes the audit report every internal gate in ext.c as "added code that
+# never compiles" -- trivially true for a file nothing includes, and not a
+# defect.
+#
+# The overlay only ever creates.  A target that already exists with different
+# content is left alone with a warning, so a tree that already carries its own
+# sched_ext is not silently clobbered; keeping an installed payload current is
+# a separate concern from installing it.
+#
+# That "already exists with different content" test is why the marker matters:
+# since Batch 57 the perf child edits kernel/sched/ext.c right after this overlay
+# creates it (sched_ext_payload_adapt, the 5.15 adaptation the compiler needs),
+# so on every later run the file legitimately differs from the archived bytes.
+# A target carrying the group's marker is therefore treated as installed, and
+# only a target that is neither the archived file nor a marked adaptation is
+# reported as foreign.
+abk_stable_backport_sched_ext_wired() {
+  local makefile="$1/kernel/sched/Makefile"
+  [ -f "$makefile" ] && grep -q 'CONFIG_SCHED_CLASS_EXT' "$makefile"
+}
+
+abk_stable_backport_overlay_sched_ext() {
+  local common_dir rel target overlay created=0 foreign=0 wired=0
+  common_dir="$(abk_stable_backport_common_dir)"
+
+  if abk_stable_backport_sched_ext_wired "$common_dir"; then
+    wired=1
+  fi
+
+  for rel in include/linux/sched/ext.h kernel/sched/ext.h kernel/sched/ext.c \
+             kernel/sched/sched_ext_glue.c; do
+    target="$common_dir/$rel"
+    overlay="$MODULE_DIR/files/$rel"
+
+    abk_require_file "$overlay"
+
+    if [ -f "$target" ] && { cmp -s "$overlay" "$target" ||
+         grep -q 'sailboat_sched_ext_payload_adapt' "$target" ||
+         grep -q 'sailboat_sched_ext_payload_task_guard' "$target" ||
+         grep -q 'sailboat_sched_ext_active_class' "$target"; }; then
+      # Already installed.  The archived bytes verbatim, or any of the three
+      # markers a registry group that adapts a payload file writes --
+      # sched_ext_payload_adapt (batch57_perf_sched_ext_adapt) and
+      # sched_ext_payload_task_guard (batch58) into kernel/sched/ext.c,
+      # sched_ext_active_class (batch59) into kernel/sched/ext.h.  A new group
+      # that adapts a payload file must add its marker here, or the second
+      # overlay call treats the edited file as foreign and never writes its empty
+      # diff base.  The marked shapes are deliberately not byte-compared -- the
+      # archived files stay byte-for-byte under files/ with their sha256 pins, and
+      # the marker is what says "this is this module's payload" rather than a
+      # foreign tree's sched_ext (nothing else can carry it: it is only ever
+      # inserted by these groups).
+      #
+      # A tree grafted before the wiring landed has the marker but no diff base;
+      # add the base in place once it does.
+      if [ "$wired" -eq 1 ] && [ -f "$target.abk-new" ] \
+         && [ ! -f "$target.abk-orig" ]; then
+        : > "$target.abk-orig"
+      fi
+      continue
+    fi
+    if [ -f "$target" ]; then
+      abk_warn "sched_ext: $rel exists and differs from the module payload; left untouched"
+      foreign=$((foreign + 1))
+      continue
+    fi
+
+    mkdir -p "$(dirname -- "$target")"
+    : > "$target.abk-new"
+    [ "$wired" -eq 0 ] || : > "$target.abk-orig"
+    cp -a "$overlay" "$target"
+    created=$((created + 1))
+    abk_log "sched_ext: overlaid $rel"
+  done
+
+  if [ "$created" -eq 0 ] && [ "$foreign" -eq 0 ]; then
+    abk_log "sched_ext: payload already in place"
+  fi
+}
+
 # The runtime companion (ksu/abk_runtime_tunables) is a distribution asset, not
 # a graft: it registers no PatchGroup and never writes into the kernel tree.  It
 # rides inside the AnyKernel3 zip so that flashing a kernel also installs the
@@ -221,12 +342,26 @@ abk_stable_backport_apply_selected() {
       stable_perf_backport) abk_stable_backport_preflight_perf ;;
       stable_display_fix) abk_stable_backport_preflight_display ;;
     esac
+    # The sched_ext payload has to exist *before* the perf child runs: that child
+    # carries sched_ext_payload_adapt, which edits the overlaid
+    # kernel/sched/ext.c.  The same overlay is then re-run after the child, once
+    # -- that second call is what writes the empty .abk-orig diff base, because
+    # until the child's sched_ext_build group has added the Makefile entry the
+    # payload is not wired.
+    if [ "$child_id" = "stable_perf_backport" ]; then
+      abk_stable_backport_overlay_sched_ext
+    fi
     abk_stable_backport_apply_child "$child_id"
     # The of/address.c overlay rides with the core child (both are mm/of core
-    # reverts).  Run it once, only when that child is selected, so a per-child
-    # invocation does not overlay three times.
+    # reverts) and the sched_ext payload with the perf child (its wiring is a
+    # scheduler graft and lives in that child's registry).  Run each only when
+    # its child is selected, so a per-child invocation does not overlay three
+    # times.
     if [ "$child_id" = "stable_backport_core" ]; then
       abk_stable_backport_overlay_of_address
+    fi
+    if [ "$child_id" = "stable_perf_backport" ]; then
+      abk_stable_backport_overlay_sched_ext
     fi
     return 0
   fi
@@ -238,8 +373,15 @@ abk_stable_backport_apply_selected() {
       stable_perf_backport) abk_stable_backport_preflight_perf ;;
       stable_display_fix) abk_stable_backport_preflight_display ;;
     esac
+    # Materialise the payload before the child that adapts it (see above).
+    if [ "$child_id" = "stable_perf_backport" ]; then
+      abk_stable_backport_overlay_sched_ext
+    fi
     abk_stable_backport_apply_child "$child_id"
   done
-  # Overlay the pre-rework of/address.c once, after the Python children.
+  # Overlay the pre-rework of/address.c once after the Python children, and re-run
+  # the sched_ext overlay once more so the now-wired payload gets its empty
+  # diff base (the second call is an idempotent no-op on the file contents).
   abk_stable_backport_overlay_of_address
+  abk_stable_backport_overlay_sched_ext
 }

@@ -273,6 +273,12 @@ cfr.cgroup_root
 cfr.frozen_only
 cfr.freezer_root
 cfr.cached_only
+scx.enabled
+scx.mark_pids
+scx.reassert_interval_sec
+boost.uclamp_min
+boost.groups
+boost.interval_sec
 report.logcat
 EOF
 }

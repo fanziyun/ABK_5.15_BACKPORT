@@ -35,6 +35,7 @@ import abk_stable_core  # noqa: E402
 import abk_stable_perf  # noqa: E402
 import abk_stable_display  # noqa: E402
 from abk_backport_engine import GraftContext  # noqa: E402
+import audit_fixture  # noqa: E402
 import sublevel_matrix  # noqa: E402
 
 MARKER = "ABK stable_515_backport:"
@@ -1106,6 +1107,71 @@ REQUIRED_CONTENT = {
          "if (lru_gen_in_fault())\n"
          "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
     ],
+    # sched_ext S1a (Batch 51).  Two claims worth pinning mechanically: the
+    # instruction generator must be built on the matcher pair this tree already
+    # has (v6.1 added a second, byte-identical pair beside it), and the prologue
+    # constant must be the 5.15 recomputation -- v6.1's
+    # "BTI_INSNS + 2 + PAC_INSNS + 8" disagrees with build_prologue(), which only
+    # pr_err_once()s and returns -1, dropping every bpf program back to the
+    # interpreter with no other symptom.
+    "perf:arm64_insn_load_literal": [
+        "aarch64_insn_gen_load_literal",
+        "aarch64_insn_gen_load_store_imm",
+        "aarch64_insn_get_load_imm_value",
+        "aarch64_insn_get_store_imm_value",
+        "AARCH64_INSN_LDST_LOAD_IMM_OFFSET",
+        "A64_LDR64LIT",
+        "A64_STR64I",
+        "A64_NOP",
+    ],
+    "perf:arm64_bpf_text_poke": [
+        "bpf_arch_text_poke",
+        "struct bpf_plt",
+        "PLT_TARGET_OFFSET",
+        "build_plt",
+        "dummy_tramp",
+        "emit_bti",
+        "#define PROLOGUE_OFFSET (BTI_INSNS + 2 + 7)",
+        "#define POKE_OFFSET (BTI_INSNS + 1)",
+        # The patchsite and the plt call have to be in the JIT body, not merely
+        # declared: a group that only appended bpf_arch_text_poke() would report
+        # applied and never be reachable.
+        "emit(A64_MOV(1, A64_R(9), A64_LR), ctx);",
+        "\tbuild_plt(&ctx);",
+    ],
+    # sched_ext S1c (Batch 52).  The trampoline is the group that makes
+    # struct_ops -- and therefore SCX -- attachable on arm64, and its
+    # "re-authored, not copied" signature is positive content, not just
+    # absence: 5.15's interface is a struct bpf_tramp_progs carrying struct
+    # bpf_prog *, entered with __bpf_prog_enter(prog), while v6.1's
+    # bpf_tramp_links / bpf_tramp_run_ctx / tlink->link.prog do not compile
+    # here.  aada47665546 is folded in (__le32 branch targets + cpu_to_le32)
+    # because this tree's ctx->image is already __le32 *, so the sparse
+    # warning that commit fixes is a hard compile error here.
+    "perf:arm64_bpf_trampoline": [
+        "arch_prepare_bpf_trampoline",
+        "prepare_trampoline",
+        "invoke_bpf_prog",
+        "invoke_bpf_mod_ret",
+        "save_args",
+        "restore_args",
+        "static inline void emit_call(u64 target, struct jit_ctx *ctx)",
+        "\t\temit_call(func_addr, ctx);",
+        "struct bpf_tramp_progs *tprogs",
+        "fentry->nr_progs",
+        "fexit->nr_progs",
+        "fmod_ret->nr_progs",
+        "__bpf_prog_enter",
+        "__bpf_prog_exit",
+        "__bpf_tramp_enter",
+        "__bpf_tramp_exit",
+        "emit_bti(A64_BTI_JC, ctx);",
+        "*branch = cpu_to_le32(A64_CBZ(1, A64_R(0), offset));",
+        "*branches[i] = cpu_to_le32(A64_CBNZ(1, A64_R(10), offset));",
+        "im->ip_after_call = ctx->image + ctx->idx;",
+        "im->ip_epilogue = ctx->image + ctx->idx;",
+        "jit_fill_hole(image, (unsigned int)(image_end - image));",
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1464,6 +1530,39 @@ REQUIRED_ABSENT = {
         ["mm/workingset.c",
          "atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);\n"
          "\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
+    ],
+    "perf:arm64_bpf_text_poke": [
+        # The v6.1 text_poke/trampoline pair is written against the post-5.15
+        # generic interface; landed verbatim it does not compile here, so the
+        # absence of that shape is the "re-authored, not copied" signature --
+        # this tree hands the arch builder struct bpf_tramp_progs and calls
+        # __bpf_prog_enter(prog).
+        ["arch/arm64/net/bpf_jit_comp.c", "bpf_tramp_links"],
+        ["arch/arm64/net/bpf_jit_comp.c", "bpf_tramp_run_ctx"],
+        # 19f68ed6dc90 (kvcalloc for ctx.offset) is deliberately not carried:
+        # kvcalloc()/kvfree() are declared in linux/mm.h, which this TU does not
+        # include on 5.15.
+        ["arch/arm64/net/bpf_jit_comp.c", "kvcalloc(prog->len + 1"],
+        ["arch/arm64/net/bpf_jit_comp.c", "kvfree(ctx.offset)"],
+    ],
+    "perf:arm64_bpf_trampoline": [
+        # v6.1's generic interface, none of which exists on 5.15 -- keeping
+        # any of it means the group copied the hunks instead of re-authoring
+        # them, and the arm64 build then fails on an undeclared type.
+        ["arch/arm64/net/bpf_jit_comp.c", "bpf_tramp_links"],
+        ["arch/arm64/net/bpf_jit_comp.c", "bpf_tramp_run_ctx"],
+        ["arch/arm64/net/bpf_jit_comp.c", "run_ctx_off"],
+        ["arch/arm64/net/bpf_jit_comp.c", "l->link.prog"],
+        ["arch/arm64/net/bpf_jit_comp.c", "tlink->link.prog"],
+        ["arch/arm64/net/bpf_jit_comp.c", "l->cookie"],
+        # eb707dde264a (reject struct arguments) references a field and a
+        # constant that do not exist on 5.15: trampoline struct arguments
+        # only landed upstream after 5.15, so the guard would not compile.
+        ["arch/arm64/net/bpf_jit_comp.c", "arg_flags"],
+        ["arch/arm64/net/bpf_jit_comp.c", "BTF_FMODEL_STRUCT_ARG"],
+        # The kvcalloc divergence is arm64_bpf_text_poke's, not this group's,
+        # but the trampoline is where upstream used it, so pin it here too.
+        ["arch/arm64/net/bpf_jit_comp.c", "kvcalloc(fmod_ret->nr_progs"],
     ],
 }
 
@@ -2294,6 +2393,45 @@ REQUIRED_IN_FUNCTION = {
           "SetPageWorkingset(page);"],
          ["\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);\n\n"]),
     ],
+    "perf:arm64_bpf_trampoline": [
+        # The two-pass build is load bearing and nothing else checks it: the
+        # first prepare_trampoline() call runs with ctx.image == NULL and only
+        # sizes the frame, the second emits.  A group that emitted in one pass
+        # would write past image_end, and one that only sized would return a
+        # length with no code behind it -- and validate_code() would still
+        # pass, because it walks ctx->idx of a zero-filled image.
+        ("arch/arm64/net/bpf_jit_comp.c", "arch_prepare_bpf_trampoline",
+         ["\tret = prepare_trampoline(&ctx, im, tprogs, orig_call, nargs, flags);\n"
+          "\tif (ret < 0)\n"
+          "\t\treturn ret;",
+          "\tif (ret > max_insns)\n"
+          "\t\treturn -EFBIG;",
+          "\tctx.image = image;\n"
+          "\tctx.idx = 0;",
+          "if (ret > 0 && validate_code(&ctx) < 0)",
+          "\tif (ret > 0)\n"
+          "\t\tret *= AARCH64_INSN_SIZE;"],
+         # eb707dde264a's guard lives here upstream; it references a field
+         # this tree's struct btf_func_model does not have.
+         ["arg_flags", "BTF_FMODEL_STRUCT_ARG"]),
+        # 5.15's __bpf_prog_exit(prog, start): the start time has to survive the
+        # program call in a callee-saved register and be passed back in x1.
+        # With a run-ctx signature it would be a third argument in x2 and the
+        # exit helper would read the program address as a start time.
+        ("arch/arm64/net/bpf_jit_comp.c", "invoke_bpf_prog",
+         ["emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);",
+          "emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);",
+          "*branch = cpu_to_le32(A64_CBZ(1, A64_R(0), offset));",
+          "emit_call((const u64)p->bpf_func, ctx);"],
+         ["run_ctx_off", "bpf_cookie"]),
+        # struct_ops dispatch reaches the trampoline through blr, so the
+        # landing pad has to be the JC form -- BTI_C would fault the first
+        # struct_ops attach on a BTI kernel.
+        ("arch/arm64/net/bpf_jit_comp.c", "prepare_trampoline",
+         ["emit_bti(A64_BTI_JC, ctx);",
+          "int retaddr_off;"],
+         []),
+    ],
 }
 
 # Needles that only exist on some baselines, so they can only be asserted on a
@@ -2319,6 +2457,479 @@ REQUIRED_CONTENT_IF_PRESENT = {
         ],
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Batch 53 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
+# consults it, and the arm64 JIT override.
+#
+# These rows are deliberately about *shape*, because the point of the batch is
+# the upstream shape it does NOT carry: the id sets stay this tree's struct
+# btf_id_set (no struct btf_id_set8, no enum btf_kfunc_type, no
+# check/acquire/release/ret_null members), the registry stays keyed by
+# program-type hook (no per-BTF kfunc_set_tab and no btf_get_module_btf()), and
+# the verifier gate stays additive (the ops callback is still tested, so tcp_ca
+# and test_run keep theirs).  A later batch that carries the real 8-byte set and
+# the flag semantics has to *delete* these rows rather than let them rot.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:btf_kfunc_id_set_api": [
+        "register_btf_kfunc_id_set",
+        "btf_kfunc_id_set_contains",
+        "struct btf_kfunc_id_set {",
+        "const struct btf_id_set *set;",
+        "BTF_SET8_START", "BTF_SET8_END", "BTF_ID_FLAGS",
+        "BTF_KFUNC_HOOK_STRUCT_OPS", "BTF_KFUNC_SET_MAX",
+        "btf_kfunc_sets[hook][btf_kfunc_set_cnt[hook]++] = kset->set;",
+    ],
+    "perf:struct_ops_kfunc_allow": [
+        "btf_kfunc_id_set_contains(resolve_prog_type(env->prog), func_id)",
+        "!env->ops->check_kfunc_call(func_id)) &&",
+    ],
+    "perf:arm64_jit_kfunc_call": [
+        "bool bpf_jit_supports_kfunc_call(void)",
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:btf_kfunc_id_set_api": [
+        # The v5.18 / v5.19 shapes this port folds away.  Each one is the
+        # signature of a different decision: btf_id_set8 and enum
+        # btf_kfunc_type are the 8-byte set, acquire_set is the v5.18
+        # four-pointer struct, and kfunc_set_tab / btf_get_module_btf are the
+        # per-BTF registry.
+        ["include/linux/btf.h", "btf_id_set8"],
+        ["include/linux/btf_ids.h", "btf_id_set8"],
+        ["kernel/bpf/btf.c", "btf_id_set8"],
+        ["include/linux/btf.h", "enum btf_kfunc_type"],
+        ["include/linux/btf.h", "acquire_set"],
+        ["kernel/bpf/btf.c", "btf_get_module_btf"],
+        ["kernel/bpf/btf.c", "kfunc_set_tab"],
+    ],
+})
+
+REQUIRED_IN_FUNCTION.update({
+    "perf:btf_kfunc_id_set_api": [
+        # The registry must be written and read through the same table, and a
+        # module-owned set must be refused rather than kept: nothing in this
+        # tree pins the registering module against an unload, so a kept set
+        # would be a use-after-free for the verifier.
+        ("kernel/bpf/btf.c", "register_btf_kfunc_id_set",
+         ["spin_lock_irqsave(&btf_kfunc_sets_lock, flags)",
+          "btf_kfunc_sets[hook][btf_kfunc_set_cnt[hook]++] = kset->set;",
+          "kset->owner",
+          "return -EOPNOTSUPP",
+          "BTF_KFUNC_SET_MAX",
+          "return -EINVAL"],
+         ["btf_get_module_btf"]),
+        ("kernel/bpf/btf.c", "btf_kfunc_id_set_contains",
+         ["btf_id_set_contains(btf_kfunc_sets[hook][i], kfunc_btf_id)",
+          "return false"],
+         []),
+    ],
+    "perf:struct_ops_kfunc_allow": [
+        # Additive, not a replacement: the callback test has to survive, or
+        # the program types that have one lose their kfuncs.
+        ("kernel/bpf/verifier.c", "check_kfunc_call",
+         ["!env->ops->check_kfunc_call ||",
+          "!env->ops->check_kfunc_call(func_id)) &&",
+          "btf_kfunc_id_set_contains(resolve_prog_type(env->prog), func_id)"],
+         []),
+    ],
+    "perf:arm64_jit_kfunc_call": [
+        ("arch/arm64/net/bpf_jit_comp.c", "bpf_jit_supports_kfunc_call",
+         ["return true;"],
+         []),
+    ],
+})
+
+REQUIRED_PAIRING.update({
+    # A registry that check_kfunc_call() never consults is the Batch 16 shape:
+    # present, compiled and inert -- every kfunc call still fails with "not
+    # allowed", which is exactly the state S1b exists to leave behind.  Keyed
+    # on the *gate* group, not on the registry group: the audit applies groups
+    # in registration order and check each one's rows as it goes, so a
+    # forward reference to a group registered later is not in the tree yet.
+    "perf:struct_ops_kfunc_allow": [
+        ("kernel/bpf/btf.c",
+         "btf_kfunc_sets[hook][btf_kfunc_set_cnt[hook]++] = kset->set;",
+         "kernel/bpf/verifier.c",
+         "btf_kfunc_id_set_contains(resolve_prog_type(env->prog), func_id)",
+         "an id-set registry nothing consults registers ids no program can "
+         "call"),
+    ],
+})
+
+
+# ---------------------------------------------------------------------------
+# Batch 55 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
+# a compiled subsystem.  These rows pin the *shape* the wiring has to have on
+# this tree, not merely that some text landed:
+#
+# * the class array is walked downwards (class--) from
+#   __end_sched_classes - 1, so ext_sched_class goes between idle and fair and
+#   sched_class_above() is the greater-address comparison -- the 6.6 spelling
+#   assumes the opposite layout;
+# * the engine is built through the module-authored glue file, not as ext.o,
+#   because ext.c has no include block and 5.15 has no build_policy.c;
+# * the task pointer is slot 7 (slot 8 is the Batch-16 kstack member) and the
+#   rq pointer is rq's slot 1;
+# * kernel/sched/ext.h is included exactly once, at the end of sched.h where
+#   the types it needs are complete -- it has no include guard.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:sched_ext_kconfig": [
+        ("kernel/Kconfig.preempt", "config SCHED_CLASS_EXT"),
+        ("kernel/Kconfig.preempt",
+         "depends on BPF_SYSCALL && BPF_JIT"),
+    ],
+    "perf:sched_ext_uapi": [
+        ("include/uapi/linux/sched.h", "#define SCHED_EXT\t\t7"),
+    ],
+    "perf:sched_ext_task_slot": [
+        ("include/linux/sched.h", "#include <linux/sched/ext.h>"),
+        ("include/linux/sched.h",
+         "ANDROID_KABI_USE(7, struct sched_ext_entity *scx);"),
+        # The Batch-16 member has to survive the new claim beside it.
+        ("include/linux/sched.h",
+         "ANDROID_KABI_USE(8, u32\t\t\tkstack_offset);"),
+    ],
+    "perf:sched_ext_rq_state": [
+        ("kernel/sched/sched.h", "enum scx_rq_flags {"),
+        ("kernel/sched/sched.h", "struct scx_rq {"),
+        ("kernel/sched/sched.h", "struct irq_work\t\tkick_cpus_irq_work;"),
+        ("kernel/sched/sched.h", "ANDROID_KABI_USE(1, struct scx_rq *scx);"),
+        # 5.15 walks the class array with class--, so above == greater address.
+        ("kernel/sched/sched.h",
+         "#define sched_class_above(_a, _b)\t((_a) > (_b))"),
+        ("kernel/sched/sched.h", "#include \"ext.h\""),
+        ("kernel/sched/sched.h", "struct bpf_verifier_ops;"),
+    ],
+    "perf:sched_ext_class_order": [
+        ("include/asm-generic/vmlinux.lds.h", "*(__ext_sched_class)"),
+    ],
+    "perf:sched_ext_build": [
+        ("kernel/sched/Makefile",
+         "obj-$(CONFIG_SCHED_CLASS_EXT) += sched_ext_glue.o"),
+    ],
+    "perf:sched_ext_init": [
+        ("kernel/sched/core.c", "init_sched_ext_class();"),
+        ("kernel/sched/core.c",
+         "&idle_sched_class + 1 != &ext_sched_class"),
+        ("kernel/sched/core.c",
+         "&ext_sched_class + 1 != &fair_sched_class"),
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:sched_ext_rq_state": [
+        # ext.h has no include guard, so a second inclusion redefines its
+        # enums and does not compile.  It may only be pulled in by sched.h.
+        ["kernel/sched/sched.h", '#include "ext.h"\n\n#include "ext.h"'],
+    ],
+    "perf:sched_ext_build": [
+        # Not ext.o: the engine has no includes and would not compile as a
+        # standalone object on this tree.
+        ["kernel/sched/Makefile", "+= ext.o\n"],
+    ],
+})
+
+# ---------------------------------------------------------------------------
+# Batch 57 (sched_ext S2b-2a): the 5.15 adaptation layer.  These rows pin the
+# shape the adaptation has to have, not merely that something landed:
+#
+# * the two core.c helpers are the *only* implementations and are now global --
+#   a tree that copied them into the payload instead would compile two
+#   divergent class selectors;
+# * the payload's four preprocessor-proof sites carry the baseline's signatures,
+#   and the 6.6 shapes are gone rather than shadowed: keeping
+#   struct affinity_context does not compile, keeping the 3-argument
+#   check_member() does not link.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:sched_ext_core_visibility": [
+        ("kernel/sched/core.c",
+         "void __setscheduler_prio(struct task_struct *p, int prio)"),
+        ("kernel/sched/core.c",
+         "void check_class_changed(struct rq *rq, struct task_struct *p,"),
+        ("kernel/sched/sched.h",
+         "extern void __setscheduler_prio(struct task_struct *p, int prio);"),
+        ("kernel/sched/sched.h",
+         "extern void check_class_changed(struct rq *rq, struct task_struct *p,"),
+    ],
+    "perf:sched_ext_change_guard": [
+        ("kernel/sched/sched.h", "struct sched_change_guard {"),
+        ("kernel/sched/sched.h", "sched_change_guard_fini(struct sched_change_guard *cg, int flags);"),
+        ("kernel/sched/core.c", "sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags)"),
+        ("kernel/sched/core.c", "void sched_change_guard_fini(struct sched_change_guard *cg, int flags)"),
+        # The guard has to sit where the tree's own dequeue_task()/enqueue_task()
+        # wrappers are visible -- that is the whole reason it is not in the glue.
+        ("kernel/sched/core.c", "\t\tdequeue_task(rq, p, flags);\n"),
+    ],
+    "perf:sched_ext_payload_adapt": [
+        ("kernel/sched/ext.c",
+         "static void set_cpus_allowed_scx(struct task_struct *p,\n"),
+        ("kernel/sched/ext.c", "const struct cpumask *newmask, u32 flags)"),
+        ("kernel/sched/ext.c",
+         "static int bpf_scx_btf_struct_access(struct bpf_verifier_log *log,\n"),
+        ("kernel/sched/ext.c", "const struct btf *btf,"),
+        ("kernel/sched/ext.c", "u32 *next_btf_id)"),
+        ("kernel/sched/ext.c",
+         "static int bpf_scx_check_member(const struct btf_type *t,\n"),
+        ("kernel/sched/ext.c",
+         "static void sysrq_handle_sched_ext_reset(int key)"),
+        # The three switches: the guard is now open-coded at each site.
+        ("kernel/sched/ext.c",
+         "\t\t\t\tstruct sched_change_guard __cg =\n"),
+        ("kernel/sched/ext.c",
+         "\t\t\tstruct sched_change_guard __cg =\n"),
+        ("kernel/sched/ext.c",
+         "\t\t\tsched_change_guard_fini(&__cg,\n"),
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:sched_ext_payload_adapt": [
+        # struct affinity_context has no other user in the payload, and the 5.15
+        # sched_class field is (p, newmask, flags) -- a kept 6.2 shape does not
+        # compile.
+        # (the needles are code, not identifiers: the adaptation comments
+        # deliberately name what they removed, so a bare identifier would match
+        # its own explanation)
+        ["kernel/sched/ext.c", "struct affinity_context *ctx)"],
+        # The OPPO vendor member: the decision is to drop the write, never to
+        # claim a task_struct slot for it.
+        ["kernel/sched/ext.c", "\tp->sched_prop = 0;"],
+        # The program argument the 5.15 struct bpf_struct_ops does not have.
+        ["kernel/sched/ext.c",
+         "const struct btf_member *member,\n\t\t\t\tconst struct bpf_prog *prog)"],
+        # The 4-argument verifier callback, replaced by the 7-argument one.
+        ["kernel/sched/ext.c", "const struct bpf_reg_state *reg,"],
+        # The 6.2 block macro itself is gone from the payload: gnu89 rejects its
+        # for-init declaration, so the sites are open-coded instead.
+        ["kernel/sched/ext.c", "SCHED_CHANGE_BLOCK("],
+    ],
+})
+
+
+
+# Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  These rows
+# pin what a later batch could silently undo:
+#
+# * the fork hooks sit at 5.15's own bodies and keep their unwind -- a tree that
+#   copied 6.6's sched_fork() instead would lose the vendor rvh traces, and a
+#   tree without out_cancel: leaks the fork reader lock on the DL rejection;
+# * copy_process()'s two failure edges reach the new label, which is the only
+#   thing that releases that lock when sched_post_fork() never runs;
+# * the payload guard edits the *tree copy*: the archived file is pinned
+#   separately by the unit test, and the unguarded fork-hook bodies must be gone
+#   rather than shadowed.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:sched_ext_fork_hooks": [
+        ("kernel/sched/core.c", "scx_pre_fork(p);"),
+        ("kernel/sched/core.c", "out_cancel:"),
+        ("kernel/sched/core.c", "scx_cancel_fork(p);"),
+        ("kernel/sched/core.c",
+         "int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)"),
+        ("kernel/sched/core.c", "\treturn scx_fork(p);\n"),
+        ("kernel/sched/core.c", "scx_post_fork(p);"),
+        ("kernel/sched/core.c", "void sched_cancel_fork(struct task_struct *p)"),
+        ("include/linux/sched/task.h",
+         "extern int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs);"),
+        ("include/linux/sched/task.h",
+         "extern void sched_cancel_fork(struct task_struct *p);"),
+    ],
+    "perf:sched_ext_fork_failure_path": [
+        ("kernel/fork.c", "goto bad_fork_sched_cancel_fork;"),
+        ("kernel/fork.c", "bad_fork_sched_cancel_fork:"),
+        ("kernel/fork.c", "retval = sched_cgroup_fork(p, args);"),
+    ],
+    "perf:sched_ext_task_teardown": [
+        ("kernel/fork.c", "sched_ext_free(tsk);"),
+    ],
+    "perf:sched_ext_setscheduler_hooks": [
+        ("kernel/sched/core.c", "\telse if (task_on_scx(p))\n"),
+        ("kernel/sched/core.c", "\tretval = scx_check_setscheduler(p, policy);\n"),
+    ],
+    "perf:sched_ext_payload_task_guard": [
+        ("kernel/sched/ext.c", "INIT_LIST_HEAD(&p->scx->tasks_node);"),
+        ("kernel/sched/ext.c", "if (scx_enabled() && p->scx)"),
+        ("kernel/sched/ext.c", "kfree(p->scx);"),
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:sched_ext_payload_task_guard": [
+        # The unguarded fork hooks: scx_pre_fork() skips a task it could not
+        # allocate state for, so these two bodies would dereference NULL.
+        ["kernel/sched/ext.c",
+         "\tif (scx_enabled())\n\t\treturn scx_ops_prepare_task(p, task_group(p));\n"],
+        ["kernel/sched/ext.c",
+         "\tif (scx_enabled())\n\t\tscx_ops_disable_task(p);\n"],
+    ],
+})
+
+REQUIRED_IN_FUNCTION.update({
+    "perf:sched_ext_fork_hooks": [
+        # The hooks have to be inside 5.15's own bodies, and the DL rejection has
+        # to reach the unwind rather than return straight out.
+        ("kernel/sched/core.c", "sched_fork",
+         ["scx_pre_fork(p);", "out_cancel:", "scx_cancel_fork(p);",
+          "task_on_scx(p)"],
+         ["return -EAGAIN;"]),
+        ("kernel/sched/core.c", "sched_cgroup_fork",
+         ["return scx_fork(p);"], []),
+        ("kernel/sched/core.c", "sched_post_fork",
+         ["scx_post_fork(p);"], []),
+    ],
+    "perf:sched_ext_setscheduler_hooks": [
+        ("kernel/sched/core.c", "__setscheduler_prio",
+         ["task_on_scx(p)"], []),
+        ("kernel/sched/core.c", "__sched_setscheduler",
+         ["scx_check_setscheduler(p, policy)"], []),
+    ],
+})
+
+# ---------------------------------------------------------------------------
+# Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+# These rows pin the three things that make an *enabled* scheduler actually
+# schedule, and the payload edit that lets them compile:
+#
+# * the active-class walk must step down 5.15's SCHED_DATA array and use its
+#   bound names -- a tree that kept the 6.6 walk would run past the array end;
+# * __pick_next_task() must leave the fair fast path and report picks, and the
+#   balance walk must start at ext when @prev is above it;
+# * the tick watchdog and the idle transition must be reachable from
+#   scheduler_tick() / the idle class rather than merely declared.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:sched_ext_active_class": [
+        ("kernel/sched/ext.h",
+         "\tif (scx_switched_all() && class == &fair_sched_class)\n\t\tclass--;\n"),
+        ("kernel/sched/ext.h",
+         "for_active_class_range(class, sched_class_highest, sched_class_lowest)"),
+    ],
+    "perf:sched_ext_pick_path": [
+        ("kernel/sched/core.c", "\tif (scx_enabled())\n\t\tgoto restart;\n"),
+        ("kernel/sched/core.c", "\tfor_each_active_class(class) {\n"),
+        ("kernel/sched/core.c", "scx_notify_pick_next_task(rq, p, class);"),
+        ("kernel/sched/core.c",
+         "for_balance_class_range(class, prev->sched_class, &idle_sched_class) {"),
+    ],
+    "perf:sched_ext_tick_watchdog": [
+        ("kernel/sched/core.c", "\tscx_notify_sched_tick();\n"),
+    ],
+    "perf:sched_ext_idle_hook": [
+        ("kernel/sched/idle.c", "\tscx_update_idle(rq, false);\n"),
+        ("kernel/sched/idle.c", "\tscx_update_idle(rq, true);\n"),
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:sched_ext_active_class": [
+        # The 6.6 walk: it counts *up* from the 6.12 bound names, which do not
+        # exist on this baseline and would leave the array if they did.
+        ["kernel/sched/ext.h", "class++;"],
+        ["kernel/sched/ext.h",
+         "for_active_class_range(class, __sched_class_highest, __sched_class_lowest)"],
+    ],
+})
+
+REQUIRED_IN_FUNCTION.update({
+    "perf:sched_ext_pick_path": [
+        # The bypass has to precede the fair shortcut, and the shortcut's
+        # for_each_class() must be gone from this function.
+        ("kernel/sched/core.c", "__pick_next_task",
+         ["scx_enabled()", "for_each_active_class(class)",
+          "scx_notify_pick_next_task(rq, p, class)"],
+         ["for_each_class(class)"]),
+        ("kernel/sched/core.c", "put_prev_task_balance",
+         ["for_balance_class_range(class, prev->sched_class, &idle_sched_class)"],
+         ["for_class_range(class, prev->sched_class, &idle_sched_class)"]),
+    ],
+    "perf:sched_ext_tick_watchdog": [
+        ("kernel/sched/core.c", "scheduler_tick",
+         ["scx_notify_sched_tick();"], []),
+    ],
+    "perf:sched_ext_idle_hook": [
+        ("kernel/sched/idle.c", "put_prev_task_idle",
+         ["scx_update_idle(rq, false);"], []),
+        ("kernel/sched/idle.c", "set_next_task_idle",
+         ["scx_update_idle(rq, true);"], []),
+    ],
+})
+
+
+# ---------------------------------------------------------------------------
+# Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.  These rows
+# pin the four gates the earlier batches sat behind, so a later batch cannot
+# quietly re-close one:
+#
+# * SCHED_EXT must be a valid policy through the ext-aware normal_policy() --
+#   and the old fair_policy() body must be gone, or __setscheduler_params()
+#   would skip the static priority and load weight for an SCX task;
+# * both priority-range syscalls must answer for SCHED_EXT;
+# * the struct_ops registry must carry the sched_ext_ops value type, or a BPF
+#   scheduler cannot be loaded at all;
+# * sched_init_debug() must register the ext dump.
+# ---------------------------------------------------------------------------
+REQUIRED_CONTENT.update({
+    "perf:sched_ext_policy_valid": [
+        ("kernel/sched/sched.h", "static inline int normal_policy(int policy)"),
+        ("kernel/sched/sched.h", "\tif (policy == SCHED_EXT)\n\t\treturn true;\n"),
+        ("kernel/sched/sched.h",
+         "return normal_policy(policy) || policy == SCHED_BATCH;"),
+    ],
+    "perf:sched_ext_priority_range": [
+        ("kernel/sched/core.c", "\tcase SCHED_EXT:\n\t\tret = 0;\n\t\tbreak;\n"),
+        ("kernel/sched/core.c", "\tcase SCHED_EXT:\n\t\tret = 0;\n\t}\n"),
+    ],
+    "perf:sched_ext_struct_ops_type": [
+        ("kernel/bpf/bpf_struct_ops_types.h",
+         "#ifdef CONFIG_SCHED_CLASS_EXT\n"),
+        ("kernel/bpf/bpf_struct_ops_types.h",
+         "BPF_STRUCT_OPS_TYPE(sched_ext_ops)"),
+    ],
+    "perf:sched_ext_debugfs": [
+        ("kernel/sched/debug.c",
+         "debugfs_create_file(\"ext\", 0444, debugfs_sched, NULL, &sched_ext_fops);"),
+    ],
+})
+
+REQUIRED_ABSENT.update({
+    "perf:sched_ext_policy_valid": [
+        # 5.15's fair_policy() body: with it back, SCHED_EXT would not take the
+        # fair path in __setscheduler_params().
+        ["kernel/sched/sched.h",
+         "\treturn policy == SCHED_NORMAL || policy == SCHED_BATCH;\n"],
+    ],
+})
+
+REQUIRED_IN_FUNCTION.update({
+    "perf:sched_ext_debugfs": [
+        ("kernel/sched/debug.c", "sched_init_debug",
+         ["debugfs_create_file(\"ext\", 0444, debugfs_sched, NULL, &sched_ext_fops);"],
+         []),
+    ],
+})
+
+REQUIRED_IN_FUNCTION.update({
+    "perf:sched_ext_init": [
+        # The init call must be inside sched_init(), and it must precede
+        # scheduler_running = 1: the per-CPU rq->scx has to exist before the
+        # scheduler can pick anything.
+        ("kernel/sched/core.c", "sched_init",
+         ["init_sched_ext_class();", "scheduler_running = 1;"],
+         []),
+        ("kernel/sched/core.c", "sched_setscheduler",
+         # The syscall stays a thin wrapper: the SCX guard goes in
+         # __sched_setscheduler, which Batch 58 pins by name below.  This row
+         # stays as the "nothing was added to the wrapper" half of that claim.
+         [],
+         ["scx_check_setscheduler"]),
+    ],
+})
 
 
 def function_body(text, name):
@@ -2369,8 +2980,11 @@ def run_tree(source):
     with tempfile.TemporaryDirectory(prefix="abk_impl_audit_") as tmp:
         root = Path(tmp) / "common"
         for rel in all_files:
-            sp = src / rel
-            if not sp.is_file():
+            # A file the module creates has no source in the fetched tree; the
+            # fixture takes it from the archived payload instead, the same bytes
+            # abk_stable_backport_overlay_sched_ext() would have put in the tree.
+            sp = audit_fixture.resolve(src, rel, MODULE_DIR)
+            if sp is None:
                 fail(f"source tree is missing {rel}")
             dp = root / rel
             dp.parent.mkdir(parents=True, exist_ok=True)

@@ -10,12 +10,16 @@ set -u
 MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/common.sh"
 . "$MODDIR/zram-policy.sh"
+. "$MODDIR/scx-policy.sh"
+. "$MODDIR/uclamp-policy.sh"
 
 case "${1:-}" in
   --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
   --supervise-cfr) abk_cfr_supervisor_main; exit 0 ;;
   --supervise-psi) abk_psi_supervisor_main; exit 0 ;;
   --supervise-lru-gen) abk_lru_gen_supervisor_main; exit 0 ;;
+  --supervise-scx) abk_scx_supervisor_main; exit 0 ;;
+  --supervise-uclamp) abk_uclamp_supervisor_main; exit 0 ;;
 esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
@@ -91,6 +95,19 @@ fi
 if [ "$(abk_cfg lru_gen.enable 0)" = "1" ] \
   && [ -e "$ABK_SYS_ROOT/kernel/mm/lru_gen/enabled" ]; then
   abk_spawn --supervise-lru-gen lru_gen
+fi
+
+# sched_ext: off unless scx.enabled=1 *and* the kernel has the class *and* the
+# two build-host artefacts are in bin/.  abk_scx_apply() logs which of the three
+# was missing; it never starts a scheduler on its own.
+abk_scx_apply
+
+# uclamp floor: writes nothing unless BOTH boost.uclamp_min and boost.groups
+# are set, and it says which half is missing when they are not.
+if [ -n "$(abk_uclamp_value)" ] && [ -n "$(abk_uclamp_groups)" ]; then
+  abk_spawn --supervise-uclamp uclamp
+else
+  abk_uclamp_apply
 fi
 
 abk_log "service: done"

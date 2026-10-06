@@ -13,7 +13,8 @@
    - New `task_struct`/exported-struct fields must reuse a free
      `ANDROID_KABI_RESERVE` slot via `ANDROID_KABI_USE` (current free set in
      android13-5.15: task_struct slots 1–8; this module uses slot 8 for
-     `kstack_offset`).
+     `kstack_offset` and slot 7 for the sched_ext task pointer,
+     `struct sched_ext_entity *scx`).
    - **This module now owns `sched_entity` slots 1–4 and `request_queue`
      slot 1 itself.**  Batch 15 absorbed the ABK_ABI_PATCH_SUITE EEVDF and
      `blk_mq_async_depth` claims, so the old "never claim these" rule is
@@ -358,7 +359,7 @@ CI executes injected modules in input order, so the canonical input is:
 | `suite_fdtable_fallback` | fs/file.c contains the suite's `nr = ALIGN(slots_wanted, BITS_PER_LONG)` fallback body (helper local + `abk_fdtable_slots_wanted`) | fdtable group → composed variant: the suite's body is rewritten onto the upstream 5.15.191 target; helpers/prechecks stay; drift degrades to `skip_suite_processed` |
 | `suite_touched(file)` | file carries `/* ABK feature_porting:` / `/* ABK security_update_backport:` markers | fdtable group and future groups sharing suite files |
 | `fdtable_upstream_shape` | slots_wanted signature + `roundup_pow_of_two(slots_wanted)` and no suite `ALIGN(slots_wanted, ...)` capacity line (the suite's unused helper may remain) | fdtable idempotency (covers both injection orders) |
-| sched.h SysVIPC tail | `ANDROID_KABI_USE(6, struct sysv_sem sysvsem)` present (ABK's kernel-specific patch reuses task_struct slots 6/7/8 for sysvsem/sysvshm behind `#ifdef CONFIG_SYSVIPC`) | kstack group moves to the still-free slot 5; a `kstack_offset inside task_struct` range check then fails the group loudly on any uncovered shape |
+| sched.h SysVIPC tail | `ANDROID_KABI_USE(6, struct sysv_sem sysvsem)` present (ABK's kernel-specific patch reuses task_struct slots 6/7/8 for sysvsem/sysvshm behind `#ifdef CONFIG_SYSVIPC`) | kstack group moves to the still-free slot 5; a `kstack_offset inside task_struct` range check then fails the group loudly on any uncovered shape. The SCX slot-7 claim anchors on `RESERVE(6)`/`RESERVE(7)`, so on this shape it has no slot to move to and reports `blocked_by_missing_anchor` |
 | `block_rolled_back` | the F2FS suite's block rollback already removed its monthly sentinel from blk-mq.c | informational; records the composition in reports |
 
 Group chaining: `pagealloc_highatomic_reserve_semantics` (5.15.188-.218)
@@ -525,5 +526,35 @@ write beyond KERNEL_ROOT so rollback can always restore it). Reports are also
 ## Backups and rollback
 
 All writes go through `write_text()`, snapshotting to `<file>.abk-orig`
-exactly once (never overwritten). `scripts/abk_rollback.sh <common-dir>
---apply` restores every snapshot tree-wide; `--list` dry-runs.
+exactly once (never overwritten) -- except for a file the module *creates*, which
+has no original and whose base stays deliberately empty (next paragraph).
+`scripts/abk_rollback.sh <common-dir> --apply` restores every snapshot
+tree-wide; `--list` dry-runs.
+
+A file the shell overlays *create* rather than rewrite (the four sched_ext files
+are the only ones today) has no original bytes to snapshot.  It is recorded by a
+zero-byte `<file>.abk-new` marker, which makes the same rollback invocation
+delete the target, the marker and any `.abk-orig` next to it.  Once the file's
+build wiring exists it also gets an empty `<file>.abk-orig`: that is the diff
+base `tests/config_gate_audit.py` attributes a module-added file's `CONFIG_*`
+gates against, and it is withheld while the payload is inert so the audit does
+not report gates for code the build never compiles.  `write_text()` therefore
+does not snapshot a target that carries the creation marker: the base must stay
+empty, or the audit would attribute only the registry's edits to the created file
+and stop auditing the whole-file gates inside it (Batch 57, whose
+`sched_ext_payload_adapt` is the first group to write a file the overlay
+created).
+
+The sched_ext overlay rides the perf child, and since Batch 57 it runs **before**
+that child (the child edits the overlaid `kernel/sched/ext.c` and, since Batch
+59, `kernel/sched/ext.h`) and once more after it -- the second call is what
+writes the empty base, because the Makefile entry only exists once the child's
+`sched_ext_build` has run.  Its "already installed" test is a **marker
+allow-list**: byte-identical to the archived payload, or carrying one of the
+markers the adapting groups insert (`sailboat_sched_ext_payload_adapt` for
+`ext.c`, `sailboat_sched_ext_active_class` for `ext.h`).  Without the matching
+marker the next run would mistake this module's own adapted payload for a
+foreign `ext.c` and leave it alone -- and because the early return skips the
+diff-base step too, the tree then fails smoke's "has no diff base although the
+build is wired".  **A new group that adapts a payload file must add its marker
+here.**

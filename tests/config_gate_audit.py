@@ -134,6 +134,68 @@ DARK_GATES = {
         "the ``!`` polarity; both branches compile, and the one that runs is "
         "the added one"
     ),
+    "SIS_PROP": (
+        "Batch 50 sched_sis_util: default-off by construction, and upstream "
+        "ships it that way.  70fb5ccf2ebb turns SIS_PROP off in the same patch "
+        "that adds SIS_UTIL, and the android15-6.6 line this group is taken "
+        "from carries exactly the pair SIS_PROP=false / SIS_UTIL=true.  In "
+        "select_idle_cpu() the two switches write the same variable: the "
+        "SIS_PROP arm computes nr from sd->avg_scan_cost and rq->avg_idle, and "
+        "the SIS_UTIL arm then overwrites nr from the periodic load balancer's "
+        "sd_share->nr_idle_scan hint.  With both on the first computation is "
+        "discarded, and with SIS_PROP on alone the group's whole point (the "
+        "sum_util-derived scan depth) is gone.  Consequence recorded rather "
+        "than discovered later: with the switch off, sd->avg_scan_cost keeps "
+        "neither its writer (the tail accounting arm, also under SIS_PROP) nor "
+        "its reader (the budget computation) -- kernel/sched/fair.c has exactly those two "
+        "references, so no stale value is ever consumed.  A future group that "
+        "wants avg_scan_cost has to move that accounting out from under this "
+        "switch, not flip the switch back on"
+    ),
+    "CONFIG_SCHED_CLASS_EXT": (
+        "Batch 55 introduces the symbol and turns it on from the module tier, "
+        "so a build from the current defconfig has it and compiles the whole "
+        "SCX payload; the reference .config is a device config taken before "
+        "that batch and therefore cannot contain a symbol that did not exist "
+        "yet, which is why the tier-claims check has to be waived for it.  The "
+        "dependency is satisfied in that same reference config "
+        "(CONFIG_BPF_SYSCALL=y and CONFIG_BPF_JIT=y), so the symbol resolves as "
+        "soon as the defconfig lane writes it -- the ABK CI build is the "
+        "compile gate here, and this entry only stops a stale config from "
+        "being read as an unmet dependency."
+    ),
+    "CONFIG_SCHED_CORE": (
+        "class A only: this is not a dependency of scheduling through SCX.  "
+        "ext.c integrates with core scheduling in five places (the "
+        "core_sched_at timestamp, the prio_less ordering and the pick_task "
+        "hook) and the class schedules correctly without it; core scheduling "
+        "is an orthogonal SMT-sibling feature this module deliberately does "
+        "not enable.  Off on the supported baseline and absent from the "
+        "reference .config, so the guarded code compiles out."
+    ),
+    "CONFIG_SCHED_SMT": (
+        "class A only: the single site is balance_scx()'s SMT-sibling "
+        "balancing, which is meaningful only together with core scheduling.  "
+        "SCHED_SMT is off in the reference .config (arm64 GKI does not enable "
+        "it) and SCHED_CORE is off as well, so the guarded block could not run "
+        "even if it compiled."
+    ),
+    "CONFIG_CPUMASK_OFFSTACK": (
+        "class A only: the site selects between two spellings of a cache-line "
+        "alignment attribute for the idle-mask tracking struct "
+        "(CL_ALIGNED_IF_ONSTACK); it does not decide whether the code runs.  "
+        "With OFFSTACK unset the cpumask is embedded in the struct and the "
+        "attribute is __cacheline_aligned_in_smp, which is what the reference "
+        ".config compiles."
+    ),
+    "CONFIG_EXT_GROUP_SCHED": (
+        "class A only, and dark by construction: the symbol does not exist "
+        "before 6.12.  It guards SCX's per-cgroup weight integration "
+        "(scx_tg_online/scx_move_task and the cgroup attach hooks); on 5.15 "
+        "the #else branch supplies no-op inline stubs under the same names, so "
+        "the engine compiles and schedules without per-cgroup SCX weights.  "
+        "There is no Kconfig symbol on this tree for a tier to enable."
+    ),
 }
 
 
