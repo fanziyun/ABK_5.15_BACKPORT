@@ -2,7 +2,7 @@
 
 ABK external `module_set` that grafts upstream kernel features / optimizations /
 structural refactors onto the **`android13-5.15-lts` rolling branch** (its matrix
-row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .217 — see
+row is keyed to the fetched tree's Makefile `SUBLEVEL`, currently .220 — see
 "Lts-only maintenance" below for what a roll means). Batch 44 dropped the
 `5.15.167 / .178 / .194` release baselines. **This is not a kernel
 source tree** — it is a Python registry that rewrites one.
@@ -11,8 +11,8 @@ source tree** — it is a Python registry that rewrites one.
 
 The Python registry **is** the patch set. There are **no `.patch` payloads** and
 `patches/` is empty: add a `PatchGroup` record to the correct child script instead.
-The single exception to "no payload files" is `files/drivers/of/address.c` — see
-"File payloads" below. Every edit is otherwise a group of ordered
+The exceptions to "no payload files" are `files/drivers/of/address.c` and the
+four sched_ext files — see "File payloads" below. Every edit is otherwise a group of ordered
 `replace_once(ctx, old, new, required)` steps in `scripts/abk_stable_core.py`
 (fs/mm/cgroup), `scripts/abk_stable_perf.py` (sched/net/locking/block), or
 `scripts/abk_stable_display.py` (the single drm revert).
@@ -48,9 +48,12 @@ with.  Markers must likewise never be retro-added to a landed
 upstream-shape group.
 
 Every write snapshots `<file>.abk-orig` once; `scripts/abk_rollback.sh <common-dir>
-[--apply|--list]` restores. **Never write outside `KERNEL_ROOT`** — the defconfig
-lane refuses to (`report_only` with the reason) because rollback can only restore
-paths under the tree.
+[--apply|--list]` restores. A file the module *creates* (only the sched_ext
+payload does) has no original to snapshot: it carries a zero-byte `<file>.abk-new`
+marker instead, which makes rollback delete it, plus an empty `<file>.abk-orig`
+once its build wiring exists so `config_gate_audit` has a diff base. **Never write
+outside `KERNEL_ROOT`** — the defconfig lane refuses to (`report_only` with the
+reason) because rollback can only restore paths under the tree.
 
 ## Adding a group (see `docs/group_recipe.md`)
 
@@ -91,7 +94,23 @@ bash tests/smoke.sh <tree>                        # end-to-end: 2-pass idempoten
 python3 tests/config_gate_audit.py <patched-tree> --config <.config>  # nothing added compiles out
 ```
 
-The last one is the only audit that needs a **build artefact** instead of just a
+None of those seven runs a compiler -- they are all text gates. A configured
+kernel tree plus an LLVM toolchain adds the missing one:
+`sh tools/compile_probe.sh <tree>` turns on `CONFIG_SCHED_CLASS_EXT` (the probe
+requires the symbol to be on already) and builds
+`kernel/sched/sched_ext_glue.o` plus `core.o`/`fair.o`/`idle.o`/`debug.o`/`fork.o`/`bpf_struct_ops.o`,
+reporting the distinct error lines. It is a build-host helper like
+`tools/hunks.py`, absent from `embed.conf`, and it is what found the SCX payload's
+real failures in Batch 56. Run it whenever a batch adds C -- `step_audit` proves
+an anchor landed, only the compiler proves the C is valid.  When a batch changes a
+header most of the tree includes (the SCX work touches
+`include/linux/sched.h`, `kernel/sched/sched.h` and
+`include/linux/sched/ext.h`), the strongest form is a full
+`make ARCH=arm64 LLVM=1 vmlinux` on the grafted tree: Batch 61 ran it, and it is
+also what produces the post-graft BTF that `tools/build_scx_artifacts.sh`
+compiles the sched_ext scheduler against.
+
+The `config_gate_audit` is the only audit that needs a **build artefact** instead of just a
 tree: it diffs every file against its `.abk-orig` snapshot to attribute the CONFIG
 gates this module added, then resolves each symbol against the `.config` the build
 produced, failing on any gate that is off and not recorded in its `DARK_GATES`
@@ -141,7 +160,7 @@ The single matrix row is keyed to the fetched tree's Makefile `SUBLEVEL`, so an
 `android13-5.15-lts` roll **breaks the audits on purpose**:
 
 ```
-no expectation recorded for sublevel '220'; supported sublevels: 216
+no expectation recorded for sublevel '221'; supported sublevels: 220
 ```
 
 That is the drift defence, not a bug. After every re-fetch:
@@ -220,8 +239,11 @@ required strings.
   a field it does not own (`cgroup.pressure` uses the cgroup's own `flags` word,
   because `struct psi_group` is embedded in `struct cgroup` on 5.15 and the ACK's
   `psi_group::enabled` member would move every member after it). This module uses
-  `task_struct` slot 8; if ABK's
-  kernel-specific patch has reused slots 6/7/8 (SysVIPC), move to slot 5. From
+  `task_struct` slot 8 (Batch 16's `kstack_offset`) and slot 7 (Batch 55's
+  `struct sched_ext_entity *scx`); if ABK's kernel-specific patch has reused
+  slots 6/7/8 (SysVIPC), the kstack group moves to the still-free slot 5, while
+  the SCX claim has no slot to move to and reports `blocked_by_missing_anchor`
+  on that shape. From
   Batch 15 this module **owns** `sched_entity` slots 1–4 (the absorbed EEVDF
   family) and `request_queue` slot 1 (the absorbed `blk_mq_async_depth`): the
   old "never claim these — ABI-suite territory" rule is retired, so they are
@@ -381,18 +403,75 @@ Distribution assets live outside the graft: `tools/` (device-facing CLIs, shippe
 into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
 implementation) and `ksu/` (the KernelSU module source). `patches/` stays empty.
 
-### File payloads (the one exception)
+### File payloads (the exceptions)
 
-`files/drivers/of/address.c` is the **only** payload file, and it exists for a
-reason no anchor graft can express: it is a whole-file *revert* of the upstream
-`ranges` flags parser rework. `scripts/stable_backport.sh`'s
+Two payload sets exist, each for a shape no anchor graft can express.
+
+`files/drivers/of/address.c` is a whole-file *revert* of the upstream `ranges`
+flags parser rework. `scripts/stable_backport.sh`'s
 `abk_stable_backport_overlay_of_address()` copies it over the tree **only** when
 the target still carries the 5.15.213 rework (`flag_cells` /
 `"default-flags"` text markers), so it is a no-op on a tree already in the
 pre-rework form. It restores the single contiguous MMIO window whose split left
 the Qualcomm SM8550 PCIe WLAN endpoint's 2 MB BAR0 unplaceable (dead `wlan0`).
-The rationale, the marker gate, and the `.abk-orig` snapshot/rollback convention
-are documented in `files/README.md`. Adding a second payload file needs the same
+
+`files/include/linux/sched/ext.h`, `files/kernel/sched/ext.h`,
+`files/kernel/sched/ext.c` and `files/kernel/sched/sched_ext_glue.c` are the
+sched_ext (SCX) BPF extensible scheduler class — a 143 KB new subsystem on a
+baseline that has none, so there is no anchor shape to attach it to.
+`abk_stable_backport_overlay_sched_ext()` creates them, never overwrites a foreign
+`ext.c`, and withholds the empty `.abk-orig` diff base until
+`abk_stable_backport_sched_ext_wired()` sees the Makefile entry — an empty base on
+an inert payload would make `config_gate_audit` flag every internal gate in
+`ext.c` as "added code that never compiles".
+
+The first three files are vendor/upstream bytes (sha256-pinned); the fourth is
+module-authored and exists because `ext.c` carries no include block: on the 6.6
+tree it is textually included from `kernel/sched/build_policy.c`, which 5.15 does
+not have (its policy files are separate objects). The glue unit supplies the
+headers, does not re-include the unguarded `kernel/sched/ext.h`, and does not pull
+in the policy `.c` files OPPO's build_policy.c does; `kernel/sched/Makefile`
+builds `sched_ext_glue.o` rather than `ext.o`, and subtracts `autogroup.h` and
+`stats.h` from the 6.6 header set (5.15's `sched.h` already includes both and
+neither has a guard; listing them again is 20 redefinition errors). Batch 54
+shipped the three engine files inert; Batch 55 added the glue unit and the
+wiring (the `CONFIG_SCHED_CLASS_EXT` symbol, the Makefile rule, `struct scx_rq`
+and `rq->scx`, the `task_struct` slot, the `SCHED_DATA` slot and the
+`init_sched_ext_class()` call). **That wiring puts the engine in the build but
+does not make the vendored bytes compile**: Batch 56 ran the first real
+compiler over them (`tools/compile_probe.sh`) and measured 12 classes of
+5.15/6.6 interface drift -- surveyed in `docs/survey_sched_ext_gap.md` §2c,
+several of them function-pointer or language-level constructs no preprocessor
+shim can bridge. **Batch 57 landed that marked 5.15 adaptation** and the probe
+now builds all seven objects on a configured 5.15.220 tree (`OK (7 object(s)
+built)`): five shims live in the glue unit (the cgroup weight helper,
+`for_each_cpu_andnot()`, the BTF bit-offset alias and the diag suppression),
+and three registry groups `batch57_perf_sched_ext_adapt` carry the rest --
+making core.c's `__setscheduler_prio()`/`check_class_changed()` visible,
+re-carrying 6.2's `SCHED_CHANGE_BLOCK` guard into core.c (where the tree's own
+`dequeue_task()`/`enqueue_task()` are), and editing the archived `ext.c` at
+the eight sites where a signature or the vendor `sched_prop` member differs.
+The archived files stay byte-for-byte in `files/`: the adaptation is applied
+to the tree, and `abk_stable_backport_overlay_sched_ext()` accepts a target
+carrying one of the adaptation markers as installed so a second run does not
+mistake this module's own edit for a foreign `ext.c`. **A new group that
+adapts a payload file must add its marker to that allow-list**, or the second
+overlay call never writes the file's empty `.abk-orig` diff base. Two payload
+files are adapted in-tree today: `kernel/sched/ext.c` (Batch 57's eight sites
+plus Batch 58's per-task guard) and `kernel/sched/ext.h` (Batch 59's
+active-class walk).
+
+Since then the functional hooks landed -- Batch 58 the task lifecycle, Batch 59
+the pick path, the tick watchdog and the idle transition, Batch 60 the
+reachability gates (`normal_policy()`/fair_policy(), the priority-range
+syscalls, `BPF_STRUCT_OPS_TYPE(sched_ext_ops)` in
+`kernel/bpf/bpf_struct_ops_types.h` and the `ext` debugfs file), which is why
+the probe's object set now also carries `kernel/bpf/bpf_struct_ops.o`. The class
+is selectable and bindable after Batch 60; what it still lacks is the userspace
+loader that attaches a BPF scheduler (S3) and any device verification.
+
+The rationale, the gate probes, both snapshot conventions and the rollback paths
+are documented in `files/README.md`. Adding a further payload file needs the same
 justification — a shape an anchor can express belongs in a `PatchGroup`, not here.
 
 What the repo **publishes** is only what the module needs: the registry
@@ -403,12 +482,28 @@ per-batch device-check records), `build/abk-trees/`, `tmp/` and `tests/out/`. Do
 paths that point into `research/` therefore refer to the maintainer's checkout, not
 to a published artefact.
 
-`tools/` carries two kinds of script and the split matters: the five **device
+`tools/` carries two kinds of script and the split matters: the six **device
 CLIs** listed in `ksu/abk_runtime_tunables/embed.conf` ship verbatim into the
-companion module's `bin/` and must survive Android mksh; `tools/hunks.py` and
-`tools/fetch_all_trees.sh` are **build-host dev helpers** (`bash`/`python3`, they
-touch `build/abk-trees/` and the upstream `.patch` archive) and are deliberately
-absent from `embed.conf`, so the packager never copies them into the zip.
+companion module's `bin/` and must survive Android mksh; `tools/hunks.py`,
+`tools/fetch_all_trees.sh`, `tools/build_scx_artifacts.sh` and
+`tools/compile_probe.sh` are **build-host dev helpers** (`bash`/`python3`; the
+last two compile in a kernel tree) and are deliberately absent from
+`embed.conf`, so the packager never copies them into the zip.  `tools/scx/`
+holds the sched_ext userspace assets; the minimal scheduler's BPF source is
+compiled by `tools/build_scx_artifacts.sh` and the resulting `.bpf.o`, together
+with the cross-built loader, is what actually ships (the sources themselves are
+not in `embed.conf`).  `tools/scx/libelf-shim/` is the
+read-only slice of libelf the Android loader build links against (the NDK ships
+none); `BUILD_SHIM_LOADER=1` proves it by parsing the same object through both
+loaders and diffing the output, which is the only evidence that a shim is safe
+to hand to a cross compiler.  `tools/scx/android-compat/` adds the kernel
+headers and macros bionic lacks, `tools/scx/build_android_loader.sh` is the
+NDK cross build, `tools/scx/run_arm64_selftest.sh` runs a static aarch64 build
+under qemu-user and diffs its parse against the x86_64 one (the only host-side
+evidence that the arm64 code path works, since the committed binary is dynamic
+bionic), and `tools/scx/prebuilt/` holds the two committed build
+products the companion ships (`embed.conf` maps them into the module's `bin/`);
+regenerating them is the two commands in `tools/scx/README.md`.
 
 Each module ships its **own** `scripts/libabk.sh`; ABK provides nothing shared. The
 reference template (`xingguangcuican6666/ABK_KSU_SANDBOX_MODULE`) has a fuller

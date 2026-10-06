@@ -65,6 +65,9 @@ FETCH_FILES=(
   include/linux/memcontrol.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
+  # Batch 58 (sched_ext S2b-2b): the fork-hook prototypes this module changes
+  # live here, and kernel/fork.c includes it.
+  include/linux/sched/task.h
   include/linux/psi_types.h
   include/linux/psi.h
   include/linux/zsmalloc.h
@@ -166,6 +169,55 @@ FETCH_FILES=(
   # frontswap_store() block the shape probe discriminates sits in the same
   # translation unit as the engine.
   mm/page_io.c
+  # Batch 50 (Tier A1): sched_sis_util -- SIS_UTIL keeps its scan-depth hint in
+  # struct sched_domain_shared (nr_idle_scan), so this header carries an anchor
+  # for the first time.  kernel/sched/sched.h (cfs_rq::idle_nr_running) and
+  # kernel/sched/features.h (SCHED_FEAT(SIS_UTIL)) are already in the tree.
+  include/linux/sched/topology.h
+  # sched_ext (S1/S1b): the arm64 BPF JIT gains a trampoline and
+  # bpf_arch_text_poke(), and the kfunc allow-list API (btf_kfunc_id_set) is an
+  # incremental verifier change.  bpf_jit_comp.c/bpf_jit.h/insn.h are the
+  # module's first arch/arm64/net and first arch/arm64/include/asm/insn.h
+  # entries; kernel/bpf/trampoline.c pins the 5.15 trampoline interface these
+  # groups have to match (bpf_tramp_progs + __bpf_prog_enter(prog), which is
+  # NOT the v6.1 bpf_tramp_links + run_ctx shape the upstream patches assume).
+  arch/arm64/net/bpf_jit_comp.c
+  arch/arm64/net/bpf_jit.h
+  arch/arm64/include/asm/insn.h
+  # the aarch64_insn_gen_load_literal()/gen_load_store_imm() implementation the
+  # arm64 bpf_plt needs (struct bpf_plt emits A64_LDR64LIT).  Note the file is
+  # arch/arm64/lib/insn.c on this branch -- arch/arm64/kernel/insn.c is a 404
+  # here (verified against the branch's own directory listing), so an upstream
+  # patch path of kernel/insn.c has to be re-pointed, not copied.
+  arch/arm64/lib/insn.c
+  include/linux/bpf.h
+  kernel/bpf/trampoline.c
+  include/linux/btf.h
+  # Batch 53 (S1b): the kfunc allow-list API.  include/linux/btf_ids.h is where
+  # the BTF_SET8_START/END + BTF_ID_FLAGS macros kernel/sched/ext.c (S2) spells
+  # have to live; btf.c holds the set registry and verifier.c consults it.
+  include/linux/btf_ids.h
+  kernel/bpf/btf.c
+  kernel/bpf/verifier.c
+  # Batch 55 (sched_ext S2b-1): the build wiring that turns the Batch-54 payload
+  # from inert text into a compiled kernel subsystem.  Kconfig.preempt carries
+  # the new CONFIG_SCHED_CLASS_EXT symbol, include/uapi/linux/sched.h the
+  # SCHED_EXT policy id the engine compares p->policy against, the sched
+  # Makefile the object rule, and vmlinux.lds.h the SCHED_DATA slot that puts
+  # ext_sched_class between fair and idle in the class array (5.15 lays the
+  # array out idle-first and walks it with class--).
+  kernel/Kconfig.preempt
+  include/uapi/linux/sched.h
+  kernel/sched/Makefile
+  include/asm-generic/vmlinux.lds.h
+  # Batch 60 (sched_ext S2b-2b, second half, part 2): the reachability batch.
+  # kernel/bpf/bpf_struct_ops_types.h is 5.15's registry of struct_ops map
+  # types -- BPF_STRUCT_OPS_TYPE(sched_ext_ops) has to go into it, or the BPF
+  # syscall has no sched_ext_ops value type for a scheduler to bind to.
+  # kernel/sched/debug.c's sched_init_debug() is where the engine exposes its
+  # /sys/kernel/debug/sched/ext dump.  Both are new files for the fixture lists.
+  kernel/bpf/bpf_struct_ops_types.h
+  kernel/sched/debug.c
 )
 
 decode() {

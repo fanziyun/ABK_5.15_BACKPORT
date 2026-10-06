@@ -753,12 +753,23 @@ def _avg_idle_apply(ctx):
         sched_h_text = ctx.read(SCHED_H)
     except FileNotFoundError as exc:
         return "blocked_by_shape", f"{exc}: file absent"
+    # The module's own SIS_UTIL group (sched_sis_util, Batch 50) inserts its
+    # block into this same function, which breaks this group's verbatim
+    # head/tail payload on a second pass.  The payload is still ours, so report
+    # it present rather than misreading the tree as a foreign SIS_UTIL shape.
+    # This is the dependency-order probe docs/group_recipe.md asks for: the
+    # later group is registered after this one, and one of this group's own
+    # added symbols names its payload.
+    if _MARK_AVG_PROBE in fair_text:
+        return "already_present", (
+            "avg_idle preemption-mode payload already present (the SIS_UTIL "
+            "group extends the same function); nothing to do")
     # Shape probe: the fair.c rewrites are keyed to the 5.15 SIS_PROP-only
     # select_idle_cpu().  sched_feat(SIS_UTIL) and sd_llc_shared->nr_idle_scan
     # are 6.1 additions (0 occurrences anywhere in 5.15 kernel/sched/), and the
     # suite's 6.1 branch deletes the SIS_PROP arms instead.  Applying this
-    # module's 5.15 replacements to a SIS_UTIL tree would leave the scan
-    # unbounded, so refuse the shape instead of guessing.
+    # module's 5.15 replacements to a foreign SIS_UTIL tree would leave the
+    # scan unbounded, so refuse the shape instead of guessing.
     if "sched_feat(SIS_UTIL)" in fair_text:
         return "blocked_by_shape", (
             "select_idle_cpu() carries SIS_UTIL (6.1+ shape), not the 5.15 "

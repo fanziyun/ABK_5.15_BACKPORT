@@ -239,6 +239,68 @@ the cap-gate's ownership refusals, and the DMIPS ceiling that a profile editing
 `scaling_max_freq` also edits.  Nothing in this module reads or writes those
 nodes any more, so nothing here describes them.
 
+## The sched_ext scheduler (off by default)
+
+Batches 54-60 of the kernel module land a BPF extensible scheduling class
+(sched_ext / SCX) and make it reachable; Batches 61/62 add the scheduler and the
+loader that attaches it. This companion is what may start it -- but only when all
+three of these hold:
+
+1. `scx.enabled=1` in `tunables.conf` (it ships `0`);
+2. the running kernel has the class: `/sys/kernel/debug/sched/ext` exists, or
+   `/proc/config.gz` says `CONFIG_SCHED_CLASS_EXT=y`;
+3. `bin/scx_loader` and `bin/abk_scx_min.bpf.o` are present. Both are build
+   host artefacts (`tools/build_scx_artifacts.sh` in the kernel repository,
+   built against a kernel that already carries the graft) -- a build that did
+   not produce them ships without a scheduler and logs that as the reason.
+
+Missing any one of the three logs one line naming it and changes nothing else.
+
+The scheduler itself is **partial**: it never calls `scx_bpf_switch_all()`, so
+only the pids in `scx.mark_pids` (space separated) move to `SCHED_EXT`.
+Everything else -- including this ROM's vendor WALT/FAS tenants -- stays on the
+built-in classes. An empty list attaches the scheduler and moves nothing, which
+is the state a first device test should start from.
+
+`scx.reassert_interval_sec` is not a tuning knob: the attach is owned by the
+loader process, so if it exits the kernel drops the scheduler and every task
+falls back to the built-in classes. The supervisor re-attaches when that
+happens, and clears a loader left behind by a previous module version first (two
+loaders cannot own the class at once).
+
+There is no device A/B yet. `action.sh scx` prints the switch, the three
+preconditions and the kernel's own `/sys/kernel/debug/sched/ext` dump;
+`bin/abk_scx_check.sh` is the same read-only verdict with exit codes a script
+can branch on (0 attached and used, 2 switch off, 3 on but not attached,
+4 attached but no task on `SCHED_EXT`).
+
+## The uclamp floor (off by default)
+
+`cpu.uclamp.min` raises the utilisation floor the scheduler assumes for a
+cgroup's tasks, which biases their placement upward and can shorten wake-up
+latency on the render path. It is a cgroup v2 node this baseline already
+exposes (`CONFIG_UCLAMP_TASK_GROUP=y`, and `CONFIG_UCLAMP_TASK=y`), so arming
+it costs no kernel change at all.
+
+It takes **both** knobs:
+
+```
+boost.uclamp_min=          # "max", or a decimal percent: 50 is 50%, 12.5 is 12.5%
+boost.groups=              # space separated cgroup v2 names under /sys/fs/cgroup
+boost.interval_sec=60      # re-assert period (10..3600)
+```
+
+With either empty, nothing is written and the log says which half is missing.
+The value format is the kernel's own (`kernel/sched/core.c`'s
+`capacity_from_percent()`: the literal `max`, or a percent parsed with
+`UCLAMP_PERCENT_SHIFT`, anything above 100 rejected); a malformed value is
+refused before the write, because a write the kernel dislikes changes nothing
+silently.
+
+Keep `boost.groups` to the groups the measurement is about: a floor on every
+group is not a boost, it is a different scheduler. `action.sh uclamp` prints the
+state and the current value of each named group.
+
 ## The cpufreq/scheduler half moved out to addon 2
 
 Everything CPU-frequency used to live here: holding every policy on the
