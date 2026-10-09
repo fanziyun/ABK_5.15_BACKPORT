@@ -7,6 +7,7 @@ Runs fully self-contained on synthetic fixtures; no kernel tree required.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -25,9 +26,11 @@ import sublevel_matrix  # noqa: E402
 from abk_backport_engine import GraftContext, PatchGroup, apply_steps, run_child  # noqa: E402
 
 FAILURES = []
+CHECKS_RUN = []
 
 
 def check(name, cond, detail=""):
+    CHECKS_RUN.append(name)
     if cond:
         print(f"  ok  {name}")
     else:
@@ -3262,7 +3265,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.52.0", "0.52.0"], _versions)
+          _versions == ["0.73.0", "0.73.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -6466,12 +6469,20 @@ def main():
     test_batch46_erofs_readmore_eof()
     test_batch41_kcompressd_offload()
     test_batch42_schedutil_smart_cap()
+    test_batch70_smaps_migration_guard()
+    test_batch71_kcompressd_trylock()
+    test_fetch_decode_roundtrip()
 
     print()
     if FAILURES:
-        print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")
+        print(f"FAILED: {len(FAILURES)} of {len(CHECKS_RUN)} check(s): {FAILURES}")
         sys.exit(1)
-    print("all checks passed")
+    # The count is part of the result.  CHANGELOG.md quotes "N checks" per batch
+    # and plan.md quotes it as the suite total, so the number has to come out of
+    # the runner rather than out of someone's arithmetic over the check sites --
+    # a check inside a loop runs once per iteration and a static count of `check(`
+    # is not the same number.
+    print(f"all checks passed ({len(CHECKS_RUN)} checks)")
 
 
 def test_batch42_schedutil_smart_cap():
@@ -6731,6 +6742,671 @@ def test_batch42_schedutil_smart_cap():
         check("an unrecognised include shape reports blocked_by_shape",
               st_o == "blocked_by_shape" and ctx3.pending_writes() == [],
               (st_o, d_o, ctx3.pending_writes()))
+
+
+# ---------------------------------------------------------------------------
+# Batch 70 / Batch 71: the two minidump fragments.
+# ---------------------------------------------------------------------------
+
+# The fs/proc/task_mmu.c regions Batch 70 rewrites, copied from the 5.15.220
+# tree (android13-5.15-lts).  Only the statements the anchors need are kept,
+# but every anchor must be byte-identical to the tree's text or the fixture
+# would prove nothing.
+TASK_MMU_FIXTURE = (
+    "static void smaps_pte_entry(pte_t *pte, unsigned long addr,\n"
+    "\t\tstruct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false, young = false, dirty = false;\n"
+    "\n"
+    "\tif (pte_present(*pte)) {\n"
+    "\t\tpage = vm_normal_page(vma, addr, *pte);\n"
+    "\t\tyoung = pte_young(*pte);\n"
+    "\t\tdirty = pte_dirty(*pte);\n"
+    "\t} else if (is_swap_pte(*pte)) {\n"
+    "\t\tswp_entry_t swpent = pte_to_swp_entry(*pte);\n"
+    "\n"
+    "\t\tif (!non_swap_entry(swpent)) {\n"
+    "\t\t\tmss->swap += PAGE_SIZE;\n"
+    "\t\t} else if (is_pfn_swap_entry(swpent)) {\n"
+    "\t\t\tif (is_migration_entry(swpent))\n"
+    "\t\t\t\tmigration = true;\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\tif (!page)\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tsmaps_account(mss, page, false, young, dirty, locked, migration);\n"
+    "}\n"
+    "\n"
+    "static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,\n"
+    "\t\tstruct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false;\n"
+    "\n"
+    "\tif (pmd_present(*pmd)) {\n"
+    "\t\tpage = follow_trans_huge_pmd(vma, addr, pmd, FOLL_DUMP);\n"
+    "\t} else if (unlikely(thp_migration_supported() && is_swap_pmd(*pmd))) {\n"
+    "\t\tswp_entry_t entry = pmd_to_swp_entry(*pmd);\n"
+    "\n"
+    "\t\tif (is_migration_entry(entry)) {\n"
+    "\t\t\tmigration = true;\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\tif (IS_ERR_OR_NULL(page))\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tsmaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd),\n"
+    "\t\t      locked, migration);\n"
+    "}\n"
+    "\n"
+    "static int smaps_hugetlb_range(pte_t *pte, unsigned long hmask,\n"
+    "\t\t\t\t unsigned long addr, unsigned long end,\n"
+    "\t\t\t\t struct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\n"
+    "\tif (pte_present(*pte)) {\n"
+    "\t\tpage = vm_normal_page(vma, addr, *pte);\n"
+    "\t} else if (is_swap_pte(*pte)) {\n"
+    "\t\tswp_entry_t swpent = pte_to_swp_entry(*pte);\n"
+    "\n"
+    "\t\tif (is_pfn_swap_entry(swpent))\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+    "\t}\n"
+    "\tif (page) {\n"
+    "\t\tif (page_mapcount(page) >= 2 || hugetlb_pmd_shared(pte))\n"
+    "\t\t\tseq_putc(m, '\\n');\n"
+    "\t}\n"
+    "\treturn 0;\n"
+    "}\n"
+    "\n"
+    # The pagemap PTE path is pte_to_pagemap_entry(), this file's
+    # per-entry helper; there is no pagemap_pte_range() in task_mmu.c.
+    "static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,\n"
+    "\t\tstruct vm_area_struct *vma, unsigned long addr, pte_t pte)\n"
+    "{\n"
+    "\tu64 frame = 0, flags = 0;\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false;\n"
+    "\n"
+    "\tif (pte_present(pte)) {\n"
+    "\t\tpage = pte_page(pte);\n"
+    "\n"
+    "\t\tflags |= PM_PRESENT;\n"
+    "\t} else if (is_swap_pte(pte)) {\n"
+    "\t\tswp_entry_t entry;\n"
+    "\n"
+    "\t\tif (pte_swp_soft_dirty(pte))\n"
+    "\t\t\tflags |= PM_SOFT_DIRTY;\n"
+    "\t\tentry = pte_to_swp_entry(pte);\n"
+    "\t\tif (pm->show_pfn)\n"
+    "\t\t\tframe = swp_type(entry) |\n"
+    "\t\t\t\t(swp_offset(entry) << MAX_SWAPFILES_SHIFT);\n"
+    "\t\tflags |= PM_SWAP;\n"
+    "\t\tmigration = is_migration_entry(entry);\n"
+    "\t\tif (is_pfn_swap_entry(entry))\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t}\n"
+    "\n"
+    "\tif (page && !PageAnon(page))\n"
+    "\t\tflags |= PM_FILE;\n"
+    "\tif (page && !migration && page_mapcount(page) == 1)\n"
+    "\t\tflags |= PM_MMAP_EXCLUSIVE;\n"
+    "\n"
+    "\treturn make_pme(frame, flags);\n"
+    "}\n"
+    "\n"
+    "static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr,\n"
+    "\t\t\t     unsigned long end, struct mm_walk *walk)\n"
+    "{\n"
+    "\tspinlock_t *ptl;\n"
+    "\tint err = 0;\n"
+    "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
+    "\tbool migration = false;\n"
+    "#endif\n"
+    "\n"
+    "\tptl = pmd_trans_huge_lock(pmdp, walk->vma);\n"
+    "\tif (ptl) {\n"
+    "\t\tu64 flags = 0, frame = 0;\n"
+    "\t\tpmd_t pmd = *pmdp;\n"
+    "\t\tstruct page *page = NULL;\n"
+    "\n"
+    "\t\tif (pmd_present(pmd)) {\n"
+    "\t\t\tpage = pmd_page(pmd);\n"
+    "\n"
+    "\t\t\tflags |= PM_PRESENT;\n"
+    "\t\t}\n"
+    "#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION\n"
+    "\t\telse if (is_swap_pmd(pmd)) {\n"
+    "\t\t\tswp_entry_t entry = pmd_to_swp_entry(pmd);\n"
+    "\t\t\tunsigned long offset;\n"
+    "\n"
+    "\t\t\tif (pm->show_pfn) {\n"
+    "\t\t\t\toffset = swp_offset(entry) +\n"
+    "\t\t\t\t\t((addr & ~PMD_MASK) >> PAGE_SHIFT);\n"
+    "\t\t\t\tframe = swp_type(entry) |\n"
+    "\t\t\t\t\t(offset << MAX_SWAPFILES_SHIFT);\n"
+    "\t\t\t}\n"
+    "\t\t\tflags |= PM_SWAP;\n"
+    "\t\t\tVM_BUG_ON(!is_pmd_migration_entry(pmd));\n"
+    "\t\t\tmigration = is_migration_entry(entry);\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t\t}\n"
+    "#endif\n"
+    "\n"
+    "\t\tif (page && !PageAnon(page))\n"
+    "\t\t\tflags |= PM_FILE;\n"
+    "\t\tif (page && !migration && page_mapcount(page) == 1)\n"
+    "\t\t\tflags |= PM_MMAP_EXCLUSIVE;\n"
+    "\n"
+    "\t\tspin_unlock(ptl);\n"
+    "\t\treturn err;\n"
+    "\t}\n"
+    "\treturn 0;\n"
+    "}\n"
+)
+
+
+def test_batch70_smaps_migration_guard():
+    """Batch 70: the smaps/pagemap walkers stop tripping swapops.h:267.
+
+    Field panic MD_RST_STAT.BIN.txt:777:
+    smaps_rollup -> smaps_pte_range -> smaps_pte_entry ->
+    pfn_swap_entry_to_page -> BUG at include/linux/swapops.h:267.  The walkers
+    never hold the target page lock, so a migration that completes between the
+    PTE snapshot and the PageLocked() check is a panic.
+
+    What the test pins is the whole guard, not just its presence: a helper that
+    exists while one caller keeps the direct call still panics on that path,
+    so each of the five call sites is counted, and the direct calls that must
+    stay direct (device-private / device-exclusive entries, whose contract is
+    not PageLocked) are pinned as still-direct.
+    """
+    print("Batch 70: smaps_migration_guard (migration-entry PageLocked race)")
+    import abk_stable_core as core
+    import batch70_core_smaps_migration_guard as b70
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "smaps_migration_guard"), None)
+    check("smaps_migration_guard group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly fs/proc/task_mmu.c",
+          group.files == [b70.TASK_MMU], group.files)
+    check("fs/proc/task_mmu.c is the module's first fs/proc target",
+          b70.TASK_MMU == "fs/proc/task_mmu.c", b70.TASK_MMU)
+
+    # fs/proc/task_mmu.c carries no other group: the guard is a single-writer
+    # file, which is also why its own helper doubles as the idempotency probe.
+    owners = [g.key for g in core.PATCH_GROUPS if b70.TASK_MMU in g.files]
+    check("no other group writes fs/proc/task_mmu.c",
+          owners == ["smaps_migration_guard"], owners)
+
+    steps = b70.build_steps()
+    check("six required steps (one helper + five caller guards), all in "
+          "fs/proc/task_mmu.c",
+          [rel for rel, _o, _n, req in steps] == [b70.TASK_MMU] * 6
+          and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+
+    fixture = TASK_MMU_FIXTURE
+    # Trap 1: a replacement block that already exists in the pristine file is
+    # short-circuited by replace_once's idempotency pre-check while the group
+    # still reports applied -- the graft never lands.
+    for index, (_rel, _old, new, _req) in enumerate(steps):
+        check(f"step {index}'s replacement is not already in the pristine file",
+              new not in fixture)
+        check(f"step {index}'s replacement does not start with its own anchor",
+              not new.startswith(_old))
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _o, new_i, _req) in enumerate(steps):
+        for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
+            if i == j or new_i in old_j:
+                continue
+            check(f"step {i} does not pre-create step {j}'s replacement",
+                  new_j not in new_i)
+
+    # Every anchor is byte-identical pristine text: the fixture is taken from
+    # the 5.15.220 tree, so these are real upstream anchors.
+    for index, (_rel, old, _n, _req) in enumerate(steps):
+        check(f"step {index}'s anchor occurs exactly once in the fixture",
+              fixture.count(old) == 1, fixture.count(old))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b70.TASK_MMU: fixture})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("the group applies on the tree's shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b70.TASK_MMU)
+
+        # The helper: the whole point is that it does NOT carry the BUG_ON
+        # contract, so it may never call pfn_swap_entry_to_page() itself.
+        helper = text[text.index("/*\n * sailboat_smaps_migration_guard:"):
+                      text.index(b70._HELPER_OLD)]
+        check("the helper resolves the page itself",
+              "p = pfn_to_page(swp_offset(entry));" in helper, helper)
+        # The comment names the form it replaces, so the assertion is over
+        # the helper's code lines only -- "no call", not "no mention".
+        helper_code = [ln for ln in helper.split("\n")
+                       if not ln.lstrip().startswith(("*", "/*", "//"))]
+        check("the helper never calls the BUG_ON form",
+              not [ln for ln in helper_code
+                   if "pfn_swap_entry_to_page" in ln],
+              helper_code)
+        check("the helper keeps the split-hazard ordering",
+              "smp_rmb();" in helper)
+        check("the helper re-checks the lock and the entry (double check)",
+              "if (!PageLocked(p))" in helper
+              and helper.count("if (!is_migration_entry(entry))") == 2,
+              helper)
+        check("the helper returns NULL rather than panicking",
+              helper.count("return NULL;") == 3, helper)
+
+        # All five callers route through it: a helper nobody calls changes
+        # nothing, and a caller left on the direct call still panics.
+        check("the smaps PTE and hugetlb callers are guarded",
+              text.count(b70.PTE_GUARD) == 2, text.count(b70.PTE_GUARD))
+        check("the smaps PMD and both pagemap callers are guarded",
+              text.count(b70.PMD_GUARD) == 3, text.count(b70.PMD_GUARD))
+
+        # ...and the device-private / device-exclusive entries keep the direct
+        # call, whose contract really is not PageLocked.
+        check("the smaps PTE non-migration path keeps the direct call",
+              "\t\t\tif (is_migration_entry(swpent)) {\n"
+              "\t\t\t\tmigration = true;\n"
+              "\t\t\t\tpage = abk_smaps_migration_page(swpent);\n"
+              "\t\t\t} else {\n"
+              "\t\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+              "\t\t\t}\n" in text)
+        check("the hugetlb non-migration path keeps the direct call",
+              "\t\tif (is_migration_entry(swpent))\n"
+              "\t\t\tpage = abk_smaps_migration_page(swpent);\n"
+              "\t\telse if (is_pfn_swap_entry(swpent))\n"
+              "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n" in text)
+        check("the pagemap PTE non-migration path keeps the direct call",
+              "\t\tif (is_migration_entry(entry))\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n"
+              "\t\telse if (is_pfn_swap_entry(entry))\n"
+              "\t\t\tpage = pfn_swap_entry_to_page(entry);\n" in text)
+        # pagemap_pmd_range's guard sits behind the tree's own VM_BUG_ON: the
+        # migration-entry precondition still has to be asserted there, or a
+        # batch that dropped it would swap the panic for a silent wrong path.
+        check("the pagemap PMD guard keeps the tree's own VM_BUG_ON",
+              "\t\t\tVM_BUG_ON(!is_pmd_migration_entry(pmd));\n"
+              "\t\t\tmigration = is_migration_entry(entry);\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n" in text)
+        # Indexed from the gate, not from the top of the file: the smaps PMD
+        # guard carries the same three-tab text and would otherwise answer.
+        gate = text.index("#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION")
+        check("the pagemap PMD guard stays inside its CONFIG gate",
+              "\t\telse if (is_swap_pmd(pmd)) {" in text
+              and gate < text.index("\t\t\tpage = abk_smaps_migration_page(entry);",
+                                   gate)
+              < text.index("#endif", gate))
+
+        # Ordering: a file-static helper must exist before its first caller.
+        first_guard = min(text.index(b70.PTE_GUARD), text.index(b70.PMD_GUARD))
+        check("the helper is defined before its first caller",
+              text.index(b70.HELPER_DEF) < first_guard)
+
+        # The migration flag is still raised on the guarded paths: the guard
+        # replaces the page resolution, not the smaps accounting contract.
+        check("the smaps PMD caller still raises the migration flag",
+              "\t\tif (is_migration_entry(entry)) {\n"
+              "\t\t\tmigration = true;\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n" in text)
+        check("the smaps PTE caller still raises the migration flag",
+              "\t\t\tif (is_migration_entry(swpent)) {\n"
+              "\t\t\t\tmigration = true;\n"
+              "\t\t\t\tpage = abk_smaps_migration_page(swpent);\n" in text)
+        # Every caller of the helper already tolerates a NULL page, which is
+        # what makes "skip the entry" the safe outcome instead of a new NULL
+        # dereference.
+        check("the NULL contract is satisfied by the callers' own code",
+              "\tif (!page)\n\t\treturn;\n" in text
+              and "\tif (IS_ERR_OR_NULL(page))\n\t\treturn;\n" in text
+              and "\tif (page && !PageAnon(page))\n" in text)
+
+        # No new translation-unit dependency: pfn_to_page() and smp_rmb() are
+        # already visible in this file, so the group must add no include and
+        # open no CONFIG gate.
+        check("the guard adds no include",
+              text.count("#include") == fixture.count("#include"),
+              text.count("#include"))
+        check("the guard opens no preprocessor gate",
+              text.count("#if") == fixture.count("#if"))
+
+        # The marker is part of the idempotency match, not decoration: a tree
+        # that kept the helper but lost the comment must NOT be skipped as
+        # already_present -- it has to fall through and report blocked_by_shape,
+        # so that a grep for the marker is never the only thing that can find
+        # this graft.
+        markerless = text.replace(b70.HELPER_MARKER, "no marker here")
+        check("the probe requires the marker, not just the helper",
+              b70.HELPER_MARKER in text and b70.HELPER_MARKER not in markerless,
+              b70.HELPER_MARKER)
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_m = make_ctx(tmp + "-m", {b70.TASK_MMU: markerless})
+            status_m, detail_m = b70._smaps_migration_guard_apply(ctx_m)
+            check("a tree whose marker is gone is refused, not skipped",
+                  status_m == "blocked_by_shape", (status_m, detail_m))
+            check("the refusal names the missing marker",
+                  b70.HELPER_MARKER in detail_m, detail_m)
+            # The teeth of the refusal: falling through to apply_steps instead
+            # would insert a second copy of a static function, because the helper
+            # step's `old` anchor still matches below the grafted helper while
+            # its `new` block no longer does.  That is a redefinition -- a
+            # compile error on a tree that used to build.
+            check("the marker-less tree is not written",
+                  ctx_m.pending_writes() == [],
+                  ctx_m.pending_writes())
+        check("a second pass cannot duplicate the helper",
+              text.count(b70.HELPER_DEF) == 1, text.count(b70.HELPER_DEF))
+        # No WARN-family: a WARN is an oops, and panic_on_oops turns it into
+        # the very panic this batch exists to remove.
+        code_lines = [ln for ln in text.split("\n")
+                      if not ln.lstrip().startswith(("*", "/*", "//"))]
+        warns = [ln.strip() for ln in code_lines
+                 if "WARN_ON" in ln or "WARN(" in ln]
+        # VM_BUG_ON is not WARN-family (it is a BUG, and its precondition is
+        # the tree's own), so the only expectation here is "no WARN at all".
+        check("no WARN in the guarded code", warns == [], warns)
+
+        ctx2 = make_ctx(tmp + "-b", {b70.TASK_MMU: text})
+        status2, detail2 = b70._smaps_migration_guard_apply(ctx2)
+        check("second pass is already_present",
+              status2 == "already_present", (status2, detail2))
+        check("second pass is byte-identical",
+              ctx2.read(b70.TASK_MMU) == text)
+
+    # An unknown shape must stop the group rather than half-patch the file.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b70.TASK_MMU: "static void other(void)\n"})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("an unknown shape reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the unknown-shape tree is not written",
+              ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written",
+              ctx.pending_writes() == [])
+
+
+def test_fetch_decode_roundtrip():
+    """The tree fetcher's decode() must refuse a body that is not clean base64.
+
+    A gitiles body carrying a byte outside the base64 alphabet has to fail
+    loudly.  The failure it guards is silent by construction: the shifted text
+    still looks like source, so it passes all three of acceptable()'s checks
+    (size, NUL-free, not-HTML) and lands in the tree as a file nobody
+    questions -- which is how one broken fetch read as anchor drift for a whole
+    batch (fs/erofs/compress.h landing as "DD..X-License-Identifier").
+
+    The two backends fail differently, which is why both are driven here:
+    python3's b64decode() without validate=True silently DISCARDS the stray
+    byte and exits 0 (measured: correct 40 bytes, rc=0), while GNU coreutils
+    >= 9 refuses the same body.  Asserting only through whichever backend the
+    host happens to have is what let that divergence hide in the first place.
+    """
+    print("fetch_sublevel_tree.sh: decode() refuses a non-canonical body")
+    tool = Path(__file__).resolve().parent / "fetch_sublevel_tree.sh"
+    check("the fetcher is present", tool.is_file(), tool)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        check("bash is available for the fetcher self-test", False, "no bash")
+        return
+    quoted = str(tool).replace("\\", "/")
+
+    def run_decode(body_b64, backend=None):
+        # The body goes through a file, never through argv.  A 76-column
+        # wrapped body is full of newlines, and argv does not reliably carry
+        # them on this platform -- passing one inline made bash treat a chunk
+        # of base64 as a script name (exit 127, "No such file or directory").
+        env = dict(os.environ)
+        if backend:
+            env["ABK_FETCH_DECODER"] = backend
+        else:
+            env.pop("ABK_FETCH_DECODER", None)
+        with tempfile.NamedTemporaryFile("w", suffix=".b64", delete=False) as fh:
+            fh.write(body_b64 if body_b64.endswith("\n") else body_b64 + "\n")
+            body_path = fh.name
+        try:
+            return subprocess.run(
+                [bash, quoted, "--decode-only"],
+                stdin=open(body_path, "rb"), capture_output=True, timeout=180,
+                env=env)
+        finally:
+            os.unlink(body_path)
+
+    raw = b"/* SPDX-License-Identifier: GPL-2.0 */\nint x;\n"
+    clean_b64 = base64.b64encode(raw).decode()
+    corrupt_b64 = clean_b64[:8] + "!" + clean_b64[8:]
+
+    for backend in ("base64", "python3"):
+        if shutil.which(backend) is None:
+            check(f"the {backend} backend is available", False, "missing")
+            continue
+
+        # Positive half: the good body must still decode to its exact source,
+        # so the check cannot be "fixed" by refusing everything.
+        good = run_decode(clean_b64, backend)
+        check(f"{backend}: a clean body decodes to its exact source",
+              good.returncode == 0 and good.stdout == raw,
+              (good.returncode, good.stdout[:60]))
+
+        # Negative half, and the one with teeth: a non-zero exit, not a look at
+        # what the self-test said about itself.
+        bad = run_decode(corrupt_b64, backend)
+        check(f"{backend}: a corrupted body is refused (non-zero exit)",
+              bad.returncode != 0,
+              (bad.returncode, bad.stdout[:60]))
+        if backend == "python3":
+            # validate=True raises before writing anything.  GNU base64 -d
+            # instead emits a short prefix and then fails, so "no bytes" is
+            # not its contract -- the caller's non-zero exit is, and the
+            # caller rm -f's the partial file (fetch_sublevel_tree.sh:234).
+            check("python3: a corrupted body yields no bytes at all",
+                  bad.stdout == b"", bad.stdout[:60])
+
+        # And the wrapped form gitiles actually sends, which validate=True
+        # rejects outright unless the CR/LF strip has done its job.
+        wrapped = base64.b64encode(raw * 40).decode()
+        wrapped = "\n".join(wrapped[i:i + 76] for i in range(0, len(wrapped), 76))
+        wr = run_decode(wrapped, backend)
+        check(f"{backend}: a 76-column wrapped body still decodes",
+              wr.returncode == 0 and wr.stdout == raw * 40,
+              (wr.returncode, wr.stdout[:40]))
+
+    # The script's own self-test must agree, and must have exercised BOTH
+    # backends rather than only the default one.
+    st = subprocess.run([bash, quoted, "--self-test-decode"],
+                        capture_output=True, text=True, timeout=180)
+    check("the fetcher self-test passes", st.returncode == 0,
+          (st.returncode, st.stdout[-300:], st.stderr[-300:]))
+    for backend in ("base64", "python3"):
+        check(f"the self-test drove the {backend} backend",
+              f"{backend} refused the corrupted body" in st.stdout,
+              st.stdout[-300:])
+
+
+def test_batch71_kcompressd_trylock():
+    """Batch 71: the kcompressd drain stops stalling in __lock_page.
+
+    Field stall md_UFS_QC_PHY.BIN.txt:23403: kcompressd0 in D state under
+    __lock_page inside abk_kcompressd_do_swapout()+0x120, the whole per-node
+    FIFO pinned behind one contended page while 1690 swap writes fail around
+    it.  The fix rewrites the lock_page() Batch 41 generates into a
+    trylock_page() that skips the entry and drops the queued reference.
+
+    The test runs the real two-group chain (Batch 41 then Batch 71) on both
+    engine shapes, because the anchor is text Batch 41 generates: proving the
+    rewrite against a hand-written fixture would prove nothing about the graft.
+    """
+    print("Batch 71: kcompressd_trylock_guard (drain must not stall on a "
+          "locked page)")
+    import abk_stable_core as core
+    import batch41_core_vm_kcompressd as b41
+    import batch71_core_kcompressd_trylock as b71
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "kcompressd_trylock_guard"), None)
+    check("kcompressd_trylock_guard group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly mm/page_io.c",
+          group.files == [b71.PAGE_IO], group.files)
+
+    keys = [g.key for g in core.PATCH_GROUPS]
+    # Trap 5: this group rewrites text vm_kcompressd_swapout generates, so it
+    # must be registered after it.
+    check("the trylock guard is registered after vm_kcompressd_swapout",
+          keys.index("kcompressd_trylock_guard")
+          > keys.index("vm_kcompressd_swapout"),
+          keys[keys.index("kcompressd_trylock_guard") - 1:
+               keys.index("kcompressd_trylock_guard") + 1])
+
+    steps = b71.build_steps()
+    check("one required step, in mm/page_io.c",
+          [(rel, req) for rel, _o, _n, req in steps] == [(b71.PAGE_IO, True)],
+          [(rel, req) for rel, _o, _n, req in steps])
+    check("the replacement does not start with its own anchor (trap 1)",
+          not steps[0][2].startswith(steps[0][1]))
+
+    # Refuses without the Batch 41 engine: an unknown tree must never be
+    # half-patched, and the refusal writes nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b71.PAGE_IO: "int swap_writepage(void)\n"})
+        status, detail = b71._kcompressd_trylock_apply(ctx)
+        check("a tree without the Batch 41 engine reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the refusal names the missing engine",
+              "vm_kcompressd_swapout" in detail, detail)
+        check("the refused tree is not written",
+              ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = b71._kcompressd_trylock_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written",
+              ctx.pending_writes() == [])
+
+    def b41_pristine(frontswap):
+        return (
+            "#include <linux/sched/task.h>\n"
+            "\n"
+            "/*\n"
+            " * We may have stale swap cache pages in memory: notice\n"
+            " * them here and get rid of the unnecessary final write.\n"
+            " */\n"
+            "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+            "{\n"
+            "\tint ret = 0;\n"
+            "\n"
+            + frontswap +
+            "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n"
+            "out:\n"
+            "\treturn ret;\n"
+            "}\n"
+            "\n"
+            + b41._ENGINE_ANCHOR_OLD
+        )
+
+    for label, frontswap in (("plain", b41.PLAIN_PROBE),
+                             ("hook", b41.HOOK_PROBE)):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, {b41.PAGE_IO: b41_pristine(frontswap)})
+            status, detail = core._vm_kcompressd_swapout_apply(ctx)
+            check(f"{label} shape: Batch 41 applies first",
+                  status == "applied", (status, detail))
+            # The anchor really is the text Batch 41 generates -- asserted on
+            # the tree's own output, not on a hand-written fixture.
+            text = ctx.read(b71.PAGE_IO)
+            _rel, anchor, _new, _req = steps[0]
+            check(f"{label} shape: the lock anchor occurs exactly once in "
+                  "Batch 41's output", text.count(anchor) == 1,
+                  text.count(anchor))
+
+            status, detail = b71._kcompressd_trylock_apply(ctx)
+            check(f"{label} shape: the trylock guard applies on top",
+                  status == "applied", (status, detail))
+            text = ctx.read(b71.PAGE_IO)
+
+            do_swapout = text[text.index("static void abk_kcompressd_do_swapout("):
+                              text.index("static bool abk_kcompressd_enqueue(")]
+            # The stall itself: no blocking take left in the drain.  Counted
+            # per line, because "unlock_page(page);" contains "lock_page(".
+            locks = [ln.strip() for ln in do_swapout.split("\n")
+                     if ln.strip() == "lock_page(page);"]
+            check(f"{label} shape: the drain no longer blocks on the page lock",
+                  locks == [], locks)
+            check(f"{label} shape: the drain takes the lock without sleeping",
+                  "if (!trylock_page(page)) {" in do_swapout)
+            # The skip path is three statements and no more: warn, drop the
+            # reference Batch 41's enqueue took, return.
+            skip = re.search(r"\tif \(!trylock_page\(page\)\) \{\n"
+                             r"(.*?)\n\t\}\n", do_swapout, re.S)
+            check(f"{label} shape: the contended path skips and drops the "
+                  "reference",
+                  skip is not None
+                  and "put_page(page);" in skip.group(1)
+                  and "return;" in skip.group(1)
+                  and "pr_warn_once(" in skip.group(1),
+                  skip.group(1) if skip else "(no skip block)")
+            # The write still runs under PG_locked: trylock keeps the
+            # ->writepage contract __swap_writepage() requires.
+            check(f"{label} shape: the write body still runs under the lock",
+                  do_swapout.index("if (!trylock_page(page)) {")
+                  < do_swapout.index("frontswap_store(page)"))
+            check(f"{label} shape: the frontswap branch still unlocks",
+                  "\t\tunlock_page(page);\n" in do_swapout)
+            check(f"{label} shape: both exits still drop their reference",
+                  do_swapout.count("put_page(page);") == 3,
+                  do_swapout.count("put_page(page);"))
+            # pr_warn_once, never WARN-family: a WARN is an oops and
+            # panic_on_oops turns it into a panic.
+            code_lines = [ln for ln in do_swapout.split("\n")
+                          if not ln.lstrip().startswith(("*", "/*", "//"))]
+            warns = [ln.strip() for ln in code_lines
+                     if "WARN_ON" in ln or "WARN(" in ln]
+            check(f"{label} shape: no WARN in the drain's code",
+                  not warns, warns)
+            check(f"{label} shape: the skip is visible in dmesg once",
+                  "kcompressd: skipping a locked page" in do_swapout)
+
+            # Both groups must be idempotent together: the successor probe on
+            # Batch 41 is what keeps its second pass already_present over the
+            # rewritten text instead of partial.
+            ctx2 = make_ctx(tmp + "-b", {b71.PAGE_IO: text})
+            status2, detail2 = core._vm_kcompressd_swapout_apply(ctx2)
+            check(f"{label} shape: Batch 41's second pass is already_present "
+                  "over the rewritten text",
+                  status2 == "already_present", (status2, detail2))
+            check(f"{label} shape: Batch 41's second pass is byte-identical",
+                  ctx2.read(b71.PAGE_IO) == text)
+            status3, detail3 = b71._kcompressd_trylock_apply(ctx2)
+            check(f"{label} shape: the trylock guard's second pass is "
+                  "already_present",
+                  status3 == "already_present", (status3, detail3))
+            check(f"{label} shape: the second pass is byte-identical",
+                  ctx2.read(b71.PAGE_IO) == text)
+            for key in ("vm_kcompressd_swapout", "kcompressd_trylock_guard"):
+                st = next(g for g in core.PATCH_GROUPS
+                          if g.key == key).run(ctx2)["status"]
+                check(f"{label} shape: {key} is idempotent",
+                      st == "already_present", (key, st))
 
 
 if __name__ == "__main__":

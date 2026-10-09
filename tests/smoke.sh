@@ -151,6 +151,9 @@ SMOKE_FILES=(
   # rollback against.  Without it the group degrades to blocked_by_shape in
   # smoke only (the reference trees carry it).
   mm/page_io.c
+  # Batch 70: smaps_migration_guard -- the module's first fs/proc group.
+  # Without it the group degrades to blocked_by_shape in smoke only.
+  fs/proc/task_mmu.c
 )
 
 WORK="$(mktemp -d)"
@@ -800,6 +803,33 @@ else
   fi
 fi
 
+# Batch 70: smaps_migration_guard is the module's first fs/proc write.  The
+# helper plus all five guarded callers must be present: a helper without a
+# caller still panics on that path, and the unguarded direct calls that
+# remain are the device-private / device-exclusive cases only.
+TASK_MMU="$KERNEL_ROOT/common/fs/proc/task_mmu.c"
+grep -q "sailboat_smaps_migration_guard" "$TASK_MMU" \
+  || fail "the smaps migration guard helper is missing"
+grep -q "static struct page \*abk_smaps_migration_page(" "$TASK_MMU" \
+  || fail "abk_smaps_migration_page() is missing"
+[ "$(grep -c "abk_smaps_migration_page(swpent);" "$TASK_MMU")" = "2" ] \
+  || fail "the smaps PTE + hugetlb callers are not both guarded"
+[ "$(grep -c "abk_smaps_migration_page(entry);" "$TASK_MMU")" = "3" ] \
+  || fail "the smaps PMD + pagemap callers are not all guarded"
+
+# Batch 71: kcompressd_trylock_guard rewrites Batch 41's generated lock line.
+# The drain must take the lock without sleeping and drop the queued reference
+# on the contended path; the blocking lock_page() in the drain must be gone.
+grep -q "sailboat_kcompressd_trylock" "$PAGE_IO" \
+  || fail "the kcompressd trylock guard is missing"
+grep -q "if (!trylock_page(page)) {" "$PAGE_IO" \
+  || fail "the drain still takes the page lock blocking"
+grep -q "kcompressd: skipping a locked page" "$PAGE_IO" \
+  || fail "the trylock skip path is missing its dmesg marker"
+if grep -qP "^\tlock_page\(page\);$" "$PAGE_IO"; then
+  fail "the blocking lock_page() in the drain survived"
+fi
+
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
@@ -867,6 +897,13 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/fs/erofs/zdata.c" \
         "$KERNEL_ROOT/common/fs/erofs/zdata.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for fs/erofs/zdata.c"
+fi
+# Batch 70 is the module's first fs/proc/ write; rollback has to restore it
+# like any other target.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/fs/proc/task_mmu.c" \
+        "$KERNEL_ROOT/common/fs/proc/task_mmu.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for fs/proc/task_mmu.c"
 fi
 
 echo "SMOKE OK"
