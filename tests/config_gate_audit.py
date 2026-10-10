@@ -125,6 +125,18 @@ DARK_GATES = {
         "the two symbols: its Kconfig step makes ZRAM_MEMORY_TRACKING select "
         "ZRAM_TRACK_ENTRY_ACTIME so age tracking no longer requires debugfs"
     ),
+    "CONFIG_HUGETLB_PAGE": (
+        "class B only (Batch 70 smaps_migration_guard): the guarded call site "
+        "is smaps_hugetlb_range(), which the baseline itself wraps in "
+        "#ifdef CONFIG_HUGETLB_PAGE / #else #define smaps_hugetlb_range NULL "
+        "-- so with the symbol off the added line leaves the build together "
+        "with the whole function, leaving no dead payload and no unmet "
+        "dependency: the helper is still called by four other smaps / "
+        "pagemap callers, three of them ungated (smaps_pte_entry, "
+        "smaps_pmd_entry, pte_to_pagemap_entry) and the fourth (pagemap_pmd_range) under "
+        "CONFIG_ARCH_ENABLE_THP_MIGRATION, which the GKI config does set).  A "
+        "hugetlb-enabled build compiles the guard and gets the same fix"
+    ),
     "CONFIG_HIGHMEM": (
         "negated guard (Batch 39 pagealloc_batch_clear): the added line is "
         "inside ``if (!IS_ENABLED(CONFIG_HIGHMEM))`` -- the batch memset is "

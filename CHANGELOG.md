@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。96 个移植组（core 71 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。98 个移植组（core 73 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -768,6 +768,50 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 通过。`tunables.conf` 注释、README 行、以及"band 不等式"那款断言同步改为 90,并在
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
+
+<a id="batch-71"></a>
+
+## Batch 71(kcompressd 换出不再卡在 __lock_page,v0.73.0,core 72 → 73 组)
+
+> **版本说明**:Batch 70 与 Batch 71 一起落在 `v0.73.0`,`module.conf` 只 bump 一次。这是本仓库的既有惯例而非破例——Batch 10-1 / 10-2 同为 `v0.12.0`([Batch 10-2](#batch-10-2) / [Batch 10-1](#batch-10-1)),Batch 10-3 / 10-4 亦然。AGENTS.md 那句「每个落地 batch bump 一次版本」在「同一轮工作切成多个 batch」时按轮计,不为每个子批次单开一版。
+
+主题:**把 Batch 41 生成文本里的阻塞式 `lock_page()` 改成 `trylock_page()`,争用就跳过该条目并丢掉排队引用**。证据是崩溃片段二 `md_UFS_QC_PHY.BIN.txt:23403`:`task:kcompressd0 state:D ... __lock_page <- abk_kcompressd_do_swapout+0x120`;同一时间窗内 `Write-error on swap-device (254:0:...)` 1690 条,kcompressd0 占 12–36% 内核 CPU、10 次 PowerDet 命中。
+
+归因:`abk_kcompressd_do_swapout()` 开头那句 `lock_page(page)`(Batch 41 为恢复 `->writepage` 契约而加——`__swap_writepage()` 的每条出口都解锁页,入口必须持 PG_locked)会睡在一个不放手的持锁者身上:把它重新映射回来的缺页、后续一趟回收、或一条卡在 `PageWriteback`/`PageDirty` 的写都可能这样。于是整条 per-node FIFO 排在它后面,而 kswapd 仍在继续入队——设备最扛不住换出压力的时候,换出压力正好堆起来。
+
+处置:trylock 成功 → 与此前逐字一致的写入路径(frontswap → `__swap_writepage`,仍在 PG_locked 下跑);trylock 失败 → 一行 `pr_warn_once`、`put_page(page)`、`return`。三条设计点各自的理由:
+
+- **trylock 而不是 lock、也不是静默丢弃**:lock 就是片段里的那次停顿;trylock 保住 `->writepage` 契约(写入仍在 PG_locked 下),只是不等。
+- **争用路径必须 `put_page()`**:入队时 `abk_kcompressd_enqueue()` 取的那次 `get_page()` 就在队列里,直接返回会把页连同它的 swap 槽一起漏掉。跳过也不丢数据——页面早已落在 swap cache(条目与数据都在),这一趟只是没压缩,后续一趟会再排队;这与 Batch 41 自己的 `PageSwapCache` 守卫是同一个论证。
+- **只用 `pr_warn_once`,不用 WARN 族**:WARN 是 oops,`panic_on_oops` 把它变成 panic,正好是本批要消除的那一类故障。
+
+形态:第二遍改写组(trap 5),注册在 `vm_kcompressd_swapout` 之后,并在该引擎缺席时以 `blocked_by_shape` 拒写(未知树不做半改);`kcompressd_trylock_guard` 的幂等探针直接认 `sailboat_kcompressd_trylock` 标记(AGENTS.md 的锚点政策:标记必须参与「跳过」的判定);`sailboat_kcompressd_trylock` 标记落在新注释里,代价照旧写明:将来某基线自带等价上游守卫时,第二遍报 `applied` 而不是 `already_present`。`vm_kcompressd_swapout` 同时补了**后继探针**(见到该标记即返回 `already_present`),否则它的第二遍会因为锁行已被改写而报 `partial`。两个新组的 group-local 探针与这条依赖已登记进 `docs/porting_policy.md` 的 Shape registry。
+
+编译门禁:**本地全量编译已过**——`android13-5.15-lts`(SUBLEVEL 220,`e7d9dafb0dd9`),`rebuild.sh --reseed`,`REBUILD_EXIT=0`,572 s(其中 ccache 命中 86.03%),`error:` 0、patch reject 0、`fs/proc/task_mmu.o` 与 `mm/page_io.o` 都在本轮重新编译(06:09:50 / 06:10:07),内核 banner `5.15.220-20261009-Batch51`。这两组此前只有文本证据(`trylock_page` 经 `<linux/mm.h>`→`<linux/bug.h>` 可见、`PageLocked`/`pfn_to_page` 经 `mm_inline.h` 可见),现在由真实编译背书。**未验证**:ABK CI 编译门禁(那是另一条 TU 切分与 KMI 检查线)与真机开机/收益窗口。
+
+验证:`py_compile` / `bash -n` / `stable_5_15_test`(全套 **1507 项**全绿,计数由 runner 自己打印——本轮给 `check()` 加了计数器,`all checks passed (N checks)` 取代了原来那句不带数字的 `all checks passed`;Batch 71 的新用例:真实跑 Batch 41 → Batch 71 的两段链、两种引擎形态、drain 里再无阻塞 `lock_page`、跳过路径三个语句齐全、两个出口的引用计数、两组各自的第二遍 `already_present`)/ `step_audit`(core 377 步)/ `implementation_audit`(组内函数级针脚双向)/ `smoke`(两遍 73 组全 `already_present`,含 `mm/page_io.c` 回滚逐字节一致)/ `config_gate_audit`(无新增 CONFIG 门,Batch 70 的 hugetlb 项已入 `DARK_GATES`)全绿。
+
+
+<a id="batch-70"></a>
+
+## Batch 70(smaps/pagemap 迁移项不再撞 swapops.h:267,v0.73.0,core 71 → 72 组)
+
+主题:**`fs/proc/task_mmu.c` 的 smaps/pagemap 遍历器改用一个不带 `BUG_ON` 契约的 helper 解析迁移项**。证据是崩溃片段一 `MD_RST_STAT.BIN.txt:777`:`kernel BUG at include/linux/swapops.h:267`,调用链 `smaps_rollup -> smaps_pte_range -> smaps_pte_entry -> pfn_swap_entry_to_page`,当时 `AnrConsumer` 正在读 `/proc/pid/smaps_rollup`。
+
+归因:`pfn_swap_entry_to_page()` 对迁移项带 `BUG_ON(!PageLocked(p))`(持锁才能安全解引用,因为迁移会把它从旧页挪走),而 smaps/pagemap 这条路只拿页表锁(`ptl`),从不持目标页的 PG_locked。PTE 快照与 `PageLocked()` 检查之间只要迁移完成一次(解锁 + `remove_migration_ptes`)或 pfn 被复用,就是一次无条件 BUG_ON。smaps 是受害者,不是成因。
+
+处置:`smaps_pte_entry` 之上加一个文件内 static helper `abk_smaps_migration_page()`——`is_migration_entry()` → `pfn_to_page(swp_offset(entry))` → `smp_rmb()`(头文件对 `__split_folio_to_order()` 记的那道顺序屏障)→ `PageLocked()` → 再查一次 `is_migration_entry()`,任一步不成立就返回 NULL;然后把该文件**全部五处** `pfn_swap_entry_to_page()` 迁移项调用改走它:`smaps_pte_entry`(崩溃点,`task_mmu.c:551`)、`smaps_pmd_entry`(THP 迁移,`:586`)、`smaps_hugetlb_range`(`:734`)、`pte_to_pagemap_entry`(`:1442`)、`pagemap_pmd_range`(`:1505`,在树自己的 `VM_BUG_ON` 之下)。设备私有 / 设备独占项保留直连调用——它们的契约本来就不是 PageLocked。
+
+竞态发生时的语义:该条目这一轮不参与计数。smaps 三个调用点本来就在 `!page`/`IS_ERR_OR_NULL(page)` 上返回,pagemap 两处本来就把 `page` 当可空用,所以「跳过」不需要任何新的空指针处理;稳态下结果与改前逐字一致——锁着的迁移页照常解析,以前会 panic 的那个窗口现在贡献 0。
+
+为什么是 helper 而不是五份内联守卫:一份 NULL/锁语义只需审一处,而不是五份拷贝。`fs/proc/task_mmu.c` 是单写者文件(这也正是 trap 5 的对侧条件),helper 兼作本组的幂等探针,**但探针认的是 `sailboat_smaps_migration_guard` 标记而不是 helper 定义**——按 AGENTS.md 的锚点政策,标记必须参与「跳过」的判定,否则注释一旦被重排(回流、缩进、licence 头搬迁),graft 就变成 grep 不到的黑块而报告仍是 `already_present`。这里的关键细节是**缺标记时必须拒写而不是继续走 `apply_steps`**:helper 那一步的 `new` 块因为标记没了而不再匹配,可它的 `old` 块仍然匹配——原先的锚点行就紧挨着 graft 进来的 helper 下方——于是 `apply_steps` 会插入**第二份** `static` 函数,那是一次重定义,即一棵本来能编的树变成编译失败。实测(先 graft、再抹掉标记、再跑一遍):helper 定义数 1 → 2。所以形态是:helper 在 → 标记也在 → `already_present`;helper 在、标记没了 → `blocked_by_shape` 并在 detail 里点名缺的标记。`fs/proc/task_mmu.c` 随本批进入 `FETCH_FILES` / `AUDIT_FILES` / `SMOKE_FILES`——在此之前没有组碰过它,这也是本模块第一个 `fs/proc` 目标。
+
+范围说明:安全类修复通常随子版本滚动到达,但这一条是支持树上实测到的稳定性修复,且与 Batch 35 记下的同一族 smaps 遍历器同处(Batch 35 当时撤回了自己的 smaps 崩溃器而不是加固遍历器)。标记按锚点政策落在 helper 注释里,代价照旧:将来某基线自带等价上游守卫时,第二遍报 `applied` 而不是 `already_present`。
+
+顺带修掉一处取树工具的假阴性:`tests/fetch_sublevel_tree.sh` 的 `decode()` 把 gitiles 的 base64 正文解出来就写盘,而正文里只要带上一个字母表外的字节,解出来就可能是整体错位一两个字节的源码——而错位的文本**看起来仍然像源码**,尺寸、NUL、HTML 三项体检全都过得去。实测命中过一次:`fs/erofs/compress.h` 落地成 `DD..X-License-Identifier`,`step_audit` 随即报 `erofs_readahead_relaxed_gfp` 在纯净树上 `blocked_by_shape`(看起来像锚点漂移,其实是树坏了)。**真正的漏洞在 python3 那条分支,不在换行**:`base64.b64decode()` 默认 `validate=False`,它会**静默丢弃**字母表外的字节并返回成功(实测:带一个杂字节的正文解出正确的 40 字节、rc=0),而 `base64 -d` 这边本来就是严格的(rc=1)。两条路径校验方式不同、行为也就不同,这才是分歧所在。现在 python3 分支改用 `validate=True`,字母表外有字节就抛错,由调用方的 `pipefail` 变成 `FAILED <path>` 与一次重跑;`ABK_FETCH_DECODER=base64|python3` 让两条分支都能被单独驱动,`--self-test-decode` 对**两条分支各跑一遍**干净正文与插了杂字节的正文。这两个模式都不是摆设:反向验证过——去掉 `validate=True`,自测与全套单测立刻转红(`python3 ACCEPTED a corrupted body`,4 项挂——这一项与 coreutils 版本无关,两条分支各自的正例/反例直接决定);去掉 `tr -d '\r\n'`,同样转红,但**挂的条数随门禁宿主的 coreutils 版本而变**:Git Bash 8.32 的 `base64 -d` 连换行也不容忍,base64 分支的干净正文与 76 列折行两条一并转红,连同 python3 分支那两条与自测共 5 项;WSL 的 9.11 会跳过换行,只剩 python3 两条加自测共 3 项。两个数字都成立,记在这里是为了免得把宿主差异误判成回归,因为 `validate=True` 把换行也算作「不是 base64 数据」,所以**这个 strip 是承重的**,不是保险性动作。未加「首字节必须是注释或 `#include`」这类启发式,因为 `.rst` / `.config` 的合法开头并不统一(实测把三个正常文件判成 SUSPECT)。**仍未解释**:在当前这台机器上两条分支都无法复现出那次错位(杂字节要么被 `base64 -d` 拒绝、要么被 python3 正确丢弃),原始那次损坏的具体成因没有复现,所以这里只修掉了「会静默通过」这一条通路,不声称根因已定位。
+
+验证:`py_compile` / `bash -n` / `stable_5_15_test`(全套 **1507 项**全绿,含 Batch 70 的新用例:6 个锚点在 5.15.220 树的原文 fixture 上各命中一次、helper 自身不含 `pfn_swap_entry_to_page`、五处调用点按 2+3 计数、必须直连的三处仍直连、helper 定义先于首个调用点、迁移标志仍照常置位、调用点自带空指针容忍、不新增 `#include`/`#if`、无 WARN 族、第二遍 `already_present` 且逐字节一致、**缺标记的树被拒写且不产生第二份 helper**、未知形态与缺文件两条路径都不写盘)/ `step_audit`(core 377 步)/ `implementation_audit`(五个调用点按**函数**级钉住,hunk 落到邻居函数不能顶账)/ `smoke`(两遍 73 组全 `already_present`,含 `fs/proc/task_mmu.c` 回滚逐字节一致)/ `config_gate_audit` 全绿(**对着 v0.73.0 这次本地构建产出的 `.config` 跑的**:81 个 `.abk-orig` 快照、class A 47 条新增门行、class B 41 条上游门、3 个默认开的 sched_feat 开关);hugetlb 那一处按 class B 记入 `DARK_GATES`(符号关掉时整函数随之消失,不留死代码;helper 另有三个不受该门控制的调用点,第四个 `pagemap_pmd_range` 受 `CONFIG_ARCH_ENABLE_THP_MIGRATION` 控制,而 GKI 配置把它开着——这一点由构建产物的 `.config` 核实,不是推断)。
+
 
 <a id="batch-49"></a>
 

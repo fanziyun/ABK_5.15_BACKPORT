@@ -146,7 +146,15 @@ GROUP_COUNTS = {
     # are a rewrite chain over the same lines, registered after the inline
     # MGLRU groups whose generated text they consume (trap 5: per-group shape
     # probes on both sides).
-    "stable_backport_core": 71,
+    # Batch 70 adds one: smaps_migration_guard -- a field-panic hardening
+    # (swapops.h:267 BUG_ON via smaps_rollup), not an upstream port, so it
+    # cannot arrive pre-applied.  Its six anchors are byte-identical pristine
+    # text in fs/proc/task_mmu.c, a file no earlier group touches.
+    # Batch 71 adds one: kcompressd_trylock_guard -- a second-pass rewrite
+    # of Batch 41's generated lock_page() line (field D-state stall), so it
+    # cannot arrive pre-applied either; it refuses when the Batch 41 engine
+    # is absent.
+    "stable_backport_core": 73,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

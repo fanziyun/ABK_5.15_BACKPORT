@@ -7,6 +7,8 @@
 #
 # Usage:
 #   bash tests/fetch_sublevel_tree.sh <branch> <outdir>
+#   bash tests/fetch_sublevel_tree.sh --self-test-decode   # decode() only
+#   bash tests/fetch_sublevel_tree.sh --decode-only          # decode stdin->stdout
 #
 # Since Batch 44 the rolling branch is the only supported baseline:
 #   android13-5.15-lts                     SUBLEVEL rolls (217 as of 2026-09)
@@ -25,9 +27,18 @@ set -euo pipefail
 
 BRANCH="${1:-}"
 OUTDIR="${2:-}"
+SELF_TEST=0
+DECODE_ONLY=0
 
-if [ -z "$BRANCH" ] || [ -z "$OUTDIR" ]; then
-  sed -n '2,23p' "$0" >&2
+# --self-test-decode and --decode-only exercise the decoder on its own and need
+# no arguments.  Both are dispatched after decode() is defined, so the flag only
+# reserves the slot here.
+if [ "${1:-}" = "--self-test-decode" ]; then
+  SELF_TEST=1
+elif [ "${1:-}" = "--decode-only" ]; then
+  DECODE_ONLY=1
+elif [ -z "$BRANCH" ] || [ -z "$OUTDIR" ]; then
+  sed -n '2,25p' "$0" >&2
   exit 2
 fi
 
@@ -166,14 +177,99 @@ FETCH_FILES=(
   # frontswap_store() block the shape probe discriminates sits in the same
   # translation unit as the engine.
   mm/page_io.c
+  # Batch 70: smaps_migration_guard -- the module's first fs/proc group;
+  # the helper plus five caller guards all live in this one file.
+  fs/proc/task_mmu.c
 )
 
+# gitiles serves the body as base64 wrapped at 76 columns.
+#
+# A body carrying a byte outside the base64 alphabet must fail loudly.  The
+# failure this guards is silent by construction: shifted text still looks like
+# source, so it passes every check in acceptable() below (size, NUL-free,
+# not-HTML) and lands in the tree as a file nobody questions.  That is not
+# hypothetical -- fs/erofs/compress.h once arrived as
+# "DD..X-License-Identifier" in place of "/* SPDX-License-Identifier", and
+# step_audit then reported erofs_readahead_relaxed_gfp as blocked_by_shape on a
+# pristine tree, which reads as anchor drift rather than a broken fetch.
+#
+# Both backends therefore *validate*, and they validate differently, which is
+# why both are here rather than one being a fallback:
+#   - python3: b64decode() without validate=True silently DISCARDS bytes outside
+#     the alphabet and returns success (measured: a body carrying a stray byte
+#     decoded to the correct 40 bytes with rc=0).  validate=True raises.
+#   - base64:  GNU coreutils >= 9 is already strict (rc=1 on the same body).
+#
+# The CR/LF strip is load-bearing rather than decorative, and it is what the
+# python3 branch needs: with validate=True a newline is "not base64 data", so a
+# still-wrapped 76-column body is rejected outright (measured) unless the
+# wrapping is stripped first.
 decode() {
-  if command -v base64 >/dev/null 2>&1; then
-    base64 -d
+  if [ -n "${ABK_FETCH_DECODER:-}" ]; then
+    _d_backend="${ABK_FETCH_DECODER}"
+  elif command -v base64 >/dev/null 2>&1; then
+    _d_backend=base64
   else
-    python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))'
+    _d_backend=python3
   fi
+  case "$_d_backend" in
+  base64)
+    tr -d '\r\n' | base64 -d
+    ;;
+  python3)
+    tr -d '\r\n' | python3 -c 'import base64,binascii,sys
+try:
+    sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read(), validate=True))
+except (binascii.Error, ValueError) as e:
+    sys.stderr.write("abk: gitiles body is not clean base64: %s\n" % e)
+    sys.exit(1)'
+    ;;
+  *)
+    echo "abk: unknown ABK_FETCH_DECODER '$_d_backend' (want base64 or python3)" >&2
+    return 1
+    ;;
+  esac
+}
+
+# Both backends run over the same two bodies, so neither can regress into
+# silent-skipping on its own.  The python3 one is the one that could: without
+# validate=True it accepts the corrupted body and exits 0, so weakening the
+# check turns this red instead of quietly passing on base64's strictness.
+decode_backend_available() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+self_test_decode() {
+  _s_rc=0
+  # The clean body as a pre-encoded literal, NOT `printf ... | base64`: under
+  # `set -euo pipefail` a pipe through a missing `base64` returns 127 and set -e
+  # aborts the whole function here -- which is exactly the host (python3, no
+  # base64) decode()'s python3 fallback and the loop's per-backend skip exist
+  # to cover, so building the vector with base64 would skip the python3 backend
+  # on the one host it must be tested on.  This is base64 of
+  # "/* SPDX-License-Identifier: GPL-2.0 */\nint x;\n".
+  _s_clean="LyogU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEdQTC0yLjAgKi8KaW50IHg7Cg=="
+  for _s_backend in base64 python3; do
+    if ! decode_backend_available "$_s_backend"; then
+      echo "self-test: $_s_backend not on this host, skipped"
+      continue
+    fi
+    if printf '%s\n' "$_s_clean" | ABK_FETCH_DECODER="$_s_backend" decode | grep -q 'SPDX-License-Identifier'; then
+      echo "self-test: $_s_backend decodes the clean body"
+    else
+      echo "self-test: $_s_backend FAILED to decode the clean body" >&2
+      _s_rc=1
+    fi
+    # The case with teeth: a stray byte inside the stream.  Without
+    # validate=True the python3 backend accepts this and exits 0.
+    if printf '%s\n' "${_s_clean:0:8}!${_s_clean:8}" | ABK_FETCH_DECODER="$_s_backend" decode >/dev/null 2>&1; then
+      echo "self-test: $_s_backend ACCEPTED a corrupted body (must be refused)" >&2
+      _s_rc=1
+    else
+      echo "self-test: $_s_backend refused the corrupted body"
+    fi
+  done
+  return "$_s_rc"
 }
 
 # A downloaded file is accepted only when it looks like source: large enough
@@ -196,6 +292,16 @@ acceptable() {
   fi
   return 0
 }
+
+if [ "$SELF_TEST" = "1" ]; then
+  self_test_decode && exit 0
+  exit 1
+fi
+
+if [ "$DECODE_ONLY" = "1" ]; then
+  decode
+  exit $?
+fi
 
 mkdir -p "$OUTDIR"
 echo "fetching ${#FETCH_FILES[@]} files from $BRANCH into $OUTDIR"
