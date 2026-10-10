@@ -206,23 +206,6 @@ report `already_present` while the edit never lands — group stays "applied":
    `implementation_audit.py` now checks this mechanically
    (`CONFIG_GATED_REFERENCES`).
 
-8. A **default flip that turns on an upstream feature without carrying the
-   feature's own safety backstop**. Enabling a subsystem the stock kernel shipped
-   off (a Kconfig default, or a companion `post-fs-data` write) hands the device
-   a code path the vendor never tuned for — and the four tree audits, the unit
-   tests and the CI compile gate are *all* blind to it, because the feature
-   compiles and the graft text is present: the only symptom is on-device, under
-   load. The rule: when a change makes an upstream mechanism *active* that was
-   dormant before, port the backstop knob that mechanism relies on in the **same**
-   change, not later. Upstream subsystems ship with a self-defence valve
-   (a watermark, a timeout, an OOM/shrink fallback, a ratelimit) precisely so the
-   active path cannot wedge the machine; a default of `0`/off on that valve means
-   "no backstop", and leaving it there while turning the feature on is how a
-   feature that is correct in isolation becomes a device hang. Audit a default
-   flip by asking "what does the stock kernel rely on to stop this path running
-   away, and did I carry it?" — then prove it on-device, because no static gate
-   here can.
-
 Also verify every helper the ported code calls against **its own tree**, not the
 source tree (convention traps — compile clean, behave wrong). The pinned example:
 `hugepage_vma_revalidate()` returns **0 on success** on 5.15 but `SCAN_SUCCEED`

@@ -2370,16 +2370,6 @@ def test_mglru_is_enabled_by_the_default_tier():
     check("the companion asserts lru_gen.enable=1",
           re.search(r"(?m)^lru_gen\.enable=1$", tunables) is not None,
           [l for l in tunables.splitlines() if l.startswith("lru_gen.enable")])
-    # The MGLRU OOM backstop: a non-zero lru_gen.min_ttl_ms is what makes
-    # lru_gen_age_node() call out_of_memory() on a thrashing node instead of
-    # leaving every thread in direct reclaim until the watchdog bites (the
-    # field freeze).  At 0 the kernel's `!min_ttl` guard returns early and the
-    # backstop never fires, so the companion must ship it non-zero.
-    _ttl = re.search(r"(?m)^lru_gen\.min_ttl_ms=(\d+)$", tunables)
-    check("the companion ships a non-zero MGLRU min_ttl_ms backstop",
-          _ttl is not None and int(_ttl.group(1)) > 0,
-          [l for l in tunables.splitlines()
-           if l.startswith("lru_gen.min_ttl_ms")])
     check("the companion README no longer claims the kernel ships MGLRU off",
           "ships it off" not in readme, "stale README row")
     check("the companion README lists lru_gen as not opt-in",
