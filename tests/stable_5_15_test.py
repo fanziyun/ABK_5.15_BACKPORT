@@ -6998,14 +6998,14 @@ def test_batch70_smaps_migration_guard():
               not [ln for ln in helper_code
                    if "pfn_swap_entry_to_page" in ln],
               helper_code)
-        check("the helper keeps the split-hazard ordering",
+        check("the helper keeps the pfn-before-flags ordering",
               "smp_rmb();" in helper)
-        check("the helper re-checks the lock and the entry (double check)",
+        check("the helper gates on PageLocked (the BUG_ON's own predicate)",
               "if (!PageLocked(p))" in helper
-              and helper.count("if (!is_migration_entry(entry))") == 2,
+              and helper.count("if (!is_migration_entry(entry))") == 1,
               helper)
         check("the helper returns NULL rather than panicking",
-              helper.count("return NULL;") == 3, helper)
+              helper.count("return NULL;") == 2, helper)
 
         # All five callers route through it: a helper nobody calls changes
         # nothing, and a caller left on the direct call still panics.
@@ -7215,7 +7215,8 @@ def test_fetch_decode_roundtrip():
             # validate=True raises before writing anything.  GNU base64 -d
             # instead emits a short prefix and then fails, so "no bytes" is
             # not its contract -- the caller's non-zero exit is, and the
-            # caller rm -f's the partial file (fetch_sublevel_tree.sh:234).
+            # caller rm -f's the partial file (the FAILED branch in
+            # fetch_sublevel_tree.sh's fetch loop).
             check("python3: a corrupted body yields no bytes at all",
                   bad.stdout == b"", bad.stdout[:60])
 
@@ -7354,16 +7355,19 @@ def test_batch71_kcompressd_trylock():
                   locks == [], locks)
             check(f"{label} shape: the drain takes the lock without sleeping",
                   "if (!trylock_page(page)) {" in do_swapout)
-            # The skip path is three statements and no more: warn, drop the
-            # reference Batch 41's enqueue took, return.
+            # The skip path: warn, count the dequeue (so enqueued - swapped
+            # stays the live queue depth), drop the reference Batch 41's
+            # enqueue took, return.
             skip = re.search(r"\tif \(!trylock_page\(page\)\) \{\n"
                              r"(.*?)\n\t\}\n", do_swapout, re.S)
-            check(f"{label} shape: the contended path skips and drops the "
-                  "reference",
+            check(f"{label} shape: the contended path skips, counts and drops "
+                  "the reference",
                   skip is not None
                   and "put_page(page);" in skip.group(1)
                   and "return;" in skip.group(1)
-                  and "pr_warn_once(" in skip.group(1),
+                  and "pr_warn_once(" in skip.group(1)
+                  and "atomic_long_inc(&abk_kcompressd_swapped);"
+                      in skip.group(1),
                   skip.group(1) if skip else "(no skip block)")
             # The write still runs under PG_locked: trylock keeps the
             # ->writepage contract __swap_writepage() requires.

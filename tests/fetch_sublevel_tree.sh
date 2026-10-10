@@ -241,7 +241,14 @@ decode_backend_available() {
 
 self_test_decode() {
   _s_rc=0
-  _s_clean=$(printf '/* SPDX-License-Identifier: GPL-2.0 */\nint x;\n' | base64 | tr -d '\n')
+  # The clean body as a pre-encoded literal, NOT `printf ... | base64`: under
+  # `set -euo pipefail` a pipe through a missing `base64` returns 127 and set -e
+  # aborts the whole function here -- which is exactly the host (python3, no
+  # base64) decode()'s python3 fallback and the loop's per-backend skip exist
+  # to cover, so building the vector with base64 would skip the python3 backend
+  # on the one host it must be tested on.  This is base64 of
+  # "/* SPDX-License-Identifier: GPL-2.0 */\nint x;\n".
+  _s_clean="LyogU1BEWC1MaWNlbnNlLUlkZW50aWZpZXI6IEdQTC0yLjAgKi8KaW50IHg7Cg=="
   for _s_backend in base64 python3; do
     if ! decode_backend_available "$_s_backend"; then
       echo "self-test: $_s_backend not on this host, skipped"

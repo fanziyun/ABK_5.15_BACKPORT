@@ -826,7 +826,13 @@ grep -q "if (!trylock_page(page)) {" "$PAGE_IO" \
   || fail "the drain still takes the page lock blocking"
 grep -q "kcompressd: skipping a locked page" "$PAGE_IO" \
   || fail "the trylock skip path is missing its dmesg marker"
-if grep -qP "^\tlock_page\(page\);$" "$PAGE_IO"; then
+# A bare, blocking `lock_page(page);` statement line must be gone from the
+# drain.  POSIX ERE (-E), not -P: a build host whose grep lacks PCRE returns
+# exit 2 for `grep -P`, which an `if grep -qP ...` reads as "no match" and the
+# guard silently passes.  `^[[:space:]]*lock_page\(page\);$` matches the whole
+# statement line only; `unlock_page(page);` starts with `unlock`, so it is not
+# matched, and `trylock_page` sits inside an `if (...)` line, also not matched.
+if grep -qE "^[[:space:]]*lock_page\(page\);$" "$PAGE_IO"; then
   fail "the blocking lock_page() in the drain survived"
 fi
 

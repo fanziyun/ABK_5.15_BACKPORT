@@ -28,7 +28,11 @@ Why trylock (not lock, not skip-silently):
   still runs under PG_locked) without the wait.
 * Dropping the reference on the contended path is required, not optional:
   every queued entry holds the ``get_page()`` Batch 41 took at enqueue time,
-  so returning without ``put_page()`` leaks the page and its swap slot.
+  so returning without ``put_page()`` leaks the page and its swap slot. The
+  skip also bumps ``abk_kcompressd_swapped`` -- a skipped page has left the
+  FIFO, and Batch 41 reports ``enqueued - swapped`` as the live queue depth,
+  so a dequeue that did not count would inflate that depth by every skipped
+  page forever.
 * ``pr_warn_once`` (never WARN-family: a WARN is an oops, and panic_on_oops
   turns it into a panic) keeps the skip visible in dmesg without spamming the
   reclaim hot path.
@@ -78,6 +82,14 @@ _TRYLOCK_NEW = (
     "\t */\n"
     "\tif (!trylock_page(page)) {\n"
     "\t\tpr_warn_once(\"kcompressd: skipping a locked page, its owner makes progress instead\\n\");\n"
+    "\t\t/*\n"
+    "\t\t * This page has left the FIFO, so it counts against the queue\n"
+    "\t\t * exactly like a written one: abk_kcompressd_swapped is what\n"
+    "\t\t * Batch 41 subtracts from abk_kcompressd_enqueued to report the\n"
+    "\t\t * live queue depth, and a dequeue that did not bump it would\n"
+    "\t\t * inflate that depth by every skipped page forever.\n"
+    "\t\t */\n"
+    "\t\tatomic_long_inc(&abk_kcompressd_swapped);\n"
     "\t\tput_page(page);\n"
     "\t\treturn;\n"
     "\t}\n"
@@ -113,7 +125,7 @@ def _kcompressd_trylock_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the single Batch-51 kcompressd trylock PatchGroup record."""
+    """Return the single Batch-71 kcompressd trylock PatchGroup record."""
     return [
         PatchGroup(
             "kcompressd_trylock_guard",

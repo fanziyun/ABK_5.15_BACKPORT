@@ -12,11 +12,11 @@ and panics the device. smaps is the victim, not the cause.
 
 What this group does: insert one file-static helper above ``smaps_pte_entry``
 that resolves a migration entry to ``struct page`` WITHOUT the lock assertion
-(``pfn_to_page(swp_offset(entry))`` plus the same ``smp_rmb`` ordering the
-header documents against ``__split_folio_to_order()``), returning NULL unless
-the entry still reads as a migration entry AND the page is currently locked;
-then route all five ``pfn_swap_entry_to_page()`` callers in ``fs/proc/task_mmu.c``
-through it:
+(``pfn_to_page(swp_offset(entry))`` plus an ``smp_rmb`` ordering the pfn read
+ahead of the ``PageLocked`` flags read), returning NULL unless the page is
+currently locked -- i.e. unless ``pfn_swap_entry_to_page()``'s own
+``BUG_ON(!PageLocked())`` predicate holds; then route all five
+``pfn_swap_entry_to_page()`` callers in ``fs/proc/task_mmu.c`` through it:
 
   1. ``smaps_pte_entry`` (the crash site, task_mmu.c:551)
   2. ``smaps_pmd_entry`` (THP migration, task_mmu.c:586)
@@ -69,13 +69,19 @@ _HELPER_OLD = (
 
 _HELPER_NEW = (
     "/*\n"
-    " * sailboat_smaps_migration_guard: resolve a migration entry without the\n"
-    " * pfn_swap_entry_to_page() BUG_ON(!PageLocked()) contract. smaps walks\n"
-    " * page tables without holding the target page lock, so a migration that\n"
-    " * unlocks plus remove_migration_ptes (or a pfn reuse) between the PTE\n"
-    " * snapshot and the check trips swapops.h:267 and panics (field BUG via\n"
-    " * smaps_rollup -> smaps_pte_range -> smaps_pte_entry). The smp_rmb() is\n"
-    " * the same ordering the header documents against __split_folio_to_order().\n"
+    " * sailboat_smaps_migration_guard: resolve a migration entry to its page\n"
+    " * WITHOUT pfn_swap_entry_to_page()'s BUG_ON(!PageLocked()) contract. The\n"
+    " * smaps/pagemap walkers hold the page-table lock but never the target\n"
+    " * page lock, so a migration entry whose page is no longer locked (the\n"
+    " * migration completed, or the pfn was reused) makes that BUG_ON panic\n"
+    " * the device (field BUG via smaps_rollup -> smaps_pte_range ->\n"
+    " * smaps_pte_entry, swapops.h:267). PageLocked(p) here IS the BUG_ON's own\n"
+    " * predicate: a page that passes it resolves exactly as\n"
+    " * pfn_swap_entry_to_page() would, and one that fails is skipped (NULL)\n"
+    " * instead of panicking. The smp_rmb() orders the entry/pfn read ahead of\n"
+    " * the PageLocked() flags read. This suppresses the panic and resolves by\n"
+    " * pfn like the upstream helper -- it does not add a page-identity\n"
+    " * re-validation the walkers' page-table lock does not already give.\n"
     " * NULL means \"skip this entry\"; every caller below already tolerates\n"
     " * it (smaps returns on NULL, pagemap_pmd_range checks page before use).\n"
     " */\n"
@@ -86,14 +92,8 @@ _HELPER_NEW = (
     "\tif (!is_migration_entry(entry))\n"
     "\t\treturn NULL;\n"
     "\tp = pfn_to_page(swp_offset(entry));\n"
-    "\t/*\n"
-    "\t * Ensure we do not race with split: matches the write barrier in\n"
-    "\t * __split_folio_to_order().\n"
-    "\t */\n"
     "\tsmp_rmb();\n"
     "\tif (!PageLocked(p))\n"
-    "\t\treturn NULL;\n"
-    "\tif (!is_migration_entry(entry))\n"
     "\t\treturn NULL;\n"
     "\treturn p;\n"
     "}\n"
@@ -230,7 +230,7 @@ def _smaps_migration_guard_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the single Batch-50 smaps guard PatchGroup record."""
+    """Return the single Batch-70 smaps guard PatchGroup record."""
     return [
         PatchGroup(
             "smaps_migration_guard",
