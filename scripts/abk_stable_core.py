@@ -3536,29 +3536,39 @@ _MODULE_CONFIGS = [
     # With the symbol unset the whole graft reduced to an always-false branch
     # (found by Batch 16's emptiness audit), so the tier has to enable it.
     ("RCU_NOCB_CPU_DEFAULT_ALL", "y"),
-    # LRU_GEN_ENABLED (MGLRU).  CONFIG_LRU_GEN is already =y in every
-    # android13-5.15 baseline, so the whole MGLRU implementation compiles --
-    # but this symbol is what DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects
-    # for ``lru_gen_caps`` (mm/vmscan.c), and without it every MGLRU branch
-    # starts false, /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the
-    # classic-LRU path runs.  Verified on the device that shipped the first
-    # cut of this batch: LRU_GEN=y, LRU_GEN_ENABLED unset, enabled == 0x0000.
-    #
-    # Turning it on is what makes this module's MGLRU work live at all:
-    # Batch 37's six v6.14 groups are compiled in but were runtime-inert for
-    # exactly the reason Batch 8's RCU graft was -- the same class of bug the
-    # emptiness audit was written to catch, one config layer further down.
-    ("LRU_GEN_ENABLED", "y"),
+    # LRU_GEN_ENABLED (MGLRU) is deliberately NOT in the default tier -- it
+    # moved to the opt-in align tier below.  The symbol is what
+    # DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects for ``lru_gen_caps``
+    # (mm/vmscan.c); with it unset every MGLRU branch starts false,
+    # /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the baseline's
+    # classic-LRU path runs -- which device evidence makes the safe default.
+    # On SM8550 vermeer (5.15.220) with MGLRU runtime-on, a sustained-thrash
+    # memory load wedged the device: two kworker/*:*H pinned at 100% kernel
+    # CPU in the MGLRU shrink path (evict_pages -> lru_gen_shrink_lruvec),
+    # lmkd starved, QCOM watchdog bite; and a third-party app (bilibili)
+    # SIGSEGV'd on launch in the dex-preload mmap path.  The identical thrash
+    # load with MGLRU OFF rode out -- zram took 8.6 GB, PSI some-avg10 peaked
+    # 24% and fell back to 2% on its own, no wedge.  So this module's MGLRU
+    # reclaim-loop rewrite (Batch 37/49) does not converge under thrash on this
+    # baseline, and turning it on by default was trap 8: an upstream mechanism
+    # made active without the self-defence the stock kernel relied on.  The
+    # MGLRU grafts stay compiled-in but runtime-inert until the shrink loop is
+    # made to converge (a dedicated follow-up PR); ABK_515_DEFCONFIG_ALIGN=1
+    # turns the symbol on for testing.
 ]
 
 _ALIGN_CONFIGS = [
     # Enabled in the android15-6.6 GKI defconfig, absent from every
     # android13-5.15 baseline, and the code already exists in 5.15 for all of
     # them -- config-only deltas, so they change runtime behaviour.
-    # LRU_GEN_ENABLED used to live here; it moved to _MODULE_CONFIGS above
-    # because it is the one symbol in this list that a *landed* group of this
-    # module (Batch 37-mglru) is inert without.  The rest stay opt-in: they are
-    # 6.6-GKI alignments, not optimizations this module ships.
+    # LRU_GEN_ENABLED is here (opt-in), not in the module tier: on SM8550
+    # vermeer this module's MGLRU reclaim-loop rewrite (Batch 37/49) does not
+    # converge under sustained thrash and wedges the device, and makes a
+    # third-party app SIGSEGV on launch (see the _MODULE_CONFIGS note and
+    # trap 8).  Keeping it opt-in leaves the MGLRU grafts compiled-in but
+    # runtime-off by default; a tester turns the whole 6.6-align set on with
+    # ABK_515_DEFCONFIG_ALIGN=1 to exercise them.
+    ("LRU_GEN_ENABLED", "y"),
     ("TCP_CONG_ADVANCED", "y"),      # prerequisite for BBR
     ("TCP_CONG_BBR", "y"),
     ("BLK_WBT", "y"),                # writeback throttling
@@ -3596,10 +3606,12 @@ _INTRODUCED_KCONFIG = {
     "RCU_NOCB_CPU_DEFAULT_ALL": "module",
     # Pre-existing baseline symbol (mm/Kconfig), like ZRAM_WRITEBACK below --
     # this table records what the module turns on, not only what it declares.
-    # It moved here from the align tier because a landed group (Batch 37's six
-    # MGLRU groups) is runtime-inert without it, and an inert optimization is
-    # not an optimization.
-    "LRU_GEN_ENABLED": "module",
+    # It is in the align (opt-in) tier, NOT the module tier: this module's
+    # MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained thrash
+    # (two kworker at 100% kernel CPU in lru_gen_shrink_lruvec) and SIGSEGVs a
+    # third-party app on launch, so MGLRU is off by default until the shrink
+    # loop converges -- see the _MODULE_CONFIGS note and trap 8.
+    "LRU_GEN_ENABLED": "align",
     "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
     "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
 }

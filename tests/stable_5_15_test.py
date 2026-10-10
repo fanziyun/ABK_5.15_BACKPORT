@@ -2149,13 +2149,15 @@ def test_config_tiers():
 
     check("module-owned tier enables the module's own symbols",
           dict(plain).get("ZRAM_MULTI_COMP") == "y"
-          and dict(plain).get("LRU_GEN_ENABLED") == "y"
+          and "LRU_GEN_ENABLED" not in dict(plain)
           and "ZRAM_WRITEBACK" not in dict(plain), sorted(dict(plain)))
-    # LRU_GEN_ENABLED used to be the align tier's marker symbol; it moved to
-    # the module tier because Batch 37's six MGLRU groups are runtime-inert
-    # without it.  TCP_CONG_BBR is now the align-only marker.
-    check("align tier adds the 6.6 GKI config deltas",
+    # LRU_GEN_ENABLED is in the opt-in align tier (not the module tier): this
+    # module's MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained
+    # thrash and SIGSEGVs a third-party app on launch, so MGLRU is off by
+    # default (trap 8).  TCP_CONG_BBR and LRU_GEN_ENABLED are both align markers.
+    check("align tier adds the 6.6 GKI config deltas (incl. opt-in MGLRU)",
           dict(align).get("TCP_CONG_BBR") == "y"
+          and dict(align).get("LRU_GEN_ENABLED") == "y"
           and "ZRAM_WRITEBACK" not in dict(align), sorted(dict(align)))
     check("ROM tier adds CONFIG_ZRAM_WRITEBACK",
           dict(rom).get("ZRAM_WRITEBACK") == "y"
@@ -2178,7 +2180,8 @@ def test_config_tiers():
           psi_status == "applied" and "per-cgroup PSI accounting" in psi_detail,
           (psi_status, psi_detail))
     check("the PSI tier keeps the module symbols and pulls in no other tier",
-          psi.get("ZRAM_MULTI_COMP") == "y" and psi.get("LRU_GEN_ENABLED") == "y"
+          psi.get("ZRAM_MULTI_COMP") == "y"
+          and "LRU_GEN_ENABLED" not in psi
           and "ZRAM_WRITEBACK" not in psi
           and "TCP_CONG_BBR" not in psi, sorted(psi))
     blocked_status, blocked_detail, _c, _t = enabled(
@@ -2320,60 +2323,51 @@ def test_introduced_kconfig_tiers():
 
 
 def test_mglru_is_enabled_by_the_default_tier():
-    """MGLRU must be on by default, or Batch 37's six groups are inert.
+    """MGLRU must be OFF by default on this baseline (device-wedge evidence).
 
-    This is the Batch 8 RCU lesson one config layer further down.  Every
-    android13-5.15 baseline already ships ``CONFIG_LRU_GEN=y``, so the whole
-    MGLRU implementation compiles -- but ``CONFIG_LRU_GEN_ENABLED`` is what
-    selects ``DEFINE_STATIC_KEY_ARRAY_TRUE`` vs ``_FALSE`` for ``lru_gen_caps``
-    in mm/vmscan.c.  With it unset every MGLRU branch starts false,
-    ``/sys/kernel/mm/lru_gen/enabled`` reads ``0x0000``, and the classic-LRU
-    path runs -- verified on the device that shipped the first cut of Batch 38.
-
-    The consequence is not cosmetic: Batch 37 landed six MGLRU performance
-    groups (``mglru_clean_workingset``, ``mglru_optimize_deactivation``,
-    ``mglru_rework_aging_feedback``, ``mglru_rework_type_selection``,
-    ``mglru_rework_refault_detection``, ``mglru_wake_flushers``) that were
-    runtime-inert for exactly this reason.  An optimization that never runs is
-    not an optimization, so the default tier has to turn the symbol on.
+    MGLRU was briefly in the module (default) tier so Batch 37/49's groups
+    would run.  Device evidence reversed that: on SM8550 vermeer (5.15.220)
+    this module's MGLRU reclaim-loop rewrite does not converge under sustained
+    memory thrash -- two kworker/*:*H pin at 100% kernel CPU in
+    ``lru_gen_shrink_lruvec``/``evict_pages``, lmkd starves, the QCOM watchdog
+    cold-resets the device, and a third-party app (bilibili) SIGSEGVs on launch
+    in the dex-preload mmap path.  The identical load with MGLRU off rode out
+    (zram took 8.6 GB, PSI self-recovered).  So ``LRU_GEN_ENABLED`` is in the
+    opt-in align tier, not the default tier: the MGLRU grafts stay compiled-in
+    but runtime-inert until the shrink loop is made to converge (a dedicated
+    follow-up PR).  This is trap 8 (AGENTS.md): an upstream mechanism must not
+    be turned on by default without the self-defence the stock kernel relied on.
     """
-    print("MGLRU is enabled by the default (module) tier")
+    print("MGLRU is OFF by default (device-wedge evidence); opt-in only")
     import abk_stable_core as core
 
     module = dict(core._MODULE_CONFIGS)
-    check("LRU_GEN_ENABLED is in the default tier",
-          module.get("LRU_GEN_ENABLED") == "y", sorted(module))
-    check("LRU_GEN_ENABLED is recorded in _INTRODUCED_KCONFIG",
-          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "module",
+    align = dict(core._ALIGN_CONFIGS)
+    check("LRU_GEN_ENABLED is NOT in the default (module) tier",
+          "LRU_GEN_ENABLED" not in module, sorted(module))
+    check("LRU_GEN_ENABLED is in the opt-in align tier",
+          align.get("LRU_GEN_ENABLED") == "y", sorted(align))
+    check("LRU_GEN_ENABLED is recorded in _INTRODUCED_KCONFIG as align",
+          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "align",
           core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED"))
-    check("LRU_GEN_ENABLED is no longer only in the opt-in align tier",
-          "LRU_GEN_ENABLED" not in dict(core._ALIGN_CONFIGS),
-          sorted(dict(core._ALIGN_CONFIGS)))
 
-    # Every MGLRU group the module ships must still be registered -- the point
-    # of enabling the symbol is to make them live, so a silently-dropped
-    # registration would defeat it.
+    # The MGLRU grafts stay registered -- they are compiled in, just
+    # runtime-off by default.  Turning the opt-in align tier on makes them live.
     mglru = sorted(g.key for g in core.PATCH_GROUPS if g.key.startswith("mglru_"))
-    check("the MGLRU groups the symbol makes live are still registered",
+    check("the MGLRU groups stay registered (compiled-in, runtime-off)",
           len(mglru) >= 6, mglru)
 
-    # The companion and the kernel tier must agree.  Before Batch 38 they did,
-    # in the wrong direction: the kernel shipped MGLRU off and the companion
-    # stated 0, and abk_apply_lru_gen() only ever *writes* on ==1, so the knob
-    # was a no-op that documented the kernel default rather than deciding it.
-    # Now the kernel defaults it on, so a companion still saying 0 is a stale
-    # comment waiting to mislead someone into thinking MGLRU is off.
+    # The companion and the kernel tier must agree: MGLRU is off by default.
+    # The kernel keeps LRU_GEN_ENABLED in the opt-in align tier, and the
+    # companion must not re-assert MGLRU on.  abk_apply_lru_gen() only ever
+    # *writes* on ==1, so lru_gen.enable=0 stops the companion forcing MGLRU on
+    # and leaves an opt-in tester (ABK_515_DEFCONFIG_ALIGN=1) free to run it.
     ksu = (Path(__file__).resolve().parent.parent / "ksu"
            / "abk_runtime_tunables")
     tunables = (ksu / "tunables.conf").read_text(encoding="utf-8")
-    readme = (ksu / "README.md").read_text(encoding="utf-8")
-    check("the companion asserts lru_gen.enable=1",
-          re.search(r"(?m)^lru_gen\.enable=1$", tunables) is not None,
+    check("the companion does not re-assert MGLRU on (lru_gen.enable=0)",
+          re.search(r"(?m)^lru_gen\.enable=0$", tunables) is not None,
           [l for l in tunables.splitlines() if l.startswith("lru_gen.enable")])
-    check("the companion README no longer claims the kernel ships MGLRU off",
-          "ships it off" not in readme, "stale README row")
-    check("the companion README lists lru_gen as not opt-in",
-          "`lru_gen` is no longer opt-in" in readme, "README opt-in paragraph")
     # The knob must stay a write-only assertion: if abk_apply_lru_gen() ever
     # grows an else-branch that writes n, a future 0 would silently disable
     # MGLRU again and the two layers would fight.
