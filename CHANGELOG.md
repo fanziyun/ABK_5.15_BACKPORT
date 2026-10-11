@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。96 个移植组（core 71 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。97 个移植组（core 72 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -768,6 +768,90 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 通过。`tunables.conf` 注释、README 行、以及"band 不等式"那款断言同步改为 90,并在
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
+
+<a id="batch-50"></a>
+
+## Batch 50(iorap2 后台预读抑制 Stage 1,v0.53.0,core 71 → 72 组)
+
+主题:**把小米 launch-boost 模块 `iorap2.ko`("mi_lb_*" 家族,driver v3.0.0,modko
+反编译件)六条 vendor hook 里不依赖用户态契约的常驻半边,转写成新 C 落地为
+`bg_readahead_tune`**。这是 iorap2 移植评估(见本轮排查记录)分出的 Stage 1:
+策略的另一半——collect/compile/preread——依赖 `/dev/iorap` ioctl 与 iorapd
+守护进程的 V2/V3 握手协议,属 Stage 2 候选;Stage 1 的四条 hook 纯内核态、
+无用户态契约,单独成立。
+
+**取证链**(全部实证,非推断):
+- 设备(vermeer,`5.15.220-20261009-Batch51`)上无 iorap2.ko:`/dev/iorap`
+  不存在、`/proc/modules` 无 iorap、`/proc/kallsyms` 无 `mi_lb` 符号、五个模块
+  目录无 `*iorap*.ko`。原厂 ko 是 android14-5.15 KMI 编的,二进制直载不可行。
+- ROM 里的用户态链条活着但被门控关闭:`/system_ext/bin/iorapd`(69 KB,无
+  perfetto 字符串,引 `/dev/iorap_dev` 与 `/proc/iorap_node/collect`,AIDL
+  `aidl.xiaomi.launch_boost.readahead`)手动拉起后立即 `exit(1)`、init 循环重试,
+  全程零内核报错——静默打开失败;开机启动由 `persist.sys.stability.PrereadEnable`
+  门控(该设备为 `false`)。框架侧 `IorapForwardingService` 在 miui-services.jar。
+- 本树上 4 个抑制 hook 全部在位:调用点 `mm/filemap.c:3023`(tune_mmap_readaround)、
+  `mm/filemap.c:3047`(do_async_mmap_readahead)、`mm/readahead.c:466`
+  (ra_tuning_max_page)、`mm/memory.c:4558`(should_fault_around);设备 kallsyms
+  同时确认 4 个 `__tracepoint_android_vh_*` 符号。
+- cgroup 判定 substrate:真机 cpuset 挂 **v1** `/dev/cpuset`(mountinfo
+  `cpuset_v2_mode`),含字面 `background` 目录;cgroup v2 `/sys/fs/cgroup/apps/
+  uid_X/pid_Y` 层级无命名子组——所以上游比对的对象就是 v1 cpuset 组名,
+  `task_css(current, cpuset_cgrp_id)->cgroup->kn->name` 的比对本设备必然生效。
+
+**四个 handler 的语义**(自反编译寄存器映射逐一还原,与树内调用点默认值对照):
+| hook | 上游函数 | 行为 |
+|---|---|---|
+| `android_vh_should_fault_around` | `should_skip_fault_around` | `*should_around = false`,整段跳过 fault-around |
+| `android_vh_do_async_mmap_readahead` | `mi_lb_skip_async_mmap_readahead` | `*skip = true`,跳过 async mmap readahead |
+| `android_vh_ra_tuning_max_page` | `adjust_readahead` | `*max_page = min(*max_page, ra_pages>>1)`,ondemand 窗口上限减半 |
+| `android_vh_tune_mmap_readaround` | `adjust_readaround` | start `pgoff-ra/4`、size `ra/2`、async `ra/8`(默认是 `-ra/2`/`ra`/`ra/4`) |
+
+共享判定条件与上游逐条对应:全局开关(上游 `g_skip_background_readahead_enable`,
+本移植为 `abk_bg_ra_suppress`,默认 1)、cpuset 组名 `"background"`
+(`strncmp`,长度 11)、年龄阈值 `nvcsw > 99`(`current->nvcsw`,年轻任务豁免——
+启动突发正是预读机制该前置加载的 IO,不能掐)。上游 per-UID 豁免表(≤128 项,
+由 iorapd 经 ioctl 喂入)**有意不移植**,理由如上。
+
+**KMI/形态**:纯追加——static 函数 + 一个 `fs_initcall` 注册四个 handler +
+两个 `module_param()` 同名形式(`/sys/module/filemap/parameters/abk_bg_ra_{
+suppress,nvcsw_min}`,0644,运行时可翻转供真机 A/B),无 struct 变更、无导出、
+无 KABI 槽位。`#ifdef CONFIG_CPUSETS` 包住整个载荷(`cpuset_cgrp_id` 是被该
+门控的枚举值,AGENTS.md trap 7),`implementation_audit.py` 的
+`CONFIG_GATED_REFERENCES` 新增 `mm/filemap.c` 表项机械强制这条纪律。
+`module_param(NAME, ...)` 两处同名形式进 `REQUIRED_CONTENT`(trap 6 的
+Batch-12 教训)。**r1 易失启动的真机修正**:`core_param()` 会剥掉模块前缀,
+两个旋钮被埋进 `/sys/module/kernel/parameters/`(kallsyms 22 个 `abk_bg_ra_*`
+符号证明载荷本身编进并运行,param 目录缺失暴露了这一点);改回
+`module_param` 同名形式后参数才落在 README 承诺的 `filemap` 目录下。
+`REQUIRED_CONTENT` 共 15 条针脚:
+4 个 register_trace_ 调用、cgroup/年龄判定原文、两个 module_param 行、
+4 个 handler 行为行(`*should_around = false` / `*skip = true` /
+`ractl->ra->ra_pages >> 1` / `start = max_t(long, 0, pgoff - ra_pages/4)`)。
+
+**已知差异与边界**(不隐瞒):① 无 UID 豁免意味着被采集优化的应用(Stage 2
+若落地)在后台也会被抑制——上游靠豁免表避免这一点,Stage 2 落地时需把豁免
+语义补回;② 收益只在页缓存真冷时兑现(重启后、久未打开的大应用),16 GB +
+MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)是常驻的;③
+未做设备 A/B,不主张任何提速数字——真机窗口待新内核刷入后跑。
+
+**验证**:`py_compile`/`bash -n`/`stable_5_15_test.py`(发布版本触点同步
+0.53.0)/`step_audit.py`(97 组、core 371 步、两遍幂等——数字与 Batch 49
+记录的 371 相同不是巧合:那 371 是 re-key 前口径,含当时仍在审计集里的
+`vmscan_tasks_rcu_qs` 单步;re-key 后 62 活跃组 370 步,加本组 1 步恰为 371,
+本组的单步确在审计集内)/
+`implementation_audit.py`(`bg_readahead_tune applied`,15 针脚全过)/
+`smoke.sh`(两遍 + 回滚字节一致,含 `mm/filemap.c`)全绿;
+`abk_stable_core.py --dry-run` 单组 `bg_readahead_tune: applied`。
+本地构建:`/root/kci515` 模式 A(`--reseed --allow-dirty-template`,模块以路径
+注入),**REBUILD_EXIT=0**,构建日志自证 97 组全落地(core 9 already_present +
+63 applied 含本组,perf 8+16,display 1)且模块版本 0.53.0;编译即 trap-6 的
+真门禁,四个 handler 的 hook 签名经编译器 + ThinLTO 验证。产物级核验:
+`System.map` 含 22 个 `abk_bg_ra` 条目(四个 handler 及其 LTO 克隆名),
+`Image` 内含 `abk_bg_ra_suppress`/`abk_bg_ra_nvcsw_min` 两个参数名字符串与
+`__initstub__kmod_filemap__..._abk_bg_ra_tune_init` initcall 桩(参数与注册
+都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
+载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
+DARK_GATES,无本组新增)。
 
 <a id="batch-49"></a>
 

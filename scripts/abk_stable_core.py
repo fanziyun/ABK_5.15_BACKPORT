@@ -5951,5 +5951,221 @@ import batch49_core_mglru_reclaim_loop as _b49_mglru  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b49_mglru.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 50: background readahead suppression -- the always-on half of the
+# iorap2 launch-boost policy (Stage 1 of the iorap2 backport).
+#
+# Xiaomi's launch-boost module (iorap2.ko, "mi_lb_*" family, driver v3.0.0)
+# registers six ACK vendor hooks.  Four of them implement a policy with no
+# userspace dependency: tasks inside the "background" cpuset cgroup that are
+# past their launch burst (voluntary context switches above 99) get file
+# readahead trimmed, so long-lived background tasks stop evicting the page
+# cache and IO bandwidth the foreground needs:
+#
+#   android_vh_should_fault_around        skip fault-around entirely
+#   android_vh_do_async_mmap_readahead    skip async mmap readahead
+#   android_vh_ra_tuning_max_page         cap ondemand_readahead at ra_pages/2
+#   android_vh_tune_mmap_readaround       window pgoff-ra/4, size ra/2, async ra/8
+#
+# The handler bodies are a fresh-C transcription of the decompiled
+# sym.should_skip_fault_around / sym.mi_lb_skip_async_mmap_readahead /
+# sym.adjust_readahead / sym.adjust_readaround, with the decompiler's raw
+# offsets resolved against this tree: the cgroup test is
+# task_css(cpuset)->cgroup->kn->name (the device mounts cpuset v1 at
+# /dev/cpuset, where the background group is literally named "background"),
+# the age test is task->nvcsw, the cap reads ractl->ra->ra_pages.  Young
+# tasks stay exempt on purpose: their burst is the IO the readahead
+# machinery exists to front-load.
+#
+# Deliberately NOT ported here: the per-UID exemption table the upstream
+# module gets fed over /dev/iorap by its iorapd daemon (this child has no
+# userspace contract, so the test is cgroup name + age threshold only, both
+# exposed as module_param() knobs), and the collect/compile/preread half of the
+# module (android_vh_filemap_read / android_vh_filemap_map_pages consumers,
+# /dev/iorap, the compiler thread) -- that half is a Stage-2 candidate and
+# would need the daemon handshake reversed first.
+#
+# Registered after every batch that edits mm/filemap.c: this group only
+# appends at EOF and its anchor is pristine text no other group writes, so
+# ordering is informational, but the shape probes run against the patched
+# text and depend on the file still containing the four call sites verbatim.
+# ============================================================================
+
+_BG_RA_ANCHOR = """EXPORT_SYMBOL(try_to_release_page);
+"""
+
+_BG_RA_PAYLOAD = """EXPORT_SYMBOL(try_to_release_page);
+
+/* sailboat_bg_readahead_tune: background readahead suppression, backported
+ * from Xiaomi's iorap2 launch-boost module (the mi_lb_* family, driver
+ * version 3.0.0).  Long-lived processes running in the "background" cpuset
+ * cgroup (Android parks cached apps there: /dev/cpuset/background) get
+ * their file readahead trimmed through the four vendor hooks this file and
+ * its neighbours already fire: fault-around is skipped, async mmap
+ * readahead is skipped, the ondemand_readahead window cap is halved and
+ * the mmap read-around window is shrunk toward the faulting offset -- so
+ * background tasks stop evicting the page cache and IO bandwidth that the
+ * foreground needs.  Young tasks are deliberately exempt: their launch
+ * burst is exactly the IO pattern the readahead machinery exists to
+ * front-load (upstream suppresses only past 99 voluntary context switches).
+ *
+ * The upstream module gates the same policy per-UID through an ioctl-fed
+ * table driven by its iorapd daemon; this backport has no userspace
+ * contract, so the test is the cgroup name plus the age threshold only,
+ * and both knobs are runtime-togglable:
+ *   /sys/module/filemap/parameters/abk_bg_ra_suppress   (default 1)
+ *   /sys/module/filemap/parameters/abk_bg_ra_nvcsw_min  (default 99)
+ */
+#include <linux/cgroup.h>
+#include <linux/moduleparam.h>
+#ifdef CONFIG_CPUSETS
+static int abk_bg_ra_suppress = 1;
+/* module_param, not core_param: core_param strips the module prefix and the
+ * knobs end up in /sys/module/kernel/parameters/ -- r1 boot proved that live.
+ * Same-name form (param name == variable name), so no module_param_named. */
+module_param(abk_bg_ra_suppress, int, 0644);
+static int abk_bg_ra_nvcsw_min = 99;
+module_param(abk_bg_ra_nvcsw_min, int, 0644);
+
+static bool abk_bg_ra_should_suppress_current(void)
+{
+\tstruct cgroup_subsys_state *css;
+\tbool matched;
+
+\tif (!READ_ONCE(abk_bg_ra_suppress))
+\t\treturn false;
+\t/* Young tasks keep their readahead: the launch burst is the IO the
+\t * readahead machinery is meant to front-load, not to fight. */
+\tif (current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min))
+\t\treturn false;
+
+\trcu_read_lock();
+\tcss = task_css(current, cpuset_cgrp_id);
+\tmatched = css && css->cgroup && css->cgroup->kn &&
+\t\t  !strncmp(css->cgroup->kn->name ?: "", "background",
+\t\t\t   sizeof("background") - 1);
+\trcu_read_unlock();
+
+\treturn matched;
+}
+
+static void abk_bg_ra_should_fault_around_cb(void *data, struct vm_fault *vmf,
+\t\t\t\t\t     bool *should_around)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*should_around = false;
+}
+
+static void abk_bg_ra_skip_async_mmap_readahead_cb(void *data,
+\t\t\t\t\t\t   struct vm_fault *vmf,
+\t\t\t\t\t\t   struct page *page,
+\t\t\t\t\t\t   bool *skip)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*skip = true;
+}
+
+static void abk_bg_ra_tune_max_page_cb(void *data,
+\t\t\t\t       struct readahead_control *ractl,
+\t\t\t\t       unsigned long *max_page)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*max_page = min_t(unsigned long, *max_page,
+\t\t\t\t  ractl->ra->ra_pages >> 1);
+}
+
+static void abk_bg_ra_tune_readaround_cb(void *data, unsigned int ra_pages,
+\t\t\t\t\t pgoff_t pgoff, pgoff_t *start,
+\t\t\t\t\t unsigned int *size,
+\t\t\t\t\t unsigned int *async_size)
+{
+\tif (!abk_bg_ra_should_suppress_current())
+\t\treturn;
+\t*start = max_t(long, 0, pgoff - ra_pages / 4);
+\t*size = ra_pages / 2;
+\t*async_size = ra_pages / 8;
+}
+
+static int __init abk_bg_ra_tune_init(void)
+{
+\tregister_trace_android_vh_should_fault_around(
+\t\t\tabk_bg_ra_should_fault_around_cb, NULL);
+\tregister_trace_android_vh_do_async_mmap_readahead(
+\t\t\tabk_bg_ra_skip_async_mmap_readahead_cb, NULL);
+\tregister_trace_android_vh_ra_tuning_max_page(
+\t\t\tabk_bg_ra_tune_max_page_cb, NULL);
+\tregister_trace_android_vh_tune_mmap_readaround(
+\t\t\tabk_bg_ra_tune_readaround_cb, NULL);
+\treturn 0;
+}
+fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+"""
+
+
+def _bg_readahead_tune_apply(ctx):
+    try:
+        filemap = ctx.read("mm/filemap.c")
+        readahead = ctx.read("mm/readahead.c")
+        memory = ctx.read("mm/memory.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
+    # The handlers only ever fire if the tree actually calls the hooks; probe
+    # every call site the way customize_alloc_gfp_vh probes its own.  A
+    # declared-but-uncalled hook would register a policy that never runs.
+    texts = {"mm/filemap.c": filemap, "mm/readahead.c": readahead,
+             "mm/memory.c": memory}
+    for rel, needle in (
+            ("mm/filemap.c",
+             "trace_android_vh_do_async_mmap_readahead(vmf, page, &skip);"),
+            ("mm/filemap.c",
+             "trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,"),
+            ("mm/readahead.c",
+             "trace_android_vh_ra_tuning_max_page(ractl, &max_pages);"),
+            ("mm/memory.c",
+             "trace_android_vh_should_fault_around(vmf, &should_around);")):
+        if needle not in texts[rel]:
+            return "blocked_by_shape", (f"{rel} does not call "
+                                        f"{needle.split('(')[0]}; the policy "
+                                        "would be registered but never fire")
+    # The callback's register_trace_ symbol is a static inline of the hook
+    # header; an include drop upstream would turn the graft into a compile
+    # error no text audit notices (docs/group_recipe.md trap 5).
+    if "#include <trace/hooks/mm.h>" not in filemap:
+        return "blocked_by_shape", ("mm/filemap.c does not include "
+                                    "<trace/hooks/mm.h>; the payload's "
+                                    "register_trace_ could not compile")
+    status, _results, detail = apply_steps(ctx, [
+        ("mm/filemap.c", _BG_RA_ANCHOR, _BG_RA_PAYLOAD, T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "bg_readahead_tune",
+        "background readahead suppression transcribed from Xiaomi's iorap2 "
+        "launch-boost module (mi_lb_* family, driver v3.0.0) -- the "
+        "policy's always-on half: tasks in the \"background\" cpuset cgroup "
+        "past their launch burst (nvcsw > abk_bg_ra_nvcsw_min, default 99) "
+        "lose fault-around and async mmap readahead, get the "
+        "ondemand_readahead cap halved (ra_pages/2) and the mmap read-around "
+        "window shrunk (start pgoff-ra/4, size ra/2, async ra/8) through the "
+        "four ACK vendor hooks this tree already fires; runtime knobs at "
+        "/sys/module/filemap/parameters/abk_bg_ra_{suppress,nvcsw_min}. "
+        "The upstream per-UID exemption table and the collect/compile/preread "
+        "half stay out (userspace contract; Stage-2 candidate)",
+        [
+            "Xiaomi iorap2.ko mi_lb policy (research/ decompile: "
+            "sym.should_skip_fault_around, sym.mi_lb_skip_async_mmap_readahead, "
+            "sym.adjust_readahead, sym.adjust_readaround)",
+        ],
+        ["mm/filemap.c"],
+        _bg_readahead_tune_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()

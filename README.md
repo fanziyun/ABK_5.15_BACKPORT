@@ -92,6 +92,7 @@ set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_p
 - `/sys/module/page_alloc/parameters/abk_gfp_fastfail*` —— 高阶分配快速失败
 - `/sys/module/cpufreq_schedutil/parameters/abk_sf_*` / `abk_sc_*` —— 智能调频下限与上限
 - `/sys/module/readahead/parameters/dynamic_readahead` —— 动态预读
+- `/sys/module/filemap/parameters/abk_bg_ra_*` —— 后台预读抑制开关与年轻任务阈值
 - `zram.abk_comp_algo` / `zram.abk_lock_algo` / `zram.abk_recomp_algo` —— 算法锁
 - `vm.kcompressd` —— 卸载线程软上限
 
