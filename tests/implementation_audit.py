@@ -1141,6 +1141,46 @@ REQUIRED_CONTENT = {
         ["mm/filemap.c", "ractl->ra->ra_pages >> 1"],
         ["mm/filemap.c", "*start = max_t(long, 0, pgoff - ra_pages / 4);"],
     ],
+    "core:bg_launch_prefetch": [
+        "sailboat_bg_launch_prefetch",
+        # The three registrations are the behaviour: without them the table
+        # never collects and never replays.
+        ["mm/filemap.c", "register_trace_android_vh_filemap_read("],
+        ["mm/filemap.c", "register_trace_android_vh_filemap_map_pages("],
+        ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
+        # The collection key and its validation at replay time: records are
+        # scalars only (dev/ino/mtime/uid), so nothing can dangle.
+        ["mm/filemap.c", "r->mtime_sec == host->i_mtime.tv_sec"],
+        ["mm/filemap.c", "f->f_mapping->host->i_ino != ino"],
+        # The replay gate (young task) and the prefetch primitive.
+        ["mm/filemap.c",
+         "current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max)"],
+        ["mm/filemap.c", "page_cache_sync_readahead("],
+        # The pre-launch kick: reopen the recorded path on a workqueue and
+        # verify it before prefetching.
+        ["mm/filemap.c", "filp_open(path, O_RDONLY | O_LARGEFILE, 0)"],
+        ["mm/filemap.c", "schedule_work(&abk_lp_kick)"],
+        ["mm/filemap.c", "d_path(&file->f_path, rec->path, ABK_LP_PATH)"],
+        # Same-name module_param form (Batch 12's lesson) on the two knobs
+        # the device test toggles.
+        ["mm/filemap.c", "module_param(abk_lp_young_max, int, 0644);"],
+        ["mm/filemap.c", "module_param(abk_lp_replay_kb, int, 0644);"],
+        # At-fault replay is opt-in (default 0): from the fault/read hook
+        # contexts it hard-reset the vermeer SoC with no panic text -- the
+        # supported replay path is the pre-launch kick, and the pin guards
+        # the gate that keeps the hook-context readahead off by default.
+        ["mm/filemap.c", "module_param(abk_lp_fault_replay, int, 0644);"],
+        ["mm/filemap.c", "if (!READ_ONCE(abk_lp_fault_replay))"],
+        # The two set-with-side-effect knobs are module_param_call, not
+        # plain module_param (a plain param write could not open the
+        # window or schedule the kick).
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, "
+         "&param_get_int,"],
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_prefetch_uid, abk_lp_prefetch_uid_set, "
+         "&param_get_int,"],
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever

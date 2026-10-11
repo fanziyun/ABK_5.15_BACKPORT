@@ -769,6 +769,91 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+<a id="batch-51"></a>
+
+## Batch 51(iorap2 采集/预取内核侧重建 Stage 2,v0.54.0,core 72 → 73 组)
+
+主题:**把 `iorap2.ko` 的 collect/compile/preread 半边在内核态重建为
+`bg_launch_prefetch`,不移植 iorapd 握手协议本身**。上游的原型是
+`mi_lb_pagecache_collect`(经 `/dev/iorap` ioctl 由 iorapd 指挥:按 UID 开
+record session、喂 UID 表、读回记录)与 `mi_lb_ioctl`;本组把"指挥"换成
+module_param 写入口,把"读回记录"换成内核自己回放,采集与预读原语照搬:
+
+- **采集**:写 UID 到 `/sys/module/filemap/parameters/abk_lp_record_uid` 打开
+  一个 `abk_lp_record_ms`(默认 4000)的窗口;窗口内
+  `android_vh_filemap_read`(进程上下文,经 `d_path()` 记录路径)与
+  `android_vh_filemap_map_pages`(调用点在 `pte_unmap_unlock()` 之后,仅置位)
+  把该 UID 进程触碰的页记进按 `(dev, ino, mtime_sec, uid)` 键控的内联
+  4096 页位图。32 个静态槽(~23 KB bss,逐出 = 环形覆盖),**任何缺页路径上
+  零分配、记录里零内核指针——不可能 UAF**;mtime 变化即自然失效。
+- **回放(at-fault)**:应用下次启动时(年轻任务,`nvcsw < abk_lp_young_max`,
+  默认 99)触到已记录 inode,经 `android_vh_should_fault_around` 的第二
+  handler(以及 `filemap_read` handler)把位图区间用
+  `page_cache_sync_readahead()` 打回页缓存,每记录一个冷却期(2×record_ms)
+  限频,单轮预算 `abk_lp_replay_kb`(默认 2 MB)。此路径运行在应用自己的
+  fault 上下文,不需要任何应用本来就没有的权限。
+- **预取(pre-launch)**:写 UID 到 `abk_lp_prefetch_uid` 触发 workqueue,对
+  该 UID 每条含路径记录 `filp_open()` 后核验 inode 键一致再按
+  `abk_lp_kick_kb`(默认 16 MB)预读。**best-effort**:内核域(`u:r:kernel:s0`)
+  对 `/data` 路径可能被 SELinux 拒绝——被拒时静默跳过,不影响 at-fault 回放。
+
+**纪律与形态**:纯追加于 Stage 1 载荷尾部(`fs_initcall(abk_bg_ra_tune_init);`
++ `#endif` 作锚),不改 Stage 1 任何文本(trap 5);对
+`android_vh_should_fault_around` 注册的是**第二个** handler(tracepoint 多
+探针语义),同一个文件里两组互不编辑。`abk_lp_young_max` 是独立旋钮而非
+引用 Stage 1 的 `abk_bg_ra_nvcsw_min`——后者声明在 `#ifdef CONFIG_CPUSETS`
+内,跨门引用会踩 trap 7。调用点上下文逐一核验:`filemap_read` 的 hook 在
+`cond_resched()` 之前的进程上下文;`filemap_map_pages` 的 hook 在
+`pte_unmap_unlock()` 之后;`should_fault_around` 的 hook 在
+`mm/memory.c:do_read_fault()` 开头、无自旋锁。`implementation_audit.py` 新增
+`core:bg_launch_prefetch` 表项 15 条针脚(三次 register_trace_、mtime 键核验
+两处、回放门、`page_cache_sync_readahead`、`filp_open`/`schedule_work`/
+`d_path`、两处 module_param 同名行、两处 module_param_call)。
+
+**r3 真机硬复位与回放上下文重构**(关键事故记录):r3b 上"开记录窗口 +
+启动应用"在两次复现中**硬复位整机**——无 panic 文本、无 pstore、无 mtdoops,
+trace_pipe 流显示 8 个 CPU 全部停在普通 syscall 中途同时消失(SoC 级硬复位,
+非内核可打印故障)。活体二分定位:回放禁用(`abk_lp_young_max=0` 让年轻判定
+恒假)时**采集路径完全稳定**(一次启动记录 597 个文件、2473 页,系统无恙);
+崩溃只出现在"记录存在 + 回放开启"的启动序列,且死亡发生在 zygote fork 之前
+的 MIUI pre-spawn 阶段(`mcd`/`mkdir`/`sed`/`pre_starting` 等以应用 uid 运行的
+年轻 helper 读应用文件,恰好满足回放的全部触发条件)。根因未定位(硬复位无
+现场可查),**处置是上下文重构而非带病运行**:`page_cache_sync_readahead()`
+从 fault/read 钩子上下文发出的路径整体退到 `abk_lp_fault_replay` 旋钮之后
+(默认 0,代码与计数保留供后续取证),受支持的回放路径改为 pre-launch
+workqueue kick——`filp_open()` + 按位图区间预读在 kthreadd 上下文做,原语
+相同、无缺页路径约束。另将表容量 32 → 96 槽(一次真实启动触碰 597 个
+文件,32 槽在回放发生前就被环形逐出)。
+
+**r3c 真机验证结果**(r3c 已永久刷入 boot_a):采集阶段单次冷启动记录
+553-706 个文件、2526-3639 页;pre-launch kick 两次跨 app 验证
+(kicks=5→7,`filp_open` 成功并按位图预取 74→79 页),`abk_lp_fault_replay`
+默认 0 下三轮易失启动 + 5 轮 suspend/resume + 永久刷入后复验全部稳定。
+kick 命中率受三重限制:96 槽环形表(一次启动触碰 ~600 文件,先触的
+dex/apk 被逐出)、仅 read 路径采集的记录携带路径、内核域 SELinux 对
+`/data` 的 `filp_open` 授权。机制链(采集→键核验→预取→统计)全通,
+预取体量与端到端启动提速留待伴生模块接入后再测。
+
+**已知边界**(不隐瞒):① 位图只覆盖每文件前 16 MB(4096 页),大 APK 的更
+深偏移不进记录;② 路径截断到 160 B,超长路径的 pre-launch kick 会打开截断
+后的路径——`filp_open` 可能失败(跳过)或命中别的文件(多做无害预读);
+③ pre-launch kick 受 SELinux 支配,可能全程无效果(stats_kicks 只计
+`filp_open` 成功数);④ at-fault 回放发生在应用首触之后,前置程度不如
+iorapd 的"启动前 fadvise",收益口径是"把启动期串行缺页折叠成批量预读"。
+真机验证数字见下。
+
+**r3 构建抓到的编译错误**(值得留档):`abk_lp_prefetch_work()` 在
+`static int abk_lp_prefetch_uid = -1;` 声明之前就读了它——因为两个 set 回调
+与 `module_param_call` 行刻意排在文件尾,而 backing int 的声明原本跟在它们
+旁边。clang 对"先使用后声明"的恢复没有报 undeclared identifier,而是把该
+标识符对齐到同作用域里类型最接近的实体(`abk_lp_prefetch_work` 自身的
+函数类型),产出三条指向 `READ_ONCE` 宏内部的误导性错误
+(`invalid lvalue in asm input for constraint 'Q'` / `'volatile' qualifier
+on function type` / `incompatible pointer to integer`),grep 诊断一度被引向
+宏展开。修法是把两个 backing int 的声明上移到表定义旁、`module_param_call`
+留在原地(宏只需要变量在展开点之前可见)。与 AGENTS.md trap 6 同类:凡是新
+引入 C 的组,本地文本门禁证明不了符号时序,只有编译能。
+
 <a id="batch-50"></a>
 
 ## Batch 50(iorap2 后台预读抑制 Stage 1,v0.53.0,core 71 → 72 组)
@@ -827,6 +912,19 @@ Batch-12 教训)。**r1 易失启动的真机修正**:`core_param()` 会剥掉�
 4 个 register_trace_ 调用、cgroup/年龄判定原文、两个 module_param 行、
 4 个 handler 行为行(`*should_around = false` / `*skip = true` /
 `ractl->ra->ra_pages >> 1` / `start = max_t(long, 0, pgoff - ra_pages/4)`)。
+
+**r2 真机 A/B 结果**(vermeer,易失引导,`abk_bg_ra_suppress` 旋钮翻转,交替
+顺序 0/1/0/1 消除顺序效应,`drop_caches` 起测):后台 IO 体量(60 s 窗口,dd
+顺序读 + 无 libc 静态 arm64 稀疏 mmap 探针混合负载,`nvcsw_min=0` 使探针
+不豁免)——suppress=0 两轮 5.9/6.6 GB,suppress=1 两轮 4.2/4.0 GB,**后台
+IO 体量稳定下降 ~35%**;`nvcsw_min=99`(默认)时读数回到未抑制水平,年轻
+豁免门行为级确认。默认配置下 4 app × 5 轮冷启动中位数两侧相等(微信
+2957→2864 ms 等),启动不受抑制影响。8 轮 suspend/resume + 600 s 后台 IO
+soak 窗口内 dmesg 零告警(开机 ≤3.3 s 的 6 条 spmi/page_alloc WARNING 为
+vendor 探测期非确定噪声:仅差 param 注册方式的两个内核开机分别 0/6 条)。
+dd 顺序读路径单测(-4%/噪声级)符合机制预期:顺序读者的数据本身必然读,
+抑制只省读窗口过冲——只有稀疏 mmap 读才显著受益,这正是后台应用访问
+dex/so 的模式。完整记录见 `research/b50_b51_device_20261011/REPORT.md`。
 
 **已知差异与边界**(不隐瞒):① 无 UID 豁免意味着被采集优化的应用(Stage 2
 若落地)在后台也会被抑制——上游靠豁免表避免这一点,Stage 2 落地时需把豁免

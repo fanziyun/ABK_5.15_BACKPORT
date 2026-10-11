@@ -151,7 +151,10 @@ GROUP_COUNTS = {
     # handlers appended to mm/filemap.c).  No upstream commit names it and no
     # baseline carries the payload, so it lands on every tree -- but it is
     # vendor-derived policy, not an upstream graft, and is documented as such.
-    "stable_backport_core": 72,
+    # Batch 51 (Stage 2) adds bg_launch_prefetch: the collect/preread half of
+    # the same module rebuilt kernel-side, also vendor-derived and appended
+    # to the same file after the Stage-1 payload's tail.
+    "stable_backport_core": 73,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

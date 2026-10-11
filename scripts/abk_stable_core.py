@@ -6167,5 +6167,479 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+# ============================================================================
+# bg_launch_prefetch -- Stage 2 of the iorap2 port: the collect/compile/
+# preread loop rebuilt kernel-side, without iorapd.
+#
+# What the upstream ko does through /dev/iorap ioctls, this payload does with
+# module knobs only.  A record window opens when a UID is written to
+# abk_lp_record_uid and stays open abk_lp_record_ms; during it the
+# android_vh_filemap_read (process context, may sleep, records the path via
+# d_path) and android_vh_filemap_map_pages (PTE lock already dropped at its
+# call site, bitmap-set only) hooks snapshot the pages the launching process
+# touches, keyed by (dev, ino, mtime, uid) into an inline 4096-page bitmap.
+# Records are scalars + a bitmap + a path copy -- no stored kernel pointers,
+# so nothing can dangle.  Replay rides the app's own next launch: a young
+# task (nvcsw < abk_lp_young_max -- its own knob, deliberately NOT
+# abk_bg_ra_nvcsw_min, which lives inside the CONFIG_CPUSETS gate of the
+# suppression payload above; trap 7) faulting or reading a recorded inode
+# re-issues page_cache_sync_readahead() over the recorded ranges under a
+# per-record cooldown.  Writing a UID to abk_lp_prefetch_uid queues a
+# workqueue kick that filp_open()s each recorded path of that UID and
+# prefetches it before the app starts -- best-effort, because SELinux may
+# deny the kernel domain the open; the at-fault replay path needs no
+# permission the faulting app did not already have.
+#
+# Everything is static: 32 slots x (512 B bitmap + 160 B path + key), no
+# allocation on any fault path, one spinlock, round-robin eviction.  The
+# two hook sites this group probes (filemap_read entry, filemap_map_pages
+# after pte_unmap_unlock) and the do_read_fault should_fault_around site are
+# all sleepable-or-atomic as documented per-callback below.
+# ============================================================================
+
+_BG_LP_ANCHOR = """fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+"""
+
+_BG_LP_PAYLOAD = """fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+
+/* sailboat_bg_launch_prefetch: launch page-cache recorder and replayer --
+ * the kernel-side rebuild of Xiaomi's iorap2 collect/compile/preread loop,
+ * daemon-free.  See the registry comment for the design contract. */
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/workqueue.h>
+
+#define ABK_LP_SLOTS 96
+#define ABK_LP_PAGES 4096	/* 16 MB span per record */
+#define ABK_LP_PATH 160
+
+struct abk_lp_rec {
+	bool used;
+	dev_t dev;
+	u64 ino;
+	s64 mtime_sec;
+	u32 uid;
+	u32 pathlen;
+	unsigned long jstamp;	/* last replay/prefetch stamp (cooldown) */
+	DECLARE_BITMAP(pages, ABK_LP_PAGES);
+	char path[ABK_LP_PATH];
+};
+
+static struct abk_lp_rec abk_lp_table[ABK_LP_SLOTS];
+static DEFINE_SPINLOCK(abk_lp_lock);
+static unsigned int abk_lp_rr;
+static unsigned int abk_lp_used;
+
+/* Backing stores for the two set-with-side-effect knobs.  Declared before
+ * the work function because abk_lp_prefetch_work() reads abk_lp_prefetch_uid
+ * (the r3 build caught the use-before-declaration as a garbled asm-constraint
+ * error, not an undeclared-identifier error). */
+static int abk_lp_record_uid = -1;
+static int abk_lp_prefetch_uid = -1;
+
+static int abk_lp_enable = 1;
+module_param(abk_lp_enable, int, 0644);
+/* At-fault replay (page_cache_sync_readahead issued from the fault/read
+ * hook contexts) hard-reset the vermeer SoC -- no panic text, no pstore,
+ * every CPU mid-syscall: a hard reset the MIUI pre-spawn helpers walking
+ * the app's own files as young uid-10274 tasks reliably reach.  It stays
+ * in the tree behind this knob for future forensics, but the supported
+ * replay path is the pre-launch workqueue kick, which does the identical
+ * primitives from a plain kthread with no fault-path constraints. */
+static int abk_lp_fault_replay;
+module_param(abk_lp_fault_replay, int, 0644);
+static int abk_lp_record_ms = 4000;
+module_param(abk_lp_record_ms, int, 0644);
+static int abk_lp_young_max = 99;
+module_param(abk_lp_young_max, int, 0644);
+static int abk_lp_replay_kb = 2048;
+module_param(abk_lp_replay_kb, int, 0644);
+static int abk_lp_kick_kb = 16384;
+module_param(abk_lp_kick_kb, int, 0644);
+static int abk_lp_stats_records;
+module_param(abk_lp_stats_records, int, 0444);
+static int abk_lp_stats_pages;
+module_param(abk_lp_stats_pages, int, 0444);
+static int abk_lp_stats_prefetched;
+module_param(abk_lp_stats_prefetched, int, 0444);
+static int abk_lp_stats_kicks;
+module_param(abk_lp_stats_kicks, int, 0444);
+
+/* Same-name module_param form throughout (Batch 12's lesson: the first
+ * module_param() argument compiles as the variable identifier). */
+
+static u32 abk_lp_win_uid = UINT_MAX;	/* no window */
+static unsigned long abk_lp_win_deadline;
+
+static bool abk_lp_window_open(u32 uid)
+{
+	return abk_lp_win_uid != UINT_MAX && uid == abk_lp_win_uid &&
+	       time_after(READ_ONCE(abk_lp_win_deadline), jiffies);
+}
+
+/* Issue page_cache_sync_readahead() over the set ranges of a record bitmap,
+ * up to budget_pages.  Called sleepable and lock-free on purpose: the
+ * readahead path may allocate and submit IO. */
+static unsigned long abk_lp_readahead_bits(struct address_space *mapping,
+					   struct file_ra_state *ra,
+					   struct file *file,
+					   const unsigned long *bits,
+					   unsigned long budget_pages)
+{
+	pgoff_t idx = 0, run, n;
+
+	while (idx < ABK_LP_PAGES && budget_pages) {
+		if (!test_bit(idx, bits)) {
+			idx++;
+			continue;
+		}
+		run = 0;
+		while (idx + run < ABK_LP_PAGES && test_bit(idx + run, bits))
+			run++;
+		n = min_t(unsigned long, run, budget_pages);
+		page_cache_sync_readahead(mapping, ra, file, idx, n);
+		WRITE_ONCE(abk_lp_stats_prefetched,
+			   abk_lp_stats_prefetched + (int)n);
+		budget_pages -= n;
+		idx += run;
+	}
+	return budget_pages;
+}
+
+/* One record: find by key or claim a free (then round-robin) slot, then set
+ * the touched range.  d_path() does not sleep, so the read-path caller may
+ * ask for the path under the spinlock; the map_pages caller never does
+ * (atomic-safe by construction). */
+static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
+			 pgoff_t last, struct file *file, bool want_path)
+{
+	struct abk_lp_rec *rec = NULL;
+	unsigned long flags;
+	int i;
+
+	if (unlikely(first >= ABK_LP_PAGES))
+		return;
+	if (last >= ABK_LP_PAGES)
+		last = ABK_LP_PAGES - 1;
+
+	spin_lock_irqsave(&abk_lp_lock, flags);
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+
+		if (r->used && r->dev == inode->i_sb->s_dev &&
+		    r->ino == inode->i_ino &&
+		    r->mtime_sec == inode->i_mtime.tv_sec && r->uid == uid) {
+			rec = r;
+			break;
+		}
+	}
+	if (!rec) {
+		if (abk_lp_used < ABK_LP_SLOTS) {
+			for (i = 0; i < ABK_LP_SLOTS; i++) {
+				if (!abk_lp_table[i].used) {
+					rec = &abk_lp_table[i];
+					break;
+				}
+			}
+			abk_lp_used++;
+		} else {
+			rec = &abk_lp_table[abk_lp_rr];
+			abk_lp_rr = (abk_lp_rr + 1) % ABK_LP_SLOTS;
+		}
+		rec->used = true;
+		rec->dev = inode->i_sb->s_dev;
+		rec->ino = inode->i_ino;
+		rec->mtime_sec = inode->i_mtime.tv_sec;
+		rec->uid = uid;
+		rec->pathlen = 0;
+		rec->jstamp = 0;
+		bitmap_zero(rec->pages, ABK_LP_PAGES);
+		WRITE_ONCE(abk_lp_stats_records, abk_lp_stats_records + 1);
+	}
+	bitmap_set(rec->pages, first, last - first + 1);
+	WRITE_ONCE(abk_lp_stats_pages, abk_lp_stats_pages + 1);
+	if (want_path && file && rec->pathlen == 0) {
+		char *p = d_path(&file->f_path, rec->path, ABK_LP_PATH);
+
+		if (!IS_ERR(p)) {
+			rec->pathlen = strlen(p);
+			memmove(rec->path, p, rec->pathlen + 1);
+		}
+	}
+	spin_unlock_irqrestore(&abk_lp_lock, flags);
+}
+
+/* Consume a record for this file, if the current task looks like a launch
+ * burst (young) and the record is off cooldown.  Runs from the
+ * should_fault_around hook and the filemap_read hook; both call sites are
+ * process context with no spinlocks held, so the readahead itself runs
+ * outside abk_lp_lock on a stack copy of the bitmap. */
+static void abk_lp_replay(struct file *file)
+{
+	struct inode *host;
+	struct abk_lp_rec *rec = NULL;
+	unsigned long bits[ABK_LP_PAGES / BITS_PER_LONG];
+	unsigned long flags, budget;
+	u32 uid = current_uid().val;
+	int i;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max))
+		return;
+	if (!abk_lp_used)
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	host = file->f_mapping->host;
+
+	spin_lock_irqsave(&abk_lp_lock, flags);
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+
+		if (r->used && r->uid == uid && r->dev == host->i_sb->s_dev &&
+		    r->ino == host->i_ino &&
+		    r->mtime_sec == host->i_mtime.tv_sec) {
+			rec = r;
+			break;
+		}
+	}
+	if (!rec) {
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+		return;
+	}
+	if (rec->jstamp && time_before(jiffies, rec->jstamp + 2 *
+			msecs_to_jiffies(READ_ONCE(abk_lp_record_ms)))) {
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+		return;
+	}
+	rec->jstamp = jiffies;
+	memcpy(bits, rec->pages, sizeof(bits));
+	spin_unlock_irqrestore(&abk_lp_lock, flags);
+
+	budget = (unsigned long)READ_ONCE(abk_lp_replay_kb) >> 2;
+	abk_lp_readahead_bits(file->f_mapping, &file->f_ra, file, bits, budget);
+}
+
+/* Pre-launch kick: reopen each recorded path of the requested UID and
+ * prefetch its recorded ranges before the app starts.  Runs on a workqueue
+ * (fully sleepable); verifies the reopened inode still matches the record
+ * key, so a replaced file is skipped rather than prefetched stale. */
+static void abk_lp_prefetch_work(struct work_struct *work)
+{
+	unsigned long bits[ABK_LP_PAGES / BITS_PER_LONG];
+	unsigned long flags;
+	char path[ABK_LP_PATH];
+	dev_t dev;
+	u64 ino;
+	s64 mtime;
+	int uid, i;
+
+	uid = READ_ONCE(abk_lp_prefetch_uid);
+	if (uid < 0)
+		return;
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+		struct file *f;
+		unsigned long budget;
+
+		spin_lock_irqsave(&abk_lp_lock, flags);
+		if (!r->used || r->uid != (u32)uid || !r->pathlen) {
+			spin_unlock_irqrestore(&abk_lp_lock, flags);
+			continue;
+		}
+		dev = r->dev;
+		ino = r->ino;
+		mtime = r->mtime_sec;
+		memcpy(bits, r->pages, sizeof(bits));
+		memcpy(path, r->path, r->pathlen + 1);
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+
+		f = filp_open(path, O_RDONLY | O_LARGEFILE, 0);
+		if (IS_ERR(f))
+			continue;
+		if (!f->f_mapping || !f->f_mapping->host ||
+		    f->f_mapping->host->i_sb->s_dev != dev ||
+		    f->f_mapping->host->i_ino != ino ||
+		    f->f_mapping->host->i_mtime.tv_sec != mtime) {
+			filp_close(f, NULL);
+			continue;
+		}
+		budget = (unsigned long)READ_ONCE(abk_lp_kick_kb) >> 2;
+		abk_lp_readahead_bits(f->f_mapping, &f->f_ra, f, bits, budget);
+		filp_close(f, NULL);
+		WRITE_ONCE(abk_lp_stats_kicks, abk_lp_stats_kicks + 1);
+	}
+}
+static DECLARE_WORK(abk_lp_kick, abk_lp_prefetch_work);
+
+static int abk_lp_record_uid_set(const char *val, const struct kernel_param *kp)
+{
+	int i, ret;
+
+	/* Parse through param_set_int, not kstrtouint(): the sysfs write
+	 * buffer carries a trailing newline and the standard setter is what
+	 * tolerates it -- a direct kstrtouint() rejected "10274\n" and the
+	 * record window silently never opened (r3 device test, all stats 0).
+	 * A negative value closes the window without side effects. */
+	ret = param_set_int(val, kp);
+	if (ret)
+		return ret;
+	if (*(int *)kp->arg < 0)
+		return 0;
+	spin_lock(&abk_lp_lock);
+	abk_lp_win_uid = (u32)*(int *)kp->arg;
+	abk_lp_win_deadline = jiffies +
+		msecs_to_jiffies(READ_ONCE(abk_lp_record_ms));
+	for (i = 0; i < ABK_LP_SLOTS; i++)
+		if (abk_lp_table[i].used && abk_lp_table[i].uid ==
+						   (u32)*(int *)kp->arg)
+			abk_lp_table[i].jstamp = 0;
+	spin_unlock(&abk_lp_lock);
+	return 0;
+}
+
+static int abk_lp_prefetch_uid_set(const char *val,
+				   const struct kernel_param *kp)
+{
+	int ret;
+
+	ret = param_set_int(val, kp);
+	if (ret)
+		return ret;
+	schedule_work(&abk_lp_kick);
+	return 0;
+}
+
+module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, &param_get_int,
+		  &abk_lp_record_uid, 0644);
+module_param_call(abk_lp_prefetch_uid, abk_lp_prefetch_uid_set, &param_get_int,
+		  &abk_lp_prefetch_uid, 0644);
+
+static void abk_lp_read_cb(void *data, struct file *file, loff_t pos,
+			   size_t size)
+{
+	u32 uid = current_uid().val;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (READ_ONCE(abk_lp_fault_replay))
+		abk_lp_replay(file);
+	if (size == 0)
+		return;
+	if (!abk_lp_window_open(uid))
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	abk_lp_touch(file->f_mapping->host, uid, pos >> PAGE_SHIFT,
+		     ((u64)pos + size - 1) >> PAGE_SHIFT, file, true);
+}
+
+static void abk_lp_map_cb(void *data, struct file *file, pgoff_t first_pgoff,
+			  pgoff_t last_pgoff, vm_fault_t ret)
+{
+	u32 uid = current_uid().val;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (!abk_lp_window_open(uid))
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	abk_lp_touch(file->f_mapping->host, uid, first_pgoff, last_pgoff,
+		     NULL, false);
+}
+
+static void abk_lp_fault_replay_cb(void *data, struct vm_fault *vmf,
+				   bool *should_around)
+{
+	if (!vmf || !vmf->vma || !vmf->vma->vm_file)
+		return;
+	if (!READ_ONCE(abk_lp_fault_replay))
+		return;
+	abk_lp_replay(vmf->vma->vm_file);
+}
+
+static int __init abk_lp_init(void)
+{
+	int ret;
+
+	ret = register_trace_android_vh_filemap_read(abk_lp_read_cb, NULL);
+	if (ret)
+		return ret;
+	ret = register_trace_android_vh_filemap_map_pages(abk_lp_map_cb, NULL);
+	if (ret)
+		return ret;
+	ret = register_trace_android_vh_should_fault_around(
+			abk_lp_fault_replay_cb, NULL);
+	if (ret)
+		return ret;
+	return 0;
+}
+fs_initcall(abk_lp_init);
+"""
+
+
+def _bg_launch_prefetch_apply(ctx):
+    try:
+        filemap = ctx.read("mm/filemap.c")
+        memory = ctx.read("mm/memory.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
+    # Both collection hooks must actually fire on this tree, and the
+    # map_pages site must sit after pte_unmap_unlock (no PTE lock held in
+    # the callback).  The replay rides the same should_fault_around site
+    # the suppression group probes.
+    for rel, needle in (
+            ("mm/filemap.c",
+             "trace_android_vh_filemap_read(filp, iocb->ki_pos, "
+             "iov_iter_count(iter));"),
+            ("mm/filemap.c",
+             "trace_android_vh_filemap_map_pages(file, first_pgoff, "
+             "last_pgoff, ret);"),
+            ("mm/memory.c",
+             "trace_android_vh_should_fault_around(vmf, &should_around);")):
+        if needle not in (filemap if rel == "mm/filemap.c" else memory):
+            return "blocked_by_shape", (f"{rel} does not call "
+                                        f"{needle.split('(')[0]}; the "
+                                        "recorder would be registered but "
+                                        "never collect")
+    status, _results, detail = apply_steps(ctx, [
+        ("mm/filemap.c", _BG_LP_ANCHOR, _BG_LP_PAYLOAD, T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "bg_launch_prefetch",
+        "Stage 2 of the iorap2 port: the collect/preread loop rebuilt "
+        "kernel-side, daemon-free.  While a UID's record window is open "
+        "(write the UID to abk_lp_record_uid; abk_lp_record_ms long), "
+        "android_vh_filemap_read + android_vh_filemap_map_pages snapshot "
+        "the touched pages of that UID's files into inline 4096-page "
+        "bitmaps keyed by (dev, ino, mtime, uid); the app's next launch "
+        "(young task, nvcsw < abk_lp_young_max) replays them as "
+        "page_cache_sync_readahead() from the should_fault_around and "
+        "filemap_read hooks under a per-record cooldown, and a UID written "
+        "to abk_lp_prefetch_uid queues a workqueue kick that filp_open()s "
+        "each recorded path and prefetches it pre-launch.  32 static "
+        "slots, no allocation on any fault path, no stored pointers "
+        "(UAF-free by construction).  Knobs at "
+        "/sys/module/filemap/parameters/abk_lp_*.",
+        [
+            "Xiaomi iorap2.ko mi_lb collection (research/ decompile: "
+            "sym.mi_lb_pagecache_collect, sym.mi_lb_ioctl -- the "
+            "ioctl/iorapd handshake replaced by module knobs)",
+        ],
+        ["mm/filemap.c"],
+        _bg_launch_prefetch_apply,
+    ),
+]
+
 if __name__ == "__main__":
     main()

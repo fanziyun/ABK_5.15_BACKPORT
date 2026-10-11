@@ -93,6 +93,8 @@ set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_p
 - `/sys/module/cpufreq_schedutil/parameters/abk_sf_*` / `abk_sc_*` —— 智能调频下限与上限
 - `/sys/module/readahead/parameters/dynamic_readahead` —— 动态预读
 - `/sys/module/filemap/parameters/abk_bg_ra_*` —— 后台预读抑制开关与年轻任务阈值
+- `/sys/module/filemap/parameters/abk_lp_*` —— 启动页缓存记录/回放（写 UID 到
+  `abk_lp_record_uid` 开采集窗口，写 UID 到 `abk_lp_prefetch_uid` 触发预启动预取）
 - `zram.abk_comp_algo` / `zram.abk_lock_algo` / `zram.abk_recomp_algo` —— 算法锁
 - `vm.kcompressd` —— 卸载线程软上限
 
