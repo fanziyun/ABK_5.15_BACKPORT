@@ -984,6 +984,28 @@ REQUIRED_CONTENT = {
          "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n"],
         ["fs/erofs/zdata.c", "cur < i_size_read(inode)"],
     ],
+    "core:smaps_migration_guard": [
+        # Batch 70: the field-panic guard (swapops.h:267 BUG_ON via
+        # smaps_rollup).  The helper must be present with its marker, and all
+        # five callers must route migration entries through it -- a tree that
+        # added the helper but left a caller on the direct call still panics
+        # on that path, so the guard is pinned per caller, not file-wide.
+        ["fs/proc/task_mmu.c", "sailboat_smaps_migration_guard"],
+        ["fs/proc/task_mmu.c", "static struct page *abk_smaps_migration_page("],
+        ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(swpent);"],
+        ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(entry);"],
+    ],
+    "core:kcompressd_writeback_pin": [
+        # Batch 71: the swap-slot writeback pin (device A/B verify_swap).
+        # The deferred swap-out must keep the page under PG_writeback across the
+        # FIFO: set_page_writeback at enqueue, end_page_writeback once the drain
+        # holds the lock, and end it again on the drain's !PageSwapCache drop
+        # path.  The marker is the only file-wide load-bearing needle: bare
+        # set_page_writeback(page);/end_page_writeback(page); already exist in a
+        # pristine tree (__swap_writepage/end_swap_bio_write and Batch 41's
+        # body), so they are pinned per-function in REQUIRED_IN_FUNCTION instead.
+        ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
+    ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",
         "abk_kcompressd_store",
@@ -1147,6 +1169,13 @@ REQUIRED_ABSENT = {
         # is already the safe action; a WARN_ON_ONCE() there would be an oops,
         # and a device booted with panic_on_oops/panic_on_warn turns an oops
         # into a panic -- strictly worse than the condition being guarded.
+        "WARN_ON_ONCE",
+        "WARN_ON(",
+        "WARN(",
+    ],
+    "core:kcompressd_writeback_pin": [
+        # The writeback-pin edits add no WARN-family check (the surrounding
+        # Batch 41 body uses pr_warn_once); keep the drain WARN-free.
         "WARN_ON_ONCE",
         "WARN_ON(",
         "WARN(",
@@ -2293,6 +2322,67 @@ REQUIRED_IN_FUNCTION = {
           "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);",
           "SetPageWorkingset(page);"],
          ["\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);\n\n"]),
+    ],
+    # --- Batch 71 -------------------------------------------------------
+    # kcompressd_writeback_pin.  The deferred swap-out must keep the page
+    # under PG_writeback across the FIFO.  enqueue side (swap_writepage): the
+    # offload branch sets writeback immediately before unlock + return 0.  drain
+    # side (abk_kcompressd_do_swapout): it locks the page then ends writeback
+    # before the write body, AND ends writeback on the !PageSwapCache drop path
+    # (which returns above the drain's own end).  Pinned per owning function and
+    # by load-bearing sequence (bare set_page_writeback/end_page_writeback
+    # pre-exist in a pristine tree) so a hunk elsewhere cannot satisfy the pins;
+    # the old trylock-skip must be gone.
+    "core:kcompressd_writeback_pin": [
+        ("mm/page_io.c", "swap_writepage",
+         ["sailboat_kcompressd_wb_pin",
+          "\t\tset_page_writeback(page);\n"
+          "\t\tunlock_page(page);\n"
+          "\t\treturn 0;\n"],
+         ["if (!trylock_page(page)) {"]),
+        ("mm/page_io.c", "abk_kcompressd_do_swapout",
+         ["sailboat_kcompressd_wb_pin",
+          "\tlock_page(page);\n",
+          "end_page_writeback(page);",
+          "end_page_writeback(page);\n\t\tput_page(page);"],
+         ["if (!trylock_page(page)) {",
+          "kcompressd: skipping a locked page"]),
+    ],
+    # --- Batch 70 -------------------------------------------------------
+    # smaps_migration_guard.  The helper is pinned in its own definition
+    # (PageLocked + re-validation + marker); each guarded caller is pinned
+    # in the function that owns it, so a hunk landing in a neighbour cannot
+    # satisfy the pin.  The unguarded direct calls that remain are the
+    # device-private / device-exclusive cases, whose contract is not
+    # PageLocked -- they must stay direct, so they are not forbidden.
+    "core:smaps_migration_guard": [
+        # The marker is pinned by REQUIRED_CONTENT above, not here: it
+        # rides in the comment *above* the helper, and function_body() only
+        # returns the body.  What has to live inside the body is the contract
+        # itself.
+        ("fs/proc/task_mmu.c", "abk_smaps_migration_page",
+         ["if (!PageLocked(p))",
+          "if (!is_migration_entry(entry))",
+          "p = pfn_to_page(swp_offset(entry));"],
+         ["pfn_swap_entry_to_page"]),
+        ("fs/proc/task_mmu.c", "smaps_pte_entry",
+         ["page = abk_smaps_migration_page(swpent);"],
+         []),
+        ("fs/proc/task_mmu.c", "smaps_pmd_entry",
+         ["page = abk_smaps_migration_page(entry);"],
+         []),
+        ("fs/proc/task_mmu.c", "smaps_hugetlb_range",
+         ["page = abk_smaps_migration_page(swpent);"],
+         []),
+        # The pagemap PTE path is pte_to_pagemap_entry(), this file's
+        # per-entry helper -- there is no pagemap_pte_range() in task_mmu.c,
+        # and function_body() would report the pin as an unfound function.
+        ("fs/proc/task_mmu.c", "pte_to_pagemap_entry",
+         ["page = abk_smaps_migration_page(entry);"],
+         []),
+        ("fs/proc/task_mmu.c", "pagemap_pmd_range",
+         ["page = abk_smaps_migration_page(entry);"],
+         []),
     ],
 }
 

@@ -207,7 +207,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override. Re-asserted on a timer, because this ROM's init writes the node back to 0 from its `SmartCacheEnable` trigger after post-fs-data |
+| `lru_gen.enable` | `0` | `1` turns MGLRU on. Default `0`: MGLRU is off because this module's reclaim-loop rewrite wedges SM8550 vermeer under sustained thrash and SIGSEGVs a third-party app on launch (see the note below). `abk_apply_lru_gen()` only ever writes on `1`, so `0` means "do not re-assert MGLRU on", not a forced-off override. Opt in by building with `ABK_515_DEFCONFIG_ALIGN=1` and setting this to `1` |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `vm.reassert_interval_sec` | `60` | seconds between lru_gen re-asserts (min 5); a repair is logged, a quiet tick writes nothing |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
@@ -224,11 +224,15 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
 **Measure before you enable the opt-in knobs.** `thp` and `swappiness` change
-global reclaim behaviour. `lru_gen` is no longer opt-in: since Batch 38 the
-kernel ships MGLRU enabled (`CONFIG_LRU_GEN_ENABLED=y` in the module tier) and
-this companion re-asserts it, so `lru_gen.enable` is a consistency knob, not a
-switch. That also means Batch 37's six MGLRU performance groups run for the
-first time on a build from this module — no device-side A/B exists yet.
+global reclaim behaviour. `lru_gen` (MGLRU) is **off by default**: on SM8550
+vermeer this module's MGLRU reclaim-loop rewrite does not converge under
+sustained memory thrash — two `kworker/*:*H` pin at 100% kernel CPU in
+`lru_gen_shrink_lruvec`, lmkd starves, the QCOM watchdog cold-resets the
+device, and a third-party app SIGSEGVs on launch. The identical load with
+MGLRU off rode out. So `LRU_GEN_ENABLED` is in the opt-in align tier
+(`ABK_515_DEFCONFIG_ALIGN=1`), the companion no longer re-asserts MGLRU on
+(`lru_gen.enable=0`), and Batch 37/49's MGLRU groups stay compiled-in but
+runtime-inert until the shrink loop is made to converge (a dedicated PR).
 
 **The cpufreq/scheduler half moved to sailboat addon 2.**  The `abk_sf_*`
 floor, the `abk_sc_*` cap, the governor held on `schedutil`, the DVFS ownership

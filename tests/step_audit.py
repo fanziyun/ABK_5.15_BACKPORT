@@ -195,6 +195,10 @@ AUDIT_FILES = [
     # file, so its comment/brace/#ifdef balance has to be auditable and its
     # anchors have to be checkable for the already_present traps.
     "mm/page_io.c",
+    # Batch 70: smaps_migration_guard -- the module's first fs/proc group.
+    # The helper plus five caller guards all live here; without the file the
+    # group degrades to blocked_by_shape in audit only.
+    "fs/proc/task_mmu.c",
 ]
 
 CHILD_MODULES = [
