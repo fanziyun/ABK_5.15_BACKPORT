@@ -7084,8 +7084,8 @@ def test_batch70_smaps_migration_guard():
         check("the probe requires the marker, not just the helper",
               b70.HELPER_MARKER in text and b70.HELPER_MARKER not in markerless,
               b70.HELPER_MARKER)
-        with tempfile.TemporaryDirectory() as tmp:
-            ctx_m = make_ctx(tmp + "-m", {b70.TASK_MMU: markerless})
+        with tempfile.TemporaryDirectory() as tmp_m:
+            ctx_m = make_ctx(tmp_m, {b70.TASK_MMU: markerless})
             status_m, detail_m = b70._smaps_migration_guard_apply(ctx_m)
             check("a tree whose marker is gone is refused, not skipped",
                   status_m == "blocked_by_shape", (status_m, detail_m))
@@ -7111,12 +7111,13 @@ def test_batch70_smaps_migration_guard():
         # the tree's own), so the only expectation here is "no WARN at all".
         check("no WARN in the guarded code", warns == [], warns)
 
-        ctx2 = make_ctx(tmp + "-b", {b70.TASK_MMU: text})
-        status2, detail2 = b70._smaps_migration_guard_apply(ctx2)
-        check("second pass is already_present",
-              status2 == "already_present", (status2, detail2))
-        check("second pass is byte-identical",
-              ctx2.read(b70.TASK_MMU) == text)
+        with tempfile.TemporaryDirectory() as tmp2:
+            ctx2 = make_ctx(tmp2, {b70.TASK_MMU: text})
+            status2, detail2 = b70._smaps_migration_guard_apply(ctx2)
+            check("second pass is already_present",
+                  status2 == "already_present", (status2, detail2))
+            check("second pass is byte-identical",
+                  ctx2.read(b70.TASK_MMU) == text)
 
     # An unknown shape must stop the group rather than half-patch the file.
     with tempfile.TemporaryDirectory() as tmp:
@@ -7273,9 +7274,9 @@ def test_batch71_kcompressd_wb_pin():
                keys.index("kcompressd_writeback_pin") + 1])
 
     steps = b71.build_steps()
-    check("two required steps, both in mm/page_io.c",
+    check("three required steps, all in mm/page_io.c",
           [(rel, req) for rel, _o, _n, req in steps]
-          == [(b71.PAGE_IO, True), (b71.PAGE_IO, True)],
+          == [(b71.PAGE_IO, True), (b71.PAGE_IO, True), (b71.PAGE_IO, True)],
           [(rel, req) for rel, _o, _n, req in steps])
     for i, (_rel, old, new, _req) in enumerate(steps):
         check(f"step {i}'s replacement does not start with its own anchor (trap 1)",
@@ -7351,22 +7352,35 @@ def test_batch71_kcompressd_wb_pin():
 
             do_swapout = text[text.index("static void abk_kcompressd_do_swapout("):
                               text.index("static bool abk_kcompressd_enqueue(")]
-            # Drain side: lock_page then end_page_writeback, before the body.
-            check(f"{label} shape: the drain still takes the page lock",
+            # Drain side: lock_page (Batch 41) then end_page_writeback (Batch 71),
+            # before the body.  The drain's end is the one followed by the blank
+            # line + body (`end_page_writeback(page);\n\n`), distinct from the
+            # drop-path end below (which is followed by put_page), so these
+            # checks cannot be satisfied by the wrong occurrence.
+            check(f"{label} shape: the drain takes the page lock",
                   "\tlock_page(page);\n" in do_swapout)
             check(f"{label} shape: the drain ends the writeback it inherited",
-                  "\tend_page_writeback(page);\n" in do_swapout)
-            check(f"{label} shape: lock precedes end_page_writeback precedes body",
-                  do_swapout.index("\tlock_page(page);\n")
-                  < do_swapout.index("\tend_page_writeback(page);\n")
+                  "end_page_writeback(page);\n\n" in do_swapout)
+            drain_end = do_swapout.index("end_page_writeback(page);\n\n")
+            check(f"{label} shape: lock precedes the drain end precedes body",
+                  do_swapout.index("\tlock_page(page);\n") < drain_end
                   < do_swapout.index("frontswap_store(page)"))
+            # Drop path (!PageSwapCache early return): it must also end the
+            # writeback the enqueue set, before put_page -- else the dropped
+            # page is stuck under PG_writeback forever.  This end sits BEFORE
+            # lock_page, since the guard returns above the drain's own end.
+            check(f"{label} shape: the drop path ends writeback before put_page",
+                  "end_page_writeback(page);\n\t\tput_page(page);" in do_swapout)
+            check(f"{label} shape: the drop-path end precedes the drain lock",
+                  do_swapout.index("end_page_writeback(page);\n\t\tput_page(page);")
+                  < do_swapout.index("\tlock_page(page);\n"))
             # The superseded trylock-skip must be gone.
             check(f"{label} shape: no trylock-skip remains",
                   "if (!trylock_page(page)) {" not in text
                   and "skipping a locked page" not in text, "trylock remnants")
-            # The marker rides in both edits.
-            check(f"{label} shape: the marker is on both edits",
-                  text.count("sailboat_kcompressd_wb_pin") == 2,
+            # The marker rides in all three edits (enqueue, drain, drop path).
+            check(f"{label} shape: the marker is on all three edits",
+                  text.count("sailboat_kcompressd_wb_pin") == 3,
                   text.count("sailboat_kcompressd_wb_pin"))
             # No WARN-family added by the pin.
             code_lines = [ln for ln in do_swapout.split("\n")

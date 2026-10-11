@@ -820,16 +820,23 @@ grep -q "static struct page \*abk_smaps_migration_page(" "$TASK_MMU" \
 # Batch 71: kcompressd_writeback_pin rewrites Batch 41's generated text so the
 # deferred swap-out keeps the page under PG_writeback across the FIFO:
 # set_page_writeback at enqueue, end_page_writeback once the drain holds the
-# lock.  Both edits carry the sailboat_kcompressd_wb_pin marker.  The superseded
-# trylock-skip must be gone.
+# lock, and end_page_writeback again on the drain's !PageSwapCache drop path
+# (which returns above the drain's own end).  All three edits carry the
+# sailboat_kcompressd_wb_pin marker.  Bare set_page_writeback/end_page_writeback
+# already exist in a pristine tree (__swap_writepage/end_swap_bio_write and
+# Batch 41's body), so the load-bearing checks are the marker count and the
+# edit-specific sequences, not a bare presence grep.  The superseded trylock-skip
+# must be gone.
 grep -q "sailboat_kcompressd_wb_pin" "$PAGE_IO" \
   || fail "the kcompressd writeback pin is missing"
-grep -q "set_page_writeback(page);" "$PAGE_IO" \
-  || fail "the enqueue writeback set is missing"
-grep -q "end_page_writeback(page);" "$PAGE_IO" \
-  || fail "the drain writeback end is missing"
-[ "$(grep -c "sailboat_kcompressd_wb_pin" "$PAGE_IO")" = "2" ] \
-  || fail "the writeback pin marker is not on both the enqueue and drain edits"
+[ "$(grep -c "sailboat_kcompressd_wb_pin" "$PAGE_IO")" = "3" ] \
+  || fail "the writeback pin marker is not on all three edits (enqueue, drain, drop)"
+# Enqueue edit: set_page_writeback immediately followed by unlock + return 0.
+grep -A2 "set_page_writeback(page);" "$PAGE_IO" | grep -q "return 0;" \
+  || fail "the enqueue writeback set is not in the offload branch"
+# Drop-path edit: end_page_writeback immediately followed by put_page.
+grep -A1 "end_page_writeback(page);" "$PAGE_IO" | grep -q "put_page(page);" \
+  || fail "the drop-path writeback end is missing"
 if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
   fail "the superseded trylock-skip survived in the drain"
 fi

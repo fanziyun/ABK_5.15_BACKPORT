@@ -771,26 +771,28 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 
 <a id="batch-71"></a>
 
-## Batch 71(kcompressd 换出不再卡在 __lock_page,v0.73.0,core 72 → 73 组)
+## Batch 71(kcompressd 延迟换出用 PG_writeback 钉住 swap 槽,v0.73.0,core 72 → 73 组)
 
 > **版本说明**:Batch 70 与 Batch 71 一起落在 `v0.73.0`,`module.conf` 只 bump 一次。这是本仓库的既有惯例而非破例——Batch 10-1 / 10-2 同为 `v0.12.0`([Batch 10-2](#batch-10-2) / [Batch 10-1](#batch-10-1)),Batch 10-3 / 10-4 亦然。AGENTS.md 那句「每个落地 batch bump 一次版本」在「同一轮工作切成多个 batch」时按轮计,不为每个子批次单开一版。
 
-主题:**把 Batch 41 生成文本里的阻塞式 `lock_page()` 改成 `trylock_page()`,争用就跳过该条目并丢掉排队引用**。证据是崩溃片段二 `md_UFS_QC_PHY.BIN.txt:23403`:`task:kcompressd0 state:D ... __lock_page <- abk_kcompressd_do_swapout+0x120`;同一时间窗内 `Write-error on swap-device (254:0:...)` 1690 条,kcompressd0 占 12–36% 内核 CPU、10 次 PowerDet 命中。
+主题:**让 Batch 41 的延迟换出在整条 FIFO 排队期间把页保持在 `PG_writeback`,堵住换出 swap 页的数据损坏**。证据是真机 A/B(SM8550 vermeer / 5.15.220,自写 `verify_swap` 逐页指纹校验):kcompressd offload 开(`/proc/sys/vm/kcompressd=64`)损坏 10/614400 页、损坏成对出现(一页页体错、相邻页全 0),关(`=0`)则 0/614400,唯一变量是 offload 开关。向上表现为随机应用(bilibili / system_server / 相机)读到坏对象指针 ART SIGSEGV,以及复用的槽/页帧轮到文件回写时落到 f2fs 即炸 data。
 
-归因:`abk_kcompressd_do_swapout()` 开头那句 `lock_page(page)`(Batch 41 为恢复 `->writepage` 契约而加——`__swap_writepage()` 的每条出口都解锁页,入口必须持 PG_locked)会睡在一个不放手的持锁者身上:把它重新映射回来的缺页、后续一趟回收、或一条卡在 `PageWriteback`/`PageDirty` 的写都可能这样。于是整条 per-node FIFO 排在它后面,而 kswapd 仍在继续入队——设备最扛不住换出压力的时候,换出压力正好堆起来。
+归因(对照设备内核 `mm/swapfile.c` + `mm/page_io.c` 确认):Batch 41 的 offload 分支在 `swap_writepage()` 里 `unlock_page(page)` + `return 0`,页在整条 per-node FIFO 排队期间**既解锁又不带 `PG_writeback`**,仅靠入队的一次 `get_page()` 钉住。`try_to_free_swap()` 只在页**不处于 writeback** 时才放槽(`if (PageWriteback(page)) return 0;` 是其第二道判断),所以排队期间一次换入缺页就能释放该 swap 槽,槽被复用给别的页,kcompressd 的延迟写随后落进已易主的槽——静默跨页/跨文件数据损坏。Batch 41 仅有的 `PageSwapCache` 守卫被作者记为「自认不可达」的风险,thrash 下即可达。
 
-处置:trylock 成功 → 与此前逐字一致的写入路径(frontswap → `__swap_writepage`,仍在 PG_locked 下跑);trylock 失败 → 一行 `pr_warn_once`、`put_page(page)`、`return`。三条设计点各自的理由:
+处置:恢复被延迟破坏的异步回写契约,三处改写同一标记 `sailboat_kcompressd_wb_pin`:
 
-- **trylock 而不是 lock、也不是静默丢弃**:lock 就是片段里的那次停顿;trylock 保住 `->writepage` 契约(写入仍在 PG_locked 下),只是不等。
-- **争用路径必须 `put_page()`**:入队时 `abk_kcompressd_enqueue()` 取的那次 `get_page()` 就在队列里,直接返回会把页连同它的 swap 槽一起漏掉。跳过也不丢数据——页面早已落在 swap cache(条目与数据都在),这一趟只是没压缩,后续一趟会再排队;这与 Batch 41 自己的 `PageSwapCache` 守卫是同一个论证。
-- **只用 `pr_warn_once`,不用 WARN 族**:WARN 是 oops,`panic_on_oops` 把它变成 panic,正好是本批要消除的那一类故障。
+- **入队(持锁时)`set_page_writeback(page)` 再 `unlock_page()`**:`PG_writeback` 钉住槽跨越整个排队期——`try_to_free_swap()` bail,`shrink_page_list()` 的 `PAGE_SUCCESS` 走 `if (PageWriteback) goto keep` 保留页直到 drain 完成,与正常在途 swap bio 行为一致。
+- **drain(`abk_kcompressd_do_swapout()` 持锁后)`end_page_writeback(page)`**:把页还原成写入体期望的「持锁 / 非 writeback」态;写入体(frontswap_store 或 `__swap_writepage`→`bdev_write_page`)自管内部 set/end,自洽。end 到写入体之间的空隙由页锁覆盖(`try_to_free_swap()` 需持锁)。保留 `lock_page()` 而非改 trylock:writeback 中的页**必须**被 drain(`end_page_writeback()` 必须跑,否则页永卡 writeback 再不可回收);页在排队期全程解锁,故这把锁很短(只等一个把最新页映射回来的瞬时缺页)。
+- **drop 路径(`!PageSwapCache` 提前返回)也 `end_page_writeback(page)` 再 `put_page()`**:该守卫在 drain 自己的 end **之前**返回,不 end 就把入队时 set 过的页永久留在 writeback(不可回收;带 writeback 位释放触发 `bad_page()`)。钉槽本身关掉了排队期清 `PageSwapCache` 的那些路径(`try_to_free_swap()` 见 writeback 即 bail、入队 `get_page()` 挡住 `__remove_mapping()` 的 ref-freeze),故此出口自认不可达——但 Batch 41 那条「自认不可达」的 `PageSwapCache` 守卫正是被 thrash 击穿才有本批,所以「writeback 中的页必须被 drain」这条不变量在每条出口都兑现,不只常路。只用 `pr_warn_once` 不用 WARN 族(WARN 是 oops,`panic_on_oops` 把它变成 panic)。
 
-形态:第二遍改写组(trap 5),注册在 `vm_kcompressd_swapout` 之后,并在该引擎缺席时以 `blocked_by_shape` 拒写(未知树不做半改);`kcompressd_trylock_guard` 的幂等探针直接认 `sailboat_kcompressd_trylock` 标记(AGENTS.md 的锚点政策:标记必须参与「跳过」的判定);`sailboat_kcompressd_trylock` 标记落在新注释里,代价照旧写明:将来某基线自带等价上游守卫时,第二遍报 `applied` 而不是 `already_present`。`vm_kcompressd_swapout` 同时补了**后继探针**(见到该标记即返回 `already_present`),否则它的第二遍会因为锁行已被改写而报 `partial`。两个新组的 group-local 探针与这条依赖已登记进 `docs/porting_policy.md` 的 Shape registry。
+形态:第二遍改写组(trap 5),注册在 `vm_kcompressd_swapout` 之后,并在该引擎缺席时以 `blocked_by_shape` 拒写(未知树不做半改);`kcompressd_writeback_pin` 的幂等探针直接认 `sailboat_kcompressd_wb_pin` 标记(AGENTS.md 的锚点政策:标记必须参与「跳过」的判定);标记落在三处新注释里(入队 set、drain end、drop-path end),代价照旧写明:将来某基线自带等价上游守卫时,第二遍报 `applied` 而不是 `already_present`。`vm_kcompressd_swapout` 同时补了**后继探针**(见到 `sailboat_kcompressd_wb_pin` 即返回 `already_present`),否则它的第二遍会因为锁行与 offload 分支已被改写而报 `partial`。两个新组的 group-local 探针与这条依赖已登记进 `docs/porting_policy.md` 的 Shape registry。
 
-编译门禁:**本地全量编译已过**——`android13-5.15-lts`(SUBLEVEL 220,`e7d9dafb0dd9`),`rebuild.sh --reseed`,`REBUILD_EXIT=0`,572 s(其中 ccache 命中 86.03%),`error:` 0、patch reject 0、`fs/proc/task_mmu.o` 与 `mm/page_io.o` 都在本轮重新编译(06:09:50 / 06:10:07),内核 banner `5.15.220-20261009-Batch51`。这两组此前只有文本证据(`trylock_page` 经 `<linux/mm.h>`→`<linux/bug.h>` 可见、`PageLocked`/`pfn_to_page` 经 `mm_inline.h` 可见),现在由真实编译背书。**未验证**:ABK CI 编译门禁(那是另一条 TU 切分与 KMI 检查线)与真机开机/收益窗口。
+编译门禁:本批的早期形态(当时的 lock/trylock 草案)曾本地全量编译通过——`android13-5.15-lts`(SUBLEVEL 220,`e7d9dafb0dd9`),`rebuild.sh --reseed`,`REBUILD_EXIT=0`,572 s(其中 ccache 命中 86.03%),`error:` 0、patch reject 0、`fs/proc/task_mmu.o` 与 `mm/page_io.o` 都重新编译,内核 banner `5.15.220-20261009-Batch51`。改写为 `PG_writeback` 钉槽后,改动只是把 `set_page_writeback`/`end_page_writeback`(本就在 `mm/page_io.c` 的 `__swap_writepage`/`end_swap_bio_write` 多处使用,无新符号或可见性风险)按异步回写契约移到入队 / drain / drop 三处;Batch 70 的 `PageLocked`/`pfn_to_page` 经已有 include 可见。钉槽形态由真机 `verify_swap` A/B 定量背书(见下「真机验证」)。**未验证**:钉槽确切字节的本地/ABK CI 全量编译门禁(另一条 TU 切分与 KMI 检查线)。
 
-验证:`py_compile` / `bash -n` / `stable_5_15_test`(全套 **1507 项**全绿,计数由 runner 自己打印——本轮给 `check()` 加了计数器,`all checks passed (N checks)` 取代了原来那句不带数字的 `all checks passed`;Batch 71 的新用例:真实跑 Batch 41 → Batch 71 的两段链、两种引擎形态、drain 里再无阻塞 `lock_page`、跳过路径三个语句齐全、两个出口的引用计数、两组各自的第二遍 `already_present`)/ `step_audit`(core 377 步)/ `implementation_audit`(组内函数级针脚双向)/ `smoke`(两遍 73 组全 `already_present`,含 `mm/page_io.c` 回滚逐字节一致)/ `config_gate_audit`(无新增 CONFIG 门,Batch 70 的 hugetlb 项已入 `DARK_GATES`)全绿。
+验证:`py_compile` / `bash -n` / `stable_5_15_test`(全套 **1512 项**全绿,计数由 runner 自己打印;Batch 71 的新用例:真实跑 Batch 41 → Batch 71 的两段链、两种引擎形态,断言入队在 `unlock_page` + `return 0` 前 `set_page_writeback`、drain 持锁后 `end_page_writeback` 且序在写入体之前、drop 路径在 `put_page` 前 `end_page_writeback` 且序在 drain 的锁之前、无 trylock 残留、三处标记齐全、两组各自第二遍 `already_present` 且逐字节一致)/ `step_audit`(core 组每步锚点落地、结构平衡、二遍幂等)/ `implementation_audit`(组内函数级针脚双向,drop-path end 按「紧接 `put_page` 的 end」这一唯一上下文钉,防被 drain 的 end 顶账)/ `smoke`(两遍 73 组全 `already_present`,含 `mm/page_io.c` 回滚逐字节一致;Batch 71 查标记计数 3、入队与 drop 两条序列各自成立)/ `config_gate_audit`(无新增 CONFIG 门,Batch 70 的 hugetlb 项已入 `DARK_GATES`)全绿。
 
+
+真机验证(SM8550 vermeer / 5.15.220,`verify_swap` 逐页指纹校验):常规压力 ×3(kcompressd 开)184 万页 **0 损坏**;容量内极限(threshold 128、108 万页过压缩)61 万页 **0 损坏**;修复前同压力 61 万页 **10 损坏**。累计约 245 万页、kcompressd 全程活跃、**0 损坏**、0 tombstone;bilibili / 相机正常启动,设备连续运行无因本修复而崩。即使 zram 短暂写失败(swap 吃紧)verify 仍 0 损坏(写失败页保持 dirty 待重试,不丢不错)。超 zram 物理容量(`mem_limit` 3.71 GB 压缩上限)的 wedge 是容量墙,任何内核皆然,与本修复无关。
 
 <a id="batch-70"></a>
 
@@ -800,7 +802,7 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 
 归因:`pfn_swap_entry_to_page()` 对迁移项带 `BUG_ON(!PageLocked(p))`(持锁才能安全解引用,因为迁移会把它从旧页挪走),而 smaps/pagemap 这条路只拿页表锁(`ptl`),从不持目标页的 PG_locked。PTE 快照与 `PageLocked()` 检查之间只要迁移完成一次(解锁 + `remove_migration_ptes`)或 pfn 被复用,就是一次无条件 BUG_ON。smaps 是受害者,不是成因。
 
-处置:`smaps_pte_entry` 之上加一个文件内 static helper `abk_smaps_migration_page()`——`is_migration_entry()` → `pfn_to_page(swp_offset(entry))` → `smp_rmb()`(头文件对 `__split_folio_to_order()` 记的那道顺序屏障)→ `PageLocked()` → 再查一次 `is_migration_entry()`,任一步不成立就返回 NULL;然后把该文件**全部五处** `pfn_swap_entry_to_page()` 迁移项调用改走它:`smaps_pte_entry`(崩溃点,`task_mmu.c:551`)、`smaps_pmd_entry`(THP 迁移,`:586`)、`smaps_hugetlb_range`(`:734`)、`pte_to_pagemap_entry`(`:1442`)、`pagemap_pmd_range`(`:1505`,在树自己的 `VM_BUG_ON` 之下)。设备私有 / 设备独占项保留直连调用——它们的契约本来就不是 PageLocked。
+处置:`smaps_pte_entry` 之上加一个文件内 static helper `abk_smaps_migration_page()`——`is_migration_entry()` → `pfn_to_page(swp_offset(entry))` → `smp_rmb()`(顺序化 pfn 读先于 `PageLocked()` flags 读)→ `PageLocked()`,任一步不成立就返回 NULL(`PageLocked(p)` 就是 `pfn_swap_entry_to_page()` 自己 `BUG_ON` 的谓词:过它的页逐字一致地按 pfn 解析,不过的页返回 NULL 而非 panic——本组只消除 panic,不声称遍历器的页表锁未给的那种页身份再验证);然后把该文件**全部五处** `pfn_swap_entry_to_page()` 迁移项调用改走它:`smaps_pte_entry`(崩溃点,`task_mmu.c:551`)、`smaps_pmd_entry`(THP 迁移,`:586`)、`smaps_hugetlb_range`(`:734`)、`pte_to_pagemap_entry`(`:1442`)、`pagemap_pmd_range`(`:1505`,在树自己的 `VM_BUG_ON` 之下)。设备私有 / 设备独占项保留直连调用——它们的契约本来就不是 PageLocked。
 
 竞态发生时的语义:该条目这一轮不参与计数。smaps 三个调用点本来就在 `!page`/`IS_ERR_OR_NULL(page)` 上返回,pagemap 两处本来就把 `page` 当可空用,所以「跳过」不需要任何新的空指针处理;稳态下结果与改前逐字一致——锁着的迁移页照常解析,以前会 panic 的那个窗口现在贡献 0。
 
@@ -2974,6 +2976,8 @@ mmap_miss = READ_ONCE(ra->mmap_miss);`，行号对、函数错，`replace_once` 
 
 `LRU_GEN_ENABLED` 从 `_ALIGN_CONFIGS`（opt-in）挪进 `_MODULE_CONFIGS`（默认层），
 `/sys/kernel/mm/lru_gen/enabled` 开机即非零。
+
+> **【Batch 70/71 更正】** 该默认已被推翻:真机 SM8550 vermeer 持续内存 thrash 下本模块 MGLRU 回收循环重写(Batch 37/49)不收敛——两个 kworker 卡在 `lru_gen_shrink_lruvec` 占满内核态、lmkd 饿死、QCOM 看门狗整机冷复位,且 MGLRU 开启时三方大应用(bilibili)启动即 SIGSEGV(dex 预加载 mmap 路径)。故 `LRU_GEN_ENABLED` 移回 `_ALIGN_CONFIGS`(opt-in)、companion `lru_gen.enable=0`,默认回退厂商经典 LRU(同压力下存活);MGLRU 的全部 graft 仍编译在树内、仅运行时默认关,`ABK_515_DEFCONFIG_ALIGN=1` 可开启测试。回收循环收敛修复另开 PR。下文是当时「默认开启」那次决定的原始记录,按历史保留。
 
 **为什么这是正确性要求而不是偏好。** 基线本来就 `CONFIG_LRU_GEN=y`，MGLRU 整套实现都编得进去；
 但这个符号决定 `mm/vmscan.c` 里 `lru_gen_caps` 取 `DEFINE_STATIC_KEY_ARRAY_TRUE` 还是

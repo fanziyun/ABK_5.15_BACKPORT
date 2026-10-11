@@ -999,10 +999,12 @@ REQUIRED_CONTENT = {
         # Batch 71: the swap-slot writeback pin (device A/B verify_swap).
         # The deferred swap-out must keep the page under PG_writeback across the
         # FIFO: set_page_writeback at enqueue, end_page_writeback once the drain
-        # holds the lock.  Both carry the marker.
+        # holds the lock, and end it again on the drain's !PageSwapCache drop
+        # path.  The marker is the only file-wide load-bearing needle: bare
+        # set_page_writeback(page);/end_page_writeback(page); already exist in a
+        # pristine tree (__swap_writepage/end_swap_bio_write and Batch 41's
+        # body), so they are pinned per-function in REQUIRED_IN_FUNCTION instead.
         ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
-        ["mm/page_io.c", "set_page_writeback(page);"],
-        ["mm/page_io.c", "end_page_writeback(page);"],
     ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",
@@ -2324,19 +2326,25 @@ REQUIRED_IN_FUNCTION = {
     # --- Batch 71 -------------------------------------------------------
     # kcompressd_writeback_pin.  The deferred swap-out must keep the page
     # under PG_writeback across the FIFO.  enqueue side (swap_writepage): the
-    # offload branch sets writeback before unlocking.  drain side
-    # (abk_kcompressd_do_swapout): it locks the page then ends writeback,
-    # before the write body.  Pinned per owning function so a hunk elsewhere
-    # cannot satisfy the pins; the old trylock-skip must be gone.
+    # offload branch sets writeback immediately before unlock + return 0.  drain
+    # side (abk_kcompressd_do_swapout): it locks the page then ends writeback
+    # before the write body, AND ends writeback on the !PageSwapCache drop path
+    # (which returns above the drain's own end).  Pinned per owning function and
+    # by load-bearing sequence (bare set_page_writeback/end_page_writeback
+    # pre-exist in a pristine tree) so a hunk elsewhere cannot satisfy the pins;
+    # the old trylock-skip must be gone.
     "core:kcompressd_writeback_pin": [
         ("mm/page_io.c", "swap_writepage",
          ["sailboat_kcompressd_wb_pin",
-          "set_page_writeback(page);"],
+          "\t\tset_page_writeback(page);\n"
+          "\t\tunlock_page(page);\n"
+          "\t\treturn 0;\n"],
          ["if (!trylock_page(page)) {"]),
         ("mm/page_io.c", "abk_kcompressd_do_swapout",
          ["sailboat_kcompressd_wb_pin",
           "\tlock_page(page);\n",
-          "end_page_writeback(page);"],
+          "end_page_writeback(page);",
+          "end_page_writeback(page);\n\t\tput_page(page);"],
          ["if (!trylock_page(page)) {",
           "kcompressd: skipping a locked page"]),
     ],

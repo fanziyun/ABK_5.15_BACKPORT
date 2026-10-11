@@ -28,7 +28,13 @@ restore the normal asynchronous-writeback contract that the deferral broke.
      before ``unlock_page()``.  PG_writeback now pins the slot for the whole
      residency -- ``try_to_free_swap()`` bails, and shrink_page_list() keeps the
      page (its PAGE_SUCCESS path does ``if (PageWriteback) goto keep``) until the
-     drain completes, exactly as a normal in-flight swap bio behaves.
+     drain completes.  This is like a normal in-flight swap bio with one
+     difference worth stating: the page stays under writeback for its whole FIFO
+     residency drained by a single per-node thread, not the milliseconds of a
+     real bio, so a sync compaction / migration / direct-reclaim ``wait_on_
+     page_writeback`` on a queued page waits for the drain, not for I/O.  The
+     queue is self-limiting (it degrades to synchronous at the soft limit), so
+     the residency is bounded, but it is not free.
   2. Drain head of abk_kcompressd_do_swapout() (page arrives unlocked + under
      writeback): ``lock_page(page)`` then ``end_page_writeback(page)``, returning
      the page to the locked / not-writeback state the write body expects.  The
@@ -36,6 +42,16 @@ restore the normal asynchronous-writeback contract that the deferral broke.
      re-sets and ends writeback itself, self-balanced.  The lock covers the
      end_page_writeback -> body gap: try_to_free_swap() needs the page lock,
      which the drain holds.
+  3. Drop path of abk_kcompressd_do_swapout(): Batch 41's ``!PageSwapCache``
+     guard returns ``put_page(page)`` *above* the lock_page()/end_page_writeback()
+     of step 2, so a page reaching it would be dropped still under the
+     writeback set in step 1 -- stuck under writeback forever (unreclaimable,
+     and freed with the bit set trips bad_page()).  So that exit ends the
+     writeback too.  The pin closes the paths that could clear PageSwapCache
+     mid-queue, so this guard is believed unreachable -- but Batch 41's guard
+     was likewise "believed unreachable" and thrash defeated it, so the pin's
+     "a page under writeback MUST be drained" invariant is honoured on every
+     exit, not just the common one.
 
 Why lock_page (not trylock-skip): a page under writeback MUST be drained --
 end_page_writeback has to run or the page is stuck under writeback forever and
@@ -50,9 +66,10 @@ Scope notes:
   ``vm_kcompressd_swapout`` and refuses (``blocked_by_shape``) when that group's
   engine is absent, so an unknown tree is never half-patched.  The ``sailboat_``
   marker rides in the new comments.
-* Both edits sit above the ``@@ABK_KCOMPRESS_SWAPOUT_BODY@@`` join point / in
-  swap_writepage()'s offload branch, byte-identical in the hook and plain
-  engine variants, so one pair of anchors covers both.
+* All three edits sit in text that is byte-identical in the hook and plain
+  engine variants -- swap_writepage()'s offload branch (enqueue) and the
+  abk_kcompressd_do_swapout() prologue above the ``@@ABK_KCOMPRESS_SWAPOUT_BODY@@``
+  join point (drain + drop path) -- so one set of anchors covers both shapes.
 """
 
 from __future__ import annotations
@@ -128,18 +145,64 @@ _WB_END_NEW = (
     "\tif (frontswap_store(page) == 0) {\n"
 )
 
+# 3) Drop path: abk_kcompressd_do_swapout()'s `!PageSwapCache` early return
+# (Batch 41) fires *above* the drain's lock_page()/end_page_writeback(), so a
+# page that reaches it is dropped while still carrying the PG_writeback set at
+# enqueue -- stuck under writeback forever (unreclaimable; freed with the bit
+# set trips bad_page()).  End the writeback on this exit too.  Anchored on the
+# `put_page(page); return; }` of that block, which is the file's only
+# two-tab `put_page(page);` immediately followed by `return;` (the body's
+# put_page is one-tab and not followed by return, abk_kcompressd_enqueue()'s is
+# followed by `}`), so the anchor is unique.  The marker rides in the comment.
+#
+# Reachability: the writeback pin itself closes the paths that could clear
+# PageSwapCache mid-queue (try_to_free_swap() bails on PageWriteback, the
+# enqueue get_page() blocks __remove_mapping()'s ref-freeze), so this exit is
+# believed unreachable -- but Batch 41's own `PageSwapCache` guard was likewise
+# "believed unreachable" and thrash defeated it, so the pin's invariant ("a
+# page under writeback MUST be drained") is honoured on every exit, not just
+# the common one.  end_page_writeback() needs no page lock (it runs from bio
+# completion) and the page is still under writeback here (nothing has ended it).
+_WB_DROP_OLD = (
+    "\t\tput_page(page);\n"
+    "\t\treturn;\n"
+    "\t}\n"
+)
+
+_WB_DROP_NEW = (
+    "\t\t/*\n"
+    "\t\t * sailboat_kcompressd_wb_pin: this page was pinned under\n"
+    "\t\t * PG_writeback at enqueue, and this drop path returns before the\n"
+    "\t\t * drain's end_page_writeback() below.  End it here too, or the page\n"
+    "\t\t * is left under writeback forever -- unreclaimable, and freeing it\n"
+    "\t\t * with the bit set trips bad_page().  No page lock is needed\n"
+    "\t\t * (end_page_writeback() runs from bio completion), and the page is\n"
+    "\t\t * still under writeback here because nothing has ended it yet.\n"
+    "\t\t */\n"
+    "\t\tend_page_writeback(page);\n"
+    "\t\tput_page(page);\n"
+    "\t\treturn;\n"
+    "\t}\n"
+)
+
 # Pins for the audits and the unit test.
 WB_MARKER = "sailboat_kcompressd_wb_pin"
 WB_SET = "set_page_writeback(page);"
 WB_END = "end_page_writeback(page);"
+# The drop-path end, pinned by its unique context (end immediately before the
+# two-tab put_page/return) so it cannot be confused with the drain's end.
+WB_DROP_END = "end_page_writeback(page);\n\t\tput_page(page);"
 DO_SWAPOUT_PROBE = "abk_kcompressd_do_swapout"
 
 
 def build_steps():
-    """Two required steps: set writeback at enqueue, end it at drain."""
+    """Three required steps: set writeback at enqueue, end it at the drain, and
+    end it on the drain's `!PageSwapCache` drop path (which returns before the
+    drain's own end)."""
     return [
         (PAGE_IO, _WB_SET_OLD, _WB_SET_NEW, T),
         (PAGE_IO, _WB_END_OLD, _WB_END_NEW, T),
+        (PAGE_IO, _WB_DROP_OLD, _WB_DROP_NEW, T),
     ]
 
 

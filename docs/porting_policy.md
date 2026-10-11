@@ -391,7 +391,7 @@ patch, so nothing can pre-apply), which is why an unrecognised shape reports
 would be a compile error, and dropping it on a tree that has the call would
 break the vendor-hook contract.
 
-Batch 70's `smaps_migration_guard` and Batch 71's `kcompressd_trylock_guard`
+Batch 70's `smaps_migration_guard` and Batch 71's `kcompressd_writeback_pin`
 add two more group-local probes, for a different reason: each has to answer a
 question no CONFIG_* can express -- *did the group that owns this text already
 rewrite it?*  They are not the same shape, and the difference is load-bearing.
@@ -408,13 +408,15 @@ the grafted helper, so falling through would insert a second copy of a static
 function -- a redefinition, i.e. a compile error on a tree that used to build
 (measured: helper count 1 -> 2).
 
-Batch 71 is the trap-5 one.  It rewrites a lock line that Batch 41 generated, so
-it probes for `sailboat_kcompressd_trylock` in Batch 41's own output and refuses
+Batch 71 is the trap-5 one.  It rewrites the offload branch and the drain
+prologue that Batch 41 generated (set_page_writeback at enqueue, end_page_writeback
+at the drain lock and on the `!PageSwapCache` drop path), so it probes for
+`sailboat_kcompressd_wb_pin` in Batch 41's own output and refuses
 with `blocked_by_shape` when Batch 41's engine is absent -- an unknown tree must
 not be half-patched.  That dependency runs the other way too, which is why Batch
-41 gained the successor probe (seeing `sailboat_kcompressd_trylock` means
-`already_present`): without it, Batch 41's second pass finds its `old` anchor
-gone and reports `partial` on a tree Batch 71 already touched.
+41 gained the successor probe (seeing `sailboat_kcompressd_wb_pin` means
+`already_present`): without it, Batch 41's second pass finds its offload-branch
+and drain anchors rewritten and reports `partial` on a tree Batch 71 already touched.
 
 Batch 8's `rcu_nocb_cpu_default_all` is a three-file opt-in source graft:
 `kernel/rcu/Kconfig` adds the configuration symbol, the kernel-parameter
