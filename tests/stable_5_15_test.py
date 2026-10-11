@@ -6464,7 +6464,7 @@ def main():
     test_batch41_kcompressd_offload()
     test_batch42_schedutil_smart_cap()
     test_batch70_smaps_migration_guard()
-    test_batch71_kcompressd_trylock()
+    test_batch71_kcompressd_wb_pin()
     test_fetch_decode_roundtrip()
 
     print()
@@ -7235,28 +7235,29 @@ def test_fetch_decode_roundtrip():
               st.stdout[-300:])
 
 
-def test_batch71_kcompressd_trylock():
-    """Batch 71: the kcompressd drain stops stalling in __lock_page.
+def test_batch71_kcompressd_wb_pin():
+    """Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO.
 
-    Field stall md_UFS_QC_PHY.BIN.txt:23403: kcompressd0 in D state under
-    __lock_page inside abk_kcompressd_do_swapout()+0x120, the whole per-node
-    FIFO pinned behind one contended page while 1690 swap writes fail around
-    it.  The fix rewrites the lock_page() Batch 41 generates into a
-    trylock_page() that skips the entry and drops the queued reference.
+    Device A/B (verify_swap) on SM8550 vermeer: kcompressd's deferred swap-out
+    corrupted 10/614400 swapped pages with the offload on, 0/614400 off.  Root
+    cause: the offload branch left the page unlocked and NOT under writeback for
+    the whole FIFO residency, so try_to_free_swap() (which bails only on
+    PageWriteback) freed and reused the swap slot mid-queue and the deferred
+    write landed in the wrong slot.  The fix restores the async-writeback
+    contract: set_page_writeback at enqueue (pins the slot), end_page_writeback
+    once the drain holds the lock.
 
     The test runs the real two-group chain (Batch 41 then Batch 71) on both
-    engine shapes, because the anchor is text Batch 41 generates: proving the
-    rewrite against a hand-written fixture would prove nothing about the graft.
+    engine shapes, because the anchors are text Batch 41 generates.
     """
-    print("Batch 71: kcompressd_trylock_guard (drain must not stall on a "
-          "locked page)")
+    print("Batch 71: kcompressd_writeback_pin (swap slot pinned under writeback)")
     import abk_stable_core as core
     import batch41_core_vm_kcompressd as b41
-    import batch71_core_kcompressd_trylock as b71
+    import batch71_core_kcompressd_wb_pin as b71
 
     group = next((g for g in core.PATCH_GROUPS
-                  if g.key == "kcompressd_trylock_guard"), None)
-    check("kcompressd_trylock_guard group registered", group is not None)
+                  if g.key == "kcompressd_writeback_pin"), None)
+    check("kcompressd_writeback_pin group registered", group is not None)
     if group is None:
         return
     check("the group owns exactly mm/page_io.c",
@@ -7265,24 +7266,26 @@ def test_batch71_kcompressd_trylock():
     keys = [g.key for g in core.PATCH_GROUPS]
     # Trap 5: this group rewrites text vm_kcompressd_swapout generates, so it
     # must be registered after it.
-    check("the trylock guard is registered after vm_kcompressd_swapout",
-          keys.index("kcompressd_trylock_guard")
+    check("the writeback pin is registered after vm_kcompressd_swapout",
+          keys.index("kcompressd_writeback_pin")
           > keys.index("vm_kcompressd_swapout"),
-          keys[keys.index("kcompressd_trylock_guard") - 1:
-               keys.index("kcompressd_trylock_guard") + 1])
+          keys[keys.index("kcompressd_writeback_pin") - 1:
+               keys.index("kcompressd_writeback_pin") + 1])
 
     steps = b71.build_steps()
-    check("one required step, in mm/page_io.c",
-          [(rel, req) for rel, _o, _n, req in steps] == [(b71.PAGE_IO, True)],
+    check("two required steps, both in mm/page_io.c",
+          [(rel, req) for rel, _o, _n, req in steps]
+          == [(b71.PAGE_IO, True), (b71.PAGE_IO, True)],
           [(rel, req) for rel, _o, _n, req in steps])
-    check("the replacement does not start with its own anchor (trap 1)",
-          not steps[0][2].startswith(steps[0][1]))
+    for i, (_rel, old, new, _req) in enumerate(steps):
+        check(f"step {i}'s replacement does not start with its own anchor (trap 1)",
+              not new.startswith(old))
 
     # Refuses without the Batch 41 engine: an unknown tree must never be
     # half-patched, and the refusal writes nothing.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {b71.PAGE_IO: "int swap_writepage(void)\n"})
-        status, detail = b71._kcompressd_trylock_apply(ctx)
+        status, detail = b71._kcompressd_wb_pin_apply(ctx)
         check("a tree without the Batch 41 engine reports blocked_by_shape",
               status == "blocked_by_shape", (status, detail))
         check("the refusal names the missing engine",
@@ -7292,7 +7295,7 @@ def test_batch71_kcompressd_trylock():
 
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {})
-        status, detail = b71._kcompressd_trylock_apply(ctx)
+        status, detail = b71._kcompressd_wb_pin_apply(ctx)
         check("a missing file reports blocked_by_shape",
               status == "blocked_by_shape", (status, detail))
         check("the empty tree is not written",
@@ -7326,85 +7329,72 @@ def test_batch71_kcompressd_trylock():
             status, detail = core._vm_kcompressd_swapout_apply(ctx)
             check(f"{label} shape: Batch 41 applies first",
                   status == "applied", (status, detail))
-            # The anchor really is the text Batch 41 generates -- asserted on
-            # the tree's own output, not on a hand-written fixture.
+            # Both anchors really are text Batch 41 generates.
             text = ctx.read(b71.PAGE_IO)
-            _rel, anchor, _new, _req = steps[0]
-            check(f"{label} shape: the lock anchor occurs exactly once in "
-                  "Batch 41's output", text.count(anchor) == 1,
-                  text.count(anchor))
+            for _rel, anchor, _new, _req in steps:
+                check(f"{label} shape: an anchor occurs exactly once in "
+                      "Batch 41's output", text.count(anchor) == 1,
+                      text.count(anchor))
 
-            status, detail = b71._kcompressd_trylock_apply(ctx)
-            check(f"{label} shape: the trylock guard applies on top",
+            status, detail = b71._kcompressd_wb_pin_apply(ctx)
+            check(f"{label} shape: the writeback pin applies on top",
                   status == "applied", (status, detail))
             text = ctx.read(b71.PAGE_IO)
 
+            # Enqueue side (swap_writepage offload branch): set_page_writeback
+            # before unlock_page + return 0, so the slot is pinned across the
+            # queue.  Pinned by sequence to prove ordering.
+            check(f"{label} shape: enqueue sets writeback before unlocking",
+                  "\t\tset_page_writeback(page);\n"
+                  "\t\tunlock_page(page);\n"
+                  "\t\treturn 0;\n" in text, "offload branch")
+
             do_swapout = text[text.index("static void abk_kcompressd_do_swapout("):
                               text.index("static bool abk_kcompressd_enqueue(")]
-            # The stall itself: no blocking take left in the drain.  Counted
-            # per line, because "unlock_page(page);" contains "lock_page(".
-            locks = [ln.strip() for ln in do_swapout.split("\n")
-                     if ln.strip() == "lock_page(page);"]
-            check(f"{label} shape: the drain no longer blocks on the page lock",
-                  locks == [], locks)
-            check(f"{label} shape: the drain takes the lock without sleeping",
-                  "if (!trylock_page(page)) {" in do_swapout)
-            # The skip path: warn, count the dequeue (so enqueued - swapped
-            # stays the live queue depth), drop the reference Batch 41's
-            # enqueue took, return.
-            skip = re.search(r"\tif \(!trylock_page\(page\)\) \{\n"
-                             r"(.*?)\n\t\}\n", do_swapout, re.S)
-            check(f"{label} shape: the contended path skips, counts and drops "
-                  "the reference",
-                  skip is not None
-                  and "put_page(page);" in skip.group(1)
-                  and "return;" in skip.group(1)
-                  and "pr_warn_once(" in skip.group(1)
-                  and "atomic_long_inc(&abk_kcompressd_swapped);"
-                      in skip.group(1),
-                  skip.group(1) if skip else "(no skip block)")
-            # The write still runs under PG_locked: trylock keeps the
-            # ->writepage contract __swap_writepage() requires.
-            check(f"{label} shape: the write body still runs under the lock",
-                  do_swapout.index("if (!trylock_page(page)) {")
+            # Drain side: lock_page then end_page_writeback, before the body.
+            check(f"{label} shape: the drain still takes the page lock",
+                  "\tlock_page(page);\n" in do_swapout)
+            check(f"{label} shape: the drain ends the writeback it inherited",
+                  "\tend_page_writeback(page);\n" in do_swapout)
+            check(f"{label} shape: lock precedes end_page_writeback precedes body",
+                  do_swapout.index("\tlock_page(page);\n")
+                  < do_swapout.index("\tend_page_writeback(page);\n")
                   < do_swapout.index("frontswap_store(page)"))
-            check(f"{label} shape: the frontswap branch still unlocks",
-                  "\t\tunlock_page(page);\n" in do_swapout)
-            check(f"{label} shape: both exits still drop their reference",
-                  do_swapout.count("put_page(page);") == 3,
-                  do_swapout.count("put_page(page);"))
-            # pr_warn_once, never WARN-family: a WARN is an oops and
-            # panic_on_oops turns it into a panic.
+            # The superseded trylock-skip must be gone.
+            check(f"{label} shape: no trylock-skip remains",
+                  "if (!trylock_page(page)) {" not in text
+                  and "skipping a locked page" not in text, "trylock remnants")
+            # The marker rides in both edits.
+            check(f"{label} shape: the marker is on both edits",
+                  text.count("sailboat_kcompressd_wb_pin") == 2,
+                  text.count("sailboat_kcompressd_wb_pin"))
+            # No WARN-family added by the pin.
             code_lines = [ln for ln in do_swapout.split("\n")
                           if not ln.lstrip().startswith(("*", "/*", "//"))]
             warns = [ln.strip() for ln in code_lines
                      if "WARN_ON" in ln or "WARN(" in ln]
-            check(f"{label} shape: no WARN in the drain's code",
-                  not warns, warns)
-            check(f"{label} shape: the skip is visible in dmesg once",
-                  "kcompressd: skipping a locked page" in do_swapout)
+            check(f"{label} shape: no WARN in the drain's code", not warns, warns)
 
-            # Both groups must be idempotent together: the successor probe on
-            # Batch 41 is what keeps its second pass already_present over the
-            # rewritten text instead of partial.
+            # Both groups idempotent together: the successor probe on Batch 41
+            # keeps its second pass already_present over the rewritten text.
             ctx2 = make_ctx(tmp + "-b", {b71.PAGE_IO: text})
             status2, detail2 = core._vm_kcompressd_swapout_apply(ctx2)
-            check(f"{label} shape: Batch 41's second pass is already_present "
-                  "over the rewritten text",
+            check(f"{label} shape: Batch 41's second pass is already_present",
                   status2 == "already_present", (status2, detail2))
             check(f"{label} shape: Batch 41's second pass is byte-identical",
                   ctx2.read(b71.PAGE_IO) == text)
-            status3, detail3 = b71._kcompressd_trylock_apply(ctx2)
-            check(f"{label} shape: the trylock guard's second pass is "
-                  "already_present",
-                  status3 == "already_present", (status3, detail3))
+            status3, detail3 = b71._kcompressd_wb_pin_apply(ctx2)
+            check(f"{label} shape: the writeback pin's second pass is "
+                  "already_present", status3 == "already_present",
+                  (status3, detail3))
             check(f"{label} shape: the second pass is byte-identical",
                   ctx2.read(b71.PAGE_IO) == text)
-            for key in ("vm_kcompressd_swapout", "kcompressd_trylock_guard"):
+            for key in ("vm_kcompressd_swapout", "kcompressd_writeback_pin"):
                 st = next(g for g in core.PATCH_GROUPS
                           if g.key == key).run(ctx2)["status"]
                 check(f"{label} shape: {key} is idempotent",
                       st == "already_present", (key, st))
+
 
 
 if __name__ == "__main__":

@@ -817,23 +817,21 @@ grep -q "static struct page \*abk_smaps_migration_page(" "$TASK_MMU" \
 [ "$(grep -c "abk_smaps_migration_page(entry);" "$TASK_MMU")" = "3" ] \
   || fail "the smaps PMD + pagemap callers are not all guarded"
 
-# Batch 71: kcompressd_trylock_guard rewrites Batch 41's generated lock line.
-# The drain must take the lock without sleeping and drop the queued reference
-# on the contended path; the blocking lock_page() in the drain must be gone.
-grep -q "sailboat_kcompressd_trylock" "$PAGE_IO" \
-  || fail "the kcompressd trylock guard is missing"
-grep -q "if (!trylock_page(page)) {" "$PAGE_IO" \
-  || fail "the drain still takes the page lock blocking"
-grep -q "kcompressd: skipping a locked page" "$PAGE_IO" \
-  || fail "the trylock skip path is missing its dmesg marker"
-# A bare, blocking `lock_page(page);` statement line must be gone from the
-# drain.  POSIX ERE (-E), not -P: a build host whose grep lacks PCRE returns
-# exit 2 for `grep -P`, which an `if grep -qP ...` reads as "no match" and the
-# guard silently passes.  `^[[:space:]]*lock_page\(page\);$` matches the whole
-# statement line only; `unlock_page(page);` starts with `unlock`, so it is not
-# matched, and `trylock_page` sits inside an `if (...)` line, also not matched.
-if grep -qE "^[[:space:]]*lock_page\(page\);$" "$PAGE_IO"; then
-  fail "the blocking lock_page() in the drain survived"
+# Batch 71: kcompressd_writeback_pin rewrites Batch 41's generated text so the
+# deferred swap-out keeps the page under PG_writeback across the FIFO:
+# set_page_writeback at enqueue, end_page_writeback once the drain holds the
+# lock.  Both edits carry the sailboat_kcompressd_wb_pin marker.  The superseded
+# trylock-skip must be gone.
+grep -q "sailboat_kcompressd_wb_pin" "$PAGE_IO" \
+  || fail "the kcompressd writeback pin is missing"
+grep -q "set_page_writeback(page);" "$PAGE_IO" \
+  || fail "the enqueue writeback set is missing"
+grep -q "end_page_writeback(page);" "$PAGE_IO" \
+  || fail "the drain writeback end is missing"
+[ "$(grep -c "sailboat_kcompressd_wb_pin" "$PAGE_IO")" = "2" ] \
+  || fail "the writeback pin marker is not on both the enqueue and drain edits"
+if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
+  fail "the superseded trylock-skip survived in the drain"
 fi
 
 # rollback must restore the pristine tree

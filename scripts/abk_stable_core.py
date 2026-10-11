@@ -5905,17 +5905,18 @@ def _vm_kcompressd_swapout_apply(ctx):
         return ("blocked_by_shape",
                 "mm/page_io.c matches neither the 167/178/194 nor the lts "
                 "shape of swap_writepage()'s frontswap_store() branch")
-    # Trap-5 successor probe: Batch 71 rewrites this group's lock_page() line
-    # into a trylock.  Without this probe the second pass would see the step-4
-    # engine anchor (still present) but miss the lock line (already rewritten)
-    # and report partial instead of already_present.  The probe lives on the
-    # successor's own marker, which the successor keeps.
+    # Trap-5 successor probe: Batch 71 rewrites this group's generated text
+    # (set_page_writeback at enqueue + end_page_writeback at the drain's lock
+    # site).  Without this probe the second pass would see the step-4 engine
+    # anchor (still present) but miss the rewritten lines and report partial
+    # instead of already_present.  The probe lives on the successor's own
+    # marker, which the successor keeps.
     try:
         _b41_text = ctx.read(_b41_kc.PAGE_IO)
     except FileNotFoundError:
         _b41_text = ""
-    if "sailboat_kcompressd_trylock" in _b41_text:
-        return "already_present", "kcompressd_trylock_guard already applied on top"
+    if "sailboat_kcompressd_wb_pin" in _b41_text:
+        return "already_present", "kcompressd_writeback_pin already applied on top"
     status, _results, detail = apply_steps(ctx, _b41_kc.build_steps(body))
     if status is None:
         return "blocked_by_shape", detail
@@ -5990,17 +5991,20 @@ import batch70_core_smaps_migration_guard as _b70_smaps  # noqa: E402
 PATCH_GROUPS = PATCH_GROUPS + _b70_smaps.build_groups(PatchGroup)
 
 # ============================================================================
-# Batch 71: kcompressd drain takes the page lock without stalling
-# (field stall md_UFS_QC_PHY.BIN.txt:23403 -- kcompressd0 in D state under
-# __lock_page inside abk_kcompressd_do_swapout+0x120, whole FIFO pinned behind
-# one contended page while 1690 swap writes fail around it).  Second-pass
-# group over Batch 41's generated text (trap 5): registered after
-# vm_kcompressd_swapout, refuses when that engine is absent.  mm/page_io.c is
-# otherwise untouched by any other group, so no further ordering applies.
+# Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO
+# (device A/B verify_swap -- kcompressd offload on corrupted 10/614400 swapped
+# pages, off 0/614400, SM8550 vermeer 5.15.220; surfaced as ART SIGSEGV in
+# random apps and /data corruption).  The deferred swap-out left the page
+# unlocked and not-writeback across the queue, so try_to_free_swap() freed and
+# reused the slot mid-queue and the deferred write corrupted another page.
+# Second-pass group over Batch 41's generated text (trap 5): set_page_writeback
+# at enqueue, end_page_writeback once the drain holds the lock.  Registered
+# after vm_kcompressd_swapout, refuses when that engine is absent.  mm/page_io.c
+# is otherwise untouched by any other group, so no further ordering applies.
 # ============================================================================
-import batch71_core_kcompressd_trylock as _b71_trylock  # noqa: E402
+import batch71_core_kcompressd_wb_pin as _b71_wb  # noqa: E402
 
-PATCH_GROUPS = PATCH_GROUPS + _b71_trylock.build_groups(PatchGroup)
+PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()

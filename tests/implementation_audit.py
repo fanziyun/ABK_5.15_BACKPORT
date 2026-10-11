@@ -995,15 +995,14 @@ REQUIRED_CONTENT = {
         ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(swpent);"],
         ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(entry);"],
     ],
-    "core:kcompressd_trylock_guard": [
-        # Batch 71: the D-state stall guard (md_UFS_QC_PHY.BIN.txt:23403).
-        # The drain must take the lock without sleeping, drop the queued
-        # reference on the contended path, and stay visible via pr_warn_once
-        # (never WARN-family -- a WARN is an oops).  The bare lock_page must
-        # be gone from the drain: with it present the stall is still possible.
-        ["mm/page_io.c", "sailboat_kcompressd_trylock"],
-        ["mm/page_io.c", "if (!trylock_page(page)) {"],
-        ["mm/page_io.c", "kcompressd: skipping a locked page"],
+    "core:kcompressd_writeback_pin": [
+        # Batch 71: the swap-slot writeback pin (device A/B verify_swap).
+        # The deferred swap-out must keep the page under PG_writeback across the
+        # FIFO: set_page_writeback at enqueue, end_page_writeback once the drain
+        # holds the lock.  Both carry the marker.
+        ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
+        ["mm/page_io.c", "set_page_writeback(page);"],
+        ["mm/page_io.c", "end_page_writeback(page);"],
     ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",
@@ -1172,8 +1171,9 @@ REQUIRED_ABSENT = {
         "WARN_ON(",
         "WARN(",
     ],
-    "core:kcompressd_trylock_guard": [
-        # Same no-WARN rule for the trylock skip path: pr_warn_once only.
+    "core:kcompressd_writeback_pin": [
+        # The writeback-pin edits add no WARN-family check (the surrounding
+        # Batch 41 body uses pr_warn_once); keep the drain WARN-free.
         "WARN_ON_ONCE",
         "WARN_ON(",
         "WARN(",
@@ -2322,18 +2322,23 @@ REQUIRED_IN_FUNCTION = {
          ["\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);\n\n"]),
     ],
     # --- Batch 71 -------------------------------------------------------
-    # kcompressd_trylock_guard.  The drain must take the lock without
-    # sleeping and drop the queued reference on the contended path; the
-    # blocking lock_page() in the drain must be gone, or the stall the
-    # fragment shows is still possible.  Pinned in the function that owns
-    # the lock site so a hunk elsewhere cannot satisfy the pins.
-    "core:kcompressd_trylock_guard": [
+    # kcompressd_writeback_pin.  The deferred swap-out must keep the page
+    # under PG_writeback across the FIFO.  enqueue side (swap_writepage): the
+    # offload branch sets writeback before unlocking.  drain side
+    # (abk_kcompressd_do_swapout): it locks the page then ends writeback,
+    # before the write body.  Pinned per owning function so a hunk elsewhere
+    # cannot satisfy the pins; the old trylock-skip must be gone.
+    "core:kcompressd_writeback_pin": [
+        ("mm/page_io.c", "swap_writepage",
+         ["sailboat_kcompressd_wb_pin",
+          "set_page_writeback(page);"],
+         ["if (!trylock_page(page)) {"]),
         ("mm/page_io.c", "abk_kcompressd_do_swapout",
-         ["sailboat_kcompressd_trylock",
-          "if (!trylock_page(page)) {",
-          "kcompressd: skipping a locked page",
-          "put_page(page);"],
-         ["\tlock_page(page);\n"]),
+         ["sailboat_kcompressd_wb_pin",
+          "\tlock_page(page);\n",
+          "end_page_writeback(page);"],
+         ["if (!trylock_page(page)) {",
+          "kcompressd: skipping a locked page"]),
     ],
     # --- Batch 70 -------------------------------------------------------
     # smaps_migration_guard.  The helper is pinned in its own definition
