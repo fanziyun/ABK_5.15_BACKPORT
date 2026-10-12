@@ -97,17 +97,35 @@ Posture:
   backing device is written in the same pre-`disksize` window and `reset` drops
   it (`reset_bdev()`), which is why the old module traded one for the other. The
   rewrite now remembers the attachment before the reset and puts it back in the
-  same window, with the ROM's own `writeback_limit` preserved; when the kernel
-  exposes writeback and nobody owns it, the module attaches a sparse backing
-  file itself (`zram.writeback=auto`: `/data/per_boot/zram/zram_swap` -- the
-  same place Android's `mmd_setup` uses -- behind a loop device, limit bounded,
-  compressed writeback on where the kernel has it).
+  same window, with the ROM's own `writeback_limit` preserved.
+* **The module does not attach one by default (`zram.writeback=off`).** The
+  destination is a per-boot directory and the owner of this path is Android's
+  own `mmd_setup`, not a module. AOSP's init.rc runs, on every boot,
+  `on property:sys.boot_completed=1` -> `exec ... /bin/rm -rf /data/per_boot`
+  -> `mkdir /data/per_boot 0700 system system encryption=Require key=per_boot_ref`,
+  so /data/per_boot is emptied at every boot and re-keyed with a fresh per-boot
+  key (vold writes the reference to `/data/.fscrypt_key_per_boot_ref`). AOSP's
+  own mmd uses `/data/per_boot/zram_swap` -- the directory root, not
+  `/data/per_boot/zram/zram_swap` -- and is started off a property its own rc
+  sets at `sys.boot_completed`, i.e. deliberately after that wipe. An attach
+  that races the wipe loses its file and leaves the loop device over an unlinked
+  inode: measured on the target device, `losetup -a` showed the ROM's loop49
+  with an empty backing filename while `/data/per_boot/zram/` no longer held the
+  file. `zram.writeback=auto` is therefore opt-in, only attaches after
+  `sys.boot_completed=1`, and releases a backing file this module created
+  itself once the policy says `off` (`losetup -d` plus `rm -f` during the next
+  rewrite, which is the only window in which the kernel lets `backing_dev` be
+  closed). A backing device attached from any other file is never released, and
+  a file left behind with nothing attached to it is removed at the first pass,
+  before init's wipe at `sys.boot_completed`.
 * Writeback is **not** enabled on the reference device's stock kernel: that
   build has no `CONFIG_ZRAM_WRITEBACK`, the ROM sets `vendor.zram.disable=1`
   and its `mmd` never completes. `zram.writeback=auto` therefore only acts if
   you turn the feature on in the kernel (`ABK_515_DEFCONFIG_ROM=1` adds
   `CONFIG_ZRAM_WRITEBACK=y`) -- and once it is on, the SELinux rule below
-  decides whether a writeback moves anything at all.
+  decides whether a writeback moves anything at all. Attaching a device is not
+  worth anything on its own here: nothing on this ROM writes the `writeback`
+  node, so `zram.writeback.trigger` has to be set as well.
 
 ## SELinux: the kernel-domain rules writeback needs
 
@@ -196,7 +214,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `zram.compact.enable` | `1` | after each sweep tick, run one gated `compact` pass (rides the sweep clock, so `zram.recomp.enable=0` stops it too) |
 | `zram.compact.min_waste_mb` | `50` | only compact when `mem_used_total − compr_data_size` exceeds this many MiB; 1..1024 |
 | `zram.compact.waste_pct` | `15` | ... and the overhead exceeds this percentage of the compressed size (both gates must agree); 1..500 |
-| `zram.writeback` | `auto` | `auto` attaches a backing file when the kernel supports writeback and nobody owns it; `off` only preserves an existing one |
+| `zram.writeback` | `off` | `off` (default) never attaches one and releases a backing file this module created; `auto` attaches one when the kernel supports writeback, nobody owns it and `sys.boot_completed=1` (an attach before that property loses the file to init's per-boot wipe). A backing device attached from another file is always preserved |
 | `zram.writeback.size_mb` | `1024` | backing file size, sparse, 64..8192 |
 | `zram.writeback.trigger` | `off` | the sweep the kernel does not run by itself: `off` touches nothing, `huge` moves incompressible pages only (frees 1:1 against the flash it spends -- the cheap mode), `idle` also moves cold compressed pages (about a third of the flash back, so only for a device against its `mem_limit`) |
 | `zram.writeback.budget_mb` | `256` | flash a sweep may spend, in MiB, re-armed before every pass and clamped down to the backing device's size so a pass cannot run it out of space; 1..65536 |
@@ -435,9 +453,10 @@ remove.
   node the module writes was verified writable from KernelSU's root context with
   no `avc: denied`, so no other rule is needed -- and none is added.
 * Nothing outside `/sys`, `/proc`, `/dev`, `/data/per_boot/zram` (the writeback
-  backing file, and only when the kernel supports writeback and
-  `zram.writeback` is not `off`) and the module's own directory is written. No
-  system/vendor file is replaced.
+  backing file, and only under `zram.writeback=auto` and only after
+  `sys.boot_completed=1`) and the module's own directory is written. With the
+  shipped `zram.writeback=off` the module creates nothing there at all, and it
+  removes a file it created earlier. No system/vendor file is replaced.
 * The one node the module writes whose effect lands outside `/sys` is
   `zram0/writeback`, and only under `zram.writeback.trigger`. It writes into
   the backing device that is already attached -- the ROM's own extm file
@@ -445,7 +464,8 @@ remove.
   `trigger=off` the module never writes that node.
 * `ABK_SYS_ROOT`, `ABK_MEMCG_ROOT`, `ABK_PROC_SWAPS`, `ABK_MEMINFO`,
   `ABK_SWAPON`, `ABK_SWAPOFF`, `ABK_MKSWAP`, `ABK_LOSETUP`, `ABK_DD`,
-  `ABK_ZRAM_NODE`, `ABK_ZRAM_WB_DIR`, `ABK_ZRAM_WB_FILE`, `ABK_STATE_DIR`,
+  `ABK_GETPROP`, `ABK_ZRAM_NODE`, `ABK_ZRAM_WB_DIR`, `ABK_ZRAM_WB_FILE`,
+  `ABK_STATE_DIR`,
   `ABK_RUN_DIR`, `ABK_CONF`, `ABK_RECOMP_TOOL`, `ABK_CFR_TOOL` and `ABK_STDOUT`
   exist so the policy can be exercised against a fixture tree by the
   repository's tests. They are not user-facing knobs.
@@ -474,6 +494,9 @@ remove.
   writeback through a module-shaped attachment moves exactly the pages it should
   with the payload verified identical before and after. What that same run also
   exposed is the SELinux dependency above -- without the rule the numbers are
-  bit-identical to "no writeback at all". Every step stays best-effort: a
-  failure logs and continues without writeback rather than blocking the swap
-  bring-up.
+  bit-identical to "no writeback at all". The part of that attachment that did
+  not survive a reboot is the destination itself: /data/per_boot is emptied at
+  every `sys.boot_completed`, which is why the auto path now waits for that
+  property and why `off` releases the module's own file. Every step stays
+  best-effort: a failure logs and continues without writeback rather than
+  blocking the swap bring-up.

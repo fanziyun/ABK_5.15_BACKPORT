@@ -3842,12 +3842,24 @@ done
 printf '#!/bin/sh\necho "losetup $*" >> "$HARNESS_CALLS"\n[ "$1" = "-f" ] && echo /dev/block/loop42\nexit 0\n' > "$T/stub/losetup"
 printf '#!/bin/sh\necho "dd $*" >> "$HARNESS_CALLS"\nexit 0\n' > "$T/stub/dd"
 chmod +x "$T/stub/losetup" "$T/stub/dd"
+# sys.boot_completed is the one property the zram writeback policy reads: init
+# wipes /data/per_boot at exactly that point, so the attach is gated on it.  The
+# stub defaults to "completed" (1); a scenario that needs the pre-boot state
+# exports ABK_TEST_BOOT_COMPLETED=0 around the call.
+cat > "$T/stub/getprop" <<'EOF'
+#!/bin/sh
+case "$1" in
+  sys.boot_completed) echo "${ABK_TEST_BOOT_COMPLETED:-1}" ;;
+esac
+EOF
+chmod +x "$T/stub/getprop"
 
 export ABK_CONF="$T/tunables.conf"
 export ABK_RUN_DIR="$T/run" ABK_STATE_DIR="$T/state" ABK_SYS_ROOT="$T/sys"
 export ABK_PROC_SWAPS="$T/proc_swaps" ABK_MEMINFO="$T/meminfo"
 export ABK_SWAPOFF="$T/stub/swapoff" ABK_SWAPON="$T/stub/swapon" ABK_MKSWAP="$T/stub/mkswap"
 export ABK_LOSETUP="$T/stub/losetup" ABK_DD="$T/stub/dd"
+export ABK_GETPROP="$T/stub/getprop"
 export ABK_ZRAM_NODE="/dev/block/zram0" ABK_ZRAM_WB_DIR="$T/wb"
 export MODDIR="$MD"
 export ABK_STDOUT=1
@@ -3892,9 +3904,11 @@ echo "RC2=$?"
 echo "primary2=$(abk_zram_primary)"
 echo "calls2=$(tr '\n' ';' < "$T/calls")"
 
-# 3. the kernel supports writeback and nobody owns it: the rewrite attaches one
+# 3. the kernel supports writeback and nobody owns it: the rewrite attaches one.
+#    auto is opt-in now, so the fixture has to ask for it.
 printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
 reset_fixture
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
 : > "$T/sys/block/zram0/writeback"
 printf 'none\n' > "$T/sys/block/zram0/backing_dev"
 printf '0\n' > "$T/sys/block/zram0/writeback_limit"
@@ -3933,6 +3947,84 @@ echo "RC5=$?"
 echo "primary5=$(abk_zram_primary)"
 echo "calls5=$(tr '\n' ';' < "$T/calls")"
 printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
+
+# 12. the boot gate.  writeback=auto, but sys.boot_completed is not set yet:
+#     init wipes /data/per_boot at exactly that property, so an attach before it
+#     loses the file to the wipe and leaves the loop over an unlinked inode.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
+export ABK_TEST_BOOT_COMPLETED=0
+echo "want12=$(abk_zram_writeback_wanted && echo yes || echo no)"
+abk_zram_takeover > "$T/out12" 2>&1
+echo "RC12=$?"
+echo "backing12=$(abk_zram_backing_dev)"
+echo "calls12=$(tr '\n' ';' < "$T/calls")"
+unset ABK_TEST_BOOT_COMPLETED
+
+# 13. after the boot the same policy attaches one; and a stranded attachment of
+#     the module's own is released (loop detached, file removed) once the policy
+#     says off -- including when the file was already unlinked by that wipe, which
+#     is the only form the kernel still reports for it ("<path> (deleted)").
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out13" 2>&1
+echo "RC13=$?"
+echo "backing13=$(abk_zram_backing_dev)"
+echo "calls13=$(tr '\n' ';' < "$T/calls")"
+
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop42\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf '1\n' > "$T/sys/block/zram0/writeback_limit_enable"
+mkdir -p "$T/sys/block/loop42/loop" "$T/wb"
+: > "$T/wb/zram_swap"
+printf '%s\n' "$T/wb/zram_swap (deleted)" > "$T/sys/block/loop42/loop/backing_file"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out13b" 2>&1
+echo "RC13b=$?"
+echo "ours13b=$(abk_zram_backing_dev_ours /dev/block/loop42 && echo yes || echo no)"
+echo "file13b=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
+echo "calls13b=$(tr '\n' ';' < "$T/calls")"
+
+# 14. a device the ROM owns is never released, even with writeback=off.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out14" 2>&1
+echo "RC14=$?"
+echo "backing14=$(abk_zram_backing_dev)"
+echo "calls14=$(tr '\n' ';' < "$T/calls")"
+
+# 15. the file an older build left behind goes at the first pass, not at the next
+#     rewrite: writeback=off and nothing attached, so the file is nobody's and
+#     would otherwise sit in /data/per_boot until init's wipe at boot_completed.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+mkdir -p "$T/wb"
+: > "$T/wb/zram_swap"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_ensure > "$T/out15" 2>&1
+echo "RC15=$?"
+echo "file15=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
+
+# 16. ... but not while a device is attached: then the file belongs to the
+#     attachment and is the rewrite's release path's business, not a bare rm -f.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+mkdir -p "$T/wb"
+: > "$T/wb/zram_swap"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_ensure > "$T/out16" 2>&1
+echo "file16=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
 
 # 6. a kernel that locks the compressors: the policy is in force by definition,
 #    so nothing is rewritten (this is the path that lets writeback and the ROM's
@@ -4016,7 +4108,7 @@ printf 'zram.recomp.enable=1\nvm.swappiness=\nbogus.key=7\n' > "$T/tunables.conf
 echo "cfg_default=$(abk_cfg zram.recomp.idle_age_sec 3600)"
 echo "cfg_empty=$(abk_cfg vm.swappiness '')"
 echo "cfg_clamped=$(abk_clamp_uint 999 0 300)"
-echo "cfg_writeback=$(abk_cfg zram.writeback auto)"
+echo "wb_mode_unset=$(abk_zram_writeback_mode)"
 echo "ram_bytes=$(abk_mem_total_bytes)"
 echo "ram_25pct=$(abk_mem_pct_bytes 25)"
 echo "ram_half=$(abk_mul_div "$(abk_mem_total_bytes)" 1 2)"
@@ -4245,8 +4337,41 @@ rm -rf "$T"
           got.get("cfg_empty") == "", r.stdout)
     check("numeric knobs are clamped to their safe range",
           got.get("cfg_clamped") == "300", r.stdout)
-    check("the writeback policy defaults to auto", got.get("cfg_writeback") == "auto",
-          r.stdout)
+    check("the writeback policy defaults to off and auto is opt-in",
+          got.get("wb_mode_unset") == "off", r.stdout)
+    check("the shipped tunables.conf carries that off default",
+          any(line.strip() == "zram.writeback=off" for line in tunables.splitlines()),
+          tunables)
+    # 12: the boot gate.  Nothing may attach before sys.boot_completed, because
+    # init empties /data/per_boot at that property (init.rc).
+    check("writeback is not wanted before the boot completes",
+          got.get("want12") == "no", r.stdout)
+    # abk_zram_backing_dev() reports the kernel's "none" as an empty string.
+    check("... and no backing file is created either",
+          got.get("RC12") == "0" and not got.get("backing12")
+          and "dd if=/dev/zero" not in got.get("calls12", "")
+          and "losetup" not in got.get("calls12", ""),
+          (got.get("RC12"), got.get("backing12"), got.get("calls12")))
+    # 13: after the boot it attaches, and with the policy off it releases its own
+    # file instead of preserving a device nothing can use.
+    check("after boot_completed the same policy attaches a backing file",
+          got.get("RC13") == "0" and got.get("backing13") == "/dev/block/loop42"
+          and "dd if=/dev/zero" in got.get("calls13", ""), got.get("calls13"))
+    check("a stranded attachment of the module's own is recognised after unlink",
+          got.get("ours13b") == "yes", r.stdout)
+    check("... and released when the policy says off",
+          got.get("RC13b") == "0" and got.get("file13b") == "removed"
+          and "losetup -d /dev/block/loop42" in got.get("calls13b", ""),
+          (got.get("calls13b"), got.get("file13b")))
+    check("a backing device the ROM owns is never released",
+          got.get("RC14") == "0" and got.get("backing14") == "/dev/block/loop7"
+          and "losetup -d" not in got.get("calls14", ""), got.get("calls14"))
+    # 15/16: what an older build left behind has to go at the first pass, without
+    # waiting for a rewrite that may never come -- but never while it is in use.
+    check("a stale backing file is removed at the first pass",
+          got.get("RC15") == "0" and got.get("file15") == "removed", r.stdout)
+    check("... but not while a backing device is attached",
+          got.get("file16") == "present", r.stdout)
     # 15561024 KiB is past 2^31 bytes; a 32-bit shell would wrap it negative.
     check("byte counts survive the 32-bit shell arithmetic limit",
           got.get("ram_bytes") == "15934488576"
