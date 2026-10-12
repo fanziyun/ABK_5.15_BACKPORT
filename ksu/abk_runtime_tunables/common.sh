@@ -10,7 +10,7 @@ ABK_TAG="ABK-Tunables"
 # It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
 # -- because nothing tied the two files together; test_runtime_tunables_module
 # now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.20.0"
+ABK_VERSION="v0.21.0"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -69,9 +69,20 @@ ABK_SWAPON="${ABK_SWAPON:-swapon}"
 ABK_MKSWAP="${ABK_MKSWAP:-mkswap}"
 ABK_LOSETUP="${ABK_LOSETUP:-losetup}"
 ABK_DD="${ABK_DD:-dd}"
+ABK_GETPROP="${ABK_GETPROP:-getprop}"
 ABK_ZRAM_NODE="${ABK_ZRAM_NODE:-/dev/block/zram0}"
-# Where a writeback backing file goes: the ROM's per-boot directory, the same
-# one Android's own mmd_setup uses for its zram backing device.
+# Where a zram.writeback=auto backing file goes.  /data/per_boot is the only
+# pre-unlock, DE-encrypted place for it, and /data/per_boot/zram is the path the
+# ROM's policy labels zram_data_file -- but it is a PER-BOOT directory, not a
+# persistent one: AOSP's init.rc runs
+#   on property:sys.boot_completed=1
+#     exec - system system -- /bin/rm -rf /data/per_boot
+#     mkdir /data/per_boot 0700 system system encryption=Require key=per_boot_ref
+# so its contents (and the key that encrypts them) do not survive a reboot.
+# AOSP's own mmd uses /data/per_boot/zram_swap (system/memory/mmd/src/main.rs)
+# and is started off a property its own rc sets at sys.boot_completed, i.e.
+# deliberately after that wipe; the module's auto-attach is gated on the same
+# property (abk_boot_completed) for the same reason.
 ABK_ZRAM_WB_DIR="${ABK_ZRAM_WB_DIR:-/data/per_boot/zram}"
 ABK_ZRAM_WB_FILE="${ABK_ZRAM_WB_FILE:-$ABK_ZRAM_WB_DIR/zram_swap}"
 ABK_STDOUT="${ABK_STDOUT:-0}"
@@ -375,7 +386,7 @@ abk_pid_write() {
 
 # --- small probes --------------------------------------------------------
 abk_getprop() {
-  getprop "$1" 2>/dev/null | tr -d '\r'
+  "$ABK_GETPROP" "$1" 2>/dev/null | tr -d '\r'
 }
 
 abk_meminfo_kb() {

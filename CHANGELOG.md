@@ -351,6 +351,42 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-21-0"></a>
+
+## companion v0.21.0（zram writeback 后备文件不再默认落在 /data/per_boot：默认关 + boot_completed 闸门 + 释放路径）
+
+现象与根因分开确认。现象：设备在 /data/per_boot 下出现 1 GiB 的 zram_swap 文件，而该目录正是开机清理/解密时序上的敏感点。根因在 AOSP 侧即可定位：system/core/rootdir/init.rc 每次开机执行
+
+    on property:sys.boot_completed=1
+        exec - system system -- /bin/rm -rf /data/per_boot
+        mkdir /data/per_boot 0700 system system encryption=Require key=per_boot_ref
+
+即 /data/per_boot 是 per-boot 目录：密钥引用由 vold 写在 /data/.fscrypt_key_per_boot_ref（system/vold/FsCrypt.cpp:561-569），每次开机重新生成，目录在每次 sys.boot_completed 被清空并用新 per-boot key 重建。AOSP 自己的 mmd 用的常量是 /data/per_boot/zram_swap（system/memory/mmd/src/main.rs:89-90；默认 1 GiB，losetup 稀疏文件），并由 mmd.rc 在 sys.boot_completed 之后才启动——刻意排在 init 那次 wipe 之后。本模块用的是 /data/per_boot/zram/zram_swap（多一层 /data/per_boot/zram，那是 vendor 打的 zram_data_file 标签路径），且在 service.sh 里创建，可能早于 sys.boot_completed：抢在 wipe 之前建的文件会被 unlink，而 loop 设备仍持有孤立 inode。仓库真机记录里已有这个形状——Batch 18 §10 记 loop49 的 losetup -a 输出为 [64819]:313194 ()（**后备文件名是空的**）、且 /data/per_boot/zram/ 里 ROM 的后备文件不在；当时记成「mmd 从未完成」，本批次更正为「init 在 boot_completed 清空了该目录」。
+
+利用率是这条记录的另一半，且是「不可达」而不是「收益小」：bd_stat 开机 615 s 后仍是 [1 0 1]（那 1 块来自模块自己的实验），ROM 的 extm/mmd 都不启动（vendor.zram.disable=1、init.svc.mmd_setup=stopped），模块自身从不写 writeback 节点（zram.writeback.trigger=off 出厂默认），因此 auto 后备设备一页都移动不了；而每次开机为它付的代价是一次完整 zram 重写（swapoff -> reset -> 挂后备设备 -> mkswap -> swapon）。默认因此改为 off，auto 变成 opt-in。
+
+「搬到别的目录」同样不行，而且不是配置问题：内核域写回页的 SELinux 规则按**文件类型**匹配（`allow kernel zram_data_file file { read write }`），而 `zram_data_file` 这个类型只由 vendor 的 file_contexts 打在 `/data/per_boot/zram`（真机实测 `u:object_r:zram_data_file:s0`，见 `sepolicy.rule` 的注释）；换路径后没有规则可依，Enforcing 下每页退化成 `-EIO`、写回**报成功却一页都不搬**（Batch 18 记录的形状）。复用 ROM 自己的后备文件等于拿走 ROM 的设备，而模块的既有约束是永不动它。所以处置只能是「默认不建」。
+
+落地（全部在 companion，内核 graft 与 CONFIG_ZRAM_WRITEBACK 的 ROM 档一行未动）：
+
+- tunables.conf：zram.writeback=off 为新默认，注释块写明 per-boot 语义、AOSP 的真实路径、以及「只开 auto 不开 trigger 不会有任何效果」；abk_zram_writeback_mode() 的缺键回退同步改为 off（默认值只有一处权威）。
+- zram-policy.sh：新增 abk_boot_completed()（sys.boot_completed=1），闸门加在 abk_zram_writeback_wanted() 里且**排在 abk_zram_writeback_owned() 之后**——ROM 自己的设备在 boot 前后都照旧保留、永不让位；boot_completed 之前不因 writeback 触发重写（算法/init/swap 三个理由各自独立，不受影响），之后由 supervisor 的下一个 tick 完成 attach，与 AOSP mmd 的时序一致。
+- zram-policy.sh：新增 abk_zram_backing_dev_ours()（读 /sys/block/<loop>/loop/backing_file，比较 <path> 与 <path> (deleted) 两种形态，于是「文件已被 wipe 掉、loop 还挂着」也认得出是自己的）与 abk_zram_release_backing_dev()（losetup -d + rm -f，只在 reset 之后调用，因为那是 backing_dev 唯一能被关闭的窗口）；abk_zram_writeback_unwanted() 在策略为 off（或内核根本没有 writeback 能力）时成立，auto 下 owned 是正常重挂而不是该释放。
+- zram-policy.sh：新增 abk_zram_drop_stale_backing_file()，由 abk_zram_ensure() 在**每次 pass、重写判定之前**执行：策略为 off 且 zram 当前没有任何后备设备时，删掉遗留的 `$ABK_ZRAM_WB_FILE`。这补的是 abk_zram_release_backing_dev() 盖不到的一格——释放只在重写里发生，而重写只在设备需要重建时才发生，于是上一个版本建的文件、或「attach 之后、reset 之前」结束的那次开机留下的文件，会一直躺在 /data/per_boot 里等 init 在 boot_completed 清空它，正是本批次要退出的那个窗口。有设备 attach 时不动：那时文件属于该 attach，走重写的释放路径。
+- action.sh：status 增加 boot_completed、backing_dev 的 owner（module / ROM-foreign）以及本模块文件是否还在磁盘上——「已 attach 但文件不见了」这条只有这里能看出来。
+- 测试缝：common.sh 新增 ABK_GETPROP（默认 getprop），与既有 ABK_LOSETUP/ABK_DD 同一风格，fixture 用它注入 sys.boot_completed。fixture 新增场景 12-16：boot 未完成时不 attach 且不产生 dd/losetup；boot 完成后同一策略 attach；off 下释放自己的文件（含已 unlink 的 " (deleted)" 形态）；off 下外来设备永不被 losetup -d；off 下没有设备 attach 的遗留后备文件在第一次 pass 被删掉、有设备 attach 时不动。zram.writeback 的默认断言从「默认 auto」改为「默认 off，且出厂 tunables.conf 就是 off」。单测 **1521 项全绿**（py_compile、bash -n 同时过）。
+- 文档更正：common.sh 与 companion README 里「/data/per_boot/zram/zram_swap 是 Android mmd_setup 用的同一个地方」不成立——AOSP 用的是目录根下的 /data/per_boot/zram_swap；README 的默认值表、写入范围与 seam 清单同步更新。
+
+边界：sys.boot_completed 永不置 1 的 ROM 下 auto 永不 attach（**故意 fail-closed**，fail-open 就是当前的撞 wipe 行为），只记 INFO；内核无 CONFIG_ZRAM_WRITEBACK 时整条路径照旧 no-op；模块更新整体替换模块目录（本模块没有 customize.sh 保留本地 tunables.conf），所以新默认对已装设备直接生效，设备上遗留的孤儿 loop 由下一次重写或人工 losetup -d 清掉，遗留的后备文件则在第一次 pass 就删掉。
+
+未在设备上确证的环节：「1 GiB 文件 <-> 卡在 /data/per_boot 解密」的精确内核态交互有两个候选机制，且两条都被本批次消除：(a) 抢在 boot_completed 之前建文件被 wipe 掉、loop 留在孤立 inode（真机已见该形状）；(b) /data/per_boot/zram 带 vendor 的 zram_data_file 标签，而 AOSP 只给了 toolbox 对 system_data_file/system_data_root_file 的 unlink/rmdir 权限（system/sepolicy/private/toolbox.te 的 "# rm -rf /data/per_boot" 三条 allow），wipe 可能因此失败并留下与 per_boot_ref 不匹配的旧策略。判定命令写在候选计划里（ls -la /data/per_boot*、cat /sys/block/loop*/loop/backing_file、dmesg 里的 avc per_boot/zram/toolbox）。
+
+版本：companion v0.20.0 -> v0.21.0（versionCode 24 -> 25，common.sh 与 module.prop 成对）；module.conf 不动，按 companion 批次的既有惯例。
+
+未做：删掉 zram.writeback* 五个键、abk_zram_create_backing_dev() 与 sepolicy.rule 里的 zram_data_file 规则——默认关已经解决本问题，删代码不会多拿到任何东西，且会失去 opt-in 的恢复路径；彻底删除属于产品取舍，另行决定。
+
+---
+
 <a id="companion-v0-18-0"></a>
 
 ## companion v0.18.0（MGLRU 每次开机都被 ROM 关回去：单次写入输掉写序）
