@@ -7410,6 +7410,14 @@ def test_batch60_sched_ext_reach():
           in w60._STRUCT_OPS_TYPES_NEW)
     check("the registry entry rides the class's config",
           "#ifdef CONFIG_SCHED_CLASS_EXT" in w60._STRUCT_OPS_TYPES_NEW)
+    # BPF_STRUCT_OPS_TYPE(_name) expands to `struct _name data;`, so the header
+    # needs the complete type or bpf_struct_ops.o fails with "field has
+    # incomplete type 'struct sched_ext_ops'".  The include must sit before the
+    # registry line inside the CONFIG_SCHED_CLASS_EXT guard (upstream sm8750
+    # spells the same two lines in that order).
+    check("the registry includes the header that defines the type",
+          "#include <linux/sched/ext.h>\nBPF_STRUCT_OPS_TYPE(sched_ext_ops)"
+          in w60._STRUCT_OPS_TYPES_NEW)
     types_h = next(g for g in perf_mod.PATCH_GROUPS
                    if g.key == "sched_ext_struct_ops_type")
     check("the registry group edits the BPF header only",

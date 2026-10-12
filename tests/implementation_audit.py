@@ -2888,6 +2888,14 @@ REQUIRED_CONTENT.update({
     "perf:sched_ext_struct_ops_type": [
         ("kernel/bpf/bpf_struct_ops_types.h",
          "#ifdef CONFIG_SCHED_CLASS_EXT\n"),
+        # BPF_STRUCT_OPS_TYPE(_name) expands into `struct _name data;`, so this
+        # translation unit needs the *complete* type.  Without the include the
+        # registry line compiles to a forward declaration and bpf_struct_ops.o
+        # dies with "field has incomplete type 'struct sched_ext_ops'" -- a
+        # C-level error no text audit can see.  Pinned here as a regression
+        # guard; it is what upstream's OnePlus sm8750 tree carries too.
+        ("kernel/bpf/bpf_struct_ops_types.h",
+         "#include <linux/sched/ext.h>\n"),
         ("kernel/bpf/bpf_struct_ops_types.h",
          "BPF_STRUCT_OPS_TYPE(sched_ext_ops)"),
     ],
