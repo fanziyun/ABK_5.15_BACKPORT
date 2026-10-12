@@ -68,7 +68,7 @@ abk_status_report() {
     abk_show "mm_stat" "$(abk_read "$ABK_ZRAM_DIR/mm_stat" | tr -d '\n')"
     abk_show "io_stat" "$(abk_read "$ABK_ZRAM_DIR/io_stat" | tr -d '\n')"
     abk_show "recomp pass cap" "$(abk_cfg zram.recomp.max_pages 131072) attempted entries (0 = unbounded; needs the kernel max_pages graft)"
-    abk_show "recomp mark cadence" "$(abk_cfg zram.recomp.mark_interval_sec 10800)s (sweeps in between pass --no-mark, so a capped sweep keeps advancing instead of re-draining its prefix)"
+    abk_show "recomp mark cadence" "$(abk_cfg zram.recomp.mark_interval_sec 3600)s (sweeps in between pass --no-mark, so a capped sweep keeps advancing instead of re-draining its prefix)"
     if [ -n "$(abk_zram_secondary)" ]; then
       abk_show "recompression armed" "yes"
     else

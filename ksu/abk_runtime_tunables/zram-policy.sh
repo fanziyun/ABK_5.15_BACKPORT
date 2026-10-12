@@ -772,10 +772,13 @@ abk_zram_supervisor_main() {
   # the mark runs on its own, much longer clock and every sweep in between
   # passes --no-mark.
   #
-  # 10800 s, not a day: a daily mark never reaches a cold set that turns over
-  # every few hours; six sweeps between marks still drain ~3 GiB per cycle.
-  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 10800)"
-  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=10800
+  # 3600 s (one hour): the drain rate is bounded by sweep cadence x budget
+  # (2 x 512 MiB per hour), not by the mark clock -- Batch 47's skip predicate
+  # makes re-armed already-optimal pages free -- so an hourly mark only changes
+  # how soon newly cold pages enter the sweep.  It must stay slower than the
+  # sweep itself: re-marking between passes would hand the set straight back.
+  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 3600)"
+  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=3600
   [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
   # _zs_mark_tick counts sweeps, so _zs_per_mark divides by the SWEEP interval
   # -- dividing by _zs_reassert once made a "24 h" mark land 30 days out.
