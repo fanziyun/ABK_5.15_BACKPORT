@@ -1,31 +1,20 @@
 #!/system/bin/sh
 # iorap-watch.sh - Stage 2b: the launch watcher that takes iorapd's place.
 #
-# Re-entered as `service.sh --supervise-iorap` from service.sh's abk_spawn.
-# The kernel owns the mechanism (bg_launch_prefetch: record windows, bitmap
-# records, the pre-launch kick); this watcher owns the policy -- it decides
-# WHEN a uid gets recorded and WHEN it gets kicked, which is what iorapd's
-# /dev/iorap handshake used to decide.
+# Re-entered as `service.sh --supervise-iorap`.  The kernel owns the mechanism
+# (bg_launch_prefetch); this watcher owns the policy -- when a uid is recorded
+# and when it is kicked, which is what iorapd's /dev/iorap handshake decided.
 #
-# Trigger source: /proc polling.  This ROM ships no per-launch logcat signal
-# (the main buffer has no "START u0" and the events buffer has no am_start --
-# both verified on vermeer), so the watcher snapshots /proc every ~300 ms and
-# reacts to processes whose UID is an app UID.  The kernel keys the record
-# table on UID, so the package name is never needed.
+# Trigger: /proc polling.  This ROM ships no per-launch logcat signal (no
+# "START u0", no am_start -- both verified on vermeer), so the watcher diffs
+# /proc every ~300 ms and reacts to new app-uid processes.  The record table
+# is keyed by uid, so the package name is never needed.
 #
-# The economics are the whole point.  One cold launch touches ~600 files and
-# the record table holds 512 slots, so recording on EVERY launch evicts
-# everything each time (measured on device with the naive flow: kicks=0 for
-# every app but the most recently collected).  Match iorapd's economics
-# instead -- record a uid ONCE per generation, kick it on every other launch:
-#   - first sighting of a uid, or after iorap.record_cool_min: kick + record
-#   - every other launch inside the generation: kick only
-# A kick-only launch does not touch the record table at all (collection is
-# window-gated), so a hot app's records survive the apps launched in between
-# and every subsequent kick keeps hitting.  The kick fires before the record
-# write on purpose: it re-reads the previous generation's pages while this
-# launch is still spawning, and the record write then re-arms that uid's
-# replay cooldowns for the next generation.
+# Economics: a cold launch touches hundreds of files, so recording on every
+# launch churns the table (kicks=0 for all but the most recent app, measured).
+# Instead: record a uid once per generation (first sighting or after
+# record_cool_min), kick it on every other launch.  Kick-only launches do not
+# touch the table (collection is window-gated), so a hot app's records survive.
 
 abk_iorap_main() {
   _io_k=/sys/module/filemap/parameters

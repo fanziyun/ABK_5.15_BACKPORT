@@ -5952,43 +5952,20 @@ import batch49_core_mglru_reclaim_loop as _b49_mglru  # noqa: E402
 PATCH_GROUPS = PATCH_GROUPS + _b49_mglru.build_groups(PatchGroup)
 
 # ============================================================================
-# Batch 50: background readahead suppression -- the always-on half of the
-# iorap2 launch-boost policy (Stage 1 of the iorap2 backport).
+# Batch 50: background readahead suppression -- Stage 1 of the iorap2 backport.
 #
-# Xiaomi's launch-boost module (iorap2.ko, "mi_lb_*" family, driver v3.0.0)
-# registers six ACK vendor hooks.  Four of them implement a policy with no
-# userspace dependency: tasks inside the "background" cpuset cgroup that are
-# past their launch burst (voluntary context switches above 99) get file
-# readahead trimmed, so long-lived background tasks stop evicting the page
-# cache and IO bandwidth the foreground needs:
+# iorap2.ko ("mi_lb_*" family, v3.0.0) registers six ACK vendor hooks; four
+# are a policy with no userspace dependency and are transcribed here from the
+# decompiled sym.should_skip_fault_around / sym.mi_lb_skip_async_mmap_readahead
+# / sym.adjust_readahead / sym.adjust_readaround, offsets resolved against this
+# tree.  Tasks in the "background" cpuset cgroup past their launch burst
+# (nvcsw > 99) get readahead trimmed: fault-around skipped, async mmap
+# readahead skipped, ondemand cap halved, read-around window shrunk.
 #
-#   android_vh_should_fault_around        skip fault-around entirely
-#   android_vh_do_async_mmap_readahead    skip async mmap readahead
-#   android_vh_ra_tuning_max_page         cap ondemand_readahead at ra_pages/2
-#   android_vh_tune_mmap_readaround       window pgoff-ra/4, size ra/2, async ra/8
-#
-# The handler bodies are a fresh-C transcription of the decompiled
-# sym.should_skip_fault_around / sym.mi_lb_skip_async_mmap_readahead /
-# sym.adjust_readahead / sym.adjust_readaround, with the decompiler's raw
-# offsets resolved against this tree: the cgroup test is
-# task_css(cpuset)->cgroup->kn->name (the device mounts cpuset v1 at
-# /dev/cpuset, where the background group is literally named "background"),
-# the age test is task->nvcsw, the cap reads ractl->ra->ra_pages.  Young
-# tasks stay exempt on purpose: their burst is the IO the readahead
-# machinery exists to front-load.
-#
-# Deliberately NOT ported here: the per-UID exemption table the upstream
-# module gets fed over /dev/iorap by its iorapd daemon (this child has no
-# userspace contract, so the test is cgroup name + age threshold only, both
-# exposed as module_param() knobs), and the collect/compile/preread half of the
-# module (android_vh_filemap_read / android_vh_filemap_map_pages consumers,
-# /dev/iorap, the compiler thread) -- that half is a Stage-2 candidate and
-# would need the daemon handshake reversed first.
-#
-# Registered after every batch that edits mm/filemap.c: this group only
-# appends at EOF and its anchor is pristine text no other group writes, so
-# ordering is informational, but the shape probes run against the patched
-# text and depend on the file still containing the four call sites verbatim.
+# Not ported: the per-UID exemption table iorapd feeds over /dev/iorap (no
+# userspace contract here) and the collect/preread half (Stage 2, below).
+# Appends at EOF; the anchor is pristine text, but the shape probes require
+# the four call sites to still be present verbatim.
 # ============================================================================
 
 _BG_RA_ANCHOR = """EXPORT_SYMBOL(try_to_release_page);
@@ -5996,33 +5973,19 @@ _BG_RA_ANCHOR = """EXPORT_SYMBOL(try_to_release_page);
 
 _BG_RA_PAYLOAD = """EXPORT_SYMBOL(try_to_release_page);
 
-/* sailboat_bg_readahead_tune: background readahead suppression, backported
- * from Xiaomi's iorap2 launch-boost module (the mi_lb_* family, driver
- * version 3.0.0).  Long-lived processes running in the "background" cpuset
- * cgroup (Android parks cached apps there: /dev/cpuset/background) get
- * their file readahead trimmed through the four vendor hooks this file and
- * its neighbours already fire: fault-around is skipped, async mmap
- * readahead is skipped, the ondemand_readahead window cap is halved and
- * the mmap read-around window is shrunk toward the faulting offset -- so
- * background tasks stop evicting the page cache and IO bandwidth that the
- * foreground needs.  Young tasks are deliberately exempt: their launch
- * burst is exactly the IO pattern the readahead machinery exists to
- * front-load (upstream suppresses only past 99 voluntary context switches).
- *
- * The upstream module gates the same policy per-UID through an ioctl-fed
- * table driven by its iorapd daemon; this backport has no userspace
- * contract, so the test is the cgroup name plus the age threshold only,
- * and both knobs are runtime-togglable:
- *   /sys/module/filemap/parameters/abk_bg_ra_suppress   (default 1)
- *   /sys/module/filemap/parameters/abk_bg_ra_nvcsw_min  (default 99)
+/* sailboat_bg_readahead_tune: background readahead suppression from Xiaomi's
+ * iorap2 (mi_lb_* family, v3.0.0).  Tasks in the "background" cpuset cgroup
+ * past their launch burst (nvcsw > abk_bg_ra_nvcsw_min) get fault-around and
+ * async mmap readahead skipped, the ondemand cap halved and the read-around
+ * window shrunk, through the four vendor hooks this file already fires.
+ * Knobs: /sys/module/filemap/parameters/abk_bg_ra_{suppress,nvcsw_min}.
  */
 #include <linux/cgroup.h>
 #include <linux/moduleparam.h>
 #ifdef CONFIG_CPUSETS
 static int abk_bg_ra_suppress = 1;
-/* module_param, not core_param: core_param strips the module prefix and the
- * knobs end up in /sys/module/kernel/parameters/ -- r1 boot proved that live.
- * Same-name form (param name == variable name), so no module_param_named. */
+/* module_param, not core_param: core_param buries knobs under
+ * /sys/module/kernel/parameters/ (r1 boot proved it); same-name form. */
 module_param(abk_bg_ra_suppress, int, 0644);
 static int abk_bg_ra_nvcsw_min = 99;
 module_param(abk_bg_ra_nvcsw_min, int, 0644);
@@ -6034,8 +5997,6 @@ static bool abk_bg_ra_should_suppress_current(void)
 
 \tif (!READ_ONCE(abk_bg_ra_suppress))
 \t\treturn false;
-\t/* Young tasks keep their readahead: the launch burst is the IO the
-\t * readahead machinery is meant to front-load, not to fight. */
 \tif (current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min))
 \t\treturn false;
 
@@ -6168,33 +6129,22 @@ PATCH_GROUPS = PATCH_GROUPS + [
 ]
 
 # ============================================================================
-# bg_launch_prefetch -- Stage 2 of the iorap2 port: the collect/compile/
-# preread loop rebuilt kernel-side, without iorapd.
+# bg_launch_prefetch -- Stage 2 of the iorap2 port: the collect/preread loop
+# rebuilt kernel-side, without iorapd.
 #
-# What the upstream ko does through /dev/iorap ioctls, this payload does with
-# module knobs only.  A record window opens when a UID is written to
-# abk_lp_record_uid and stays open abk_lp_record_ms; during it the
-# android_vh_filemap_read (process context, may sleep, records the path via
-# d_path) and android_vh_filemap_map_pages (PTE lock already dropped at its
-# call site, bitmap-set only) hooks snapshot the pages the launching process
+# A record window opens when a UID is written to abk_lp_record_uid (open for
+# abk_lp_record_ms); during it the android_vh_filemap_read and
+# android_vh_filemap_map_pages hooks snapshot the pages the launching process
 # touches, keyed by (dev, ino, mtime, uid) into an inline 4096-page bitmap.
-# Records are scalars + a bitmap + a path copy -- no stored kernel pointers,
-# so nothing can dangle.  Replay rides the app's own next launch: a young
-# task (nvcsw < abk_lp_young_max -- its own knob, deliberately NOT
-# abk_bg_ra_nvcsw_min, which lives inside the CONFIG_CPUSETS gate of the
-# suppression payload above; trap 7) faulting or reading a recorded inode
-# re-issues page_cache_sync_readahead() over the recorded ranges under a
-# per-record cooldown.  Writing a UID to abk_lp_prefetch_uid queues a
-# workqueue kick that filp_open()s each recorded path of that UID and
-# prefetches it before the app starts -- best-effort, because SELinux may
-# deny the kernel domain the open; the at-fault replay path needs no
-# permission the faulting app did not already have.
-#
-# Everything is static: 32 slots x (512 B bitmap + 160 B path + key), no
-# allocation on any fault path, one spinlock, round-robin eviction.  The
-# two hook sites this group probes (filemap_read entry, filemap_map_pages
-# after pte_unmap_unlock) and the do_read_fault should_fault_around site are
-# all sleepable-or-atomic as documented per-callback below.
+# Records hold scalars + bitmap + a path copy, no stored pointers, so nothing
+# can dangle.  Writing a UID to abk_lp_prefetch_uid queues a workqueue kick
+# that filp_open()s each recorded path and prefetches it before the app
+# starts (best-effort: SELinux may deny the kernel-domain open).  512 B
+# bitmap + 160 B path per slot, 4096 slots, LRU eviction, one spinlock, no
+# allocation on any fault path.  at-fault replay is kept behind
+# abk_lp_fault_replay (default 0: it hard-reset the SoC from fault context).
+# abk_lp_young_max is its own knob, NOT abk_bg_ra_nvcsw_min (that one is
+# inside the CONFIG_CPUSETS gate of the Stage-1 payload; trap 7).
 # ============================================================================
 
 _BG_LP_ANCHOR = """fs_initcall(abk_bg_ra_tune_init);
@@ -6232,22 +6182,17 @@ static struct abk_lp_rec abk_lp_table[ABK_LP_SLOTS];
 static DEFINE_SPINLOCK(abk_lp_lock);
 static bool abk_lp_seeded;	/* any record exists (replay fast gate) */
 
-/* Backing stores for the two set-with-side-effect knobs.  Declared before
- * the work function because abk_lp_prefetch_work() reads abk_lp_prefetch_uid
- * (the r3 build caught the use-before-declaration as a garbled asm-constraint
- * error, not an undeclared-identifier error). */
+/* Backing stores for the two set-with-side-effect knobs, declared before
+ * abk_lp_prefetch_work() which reads abk_lp_prefetch_uid. */
 static int abk_lp_record_uid = -1;
 static int abk_lp_prefetch_uid = -1;
 
 static int abk_lp_enable = 1;
 module_param(abk_lp_enable, int, 0644);
-/* At-fault replay (page_cache_sync_readahead issued from the fault/read
- * hook contexts) hard-reset the vermeer SoC -- no panic text, no pstore,
- * every CPU mid-syscall: a hard reset the MIUI pre-spawn helpers walking
- * the app's own files as young uid-10274 tasks reliably reach.  It stays
- * in the tree behind this knob for future forensics, but the supported
- * replay path is the pre-launch workqueue kick, which does the identical
- * primitives from a plain kthread with no fault-path constraints. */
+/* at-fault replay is off by default: issuing page_cache_sync_readahead from
+ * the fault/read hook contexts hard-reset the SoC (no panic text); the
+ * supported replay path is the pre-launch kick.  Kept behind the knob for
+ * future forensics. */
 static int abk_lp_fault_replay;
 module_param(abk_lp_fault_replay, int, 0644);
 static int abk_lp_record_ms = 4000;
@@ -6266,9 +6211,6 @@ static int abk_lp_stats_prefetched;
 module_param(abk_lp_stats_prefetched, int, 0444);
 static int abk_lp_stats_kicks;
 module_param(abk_lp_stats_kicks, int, 0444);
-
-/* Same-name module_param form throughout (Batch 12's lesson: the first
- * module_param() argument compiles as the variable identifier). */
 
 static u32 abk_lp_win_uid = UINT_MAX;	/* no window */
 static unsigned long abk_lp_win_deadline;
@@ -6337,14 +6279,12 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 		}
 	}
 	if (!rec) {
-		/* Shared-file skip: framework jars/libs/apex pages are touched
-		 * by every app; recording them per-uid churned the whole table
-		 * with a single cold launch (measured: ~600 records per
-		 * launch, 512 slots).  If another uid already holds this
-		 * exact (dev, ino, mtime), those pages are shared page cache
-		 * owned by whichever app recorded them first -- skip.  A
-		 * genuine file update changes i_mtime, fails this scan and
-		 * gets recorded fresh for whoever launches next. */
+		/* Shared-file skip: framework jars/libs/apex are touched by
+		 * every app.  If another uid already recorded this exact
+		 * (dev, ino, mtime), the pages are shared cache owned by the
+		 * first recorder -- skip, or one cold launch (~600 records)
+		 * churns the whole table.  A file update changes i_mtime and
+		 * gets recorded fresh. */
 		for (i = 0; i < ABK_LP_SLOTS; i++) {
 			struct abk_lp_rec *r = &abk_lp_table[i];
 
@@ -6355,11 +6295,8 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 				return;
 			}
 		}
-		/* LRU eviction, not round-robin: the watcher records a uid
-		 * once per generation and kicks it on every other launch,
-		 * so a hot app's records must survive every other app's
-		 * collection.  Round-robin churned exactly those (measured
-		 * on device: kicks=0 for any app but the most recent). */
+		/* LRU eviction so a hot app's records survive other apps'
+		 * collection (round-robin churned exactly those). */
 		for (i = 0; i < ABK_LP_SLOTS; i++) {
 			struct abk_lp_rec *r = &abk_lp_table[i];
 
@@ -6505,11 +6442,9 @@ static int abk_lp_record_uid_set(const char *val, const struct kernel_param *kp)
 {
 	int i, ret;
 
-	/* Parse through param_set_int, not kstrtouint(): the sysfs write
-	 * buffer carries a trailing newline and the standard setter is what
-	 * tolerates it -- a direct kstrtouint() rejected "10274\n" and the
-	 * record window silently never opened (r3 device test, all stats 0).
-	 * A negative value closes the window without side effects. */
+	/* param_set_int, not kstrtouint: the sysfs write carries a trailing
+	 * newline the standard setter tolerates (a bare kstrtouint rejected
+	 * "10274\n" and the window never opened).  Negative closes it. */
 	ret = param_set_int(val, kp);
 	if (ret)
 		return ret;
@@ -6574,12 +6509,10 @@ static void abk_lp_map_cb(void *data, struct file *file, pgoff_t first_pgoff,
 		return;
 	if (!file->f_mapping || !file->f_mapping->host)
 		return;
-	/* want_path=true here too: a heavy app (QQ/WeChat) faults its code
-	 * in through map_pages, not read(), so a record collected without a
-	 * path has nothing for the pre-launch kick's filp_open() to reopen
-	 * -- measured as prefetched=0 for QQ.  The call site is after
-	 * pte_unmap_unlock(), process context, and d_path() does not sleep,
-	 * so recording the path here is as safe as in the read hook. */
+	/* want_path=true: heavy apps fault code in through map_pages, not
+	 * read(), so a pathless record gives the kick's filp_open() nothing
+	 * to reopen (QQ measured prefetched=0).  Call site is after
+	 * pte_unmap_unlock(), process context; d_path() does not sleep. */
 	abk_lp_touch(file->f_mapping->host, uid, first_pgoff, last_pgoff,
 		     file, true);
 }
@@ -6659,9 +6592,9 @@ PATCH_GROUPS = PATCH_GROUPS + [
         "page_cache_sync_readahead() from the should_fault_around and "
         "filemap_read hooks under a per-record cooldown, and a UID written "
         "to abk_lp_prefetch_uid queues a workqueue kick that filp_open()s "
-        "each recorded path and prefetches it pre-launch.  32 static "
-        "slots, no allocation on any fault path, no stored pointers "
-        "(UAF-free by construction).  Knobs at "
+        "each recorded path and prefetches it pre-launch.  4096 static "
+        "slots, LRU eviction, no allocation on any fault path, no stored "
+        "pointers (UAF-free by construction).  Knobs at "
         "/sys/module/filemap/parameters/abk_lp_*.",
         [
             "Xiaomi iorap2.ko mi_lb collection (research/ decompile: "
