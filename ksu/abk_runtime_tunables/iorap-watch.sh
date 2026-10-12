@@ -17,6 +17,7 @@
 # touch the table (collection is window-gated), so a hot app's records survive.
 
 abk_iorap_main() {
+  abk_pid_write iorap-watch "$$"
   _io_k=/sys/module/filemap/parameters
   if [ ! -f "$_io_k/abk_lp_enable" ]; then
     abk_log "iorap-watch: kernel has no bg_launch_prefetch, watcher not started"
@@ -27,9 +28,13 @@ abk_iorap_main() {
     return 0
   fi
   _io_min_uid=$(abk_cfg iorap.min_uid 10000)
+  abk_is_uint "$_io_min_uid" || _io_min_uid=10000
   _io_rec_cool=$(abk_cfg iorap.record_cool_min 360)
+  abk_is_uint "$_io_rec_cool" || _io_rec_cool=360
   _io_kick_cool=$(abk_cfg iorap.kick_cool_sec 60)
+  abk_is_uint "$_io_kick_cool" || _io_kick_cool=60
   _io_gap=$(abk_cfg iorap.global_gap_sec 2)
+  abk_is_uint "$_io_gap" || _io_gap=2
   _io_st="$ABK_STATE_DIR/iorap"
   _io_run="$ABK_RUN_DIR/iorap"
   mkdir -p "$_io_st" "$_io_run" 2>/dev/null || true

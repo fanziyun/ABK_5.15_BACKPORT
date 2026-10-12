@@ -6241,7 +6241,9 @@ static unsigned long abk_lp_win_deadline;
 
 static bool abk_lp_window_open(u32 uid)
 {
-	return abk_lp_win_uid != UINT_MAX && uid == abk_lp_win_uid &&
+	u32 win = READ_ONCE(abk_lp_win_uid);
+
+	return win != UINT_MAX && uid == win &&
 	       time_after(READ_ONCE(abk_lp_win_deadline), jiffies);
 }
 
@@ -6290,6 +6292,8 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 		return;
 	if (last >= ABK_LP_PAGES)
 		last = ABK_LP_PAGES - 1;
+	if (last < first)
+		return;
 
 	spin_lock_irqsave(&abk_lp_lock, flags);
 	for (i = 0; i < ABK_LP_SLOTS; i++) {
@@ -6475,9 +6479,9 @@ static int abk_lp_record_uid_set(const char *val, const struct kernel_param *kp)
 	if (*(int *)kp->arg < 0)
 		return 0;
 	spin_lock(&abk_lp_lock);
-	abk_lp_win_uid = (u32)*(int *)kp->arg;
-	abk_lp_win_deadline = jiffies +
-		msecs_to_jiffies(READ_ONCE(abk_lp_record_ms));
+	WRITE_ONCE(abk_lp_win_uid, (u32)*(int *)kp->arg);
+	WRITE_ONCE(abk_lp_win_deadline,
+		   jiffies + msecs_to_jiffies(READ_ONCE(abk_lp_record_ms)));
 	for (i = 0; i < ABK_LP_SLOTS; i++)
 		if (abk_lp_table[i].used && abk_lp_table[i].uid ==
 						   (u32)*(int *)kp->arg)
@@ -6494,7 +6498,7 @@ static int abk_lp_prefetch_uid_set(const char *val,
 	ret = param_set_int(val, kp);
 	if (ret)
 		return ret;
-	schedule_work(&abk_lp_kick);
+	queue_work(system_long_wq, &abk_lp_kick);
 	return 0;
 }
 
@@ -6560,12 +6564,18 @@ static int __init abk_lp_init(void)
 		return ret;
 	ret = register_trace_android_vh_filemap_map_pages(abk_lp_map_cb, NULL);
 	if (ret)
-		return ret;
+		goto unreg_read;
 	ret = register_trace_android_vh_should_fault_around(
 			abk_lp_fault_replay_cb, NULL);
 	if (ret)
-		return ret;
+		goto unreg_map;
 	return 0;
+
+unreg_map:
+	unregister_trace_android_vh_filemap_map_pages(abk_lp_map_cb, NULL);
+unreg_read:
+	unregister_trace_android_vh_filemap_read(abk_lp_read_cb, NULL);
+	return ret;
 }
 fs_initcall(abk_lp_init);
 """

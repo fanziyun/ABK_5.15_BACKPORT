@@ -1181,7 +1181,7 @@ REQUIRED_CONTENT = {
         # The pre-launch kick: reopen the recorded path on a workqueue and
         # verify it before prefetching.
         ["mm/filemap.c", "filp_open(path, O_RDONLY | O_LARGEFILE, 0)"],
-        ["mm/filemap.c", "schedule_work(&abk_lp_kick)"],
+        ["mm/filemap.c", "queue_work(system_long_wq, &abk_lp_kick)"],
         ["mm/filemap.c", "d_path(&file->f_path, rec->path, ABK_LP_PATH)"],
         # Same-name module_param form (Batch 12's lesson) on the two knobs
         # the device test toggles.
