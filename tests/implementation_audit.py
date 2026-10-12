@@ -2588,6 +2588,11 @@ REQUIRED_CONTENT.update({
     ],
     "perf:sched_ext_task_slot": [
         ("include/linux/sched.h", "#include <linux/sched/ext.h>"),
+        # The SCX pointer's slot is read from the tree (batch55's
+        # _scx_slot_step): slot 7 on a clean tree, slot 2 when ABK's SysVIPC
+        # patch has spent slots 6/7/8.  The audit runs against a clean
+        # reference tree, so slot 7 is what must appear there; the slot-2 form
+        # is covered by the unit test's shape cases.
         ("include/linux/sched.h",
          "ANDROID_KABI_USE(7, struct sched_ext_entity *scx);"),
         # The Batch-16 member has to survive the new claim beside it.

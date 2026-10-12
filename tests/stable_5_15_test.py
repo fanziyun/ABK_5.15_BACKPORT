@@ -3267,7 +3267,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.72.0", "0.72.0"], _versions)
+          _versions == ["0.73.0", "0.73.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -8152,8 +8152,10 @@ def test_sched_ext_wiring():
     * the class is placed where 5.15's walk expects it and the comparison
       polarity matches that walk (the 6.6 spelling is the mirror image);
     * the engine is built through the glue translation unit, not ext.o;
-    * the task pointer takes slot 7 beside the Batch-16 slot-8 member, and the
-      earlier group's shape probe was repaired so the pair stays idempotent;
+    * the task pointer takes a task_struct KABI reserve slot read from the tree
+      (7 clean, 2 under ABK's SysVIPC patch) beside the Batch-16 slot-8 member,
+      and the earlier group's shape probe was repaired so the pair stays
+      idempotent;
     * SCHED_EXT is defined but not accepted: valid_policy()/normal_policy() and
       __sched_setscheduler's scx gate are the next batch, and landing them here
       would make a class with no fork hooks reachable.
@@ -8176,6 +8178,39 @@ def test_sched_ext_wiring():
           "randomize_kstack_pertask" in keys
           and keys.index("sched_ext_task_slot")
           > keys.index("randomize_kstack_pertask"))
+    # The SCX slot is read from the tree, not hard-coded: slot 7 on a clean
+    # tree, slot 2 when ABK's SysVIPC patch (VIRTUALIZATION_SUPPORT=678) has
+    # spent slots 6/7/8.  Hard-coding slot 7 is what broke the 678 build --
+    # the required slot step missed, and being transactional it rolled the
+    # whole group back, include and all, so struct scx_rq referenced a type
+    # nothing had defined.  Pin both shapes so that cannot come back.
+    import batch55_perf_sched_ext_wiring as w55
+    check("the clean-shape step claims slot 7",
+          w55._scx_slot_step("clean tree text")[1] == w55._SCHED_H_SLOT_OLD
+          and "ANDROID_KABI_USE(7, struct sched_ext_entity *scx);"
+          in w55._SCHED_H_SLOT_NEW)
+    check("the SysVIPC-shape step claims slot 2",
+          w55._scx_slot_step(
+              "\tANDROID_KABI_USE(6, struct sysv_sem sysvsem);\n")[1]
+          == w55._SYSVIPC_SLOT_OLD
+          and "ANDROID_KABI_USE(2, struct sched_ext_entity *scx);"
+          in w55._SYSVIPC_SLOT_NEW)
+    # Both shape anchors must carry the kstack marker comment, which only
+    # exists inside struct task_struct.  A bare RESERVE(n) also lives in
+    # struct sched_rt_entity and replace_once rewrites the first match, so
+    # without the marker the step would silently edit the wrong struct.  This
+    # is the property that makes the anchor unique; the empirical count is
+    # checked by research/scx_device_verify_20261012/verify_anchors.sh.
+    check("both slot anchors carry the kstack marker (what makes them unique)",
+          all(w55._KSTACK_MARKER in getattr(w55, n) for n in
+              ("_SCHED_H_SLOT_OLD", "_SCHED_H_SLOT_NEW",
+               "_SYSVIPC_SLOT_OLD", "_SYSVIPC_SLOT_NEW")))
+    # The include step must NOT be split out of the slot step: they are one
+    # transactional group on purpose (the include is what makes the KABI
+    # member's type complete), so a slot miss must not silently leave the
+    # member written without its type.
+    check("the group carries the include and a slot step together",
+          "#include <linux/sched/ext.h>" in w55._SCHED_H_INCLUDE_NEW)
     # The adaptation (Batch 57), task-lifecycle (Batch 58) and scheduling-core
     # (Batch 59) groups follow immediately: they adapt the payload this wiring
     # creates, so they have to run after it.
