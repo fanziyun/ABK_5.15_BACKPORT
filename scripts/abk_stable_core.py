@@ -6574,8 +6574,14 @@ static void abk_lp_map_cb(void *data, struct file *file, pgoff_t first_pgoff,
 		return;
 	if (!file->f_mapping || !file->f_mapping->host)
 		return;
+	/* want_path=true here too: a heavy app (QQ/WeChat) faults its code
+	 * in through map_pages, not read(), so a record collected without a
+	 * path has nothing for the pre-launch kick's filp_open() to reopen
+	 * -- measured as prefetched=0 for QQ.  The call site is after
+	 * pte_unmap_unlock(), process context, and d_path() does not sleep,
+	 * so recording the path here is as safe as in the read hook. */
 	abk_lp_touch(file->f_mapping->host, uid, first_pgoff, last_pgoff,
-		     NULL, false);
+		     file, true);
 }
 
 static void abk_lp_fault_replay_cb(void *data, struct vm_fault *vmf,
