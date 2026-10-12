@@ -4021,7 +4021,8 @@ PATCH_GROUPS = PATCH_GROUPS + _b53_kfunc.build_groups(PatchGroup)
 # ============================================================================
 # Batch 55 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
 # a compiled subsystem.  Registered last on purpose: sched_ext_task_slot claims
-# task_struct KABI slot 7 and anchors on the post-randomize_kstack_pertask run
+# a task_struct KABI reserve slot (7 on a clean tree, 2 when ABK's SysVIPC
+# patch has spent 6/7/8) and anchors on the post-randomize_kstack_pertask run
 # (which appended to slot 8), so the two must run in that order.
 # ============================================================================
 import batch55_perf_sched_ext_wiring as _b55_scx  # noqa: E402

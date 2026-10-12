@@ -18,12 +18,14 @@ Measured against the android13-5.15-lts reference tree (5.15.220):
   the engine compares p->policy against.
 * sched_ext_task_slot -- include/linux/sched/ext.h included from
   include/linux/sched.h (the 6.6 tree includes it at the same point), and the
-  per-task "struct sched_ext_entity *scx" claimed in the task_struct KABI
-  reserve slot 7.  Slot 8 is already this module's (the Batch 16 kstack_offset),
-  so this group anchors on the post-randomize_kstack_pertask run and is
-  registered after it; the earlier group's own kstack_offset); shape probe keeps
-  the pair idempotent (group_recipe trap 5 -- Batch 55 also repaired that probe,
-  which spelled the member without its closing parenthesis and so never fired).
+  per-task "struct sched_ext_entity *scx" claimed in a task_struct KABI reserve
+  slot read from the tree: slot 7 by default, slot 2 when ABK's SysVIPC patch
+  (VIRTUALIZATION_SUPPORT=678) has spent slots 6/7/8.  Slot 8 is already this
+  module's (the Batch 16 kstack_offset), so this group anchors on the
+  post-randomize_kstack_pertask run and is registered after it; the earlier
+  group's own kstack_offset); shape probe keeps the pair idempotent
+  (group_recipe trap 5 -- Batch 55 also repaired that probe, which spelled the
+  member without its closing parenthesis and so never fired).
 * sched_ext_rq_state -- struct scx_rq (plus enum scx_rq_flags) and the struct rq
   pointer to it, sched_class_above() (5.15 walks the class array with class--
   from __end_sched_classes - 1, so "above" is the greater address -- the 6.6
@@ -183,11 +185,68 @@ _SCHED_H_SLOT_NEW = (
     "\tANDROID_KABI_USE(8, u32\t\t\tkstack_offset);\n"
 )
 
+# Slot choice is read from the tree, the same way Batch 16's kstack group picks
+# its own (abk_stable_perf.py's _sched_h_kstack_step).  Two shapes are known:
+#
+#   * the plain tree: the kstack claim sits at slot 8 and slots 6/7 are still
+#     bare RESERVE, so SCX takes slot 7 (the shape this group was written for).
+#
+#   * ABK's kernel-specific patch has spent slots 6/7/8 on SysVIPC
+#     (VIRTUALIZATION_SUPPORT=678): kstack moved to slot 5 and slots 2/3/4 are
+#     still bare RESERVE, so SCX takes slot 2 -- the lowest free slot, and the
+#     same slot the upstream OPPO 6.6 tree uses for this exact member
+#     (docs/survey_sched_ext_gap.md section 4:
+#     `ANDROID_KABI_USE(2, struct sched_ext_entity *scx)`).
+#
+# Hard-coding slot 7 is what broke the 678 build: the slot-7 anchor is absent
+# there, the required step misses, and because apply_steps is transactional the
+# whole group -- including the sched/ext.h include above -- is rolled back,
+# leaving struct scx_rq to reference a type nothing defined.  Reading the tree
+# first fixes the slot and, with it, the include.
+#
+# A bare RESERVE(n) is NOT usable as an anchor on its own: struct sched_rt_entity
+# also carries RESERVE(1..4), and replace_once rewrites the first match.  Each
+# anchor therefore ends on the kstack marker comment, which only exists inside
+# struct task_struct.
+_KSTACK_MARKER = (
+    "\t/* ABK stable_515_backport: per-task kstack randomization offset (5.15.210) mapped onto the KABI reserve slot. */\n"
+)
+
+_SCX_SLOT_COMMENT = (
+    "\t/* sailboat_sched_ext: per-task SCX state pointer, one pointer in one KABI\n"
+    "\t * reserve slot.  struct sched_ext_entity is far larger than a slot, so the\n"
+    "\t * relation has to be indirect. */\n"
+)
+
+_SYSVIPC_SLOT_OLD = (
+    "\tANDROID_KABI_RESERVE(2);\n"
+    "\tANDROID_KABI_RESERVE(3);\n"
+    "\tANDROID_KABI_RESERVE(4);\n"
+) + _KSTACK_MARKER
+
+_SYSVIPC_SLOT_NEW = (
+    _SCX_SLOT_COMMENT
+    + "\tANDROID_KABI_USE(2, struct sched_ext_entity *scx);\n"
+    "\tANDROID_KABI_RESERVE(3);\n"
+    "\tANDROID_KABI_RESERVE(4);\n"
+) + _KSTACK_MARKER
+
+# The SysVIPC tail the ABK patch writes; its presence is the shape probe.
+_SYSVIPC_PROBE = "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)"
+
+
+def _scx_slot_step(text):
+    """Return the (rel, old, new, required) slot step for this tree shape."""
+    if _SYSVIPC_PROBE in text:
+        return (SCHED_H, _SYSVIPC_SLOT_OLD, _SYSVIPC_SLOT_NEW, True)
+    return (SCHED_H, _SCHED_H_SLOT_OLD, _SCHED_H_SLOT_NEW, True)
+
 
 def _sched_ext_task_slot_apply(ctx):
+    text = ctx.read(SCHED_H)
     status, _results, detail = apply_steps(ctx, [
         (SCHED_H, _SCHED_H_INCLUDE_OLD, _SCHED_H_INCLUDE_NEW, True),
-        (SCHED_H, _SCHED_H_SLOT_OLD, _SCHED_H_SLOT_NEW, True),
+        _scx_slot_step(text),
     ])
     return status, detail
 
@@ -435,9 +494,10 @@ def build_groups(PatchGroup):
             "the per-task SCX state: include/linux/sched/ext.h included from "
             "include/linux/sched.h at the position the 6.6 tree uses, and "
             "struct sched_ext_entity *scx claimed in task_struct's KABI reserve "
-            "slot 7.  struct sched_ext_entity is much larger than one slot, so "
-            "the task relation has to be a pointer; slot 8 is already this "
-            "module's kstack_offset, so the group anchors on the "
+            "slot read from the tree (7 on a clean tree, 2 when ABK's SysVIPC "
+            "patch has spent 6/7/8).  struct sched_ext_entity is much larger "
+            "than one slot, so the task relation has to be a pointer; slot 8 is "
+            "already this module's kstack_offset, so the group anchors on the "
             "post-randomize_kstack_pertask run and is registered after it "
             "(group_recipe trap 5 -- the earlier group's kstack_offset; probe "
             "keeps the rewrite idempotent).",
