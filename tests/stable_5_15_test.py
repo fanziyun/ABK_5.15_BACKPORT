@@ -3180,8 +3180,8 @@ def test_runtime_tunables_module():
         return
 
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
-                "service.sh", "action.sh", "tunables.conf", "embed.conf",
-                "sepolicy.rule", "README.md")
+                "service.sh", "action.sh", "iorap-watch.sh", "tunables.conf",
+                "embed.conf", "sepolicy.rule", "README.md")
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
@@ -3262,7 +3262,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.54.0", "0.54.0"], _versions)
+          _versions == ["0.55.0", "0.55.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads

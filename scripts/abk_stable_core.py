@@ -6211,7 +6211,7 @@ _BG_LP_PAYLOAD = """fs_initcall(abk_bg_ra_tune_init);
 #include <linux/fs.h>
 #include <linux/workqueue.h>
 
-#define ABK_LP_SLOTS 96
+#define ABK_LP_SLOTS 4096
 #define ABK_LP_PAGES 4096	/* 16 MB span per record */
 #define ABK_LP_PATH 160
 
@@ -6223,14 +6223,14 @@ struct abk_lp_rec {
 	u32 uid;
 	u32 pathlen;
 	unsigned long jstamp;	/* last replay/prefetch stamp (cooldown) */
+	unsigned long touch;	/* LRU recency: last collect that hit us */
 	DECLARE_BITMAP(pages, ABK_LP_PAGES);
 	char path[ABK_LP_PATH];
 };
 
 static struct abk_lp_rec abk_lp_table[ABK_LP_SLOTS];
 static DEFINE_SPINLOCK(abk_lp_lock);
-static unsigned int abk_lp_rr;
-static unsigned int abk_lp_used;
+static bool abk_lp_seeded;	/* any record exists (replay fast gate) */
 
 /* Backing stores for the two set-with-side-effect knobs.  Declared before
  * the work function because abk_lp_prefetch_work() reads abk_lp_prefetch_uid
@@ -6316,6 +6316,7 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 			 pgoff_t last, struct file *file, bool want_path)
 {
 	struct abk_lp_rec *rec = NULL;
+	struct abk_lp_rec *victim = NULL;
 	unsigned long flags;
 	int i;
 
@@ -6336,18 +6337,40 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 		}
 	}
 	if (!rec) {
-		if (abk_lp_used < ABK_LP_SLOTS) {
-			for (i = 0; i < ABK_LP_SLOTS; i++) {
-				if (!abk_lp_table[i].used) {
-					rec = &abk_lp_table[i];
-					break;
-				}
+		/* Shared-file skip: framework jars/libs/apex pages are touched
+		 * by every app; recording them per-uid churned the whole table
+		 * with a single cold launch (measured: ~600 records per
+		 * launch, 512 slots).  If another uid already holds this
+		 * exact (dev, ino, mtime), those pages are shared page cache
+		 * owned by whichever app recorded them first -- skip.  A
+		 * genuine file update changes i_mtime, fails this scan and
+		 * gets recorded fresh for whoever launches next. */
+		for (i = 0; i < ABK_LP_SLOTS; i++) {
+			struct abk_lp_rec *r = &abk_lp_table[i];
+
+			if (r->used && r->dev == inode->i_sb->s_dev &&
+			    r->ino == inode->i_ino &&
+			    r->mtime_sec == inode->i_mtime.tv_sec) {
+				spin_unlock_irqrestore(&abk_lp_lock, flags);
+				return;
 			}
-			abk_lp_used++;
-		} else {
-			rec = &abk_lp_table[abk_lp_rr];
-			abk_lp_rr = (abk_lp_rr + 1) % ABK_LP_SLOTS;
 		}
+		/* LRU eviction, not round-robin: the watcher records a uid
+		 * once per generation and kicks it on every other launch,
+		 * so a hot app's records must survive every other app's
+		 * collection.  Round-robin churned exactly those (measured
+		 * on device: kicks=0 for any app but the most recent). */
+		for (i = 0; i < ABK_LP_SLOTS; i++) {
+			struct abk_lp_rec *r = &abk_lp_table[i];
+
+			if (!r->used) {
+				victim = r;
+				break;
+			}
+			if (!victim || time_before(r->touch, victim->touch))
+				victim = r;
+		}
+		rec = victim;
 		rec->used = true;
 		rec->dev = inode->i_sb->s_dev;
 		rec->ino = inode->i_ino;
@@ -6355,9 +6378,12 @@ static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
 		rec->uid = uid;
 		rec->pathlen = 0;
 		rec->jstamp = 0;
+		rec->touch = jiffies;
 		bitmap_zero(rec->pages, ABK_LP_PAGES);
+		WRITE_ONCE(abk_lp_seeded, true);
 		WRITE_ONCE(abk_lp_stats_records, abk_lp_stats_records + 1);
 	}
+	rec->touch = jiffies;
 	bitmap_set(rec->pages, first, last - first + 1);
 	WRITE_ONCE(abk_lp_stats_pages, abk_lp_stats_pages + 1);
 	if (want_path && file && rec->pathlen == 0) {
@@ -6389,7 +6415,7 @@ static void abk_lp_replay(struct file *file)
 		return;
 	if (current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max))
 		return;
-	if (!abk_lp_used)
+	if (!READ_ONCE(abk_lp_seeded))
 		return;
 	if (!file->f_mapping || !file->f_mapping->host)
 		return;
