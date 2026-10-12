@@ -769,6 +769,35 @@ tunables.conf` 把配置文件清空,于是那轮看到 `want=none` —— 顺�
 注释里写清"cap_pct 若高于 vendor 钉子就是 armed 但从不执行",供下次排查直接用。
 **这一改的生效性尚未复测** —— 打包刷入重启后的验证见下次记录。
 
+<a id="batch-72"></a>
+
+## Batch 72（真机编译修复：`bpf_struct_ops_types.h` 缺 `#include <linux/sched/ext.h>`，v0.73.0，无新 PatchGroup，组数不变 core 71 / perf 54 / display 1）
+
+**目标**：让 SCX 嫁接在一个**模板构建**上真正过编译 —— 此前它只在本机构建夹具上被证明「能编译」，而那次夹具恰好绕开了本缺陷。
+
+**现象与根因**：CNB 模板构建（`rebuild.sh`，android13-5.15-lts @ 220）在 `build` 阶段以 `REBUILD_EXIT=2` 失败，唯一一条 error：
+
+```
+kernel/bpf/bpf_struct_ops_types.h:19:1: error: field has incomplete type 'struct sched_ext_ops'
+  BPF_STRUCT_OPS_TYPE(sched_ext_ops)
+note: forward declaration of 'struct sched_ext_ops'
+make[2]: *** [scripts/Makefile.build:287: kernel/bpf/bpf_struct_ops.o] Error 1
+```
+
+`kernel/bpf/bpf_struct_ops.c` 把 `bpf_struct_ops_types.h` 以四种不同的 `BPF_STRUCT_OPS_TYPE` 定义**各包含一次**，第一种展开成 `struct _name data ____cacheline_aligned_in_smp;`，要求 `_name` 是**完整类型**。Batch 60 往该头加了 `BPF_STRUCT_OPS_TYPE(sched_ext_ops)`，但没有把定义该类型的 `<linux/sched/ext.h>` 带进来，于是该 TU 里 `struct sched_ext_ops` 只有前向声明。
+
+**为什么四道树级审计全绿**：`step_audit` / `implementation_audit` / `smoke` 都是**文本门禁**，不跑预处理器，看不见「类型不完整」。这与 `AGENTS.md` 记录的第 6/7 条 authoring trap 同类 —— 只有编译器能证明 C 有效。
+
+**为什么本机夹具没暴露**：`pr39-verification/build-kernel.sh` 用的树与模板构建的 include 链不同；该夹具的 `bpf_struct_ops.o` 能编过，所以这条缺陷在它上面是隐性的。真正跑模板配置的只有 CNB 这一步。
+
+**修法（一行，与上游一致）**：在 `BPF_STRUCT_OPS_TYPE(sched_ext_ops)` **之前**加 `#include <linux/sched/ext.h>`，与上游 OnePlus `android_kernel_common_oneplus_sm8750` 的同文件写法（同 `CONFIG_SCHED_CLASS_EXT` 门内、include 在前）逐字相同。该头有 include guard（`_LINUX_SCHED_EXT_H`）且只拉 `<linux/llist.h>`，可安全重复包含 —— 与 `kernel/sched/ext.h`（无 guard，故只在 `kernel/sched/sched.h` 尾部包含一次）不同。
+
+**回归守卫**：`tests/stable_5_15_test.py` 与 `tests/implementation_audit.py` 各加一条断言，把「include 必须紧邻在注册行之前」钉住。两条都做过反向验证（删掉 include 后断言翻红），即对缺陷有分辨力。
+
+**边界**：本批只改注册头的一行 include；未改任何 SCX 语义、KMI 槽位或 config 档位。真机尚未验证 SCX 是否真正可调度。
+
+---
+
 <a id="batch-69"></a>
 
 ## Batch 69（Tier D/E 裁决：一项已落地、一项无上游实现，v0.72.0，无新 PatchGroup，组数不变 core 71 / perf 54 / display 1）
