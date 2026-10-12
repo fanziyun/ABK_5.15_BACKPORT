@@ -146,6 +146,14 @@ GROUP_COUNTS = {
     # are a rewrite chain over the same lines, registered after the inline
     # MGLRU groups whose generated text they consume (trap 5: per-group shape
     # probes on both sides).
+    # Batch 50 adds one: bg_readahead_tune, the always-on half of Xiaomi's
+    # iorap2 launch-boost policy transcribed to fresh C (four ACK vendor-hook
+    # handlers appended to mm/filemap.c).  No upstream commit names it and no
+    # baseline carries the payload, so it lands on every tree -- but it is
+    # vendor-derived policy, not an upstream graft, and is documented as such.
+    # Batch 51 (Stage 2) adds bg_launch_prefetch: the collect/preread half of
+    # the same module rebuilt kernel-side, also vendor-derived and appended
+    # to the same file after the Stage-1 payload's tail.
     # Batch 70 adds one: smaps_migration_guard -- a field-panic hardening
     # (swapops.h:267 BUG_ON via smaps_rollup), not an upstream port, so it
     # cannot arrive pre-applied.  Its six anchors are byte-identical pristine
@@ -154,7 +162,7 @@ GROUP_COUNTS = {
     # Batch 41's generated text (set_page_writeback at enqueue + end at drain,
     # device A/B swap-corruption fix), so it cannot arrive pre-applied either;
     # it refuses when the Batch 41 engine is absent.
-    "stable_backport_core": 73,
+    "stable_backport_core": 75,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

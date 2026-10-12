@@ -273,6 +273,11 @@ cfr.cgroup_root
 cfr.frozen_only
 cfr.freezer_root
 cfr.cached_only
+iorap.watch
+iorap.min_uid
+iorap.record_cool_min
+iorap.kick_cool_sec
+iorap.global_gap_sec
 report.logcat
 EOF
 }

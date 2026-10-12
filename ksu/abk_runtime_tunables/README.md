@@ -221,6 +221,11 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `cfr.freeze` | `0` | quiesce a group during its sweep (undone in the same sweep) |
 | `cfr.quota_mb` | *(empty)* | cap the reclaimed bytes per group |
 | `cfr.group` | *(empty)* | group names to sweep; empty = every `uid_*` group (this ROM names its groups: `cfr.group=freeze-app game`) |
+| `iorap.watch` | `1` | **the iorapd replacement (Stage 2b)**: a `/proc` watcher that drives the kernel's launch record/prefetch knobs as apps spawn. Economics: a uid is **recorded once per generation**, **kicked on every other launch** — a kick-only launch never touches the record table, which is what lets a hot app's records survive the apps launched in between (recording on every launch churned the table and killed every kick but the most recent app's — measured). Requires the v0.54+ kernel (`/sys/module/filemap/parameters/abk_lp_enable`); on an older kernel the watcher logs and exits |
+| `iorap.min_uid` | `10000` | app-UID floor; system/systemui spawns (1000-9999) are never triggered |
+| `iorap.record_cool_min` | `360` | minutes between record generations of one uid (matches how often an app's on-disk files actually change) |
+| `iorap.kick_cool_sec` | `60` | seconds between kicks of the same uid; a spawn burst of one app counts once |
+| `iorap.global_gap_sec` | `2` | seconds between any two triggers; a launcher fan-out triggers one at a time, the rest are picked up on their next spawn |
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
 **Measure before you enable the opt-in knobs.** `thp` and `swappiness` change

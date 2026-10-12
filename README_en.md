@@ -104,6 +104,11 @@ Knobs:
 - `/sys/module/cpufreq_schedutil/parameters/abk_sf_*` / `abk_sc_*` — smart-freq
   floor and cap
 - `/sys/module/readahead/parameters/dynamic_readahead` — dynamic readahead
+- `/sys/module/filemap/parameters/abk_bg_ra_*` — background readahead
+  suppression switch and young-task threshold
+- `/sys/module/filemap/parameters/abk_lp_*` — launch page-cache record/replay
+  (write a UID to `abk_lp_record_uid` to open a record window, to
+  `abk_lp_prefetch_uid` to kick a pre-launch prefetch)
 - `zram.abk_comp_algo` / `zram.abk_lock_algo` / `zram.abk_recomp_algo` — the
   compressor lock
 - `vm.kcompressd` — the offload thread's soft limit

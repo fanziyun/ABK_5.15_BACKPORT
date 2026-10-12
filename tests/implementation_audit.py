@@ -57,6 +57,14 @@ CONFIG_GATED_REFERENCES = {
           "zram->nr_pages", "zram->wb_compressed", "zram->stats.bd_",
           "abk_zram_bvec_read(")),
     ],
+    # bg_readahead_tune (Batch 50): cpuset_cgrp_id only exists under
+    # CONFIG_CPUSETS (the enum entry in cgroup_subsys.h is itself gated on
+    # it), so the whole payload block sits inside #ifdef CONFIG_CPUSETS and
+    # this table enforces that mechanically instead of trusting the review.
+    "mm/filemap.c": [
+        ("CONFIG_CPUSETS",
+         ("cpuset_cgrp_id",)),
+    ],
 }
 
 
@@ -1127,6 +1135,73 @@ REQUIRED_CONTENT = {
         ["mm/workingset.c",
          "if (lru_gen_in_fault())\n"
          "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
+    ],
+    "core:bg_readahead_tune": [
+        "sailboat_bg_readahead_tune",
+        # The registration is the behaviour: an initcall that never registers
+        # the four handlers is an empty implementation.
+        ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
+        ["mm/filemap.c", "register_trace_android_vh_do_async_mmap_readahead("],
+        ["mm/filemap.c", "register_trace_android_vh_ra_tuning_max_page("],
+        ["mm/filemap.c", "register_trace_android_vh_tune_mmap_readaround("],
+        # The policy's two inputs, verbatim: the cgroup test and the age
+        # test (upstream's nvcsw>99 guard).
+        ["mm/filemap.c", 'task_css(current, cpuset_cgrp_id)'],
+        ["mm/filemap.c", '"background"'],
+        ["mm/filemap.c", "current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min)"],
+        # module_param(NAME, ...) compiles NAME as the *identifier*: the knob
+        # name and the variable must be the same token here (Batch 12's
+        # module_param lesson).  core_param would strip the module prefix and
+        # bury the knobs under /sys/module/kernel/parameters/ -- proven live
+        # on the r1 boot, hence module_param with the same-name form.
+        ["mm/filemap.c", "module_param(abk_bg_ra_suppress, int, 0644);"],
+        ["mm/filemap.c", "module_param(abk_bg_ra_nvcsw_min, int, 0644);"],
+        # The four handler bodies, in enough detail that gutting one (e.g.
+        # making every handler an empty return) fails the audit.
+        ["mm/filemap.c", "*should_around = false;"],
+        ["mm/filemap.c", "*skip = true;"],
+        ["mm/filemap.c", "ractl->ra->ra_pages >> 1"],
+        ["mm/filemap.c", "*start = max_t(long, 0, pgoff - ra_pages / 4);"],
+    ],
+    "core:bg_launch_prefetch": [
+        "sailboat_bg_launch_prefetch",
+        # The three registrations are the behaviour: without them the table
+        # never collects and never replays.
+        ["mm/filemap.c", "register_trace_android_vh_filemap_read("],
+        ["mm/filemap.c", "register_trace_android_vh_filemap_map_pages("],
+        ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
+        # The collection key and its validation at replay time: records are
+        # scalars only (dev/ino/mtime/uid), so nothing can dangle.
+        ["mm/filemap.c", "r->mtime_sec == host->i_mtime.tv_sec"],
+        ["mm/filemap.c", "f->f_mapping->host->i_ino != ino"],
+        # The replay gate (young task) and the prefetch primitive.
+        ["mm/filemap.c",
+         "current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max)"],
+        ["mm/filemap.c", "page_cache_sync_readahead("],
+        # The pre-launch kick: reopen the recorded path on a workqueue and
+        # verify it before prefetching.
+        ["mm/filemap.c", "filp_open(path, O_RDONLY | O_LARGEFILE, 0)"],
+        ["mm/filemap.c", "queue_work(system_long_wq, &abk_lp_kick)"],
+        ["mm/filemap.c", "d_path(&file->f_path, rec->path, ABK_LP_PATH)"],
+        # Same-name module_param form (Batch 12's lesson) on the two knobs
+        # the device test toggles.
+        ["mm/filemap.c", "module_param(abk_lp_young_max, int, 0644);"],
+        ["mm/filemap.c", "module_param(abk_lp_replay_kb, int, 0644);"],
+        # At-fault replay is opt-in (default 0): from the fault/read hook
+        # contexts it hard-reset the vermeer SoC with no panic text -- the
+        # supported replay path is the pre-launch kick, and the pin guards
+        # the gate that keeps the hook-context readahead off by default.
+        ["mm/filemap.c", "module_param(abk_lp_fault_replay, int, 0644);"],
+        ["mm/filemap.c", "if (!READ_ONCE(abk_lp_fault_replay))"],
+        # The two set-with-side-effect knobs are module_param_call, not
+        # plain module_param (a plain param write could not open the
+        # window or schedule the kick).
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, "
+         "&param_get_int,"],
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_prefetch_uid, abk_lp_prefetch_uid_set, "
+         "&param_get_int,"],
     ],
 }
 

@@ -3177,8 +3177,8 @@ def test_runtime_tunables_module():
         return
 
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
-                "service.sh", "action.sh", "tunables.conf", "embed.conf",
-                "sepolicy.rule", "README.md")
+                "service.sh", "action.sh", "iorap-watch.sh", "tunables.conf",
+                "embed.conf", "sepolicy.rule", "README.md")
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
