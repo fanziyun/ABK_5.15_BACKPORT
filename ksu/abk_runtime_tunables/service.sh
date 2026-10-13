@@ -12,6 +12,7 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/zram-policy.sh"
 . "$MODDIR/scx-policy.sh"
 . "$MODDIR/uclamp-policy.sh"
+. "$MODDIR/iorap-watch.sh"
 
 case "${1:-}" in
   --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
@@ -20,6 +21,7 @@ case "${1:-}" in
   --supervise-lru-gen) abk_lru_gen_supervisor_main; exit 0 ;;
   --supervise-scx) abk_scx_supervisor_main; exit 0 ;;
   --supervise-uclamp) abk_uclamp_supervisor_main; exit 0 ;;
+  --supervise-iorap) abk_iorap_main; exit 0 ;;
 esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
@@ -108,6 +110,17 @@ if [ -n "$(abk_uclamp_value)" ] && [ -n "$(abk_uclamp_groups)" ]; then
   abk_spawn --supervise-uclamp uclamp
 else
   abk_uclamp_apply
+fi
+
+# Stage 2b: the iorapd replacement.  Watches /proc for new app-uid processes
+# and drives the kernel's launch record/prefetch knobs -- record a uid once
+# per generation, kick it on every other launch (the economics are documented
+# in iorap-watch.sh).  Requires the bg_launch_prefetch kernel group (v0.54+);
+# without it the watcher exits after logging, so the spawn is gated on the
+# knob existing rather than on a kernel version.
+if [ -e /sys/module/filemap/parameters/abk_lp_enable ] \
+  && [ "$(abk_cfg iorap.watch 1)" = "1" ]; then
+  abk_spawn --supervise-iorap iorap-watch
 fi
 
 abk_log "service: done"

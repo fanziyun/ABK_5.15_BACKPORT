@@ -187,6 +187,9 @@ SMOKE_FILES=(
   include/uapi/linux/sched.h
   kernel/sched/Makefile
   include/asm-generic/vmlinux.lds.h
+  # Batch 70: smaps_migration_guard -- the module's first fs/proc group.
+  # Without it the group degrades to blocked_by_shape in smoke only.
+  fs/proc/task_mmu.c
 )
 
 WORK="$(mktemp -d)"
@@ -962,6 +965,43 @@ grep -q 'scx_update_idle(rq, true);' "$KERNEL_ROOT/common/kernel/sched/idle.c" \
   || fail "the idle class never reports entering idle to SCX"
 grep -q 'scx_update_idle(rq, false);' "$KERNEL_ROOT/common/kernel/sched/idle.c" \
   || fail "the idle class never reports leaving idle to SCX"
+# Batch 70: smaps_migration_guard is the module's first fs/proc write.  The
+# helper plus all five guarded callers must be present: a helper without a
+# caller still panics on that path, and the unguarded direct calls that
+# remain are the device-private / device-exclusive cases only.
+TASK_MMU="$KERNEL_ROOT/common/fs/proc/task_mmu.c"
+grep -q "sailboat_smaps_migration_guard" "$TASK_MMU" \
+  || fail "the smaps migration guard helper is missing"
+grep -q "static struct page \*abk_smaps_migration_page(" "$TASK_MMU" \
+  || fail "abk_smaps_migration_page() is missing"
+[ "$(grep -c "abk_smaps_migration_page(swpent);" "$TASK_MMU")" = "2" ] \
+  || fail "the smaps PTE + hugetlb callers are not both guarded"
+[ "$(grep -c "abk_smaps_migration_page(entry);" "$TASK_MMU")" = "3" ] \
+  || fail "the smaps PMD + pagemap callers are not all guarded"
+
+# Batch 71: kcompressd_writeback_pin rewrites Batch 41's generated text so the
+# deferred swap-out keeps the page under PG_writeback across the FIFO:
+# set_page_writeback at enqueue, end_page_writeback once the drain holds the
+# lock, and end_page_writeback again on the drain's !PageSwapCache drop path
+# (which returns above the drain's own end).  All three edits carry the
+# sailboat_kcompressd_wb_pin marker.  Bare set_page_writeback/end_page_writeback
+# already exist in a pristine tree (__swap_writepage/end_swap_bio_write and
+# Batch 41's body), so the load-bearing checks are the marker count and the
+# edit-specific sequences, not a bare presence grep.  The superseded trylock-skip
+# must be gone.
+grep -q "sailboat_kcompressd_wb_pin" "$PAGE_IO" \
+  || fail "the kcompressd writeback pin is missing"
+[ "$(grep -c "sailboat_kcompressd_wb_pin" "$PAGE_IO")" = "3" ] \
+  || fail "the writeback pin marker is not on all three edits (enqueue, drain, drop)"
+# Enqueue edit: set_page_writeback immediately followed by unlock + return 0.
+grep -A2 "set_page_writeback(page);" "$PAGE_IO" | grep -q "return 0;" \
+  || fail "the enqueue writeback set is not in the offload branch"
+# Drop-path edit: end_page_writeback immediately followed by put_page.
+grep -A1 "end_page_writeback(page);" "$PAGE_IO" | grep -q "put_page(page);" \
+  || fail "the drop-path writeback end is missing"
+if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
+  fail "the superseded trylock-skip survived in the drain"
+fi
 
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
@@ -1036,6 +1076,13 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/fs/erofs/zdata.c" \
         "$KERNEL_ROOT/common/fs/erofs/zdata.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for fs/erofs/zdata.c"
+fi
+# Batch 70 is the module's first fs/proc/ write; rollback has to restore it
+# like any other target.
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/fs/proc/task_mmu.c" \
+        "$KERNEL_ROOT/common/fs/proc/task_mmu.c" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for fs/proc/task_mmu.c"
 fi
 
 # Batch 53 (sched_ext S1b) is the module's first write to kernel/bpf/btf.c and

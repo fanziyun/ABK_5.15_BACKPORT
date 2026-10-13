@@ -70,7 +70,7 @@ abk_status_report() {
     abk_show "mm_stat" "$(abk_read "$ABK_ZRAM_DIR/mm_stat" | tr -d '\n')"
     abk_show "io_stat" "$(abk_read "$ABK_ZRAM_DIR/io_stat" | tr -d '\n')"
     abk_show "recomp pass cap" "$(abk_cfg zram.recomp.max_pages 131072) attempted entries (0 = unbounded; needs the kernel max_pages graft)"
-    abk_show "recomp mark cadence" "$(abk_cfg zram.recomp.mark_interval_sec 10800)s (sweeps in between pass --no-mark, so a capped sweep keeps advancing instead of re-draining its prefix)"
+    abk_show "recomp mark cadence" "$(abk_cfg zram.recomp.mark_interval_sec 3600)s (sweeps in between pass --no-mark, so a capped sweep keeps advancing instead of re-draining its prefix)"
     if [ -n "$(abk_zram_secondary)" ]; then
       abk_show "recompression armed" "yes"
     else
@@ -78,7 +78,24 @@ abk_status_report() {
     fi
     if abk_zram_writeback_capable; then
       abk_show "zram writeback" "supported (want=$(abk_zram_writeback_mode))"
-      abk_show "backing_dev" "$(abk_zram_backing_dev)"
+      abk_show "boot_completed" "$(abk_getprop sys.boot_completed)"
+      _st_wb_dev="$(abk_zram_backing_dev)"
+      abk_show "backing_dev" "${_st_wb_dev:-none}"
+      # "attached, but the file is gone" is the shape a per-boot wipe leaves
+      # behind (init deletes /data/per_boot under the running loop), and it is
+      # invisible in every node except this one: backing_dev still reads as a
+      # device, while every writeback page returns -EIO.
+      if [ -n "$_st_wb_dev" ]; then
+        if abk_zram_backing_dev_ours "$_st_wb_dev"; then
+          if [ -e "$ABK_ZRAM_WB_FILE" ]; then
+            abk_show "backing_dev owner" "module ($ABK_ZRAM_WB_FILE)"
+          else
+            abk_show "backing_dev owner" "module, file gone -- writeback can move nothing"
+          fi
+        else
+          abk_show "backing_dev owner" "ROM/foreign (left alone)"
+        fi
+      fi
       abk_show "writeback_limit" \
         "$(abk_read "$ABK_ZRAM_DIR/writeback_limit" | tr -d '\n') (enable $(abk_read "$ABK_ZRAM_DIR/writeback_limit_enable" | tr -d '\n'))"
       # bd_stat is the only honest verdict on this path: the kernel-domain rule

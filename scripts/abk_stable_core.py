@@ -1540,11 +1540,18 @@ def _mglru_rework_aging_feedback_apply(ctx):
     Re-authored for the 6.1-shape functions (lru_gen_struct/lists, sort_page,
     evict_pages, age_lruvec, get_nr_to_scan with need_aging); the per-memcg
     swappiness read stays on the baseline's mem_cgroup_swappiness().
-    MIN/MAX_SWAPPINESS and get_swappiness()'s !may_swap short-circuit are NOT
-    added here: upstream 410abb20acae/68cd9050d871 own them and this module
-    lands that series as the batch37 reclaim chain, registered after this
-    group -- adding them twice would both duplicate the defines and pull the
-    anchor out from under the swappiness-argument group.
+    MIN_SWAPPINESS/MAX_SWAPPINESS are NOT added here: upstream
+    410abb20acae/68cd9050d871 own them and this module lands that series as
+    the batch37 reclaim chain, registered after this group -- adding them
+    twice would duplicate the defines and pull the anchor out from under the
+    swappiness-argument group.  get_swappiness()'s !may_swap short-circuit,
+    however, IS added here: neither of those commits carries it and the
+    baseline get_swappiness() lacks it (the may_swap dance removed above was
+    the baseline's only holder), so landing the unconditional call without
+    the guard would let a may_swap=0 cgroup reclaim (memsw limit,
+    memory.reclaim noswap=1) run with the full swappiness and add_to_swap()
+    its way past a memory+swap limit.  The guard is upstream's own shape:
+    mainline get_swappiness() opens with it (verified on v6.11).
     """
     try:
         _probe = ctx.read("mm/vmscan.c")
@@ -2159,6 +2166,33 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\tunsigned long nr_to_scan;\n"
          "\n"
          "\t\tnr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);\n",
+         T),
+        # -- get_swappiness(): the !may_swap short-circuit.  The dance removed
+        #    above was the baseline's only may_swap gate, and the unconditional
+        #    call upstream pairs with this rework is only safe because its
+        #    get_swappiness() opens with this guard (v6.11+, verified).  The
+        #    baseline function lacks it, and neither 410abb20acae nor
+        #    68cd9050d871 adds it, so without this step a may_swap=0 cgroup
+        #    reclaim (memsw limit, memory.reclaim noswap=1) would run with the
+        #    full swappiness and add_to_swap() its way past a memory+swap
+        #    limit.  Same group as the dance removal on purpose: one required
+        #    miss aborts both, so the protection can never land half-way.
+        ("mm/vmscan.c",
+         "static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)\n"
+         "{\n"
+         "\tint swappiness;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
+         "\tstruct pglist_data *pgdat = lruvec_pgdat(lruvec);\n"
+         "\n",
+         "static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)\n"
+         "{\n"
+         "\tint swappiness;\n"
+         "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);\n"
+         "\tstruct pglist_data *pgdat = lruvec_pgdat(lruvec);\n"
+         "\n"
+         "\tif (!sc->may_swap)\n"
+         "\t\treturn 0;\n"
+         "\n",
          T),
         # -- run_aging()/run_cmd(): debugfs paths follow the same rules --
         ("mm/vmscan.c",
@@ -3058,9 +3092,9 @@ def _zram_recompression_apply(ctx):
          "\thandle_new = zs_malloc(zram->mem_pool, comp_len_new,\n"
          "\t\t\t       __GFP_KSWAPD_RECLAIM | __GFP_NOWARN |\n"
          "\t\t\t       __GFP_HIGHMEM | __GFP_MOVABLE);\n"
-         "\tif (IS_ERR_VALUE(handle_new)) {\n"
+         "\tif (!handle_new) {\n"
          "\t\tzcomp_stream_put(zram->comps[prio]);\n"
-         "\t\treturn PTR_ERR((void *)handle_new);\n"
+         "\t\treturn -ENOMEM;\n"
          "\t}\n\n"
          "\tdst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);\n"
          "\tmemcpy(dst, zstrm->buffer, comp_len_new);\n"
@@ -3536,19 +3570,25 @@ _MODULE_CONFIGS = [
     # With the symbol unset the whole graft reduced to an always-false branch
     # (found by Batch 16's emptiness audit), so the tier has to enable it.
     ("RCU_NOCB_CPU_DEFAULT_ALL", "y"),
-    # LRU_GEN_ENABLED (MGLRU).  CONFIG_LRU_GEN is already =y in every
-    # android13-5.15 baseline, so the whole MGLRU implementation compiles --
-    # but this symbol is what DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects
-    # for ``lru_gen_caps`` (mm/vmscan.c), and without it every MGLRU branch
-    # starts false, /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the
-    # classic-LRU path runs.  Verified on the device that shipped the first
-    # cut of this batch: LRU_GEN=y, LRU_GEN_ENABLED unset, enabled == 0x0000.
-    #
-    # Turning it on is what makes this module's MGLRU work live at all:
-    # Batch 37's six v6.14 groups are compiled in but were runtime-inert for
-    # exactly the reason Batch 8's RCU graft was -- the same class of bug the
-    # emptiness audit was written to catch, one config layer further down.
-    ("LRU_GEN_ENABLED", "y"),
+    # LRU_GEN_ENABLED (MGLRU) is deliberately NOT in the default tier -- it
+    # moved to the opt-in align tier below.  The symbol is what
+    # DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects for ``lru_gen_caps``
+    # (mm/vmscan.c); with it unset every MGLRU branch starts false,
+    # /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the baseline's
+    # classic-LRU path runs -- which device evidence makes the safe default.
+    # On SM8550 vermeer (5.15.220) with MGLRU runtime-on, a sustained-thrash
+    # memory load wedged the device: two kworker/*:*H pinned at 100% kernel
+    # CPU in the MGLRU shrink path (evict_pages -> lru_gen_shrink_lruvec),
+    # lmkd starved, QCOM watchdog bite; and a third-party app (bilibili)
+    # SIGSEGV'd on launch in the dex-preload mmap path.  The identical thrash
+    # load with MGLRU OFF rode out -- zram took 8.6 GB, PSI some-avg10 peaked
+    # 24% and fell back to 2% on its own, no wedge.  So this module's MGLRU
+    # reclaim-loop rewrite (Batch 37/49) does not converge under thrash on this
+    # baseline, and turning it on by default was trap 8: an upstream mechanism
+    # made active without the self-defence the stock kernel relied on.  The
+    # MGLRU grafts stay compiled-in but runtime-inert until the shrink loop is
+    # made to converge (a dedicated follow-up PR); ABK_515_DEFCONFIG_ALIGN=1
+    # turns the symbol on for testing.
     # SCHED_CLASS_EXT (Batch 55): the sched_ext class.  The symbol is introduced
     # by this module's Kconfig group, so without a tier entry nothing would ever
     # compile the three-file payload or its glue translation unit -- the exact
@@ -3563,10 +3603,14 @@ _ALIGN_CONFIGS = [
     # Enabled in the android15-6.6 GKI defconfig, absent from every
     # android13-5.15 baseline, and the code already exists in 5.15 for all of
     # them -- config-only deltas, so they change runtime behaviour.
-    # LRU_GEN_ENABLED used to live here; it moved to _MODULE_CONFIGS above
-    # because it is the one symbol in this list that a *landed* group of this
-    # module (Batch 37-mglru) is inert without.  The rest stay opt-in: they are
-    # 6.6-GKI alignments, not optimizations this module ships.
+    # LRU_GEN_ENABLED is here (opt-in), not in the module tier: on SM8550
+    # vermeer this module's MGLRU reclaim-loop rewrite (Batch 37/49) does not
+    # converge under sustained thrash and wedges the device, and makes a
+    # third-party app SIGSEGV on launch (see the _MODULE_CONFIGS note and
+    # trap 8).  Keeping it opt-in leaves the MGLRU grafts compiled-in but
+    # runtime-off by default; a tester turns the whole 6.6-align set on with
+    # ABK_515_DEFCONFIG_ALIGN=1 to exercise them.
+    ("LRU_GEN_ENABLED", "y"),
     ("TCP_CONG_ADVANCED", "y"),      # prerequisite for BBR
     ("TCP_CONG_BBR", "y"),
     ("BLK_WBT", "y"),                # writeback throttling
@@ -3604,10 +3648,12 @@ _INTRODUCED_KCONFIG = {
     "RCU_NOCB_CPU_DEFAULT_ALL": "module",
     # Pre-existing baseline symbol (mm/Kconfig), like ZRAM_WRITEBACK below --
     # this table records what the module turns on, not only what it declares.
-    # It moved here from the align tier because a landed group (Batch 37's six
-    # MGLRU groups) is runtime-inert without it, and an inert optimization is
-    # not an optimization.
-    "LRU_GEN_ENABLED": "module",
+    # It is in the align (opt-in) tier, NOT the module tier: this module's
+    # MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained thrash
+    # (two kworker at 100% kernel CPU in lru_gen_shrink_lruvec) and SIGSEGVs a
+    # third-party app on launch, so MGLRU is off by default until the shrink
+    # loop converges -- see the _MODULE_CONFIGS note and trap 8.
+    "LRU_GEN_ENABLED": "align",
     "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
     "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
     # Introduced by Batch 55's Kconfig group and enabled by the module tier, so
@@ -5905,6 +5951,18 @@ def _vm_kcompressd_swapout_apply(ctx):
         return ("blocked_by_shape",
                 "mm/page_io.c matches neither the 167/178/194 nor the lts "
                 "shape of swap_writepage()'s frontswap_store() branch")
+    # Trap-5 successor probe: Batch 71 rewrites this group's generated text
+    # (set_page_writeback at enqueue + end_page_writeback at the drain's lock
+    # site).  Without this probe the second pass would see the step-4 engine
+    # anchor (still present) but miss the rewritten lines and report partial
+    # instead of already_present.  The probe lives on the successor's own
+    # marker, which the successor keeps.
+    try:
+        _b41_text = ctx.read(_b41_kc.PAGE_IO)
+    except FileNotFoundError:
+        _b41_text = ""
+    if "sailboat_kcompressd_wb_pin" in _b41_text:
+        return "already_present", "kcompressd_writeback_pin already applied on top"
     status, _results, detail = apply_steps(ctx, _b41_kc.build_steps(body))
     if status is None:
         return "blocked_by_shape", detail
@@ -5962,6 +6020,702 @@ PATCH_GROUPS = PATCH_GROUPS + _b46_erofs.build_groups(PatchGroup)
 import batch49_core_mglru_reclaim_loop as _b49_mglru  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b49_mglru.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 50: background readahead suppression -- Stage 1 of the iorap2 backport.
+#
+# iorap2.ko ("mi_lb_*" family, v3.0.0) registers six ACK vendor hooks; four
+# are a policy with no userspace dependency and are transcribed here from the
+# decompiled sym.should_skip_fault_around / sym.mi_lb_skip_async_mmap_readahead
+# / sym.adjust_readahead / sym.adjust_readaround, offsets resolved against this
+# tree.  Tasks in the "background" cpuset cgroup past their launch burst
+# (nvcsw > 99) get readahead trimmed: fault-around skipped, async mmap
+# readahead skipped, ondemand cap halved, read-around window shrunk.
+#
+# Not ported: the per-UID exemption table iorapd feeds over /dev/iorap (no
+# userspace contract here) and the collect/preread half (Stage 2, below).
+# Appends at EOF; the anchor is pristine text, but the shape probes require
+# the four call sites to still be present verbatim.
+# ============================================================================
+
+_BG_RA_ANCHOR = """EXPORT_SYMBOL(try_to_release_page);
+"""
+
+_BG_RA_PAYLOAD = """EXPORT_SYMBOL(try_to_release_page);
+
+/* sailboat_bg_readahead_tune: background readahead suppression from Xiaomi's
+ * iorap2 (mi_lb_* family, v3.0.0).  Tasks in the "background" cpuset cgroup
+ * past their launch burst (nvcsw > abk_bg_ra_nvcsw_min) get fault-around and
+ * async mmap readahead skipped, the ondemand cap halved and the read-around
+ * window shrunk, through the four vendor hooks this file already fires.
+ * Knobs: /sys/module/filemap/parameters/abk_bg_ra_{suppress,nvcsw_min}.
+ */
+#include <linux/cgroup.h>
+#include <linux/moduleparam.h>
+#ifdef CONFIG_CPUSETS
+static int abk_bg_ra_suppress = 1;
+/* module_param, not core_param: core_param buries knobs under
+ * /sys/module/kernel/parameters/ (r1 boot proved it); same-name form. */
+module_param(abk_bg_ra_suppress, int, 0644);
+static int abk_bg_ra_nvcsw_min = 99;
+module_param(abk_bg_ra_nvcsw_min, int, 0644);
+
+static bool abk_bg_ra_should_suppress_current(void)
+{
+\tstruct cgroup_subsys_state *css;
+\tbool matched;
+
+\tif (!READ_ONCE(abk_bg_ra_suppress))
+\t\treturn false;
+\tif (current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min))
+\t\treturn false;
+
+\trcu_read_lock();
+\tcss = task_css(current, cpuset_cgrp_id);
+\tmatched = css && css->cgroup && css->cgroup->kn &&
+\t\t  !strncmp(css->cgroup->kn->name ?: "", "background",
+\t\t\t   sizeof("background") - 1);
+\trcu_read_unlock();
+
+\treturn matched;
+}
+
+static void abk_bg_ra_should_fault_around_cb(void *data, struct vm_fault *vmf,
+\t\t\t\t\t     bool *should_around)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*should_around = false;
+}
+
+static void abk_bg_ra_skip_async_mmap_readahead_cb(void *data,
+\t\t\t\t\t\t   struct vm_fault *vmf,
+\t\t\t\t\t\t   struct page *page,
+\t\t\t\t\t\t   bool *skip)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*skip = true;
+}
+
+static void abk_bg_ra_tune_max_page_cb(void *data,
+\t\t\t\t       struct readahead_control *ractl,
+\t\t\t\t       unsigned long *max_page)
+{
+\tif (abk_bg_ra_should_suppress_current())
+\t\t*max_page = min_t(unsigned long, *max_page,
+\t\t\t\t  ractl->ra->ra_pages >> 1);
+}
+
+static void abk_bg_ra_tune_readaround_cb(void *data, unsigned int ra_pages,
+\t\t\t\t\t pgoff_t pgoff, pgoff_t *start,
+\t\t\t\t\t unsigned int *size,
+\t\t\t\t\t unsigned int *async_size)
+{
+\tif (!abk_bg_ra_should_suppress_current())
+\t\treturn;
+\t*start = max_t(long, 0, pgoff - ra_pages / 4);
+\t*size = ra_pages / 2;
+\t*async_size = ra_pages / 8;
+}
+
+static int __init abk_bg_ra_tune_init(void)
+{
+\tregister_trace_android_vh_should_fault_around(
+\t\t\tabk_bg_ra_should_fault_around_cb, NULL);
+\tregister_trace_android_vh_do_async_mmap_readahead(
+\t\t\tabk_bg_ra_skip_async_mmap_readahead_cb, NULL);
+\tregister_trace_android_vh_ra_tuning_max_page(
+\t\t\tabk_bg_ra_tune_max_page_cb, NULL);
+\tregister_trace_android_vh_tune_mmap_readaround(
+\t\t\tabk_bg_ra_tune_readaround_cb, NULL);
+\treturn 0;
+}
+fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+"""
+
+
+def _bg_readahead_tune_apply(ctx):
+    try:
+        filemap = ctx.read("mm/filemap.c")
+        readahead = ctx.read("mm/readahead.c")
+        memory = ctx.read("mm/memory.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
+    # The handlers only ever fire if the tree actually calls the hooks; probe
+    # every call site the way customize_alloc_gfp_vh probes its own.  A
+    # declared-but-uncalled hook would register a policy that never runs.
+    texts = {"mm/filemap.c": filemap, "mm/readahead.c": readahead,
+             "mm/memory.c": memory}
+    for rel, needle in (
+            ("mm/filemap.c",
+             "trace_android_vh_do_async_mmap_readahead(vmf, page, &skip);"),
+            ("mm/filemap.c",
+             "trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,"),
+            ("mm/readahead.c",
+             "trace_android_vh_ra_tuning_max_page(ractl, &max_pages);"),
+            ("mm/memory.c",
+             "trace_android_vh_should_fault_around(vmf, &should_around);")):
+        if needle not in texts[rel]:
+            return "blocked_by_shape", (f"{rel} does not call "
+                                        f"{needle.split('(')[0]}; the policy "
+                                        "would be registered but never fire")
+    # The callback's register_trace_ symbol is a static inline of the hook
+    # header; an include drop upstream would turn the graft into a compile
+    # error no text audit notices (docs/group_recipe.md trap 5).
+    if "#include <trace/hooks/mm.h>" not in filemap:
+        return "blocked_by_shape", ("mm/filemap.c does not include "
+                                    "<trace/hooks/mm.h>; the payload's "
+                                    "register_trace_ could not compile")
+    status, _results, detail = apply_steps(ctx, [
+        ("mm/filemap.c", _BG_RA_ANCHOR, _BG_RA_PAYLOAD, T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "bg_readahead_tune",
+        "background readahead suppression transcribed from Xiaomi's iorap2 "
+        "launch-boost module (mi_lb_* family, driver v3.0.0) -- the "
+        "policy's always-on half: tasks in the \"background\" cpuset cgroup "
+        "past their launch burst (nvcsw > abk_bg_ra_nvcsw_min, default 99) "
+        "lose fault-around and async mmap readahead, get the "
+        "ondemand_readahead cap halved (ra_pages/2) and the mmap read-around "
+        "window shrunk (start pgoff-ra/4, size ra/2, async ra/8) through the "
+        "four ACK vendor hooks this tree already fires; runtime knobs at "
+        "/sys/module/filemap/parameters/abk_bg_ra_{suppress,nvcsw_min}. "
+        "The upstream per-UID exemption table and the collect/compile/preread "
+        "half stay out (userspace contract; Stage-2 candidate)",
+        [
+            "Xiaomi iorap2.ko mi_lb policy (research/ decompile: "
+            "sym.should_skip_fault_around, sym.mi_lb_skip_async_mmap_readahead, "
+            "sym.adjust_readahead, sym.adjust_readaround)",
+        ],
+        ["mm/filemap.c"],
+        _bg_readahead_tune_apply,
+    ),
+]
+
+# ============================================================================
+# bg_launch_prefetch -- Stage 2 of the iorap2 port: the collect/preread loop
+# rebuilt kernel-side, without iorapd.
+#
+# A record window opens when a UID is written to abk_lp_record_uid (open for
+# abk_lp_record_ms); during it the android_vh_filemap_read and
+# android_vh_filemap_map_pages hooks snapshot the pages the launching process
+# touches, keyed by (dev, ino, mtime, uid) into an inline 4096-page bitmap.
+# Records hold scalars + bitmap + a path copy, no stored pointers, so nothing
+# can dangle.  Writing a UID to abk_lp_prefetch_uid queues a workqueue kick
+# that filp_open()s each recorded path and prefetches it before the app
+# starts (best-effort: SELinux may deny the kernel-domain open).  512 B
+# bitmap + 160 B path per slot, 4096 slots, LRU eviction, one spinlock, no
+# allocation on any fault path.  at-fault replay is kept behind
+# abk_lp_fault_replay (default 0: it hard-reset the SoC from fault context).
+# abk_lp_young_max is its own knob, NOT abk_bg_ra_nvcsw_min (that one is
+# inside the CONFIG_CPUSETS gate of the Stage-1 payload; trap 7).
+# ============================================================================
+
+_BG_LP_ANCHOR = """fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+"""
+
+_BG_LP_PAYLOAD = """fs_initcall(abk_bg_ra_tune_init);
+#endif /* CONFIG_CPUSETS */
+
+/* sailboat_bg_launch_prefetch: launch page-cache recorder and replayer --
+ * the kernel-side rebuild of Xiaomi's iorap2 collect/compile/preread loop,
+ * daemon-free.  See the registry comment for the design contract. */
+#include <linux/cred.h>
+#include <linux/fs.h>
+#include <linux/workqueue.h>
+
+#define ABK_LP_SLOTS 4096
+#define ABK_LP_PAGES 4096	/* 16 MB span per record */
+#define ABK_LP_PATH 160
+
+struct abk_lp_rec {
+	bool used;
+	dev_t dev;
+	u64 ino;
+	s64 mtime_sec;
+	u32 uid;
+	u32 pathlen;
+	unsigned long jstamp;	/* last replay/prefetch stamp (cooldown) */
+	unsigned long touch;	/* LRU recency: last collect that hit us */
+	DECLARE_BITMAP(pages, ABK_LP_PAGES);
+	char path[ABK_LP_PATH];
+};
+
+static struct abk_lp_rec abk_lp_table[ABK_LP_SLOTS];
+static DEFINE_SPINLOCK(abk_lp_lock);
+static bool abk_lp_seeded;	/* any record exists (replay fast gate) */
+
+/* Backing stores for the two set-with-side-effect knobs, declared before
+ * abk_lp_prefetch_work() which reads abk_lp_prefetch_uid. */
+static int abk_lp_record_uid = -1;
+static int abk_lp_prefetch_uid = -1;
+
+static int abk_lp_enable = 1;
+module_param(abk_lp_enable, int, 0644);
+/* at-fault replay is off by default: issuing page_cache_sync_readahead from
+ * the fault/read hook contexts hard-reset the SoC (no panic text); the
+ * supported replay path is the pre-launch kick.  Kept behind the knob for
+ * future forensics. */
+static int abk_lp_fault_replay;
+module_param(abk_lp_fault_replay, int, 0644);
+static int abk_lp_record_ms = 4000;
+module_param(abk_lp_record_ms, int, 0644);
+static int abk_lp_young_max = 99;
+module_param(abk_lp_young_max, int, 0644);
+static int abk_lp_replay_kb = 2048;
+module_param(abk_lp_replay_kb, int, 0644);
+static int abk_lp_kick_kb = 16384;
+module_param(abk_lp_kick_kb, int, 0644);
+static int abk_lp_stats_records;
+module_param(abk_lp_stats_records, int, 0444);
+static int abk_lp_stats_pages;
+module_param(abk_lp_stats_pages, int, 0444);
+static int abk_lp_stats_prefetched;
+module_param(abk_lp_stats_prefetched, int, 0444);
+static int abk_lp_stats_kicks;
+module_param(abk_lp_stats_kicks, int, 0444);
+
+static u32 abk_lp_win_uid = UINT_MAX;	/* no window */
+static unsigned long abk_lp_win_deadline;
+
+static bool abk_lp_window_open(u32 uid)
+{
+	u32 win = READ_ONCE(abk_lp_win_uid);
+
+	return win != UINT_MAX && uid == win &&
+	       time_after(READ_ONCE(abk_lp_win_deadline), jiffies);
+}
+
+/* Issue page_cache_sync_readahead() over the set ranges of a record bitmap,
+ * up to budget_pages.  Called sleepable and lock-free on purpose: the
+ * readahead path may allocate and submit IO. */
+static unsigned long abk_lp_readahead_bits(struct address_space *mapping,
+					   struct file_ra_state *ra,
+					   struct file *file,
+					   const unsigned long *bits,
+					   unsigned long budget_pages)
+{
+	pgoff_t idx = 0, run, n;
+
+	while (idx < ABK_LP_PAGES && budget_pages) {
+		if (!test_bit(idx, bits)) {
+			idx++;
+			continue;
+		}
+		run = 0;
+		while (idx + run < ABK_LP_PAGES && test_bit(idx + run, bits))
+			run++;
+		n = min_t(unsigned long, run, budget_pages);
+		page_cache_sync_readahead(mapping, ra, file, idx, n);
+		WRITE_ONCE(abk_lp_stats_prefetched,
+			   abk_lp_stats_prefetched + (int)n);
+		budget_pages -= n;
+		idx += run;
+	}
+	return budget_pages;
+}
+
+/* One record: find by key or claim a free (then round-robin) slot, then set
+ * the touched range.  d_path() does not sleep, so the read-path caller may
+ * ask for the path under the spinlock; the map_pages caller never does
+ * (atomic-safe by construction). */
+static void abk_lp_touch(struct inode *inode, u32 uid, pgoff_t first,
+			 pgoff_t last, struct file *file, bool want_path)
+{
+	struct abk_lp_rec *rec = NULL;
+	struct abk_lp_rec *victim = NULL;
+	unsigned long flags;
+	int i;
+
+	if (unlikely(first >= ABK_LP_PAGES))
+		return;
+	if (last >= ABK_LP_PAGES)
+		last = ABK_LP_PAGES - 1;
+	if (last < first)
+		return;
+
+	spin_lock_irqsave(&abk_lp_lock, flags);
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+
+		if (r->used && r->dev == inode->i_sb->s_dev &&
+		    r->ino == inode->i_ino &&
+		    r->mtime_sec == inode->i_mtime.tv_sec && r->uid == uid) {
+			rec = r;
+			break;
+		}
+	}
+	if (!rec) {
+		/* Shared-file skip: framework jars/libs/apex are touched by
+		 * every app.  If another uid already recorded this exact
+		 * (dev, ino, mtime), the pages are shared cache owned by the
+		 * first recorder -- skip, or one cold launch (~600 records)
+		 * churns the whole table.  A file update changes i_mtime and
+		 * gets recorded fresh. */
+		for (i = 0; i < ABK_LP_SLOTS; i++) {
+			struct abk_lp_rec *r = &abk_lp_table[i];
+
+			if (r->used && r->dev == inode->i_sb->s_dev &&
+			    r->ino == inode->i_ino &&
+			    r->mtime_sec == inode->i_mtime.tv_sec) {
+				spin_unlock_irqrestore(&abk_lp_lock, flags);
+				return;
+			}
+		}
+		/* LRU eviction so a hot app's records survive other apps'
+		 * collection (round-robin churned exactly those). */
+		for (i = 0; i < ABK_LP_SLOTS; i++) {
+			struct abk_lp_rec *r = &abk_lp_table[i];
+
+			if (!r->used) {
+				victim = r;
+				break;
+			}
+			if (!victim || time_before(r->touch, victim->touch))
+				victim = r;
+		}
+		rec = victim;
+		rec->used = true;
+		rec->dev = inode->i_sb->s_dev;
+		rec->ino = inode->i_ino;
+		rec->mtime_sec = inode->i_mtime.tv_sec;
+		rec->uid = uid;
+		rec->pathlen = 0;
+		rec->jstamp = 0;
+		rec->touch = jiffies;
+		bitmap_zero(rec->pages, ABK_LP_PAGES);
+		WRITE_ONCE(abk_lp_seeded, true);
+		WRITE_ONCE(abk_lp_stats_records, abk_lp_stats_records + 1);
+	}
+	rec->touch = jiffies;
+	bitmap_set(rec->pages, first, last - first + 1);
+	WRITE_ONCE(abk_lp_stats_pages, abk_lp_stats_pages + 1);
+	if (want_path && file && rec->pathlen == 0) {
+		char *p = d_path(&file->f_path, rec->path, ABK_LP_PATH);
+
+		if (!IS_ERR(p)) {
+			rec->pathlen = strlen(p);
+			memmove(rec->path, p, rec->pathlen + 1);
+		}
+	}
+	spin_unlock_irqrestore(&abk_lp_lock, flags);
+}
+
+/* Consume a record for this file, if the current task looks like a launch
+ * burst (young) and the record is off cooldown.  Runs from the
+ * should_fault_around hook and the filemap_read hook; both call sites are
+ * process context with no spinlocks held, so the readahead itself runs
+ * outside abk_lp_lock on a stack copy of the bitmap. */
+static void abk_lp_replay(struct file *file)
+{
+	struct inode *host;
+	struct abk_lp_rec *rec = NULL;
+	unsigned long bits[ABK_LP_PAGES / BITS_PER_LONG];
+	unsigned long flags, budget;
+	u32 uid = current_uid().val;
+	int i;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max))
+		return;
+	if (!READ_ONCE(abk_lp_seeded))
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	host = file->f_mapping->host;
+
+	spin_lock_irqsave(&abk_lp_lock, flags);
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+
+		if (r->used && r->uid == uid && r->dev == host->i_sb->s_dev &&
+		    r->ino == host->i_ino &&
+		    r->mtime_sec == host->i_mtime.tv_sec) {
+			rec = r;
+			break;
+		}
+	}
+	if (!rec) {
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+		return;
+	}
+	if (rec->jstamp && time_before(jiffies, rec->jstamp + 2 *
+			msecs_to_jiffies(READ_ONCE(abk_lp_record_ms)))) {
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+		return;
+	}
+	rec->jstamp = jiffies;
+	memcpy(bits, rec->pages, sizeof(bits));
+	spin_unlock_irqrestore(&abk_lp_lock, flags);
+
+	budget = (unsigned long)READ_ONCE(abk_lp_replay_kb) >> 2;
+	abk_lp_readahead_bits(file->f_mapping, &file->f_ra, file, bits, budget);
+}
+
+/* Pre-launch kick: reopen each recorded path of the requested UID and
+ * prefetch its recorded ranges before the app starts.  Runs on a workqueue
+ * (fully sleepable); verifies the reopened inode still matches the record
+ * key, so a replaced file is skipped rather than prefetched stale. */
+static void abk_lp_prefetch_work(struct work_struct *work)
+{
+	unsigned long bits[ABK_LP_PAGES / BITS_PER_LONG];
+	unsigned long flags;
+	char path[ABK_LP_PATH];
+	dev_t dev;
+	u64 ino;
+	s64 mtime;
+	int uid, i;
+
+	uid = READ_ONCE(abk_lp_prefetch_uid);
+	if (uid < 0)
+		return;
+	for (i = 0; i < ABK_LP_SLOTS; i++) {
+		struct abk_lp_rec *r = &abk_lp_table[i];
+		struct file *f;
+		unsigned long budget;
+
+		spin_lock_irqsave(&abk_lp_lock, flags);
+		if (!r->used || r->uid != (u32)uid || !r->pathlen) {
+			spin_unlock_irqrestore(&abk_lp_lock, flags);
+			continue;
+		}
+		dev = r->dev;
+		ino = r->ino;
+		mtime = r->mtime_sec;
+		memcpy(bits, r->pages, sizeof(bits));
+		memcpy(path, r->path, r->pathlen + 1);
+		spin_unlock_irqrestore(&abk_lp_lock, flags);
+
+		f = filp_open(path, O_RDONLY | O_LARGEFILE, 0);
+		if (IS_ERR(f))
+			continue;
+		if (!f->f_mapping || !f->f_mapping->host ||
+		    f->f_mapping->host->i_sb->s_dev != dev ||
+		    f->f_mapping->host->i_ino != ino ||
+		    f->f_mapping->host->i_mtime.tv_sec != mtime) {
+			filp_close(f, NULL);
+			continue;
+		}
+		budget = (unsigned long)READ_ONCE(abk_lp_kick_kb) >> 2;
+		abk_lp_readahead_bits(f->f_mapping, &f->f_ra, f, bits, budget);
+		filp_close(f, NULL);
+		WRITE_ONCE(abk_lp_stats_kicks, abk_lp_stats_kicks + 1);
+	}
+}
+static DECLARE_WORK(abk_lp_kick, abk_lp_prefetch_work);
+
+static int abk_lp_record_uid_set(const char *val, const struct kernel_param *kp)
+{
+	int i, ret;
+
+	/* param_set_int, not kstrtouint: the sysfs write carries a trailing
+	 * newline the standard setter tolerates (a bare kstrtouint rejected
+	 * "10274\n" and the window never opened).  Negative closes it. */
+	ret = param_set_int(val, kp);
+	if (ret)
+		return ret;
+	if (*(int *)kp->arg < 0)
+		return 0;
+	spin_lock(&abk_lp_lock);
+	WRITE_ONCE(abk_lp_win_uid, (u32)*(int *)kp->arg);
+	WRITE_ONCE(abk_lp_win_deadline,
+		   jiffies + msecs_to_jiffies(READ_ONCE(abk_lp_record_ms)));
+	for (i = 0; i < ABK_LP_SLOTS; i++)
+		if (abk_lp_table[i].used && abk_lp_table[i].uid ==
+						   (u32)*(int *)kp->arg)
+			abk_lp_table[i].jstamp = 0;
+	spin_unlock(&abk_lp_lock);
+	return 0;
+}
+
+static int abk_lp_prefetch_uid_set(const char *val,
+				   const struct kernel_param *kp)
+{
+	int ret;
+
+	ret = param_set_int(val, kp);
+	if (ret)
+		return ret;
+	queue_work(system_long_wq, &abk_lp_kick);
+	return 0;
+}
+
+module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, &param_get_int,
+		  &abk_lp_record_uid, 0644);
+module_param_call(abk_lp_prefetch_uid, abk_lp_prefetch_uid_set, &param_get_int,
+		  &abk_lp_prefetch_uid, 0644);
+
+static void abk_lp_read_cb(void *data, struct file *file, loff_t pos,
+			   size_t size)
+{
+	u32 uid = current_uid().val;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (READ_ONCE(abk_lp_fault_replay))
+		abk_lp_replay(file);
+	if (size == 0)
+		return;
+	if (!abk_lp_window_open(uid))
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	abk_lp_touch(file->f_mapping->host, uid, pos >> PAGE_SHIFT,
+		     ((u64)pos + size - 1) >> PAGE_SHIFT, file, true);
+}
+
+static void abk_lp_map_cb(void *data, struct file *file, pgoff_t first_pgoff,
+			  pgoff_t last_pgoff, vm_fault_t ret)
+{
+	u32 uid = current_uid().val;
+
+	if (!READ_ONCE(abk_lp_enable) || !file)
+		return;
+	if (!abk_lp_window_open(uid))
+		return;
+	if (!file->f_mapping || !file->f_mapping->host)
+		return;
+	/* want_path=true: heavy apps fault code in through map_pages, not
+	 * read(), so a pathless record gives the kick's filp_open() nothing
+	 * to reopen (QQ measured prefetched=0).  Call site is after
+	 * pte_unmap_unlock(), process context; d_path() does not sleep. */
+	abk_lp_touch(file->f_mapping->host, uid, first_pgoff, last_pgoff,
+		     file, true);
+}
+
+static void abk_lp_fault_replay_cb(void *data, struct vm_fault *vmf,
+				   bool *should_around)
+{
+	if (!vmf || !vmf->vma || !vmf->vma->vm_file)
+		return;
+	if (!READ_ONCE(abk_lp_fault_replay))
+		return;
+	abk_lp_replay(vmf->vma->vm_file);
+}
+
+static int __init abk_lp_init(void)
+{
+	int ret;
+
+	ret = register_trace_android_vh_filemap_read(abk_lp_read_cb, NULL);
+	if (ret)
+		return ret;
+	ret = register_trace_android_vh_filemap_map_pages(abk_lp_map_cb, NULL);
+	if (ret)
+		goto unreg_read;
+	ret = register_trace_android_vh_should_fault_around(
+			abk_lp_fault_replay_cb, NULL);
+	if (ret)
+		goto unreg_map;
+	return 0;
+
+unreg_map:
+	unregister_trace_android_vh_filemap_map_pages(abk_lp_map_cb, NULL);
+unreg_read:
+	unregister_trace_android_vh_filemap_read(abk_lp_read_cb, NULL);
+	return ret;
+}
+fs_initcall(abk_lp_init);
+"""
+
+
+def _bg_launch_prefetch_apply(ctx):
+    try:
+        filemap = ctx.read("mm/filemap.c")
+        memory = ctx.read("mm/memory.c")
+    except OSError as exc:
+        return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
+    # Both collection hooks must actually fire on this tree, and the
+    # map_pages site must sit after pte_unmap_unlock (no PTE lock held in
+    # the callback).  The replay rides the same should_fault_around site
+    # the suppression group probes.
+    for rel, needle in (
+            ("mm/filemap.c",
+             "trace_android_vh_filemap_read(filp, iocb->ki_pos, "
+             "iov_iter_count(iter));"),
+            ("mm/filemap.c",
+             "trace_android_vh_filemap_map_pages(file, first_pgoff, "
+             "last_pgoff, ret);"),
+            ("mm/memory.c",
+             "trace_android_vh_should_fault_around(vmf, &should_around);")):
+        if needle not in (filemap if rel == "mm/filemap.c" else memory):
+            return "blocked_by_shape", (f"{rel} does not call "
+                                        f"{needle.split('(')[0]}; the "
+                                        "recorder would be registered but "
+                                        "never collect")
+    status, _results, detail = apply_steps(ctx, [
+        ("mm/filemap.c", _BG_LP_ANCHOR, _BG_LP_PAYLOAD, T),
+    ])
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "bg_launch_prefetch",
+        "Stage 2 of the iorap2 port: the collect/preread loop rebuilt "
+        "kernel-side, daemon-free.  While a UID's record window is open "
+        "(write the UID to abk_lp_record_uid; abk_lp_record_ms long), "
+        "android_vh_filemap_read + android_vh_filemap_map_pages snapshot "
+        "the touched pages of that UID's files into inline 4096-page "
+        "bitmaps keyed by (dev, ino, mtime, uid); the app's next launch "
+        "(young task, nvcsw < abk_lp_young_max) replays them as "
+        "page_cache_sync_readahead() from the should_fault_around and "
+        "filemap_read hooks under a per-record cooldown, and a UID written "
+        "to abk_lp_prefetch_uid queues a workqueue kick that filp_open()s "
+        "each recorded path and prefetches it pre-launch.  4096 static "
+        "slots, LRU eviction, no allocation on any fault path, no stored "
+        "pointers (UAF-free by construction).  Knobs at "
+        "/sys/module/filemap/parameters/abk_lp_*.",
+        [
+            "Xiaomi iorap2.ko mi_lb collection (research/ decompile: "
+            "sym.mi_lb_pagecache_collect, sym.mi_lb_ioctl -- the "
+            "ioctl/iorapd handshake replaced by module knobs)",
+        ],
+        ["mm/filemap.c"],
+        _bg_launch_prefetch_apply,
+    ),
+]
+
+# ============================================================================
+# Batch 70: the smaps migration-entry PageLocked race guard
+# (field panic MD_RST_STAT.BIN.txt:777 -- smaps_rollup -> smaps_pte_range ->
+# pfn_swap_entry_to_page -> swapops.h:267 BUG_ON).  One helper plus five
+# caller guards, all in fs/proc/task_mmu.c -- a file no earlier group
+# touches, so registration order is free; registered last.  Nothing is
+# probed except the helper itself (the group's own idempotency probe): the
+# five anchors are byte-identical pristine text with no per-baseline
+# variance, and device-private / device-exclusive entries keep the direct
+# call because their contract is not PageLocked.
+# ============================================================================
+import batch70_core_smaps_migration_guard as _b70_smaps  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b70_smaps.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO
+# (device A/B verify_swap -- kcompressd offload on corrupted 10/614400 swapped
+# pages, off 0/614400, SM8550 vermeer 5.15.220; surfaced as ART SIGSEGV in
+# random apps and /data corruption).  The deferred swap-out left the page
+# unlocked and not-writeback across the queue, so try_to_free_swap() freed and
+# reused the slot mid-queue and the deferred write corrupted another page.
+# Second-pass group over Batch 41's generated text (trap 5): set_page_writeback
+# at enqueue, end_page_writeback once the drain holds the lock.  Registered
+# after vm_kcompressd_swapout, refuses when that engine is absent.  mm/page_io.c
+# is otherwise untouched by any other group, so no further ordering applies.
+# ============================================================================
+import batch71_core_kcompressd_wb_pin as _b71_wb  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)
 
 if __name__ == "__main__":
     main()

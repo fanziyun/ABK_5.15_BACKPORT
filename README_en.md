@@ -51,11 +51,11 @@
 
 | child id | content | groups |
 |---|---|---:|
-| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 71 |
+| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 75 |
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 54 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**126 graft groups** in total (the perf child counts 54, including Batch 57's three sched_ext payload-adaptation groups, Batch 58's five task-lifecycle hook groups, Batch 59's four scheduling-core hook groups and Batch 60's four reachability groups); one injection string covers `android13-5.15-lts`.
+**130 graft groups** in total (the perf child counts 54, including Batch 57's three sched_ext payload-adaptation groups, Batch 58's five task-lifecycle hook groups, Batch 59's four scheduling-core hook groups and Batch 60's four reachability groups); one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
 keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44
@@ -104,6 +104,11 @@ Knobs:
 - `/sys/module/cpufreq_schedutil/parameters/abk_sf_*` / `abk_sc_*` — smart-freq
   floor and cap
 - `/sys/module/readahead/parameters/dynamic_readahead` — dynamic readahead
+- `/sys/module/filemap/parameters/abk_bg_ra_*` — background readahead
+  suppression switch and young-task threshold
+- `/sys/module/filemap/parameters/abk_lp_*` — launch page-cache record/replay
+  (write a UID to `abk_lp_record_uid` to open a record window, to
+  `abk_lp_prefetch_uid` to kick a pre-launch prefetch)
 - `zram.abk_comp_algo` / `zram.abk_lock_algo` / `zram.abk_recomp_algo` — the
   compressor lock
 - `vm.kcompressd` — the offload thread's soft limit

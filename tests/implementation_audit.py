@@ -58,6 +58,14 @@ CONFIG_GATED_REFERENCES = {
           "zram->nr_pages", "zram->wb_compressed", "zram->stats.bd_",
           "abk_zram_bvec_read(")),
     ],
+    # bg_readahead_tune (Batch 50): cpuset_cgrp_id only exists under
+    # CONFIG_CPUSETS (the enum entry in cgroup_subsys.h is itself gated on
+    # it), so the whole payload block sits inside #ifdef CONFIG_CPUSETS and
+    # this table enforces that mechanically instead of trusting the review.
+    "mm/filemap.c": [
+        ("CONFIG_CPUSETS",
+         ("cpuset_cgrp_id",)),
+    ],
 }
 
 
@@ -985,6 +993,28 @@ REQUIRED_CONTENT = {
          "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n"],
         ["fs/erofs/zdata.c", "cur < i_size_read(inode)"],
     ],
+    "core:smaps_migration_guard": [
+        # Batch 70: the field-panic guard (swapops.h:267 BUG_ON via
+        # smaps_rollup).  The helper must be present with its marker, and all
+        # five callers must route migration entries through it -- a tree that
+        # added the helper but left a caller on the direct call still panics
+        # on that path, so the guard is pinned per caller, not file-wide.
+        ["fs/proc/task_mmu.c", "sailboat_smaps_migration_guard"],
+        ["fs/proc/task_mmu.c", "static struct page *abk_smaps_migration_page("],
+        ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(swpent);"],
+        ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(entry);"],
+    ],
+    "core:kcompressd_writeback_pin": [
+        # Batch 71: the swap-slot writeback pin (device A/B verify_swap).
+        # The deferred swap-out must keep the page under PG_writeback across the
+        # FIFO: set_page_writeback at enqueue, end_page_writeback once the drain
+        # holds the lock, and end it again on the drain's !PageSwapCache drop
+        # path.  The marker is the only file-wide load-bearing needle: bare
+        # set_page_writeback(page);/end_page_writeback(page); already exist in a
+        # pristine tree (__swap_writepage/end_swap_bio_write and Batch 41's
+        # body), so they are pinned per-function in REQUIRED_IN_FUNCTION instead.
+        ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
+    ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",
         "abk_kcompressd_store",
@@ -1172,6 +1202,73 @@ REQUIRED_CONTENT = {
         "im->ip_epilogue = ctx->image + ctx->idx;",
         "jit_fill_hole(image, (unsigned int)(image_end - image));",
     ],
+    "core:bg_readahead_tune": [
+        "sailboat_bg_readahead_tune",
+        # The registration is the behaviour: an initcall that never registers
+        # the four handlers is an empty implementation.
+        ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
+        ["mm/filemap.c", "register_trace_android_vh_do_async_mmap_readahead("],
+        ["mm/filemap.c", "register_trace_android_vh_ra_tuning_max_page("],
+        ["mm/filemap.c", "register_trace_android_vh_tune_mmap_readaround("],
+        # The policy's two inputs, verbatim: the cgroup test and the age
+        # test (upstream's nvcsw>99 guard).
+        ["mm/filemap.c", 'task_css(current, cpuset_cgrp_id)'],
+        ["mm/filemap.c", '"background"'],
+        ["mm/filemap.c", "current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min)"],
+        # module_param(NAME, ...) compiles NAME as the *identifier*: the knob
+        # name and the variable must be the same token here (Batch 12's
+        # module_param lesson).  core_param would strip the module prefix and
+        # bury the knobs under /sys/module/kernel/parameters/ -- proven live
+        # on the r1 boot, hence module_param with the same-name form.
+        ["mm/filemap.c", "module_param(abk_bg_ra_suppress, int, 0644);"],
+        ["mm/filemap.c", "module_param(abk_bg_ra_nvcsw_min, int, 0644);"],
+        # The four handler bodies, in enough detail that gutting one (e.g.
+        # making every handler an empty return) fails the audit.
+        ["mm/filemap.c", "*should_around = false;"],
+        ["mm/filemap.c", "*skip = true;"],
+        ["mm/filemap.c", "ractl->ra->ra_pages >> 1"],
+        ["mm/filemap.c", "*start = max_t(long, 0, pgoff - ra_pages / 4);"],
+    ],
+    "core:bg_launch_prefetch": [
+        "sailboat_bg_launch_prefetch",
+        # The three registrations are the behaviour: without them the table
+        # never collects and never replays.
+        ["mm/filemap.c", "register_trace_android_vh_filemap_read("],
+        ["mm/filemap.c", "register_trace_android_vh_filemap_map_pages("],
+        ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
+        # The collection key and its validation at replay time: records are
+        # scalars only (dev/ino/mtime/uid), so nothing can dangle.
+        ["mm/filemap.c", "r->mtime_sec == host->i_mtime.tv_sec"],
+        ["mm/filemap.c", "f->f_mapping->host->i_ino != ino"],
+        # The replay gate (young task) and the prefetch primitive.
+        ["mm/filemap.c",
+         "current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max)"],
+        ["mm/filemap.c", "page_cache_sync_readahead("],
+        # The pre-launch kick: reopen the recorded path on a workqueue and
+        # verify it before prefetching.
+        ["mm/filemap.c", "filp_open(path, O_RDONLY | O_LARGEFILE, 0)"],
+        ["mm/filemap.c", "queue_work(system_long_wq, &abk_lp_kick)"],
+        ["mm/filemap.c", "d_path(&file->f_path, rec->path, ABK_LP_PATH)"],
+        # Same-name module_param form (Batch 12's lesson) on the two knobs
+        # the device test toggles.
+        ["mm/filemap.c", "module_param(abk_lp_young_max, int, 0644);"],
+        ["mm/filemap.c", "module_param(abk_lp_replay_kb, int, 0644);"],
+        # At-fault replay is opt-in (default 0): from the fault/read hook
+        # contexts it hard-reset the vermeer SoC with no panic text -- the
+        # supported replay path is the pre-launch kick, and the pin guards
+        # the gate that keeps the hook-context readahead off by default.
+        ["mm/filemap.c", "module_param(abk_lp_fault_replay, int, 0644);"],
+        ["mm/filemap.c", "if (!READ_ONCE(abk_lp_fault_replay))"],
+        # The two set-with-side-effect knobs are module_param_call, not
+        # plain module_param (a plain param write could not open the
+        # window or schedule the kick).
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, "
+         "&param_get_int,"],
+        ["mm/filemap.c",
+         "module_param_call(abk_lp_prefetch_uid, abk_lp_prefetch_uid_set, "
+         "&param_get_int,"],
+    ],
 }
 
 # Removal grafts: content that must NOT survive into the patched text wherever
@@ -1213,6 +1310,13 @@ REQUIRED_ABSENT = {
         # is already the safe action; a WARN_ON_ONCE() there would be an oops,
         # and a device booted with panic_on_oops/panic_on_warn turns an oops
         # into a panic -- strictly worse than the condition being guarded.
+        "WARN_ON_ONCE",
+        "WARN_ON(",
+        "WARN(",
+    ],
+    "core:kcompressd_writeback_pin": [
+        # The writeback-pin edits add no WARN-family check (the surrounding
+        # Batch 41 body uses pr_warn_once); keep the drain WARN-free.
         "WARN_ON_ONCE",
         "WARN_ON(",
         "WARN(",
@@ -2430,6 +2534,67 @@ REQUIRED_IN_FUNCTION = {
         ("arch/arm64/net/bpf_jit_comp.c", "prepare_trampoline",
          ["emit_bti(A64_BTI_JC, ctx);",
           "int retaddr_off;"],
+         []),
+    ],
+    # --- Batch 71 -------------------------------------------------------
+    # kcompressd_writeback_pin.  The deferred swap-out must keep the page
+    # under PG_writeback across the FIFO.  enqueue side (swap_writepage): the
+    # offload branch sets writeback immediately before unlock + return 0.  drain
+    # side (abk_kcompressd_do_swapout): it locks the page then ends writeback
+    # before the write body, AND ends writeback on the !PageSwapCache drop path
+    # (which returns above the drain's own end).  Pinned per owning function and
+    # by load-bearing sequence (bare set_page_writeback/end_page_writeback
+    # pre-exist in a pristine tree) so a hunk elsewhere cannot satisfy the pins;
+    # the old trylock-skip must be gone.
+    "core:kcompressd_writeback_pin": [
+        ("mm/page_io.c", "swap_writepage",
+         ["sailboat_kcompressd_wb_pin",
+          "\t\tset_page_writeback(page);\n"
+          "\t\tunlock_page(page);\n"
+          "\t\treturn 0;\n"],
+         ["if (!trylock_page(page)) {"]),
+        ("mm/page_io.c", "abk_kcompressd_do_swapout",
+         ["sailboat_kcompressd_wb_pin",
+          "\tlock_page(page);\n",
+          "end_page_writeback(page);",
+          "end_page_writeback(page);\n\t\tput_page(page);"],
+         ["if (!trylock_page(page)) {",
+          "kcompressd: skipping a locked page"]),
+    ],
+    # --- Batch 70 -------------------------------------------------------
+    # smaps_migration_guard.  The helper is pinned in its own definition
+    # (PageLocked + re-validation + marker); each guarded caller is pinned
+    # in the function that owns it, so a hunk landing in a neighbour cannot
+    # satisfy the pin.  The unguarded direct calls that remain are the
+    # device-private / device-exclusive cases, whose contract is not
+    # PageLocked -- they must stay direct, so they are not forbidden.
+    "core:smaps_migration_guard": [
+        # The marker is pinned by REQUIRED_CONTENT above, not here: it
+        # rides in the comment *above* the helper, and function_body() only
+        # returns the body.  What has to live inside the body is the contract
+        # itself.
+        ("fs/proc/task_mmu.c", "abk_smaps_migration_page",
+         ["if (!PageLocked(p))",
+          "if (!is_migration_entry(entry))",
+          "p = pfn_to_page(swp_offset(entry));"],
+         ["pfn_swap_entry_to_page"]),
+        ("fs/proc/task_mmu.c", "smaps_pte_entry",
+         ["page = abk_smaps_migration_page(swpent);"],
+         []),
+        ("fs/proc/task_mmu.c", "smaps_pmd_entry",
+         ["page = abk_smaps_migration_page(entry);"],
+         []),
+        ("fs/proc/task_mmu.c", "smaps_hugetlb_range",
+         ["page = abk_smaps_migration_page(swpent);"],
+         []),
+        # The pagemap PTE path is pte_to_pagemap_entry(), this file's
+        # per-entry helper -- there is no pagemap_pte_range() in task_mmu.c,
+        # and function_body() would report the pin as an unfound function.
+        ("fs/proc/task_mmu.c", "pte_to_pagemap_entry",
+         ["page = abk_smaps_migration_page(entry);"],
+         []),
+        ("fs/proc/task_mmu.c", "pagemap_pmd_range",
+         ["page = abk_smaps_migration_page(entry);"],
          []),
     ],
 }

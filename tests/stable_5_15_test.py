@@ -7,6 +7,7 @@ Runs fully self-contained on synthetic fixtures; no kernel tree required.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -26,9 +27,11 @@ import sublevel_matrix  # noqa: E402
 from abk_backport_engine import GraftContext, PatchGroup, apply_steps, run_child  # noqa: E402
 
 FAILURES = []
+CHECKS_RUN = []
 
 
 def check(name, cond, detail=""):
+    CHECKS_RUN.append(name)
     if cond:
         print(f"  ok  {name}")
     else:
@@ -2147,13 +2150,15 @@ def test_config_tiers():
 
     check("module-owned tier enables the module's own symbols",
           dict(plain).get("ZRAM_MULTI_COMP") == "y"
-          and dict(plain).get("LRU_GEN_ENABLED") == "y"
+          and "LRU_GEN_ENABLED" not in dict(plain)
           and "ZRAM_WRITEBACK" not in dict(plain), sorted(dict(plain)))
-    # LRU_GEN_ENABLED used to be the align tier's marker symbol; it moved to
-    # the module tier because Batch 37's six MGLRU groups are runtime-inert
-    # without it.  TCP_CONG_BBR is now the align-only marker.
-    check("align tier adds the 6.6 GKI config deltas",
+    # LRU_GEN_ENABLED is in the opt-in align tier (not the module tier): this
+    # module's MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained
+    # thrash and SIGSEGVs a third-party app on launch, so MGLRU is off by
+    # default (trap 8).  TCP_CONG_BBR and LRU_GEN_ENABLED are both align markers.
+    check("align tier adds the 6.6 GKI config deltas (incl. opt-in MGLRU)",
           dict(align).get("TCP_CONG_BBR") == "y"
+          and dict(align).get("LRU_GEN_ENABLED") == "y"
           and "ZRAM_WRITEBACK" not in dict(align), sorted(dict(align)))
     check("ROM tier adds CONFIG_ZRAM_WRITEBACK",
           dict(rom).get("ZRAM_WRITEBACK") == "y"
@@ -2176,7 +2181,8 @@ def test_config_tiers():
           psi_status == "applied" and "per-cgroup PSI accounting" in psi_detail,
           (psi_status, psi_detail))
     check("the PSI tier keeps the module symbols and pulls in no other tier",
-          psi.get("ZRAM_MULTI_COMP") == "y" and psi.get("LRU_GEN_ENABLED") == "y"
+          psi.get("ZRAM_MULTI_COMP") == "y"
+          and "LRU_GEN_ENABLED" not in psi
           and "ZRAM_WRITEBACK" not in psi
           and "TCP_CONG_BBR" not in psi, sorted(psi))
     blocked_status, blocked_detail, _c, _t = enabled(
@@ -2318,60 +2324,51 @@ def test_introduced_kconfig_tiers():
 
 
 def test_mglru_is_enabled_by_the_default_tier():
-    """MGLRU must be on by default, or Batch 37's six groups are inert.
+    """MGLRU must be OFF by default on this baseline (device-wedge evidence).
 
-    This is the Batch 8 RCU lesson one config layer further down.  Every
-    android13-5.15 baseline already ships ``CONFIG_LRU_GEN=y``, so the whole
-    MGLRU implementation compiles -- but ``CONFIG_LRU_GEN_ENABLED`` is what
-    selects ``DEFINE_STATIC_KEY_ARRAY_TRUE`` vs ``_FALSE`` for ``lru_gen_caps``
-    in mm/vmscan.c.  With it unset every MGLRU branch starts false,
-    ``/sys/kernel/mm/lru_gen/enabled`` reads ``0x0000``, and the classic-LRU
-    path runs -- verified on the device that shipped the first cut of Batch 38.
-
-    The consequence is not cosmetic: Batch 37 landed six MGLRU performance
-    groups (``mglru_clean_workingset``, ``mglru_optimize_deactivation``,
-    ``mglru_rework_aging_feedback``, ``mglru_rework_type_selection``,
-    ``mglru_rework_refault_detection``, ``mglru_wake_flushers``) that were
-    runtime-inert for exactly this reason.  An optimization that never runs is
-    not an optimization, so the default tier has to turn the symbol on.
+    MGLRU was briefly in the module (default) tier so Batch 37/49's groups
+    would run.  Device evidence reversed that: on SM8550 vermeer (5.15.220)
+    this module's MGLRU reclaim-loop rewrite does not converge under sustained
+    memory thrash -- two kworker/*:*H pin at 100% kernel CPU in
+    ``lru_gen_shrink_lruvec``/``evict_pages``, lmkd starves, the QCOM watchdog
+    cold-resets the device, and a third-party app (bilibili) SIGSEGVs on launch
+    in the dex-preload mmap path.  The identical load with MGLRU off rode out
+    (zram took 8.6 GB, PSI self-recovered).  So ``LRU_GEN_ENABLED`` is in the
+    opt-in align tier, not the default tier: the MGLRU grafts stay compiled-in
+    but runtime-inert until the shrink loop is made to converge (a dedicated
+    follow-up PR).  This is trap 8 (AGENTS.md): an upstream mechanism must not
+    be turned on by default without the self-defence the stock kernel relied on.
     """
-    print("MGLRU is enabled by the default (module) tier")
+    print("MGLRU is OFF by default (device-wedge evidence); opt-in only")
     import abk_stable_core as core
 
     module = dict(core._MODULE_CONFIGS)
-    check("LRU_GEN_ENABLED is in the default tier",
-          module.get("LRU_GEN_ENABLED") == "y", sorted(module))
-    check("LRU_GEN_ENABLED is recorded in _INTRODUCED_KCONFIG",
-          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "module",
+    align = dict(core._ALIGN_CONFIGS)
+    check("LRU_GEN_ENABLED is NOT in the default (module) tier",
+          "LRU_GEN_ENABLED" not in module, sorted(module))
+    check("LRU_GEN_ENABLED is in the opt-in align tier",
+          align.get("LRU_GEN_ENABLED") == "y", sorted(align))
+    check("LRU_GEN_ENABLED is recorded in _INTRODUCED_KCONFIG as align",
+          core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "align",
           core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED"))
-    check("LRU_GEN_ENABLED is no longer only in the opt-in align tier",
-          "LRU_GEN_ENABLED" not in dict(core._ALIGN_CONFIGS),
-          sorted(dict(core._ALIGN_CONFIGS)))
 
-    # Every MGLRU group the module ships must still be registered -- the point
-    # of enabling the symbol is to make them live, so a silently-dropped
-    # registration would defeat it.
+    # The MGLRU grafts stay registered -- they are compiled in, just
+    # runtime-off by default.  Turning the opt-in align tier on makes them live.
     mglru = sorted(g.key for g in core.PATCH_GROUPS if g.key.startswith("mglru_"))
-    check("the MGLRU groups the symbol makes live are still registered",
+    check("the MGLRU groups stay registered (compiled-in, runtime-off)",
           len(mglru) >= 6, mglru)
 
-    # The companion and the kernel tier must agree.  Before Batch 38 they did,
-    # in the wrong direction: the kernel shipped MGLRU off and the companion
-    # stated 0, and abk_apply_lru_gen() only ever *writes* on ==1, so the knob
-    # was a no-op that documented the kernel default rather than deciding it.
-    # Now the kernel defaults it on, so a companion still saying 0 is a stale
-    # comment waiting to mislead someone into thinking MGLRU is off.
+    # The companion and the kernel tier must agree: MGLRU is off by default.
+    # The kernel keeps LRU_GEN_ENABLED in the opt-in align tier, and the
+    # companion must not re-assert MGLRU on.  abk_apply_lru_gen() only ever
+    # *writes* on ==1, so lru_gen.enable=0 stops the companion forcing MGLRU on
+    # and leaves an opt-in tester (ABK_515_DEFCONFIG_ALIGN=1) free to run it.
     ksu = (Path(__file__).resolve().parent.parent / "ksu"
            / "abk_runtime_tunables")
     tunables = (ksu / "tunables.conf").read_text(encoding="utf-8")
-    readme = (ksu / "README.md").read_text(encoding="utf-8")
-    check("the companion asserts lru_gen.enable=1",
-          re.search(r"(?m)^lru_gen\.enable=1$", tunables) is not None,
+    check("the companion does not re-assert MGLRU on (lru_gen.enable=0)",
+          re.search(r"(?m)^lru_gen\.enable=0$", tunables) is not None,
           [l for l in tunables.splitlines() if l.startswith("lru_gen.enable")])
-    check("the companion README no longer claims the kernel ships MGLRU off",
-          "ships it off" not in readme, "stale README row")
-    check("the companion README lists lru_gen as not opt-in",
-          "`lru_gen` is no longer opt-in" in readme, "README opt-in paragraph")
     # The knob must stay a write-only assertion: if abk_apply_lru_gen() ever
     # grows an else-branch that writes n, a future 0 would silently disable
     # MGLRU again and the two layers would fight.
@@ -3181,8 +3178,8 @@ def test_runtime_tunables_module():
         return
 
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
-                "service.sh", "action.sh", "tunables.conf", "embed.conf",
-                "sepolicy.rule", "README.md",
+                "service.sh", "action.sh", "iorap-watch.sh", "tunables.conf",
+                "embed.conf", "sepolicy.rule", "README.md",
                 # Batch 63: the sched_ext half of the policy (off by default).
                 "scx-policy.sh",
                 # Batch 67: the uclamp floor (off by default).
@@ -3267,7 +3264,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.73.0", "0.73.0"], _versions)
+          _versions == ["0.74.0", "0.74.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3437,7 +3434,7 @@ def test_runtime_tunables_module():
     _zs_readme = (module_dir / "README.md").read_text(encoding="utf-8")
     for _key, _value in (("zram.recomp.idle_age_sec", "900"),
                          ("zram.recomp.interval_sec", "1800"),
-                         ("zram.recomp.mark_interval_sec", "10800"),
+                         ("zram.recomp.mark_interval_sec", "3600"),
                          ("zram.recomp.max_pages", "131072")):
         check(f"tunables.conf ships {_key}={_value}",
               re.search(rf"(?m)^{re.escape(_key)}={_value}\s*$", tunables)
@@ -3858,12 +3855,24 @@ done
 printf '#!/bin/sh\necho "losetup $*" >> "$HARNESS_CALLS"\n[ "$1" = "-f" ] && echo /dev/block/loop42\nexit 0\n' > "$T/stub/losetup"
 printf '#!/bin/sh\necho "dd $*" >> "$HARNESS_CALLS"\nexit 0\n' > "$T/stub/dd"
 chmod +x "$T/stub/losetup" "$T/stub/dd"
+# sys.boot_completed is the one property the zram writeback policy reads: init
+# wipes /data/per_boot at exactly that point, so the attach is gated on it.  The
+# stub defaults to "completed" (1); a scenario that needs the pre-boot state
+# exports ABK_TEST_BOOT_COMPLETED=0 around the call.
+cat > "$T/stub/getprop" <<'EOF'
+#!/bin/sh
+case "$1" in
+  sys.boot_completed) echo "${ABK_TEST_BOOT_COMPLETED:-1}" ;;
+esac
+EOF
+chmod +x "$T/stub/getprop"
 
 export ABK_CONF="$T/tunables.conf"
 export ABK_RUN_DIR="$T/run" ABK_STATE_DIR="$T/state" ABK_SYS_ROOT="$T/sys"
 export ABK_PROC_SWAPS="$T/proc_swaps" ABK_MEMINFO="$T/meminfo"
 export ABK_SWAPOFF="$T/stub/swapoff" ABK_SWAPON="$T/stub/swapon" ABK_MKSWAP="$T/stub/mkswap"
 export ABK_LOSETUP="$T/stub/losetup" ABK_DD="$T/stub/dd"
+export ABK_GETPROP="$T/stub/getprop"
 export ABK_ZRAM_NODE="/dev/block/zram0" ABK_ZRAM_WB_DIR="$T/wb"
 export MODDIR="$MD"
 export ABK_STDOUT=1
@@ -3908,9 +3917,11 @@ echo "RC2=$?"
 echo "primary2=$(abk_zram_primary)"
 echo "calls2=$(tr '\n' ';' < "$T/calls")"
 
-# 3. the kernel supports writeback and nobody owns it: the rewrite attaches one
+# 3. the kernel supports writeback and nobody owns it: the rewrite attaches one.
+#    auto is opt-in now, so the fixture has to ask for it.
 printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
 reset_fixture
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
 : > "$T/sys/block/zram0/writeback"
 printf 'none\n' > "$T/sys/block/zram0/backing_dev"
 printf '0\n' > "$T/sys/block/zram0/writeback_limit"
@@ -3949,6 +3960,84 @@ echo "RC5=$?"
 echo "primary5=$(abk_zram_primary)"
 echo "calls5=$(tr '\n' ';' < "$T/calls")"
 printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$T/proc_swaps"
+
+# 12. the boot gate.  writeback=auto, but sys.boot_completed is not set yet:
+#     init wipes /data/per_boot at exactly that property, so an attach before it
+#     loses the file to the wipe and leaves the loop over an unlinked inode.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
+export ABK_TEST_BOOT_COMPLETED=0
+echo "want12=$(abk_zram_writeback_wanted && echo yes || echo no)"
+abk_zram_takeover > "$T/out12" 2>&1
+echo "RC12=$?"
+echo "backing12=$(abk_zram_backing_dev)"
+echo "calls12=$(tr '\n' ';' < "$T/calls")"
+unset ABK_TEST_BOOT_COMPLETED
+
+# 13. after the boot the same policy attaches one; and a stranded attachment of
+#     the module's own is released (loop detached, file removed) once the policy
+#     says off -- including when the file was already unlinked by that wipe, which
+#     is the only form the kernel still reports for it ("<path> (deleted)").
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+printf 'zram.recomp.enable=1\nzram.writeback=auto\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out13" 2>&1
+echo "RC13=$?"
+echo "backing13=$(abk_zram_backing_dev)"
+echo "calls13=$(tr '\n' ';' < "$T/calls")"
+
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop42\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf '1\n' > "$T/sys/block/zram0/writeback_limit_enable"
+mkdir -p "$T/sys/block/loop42/loop" "$T/wb"
+: > "$T/wb/zram_swap"
+printf '%s\n' "$T/wb/zram_swap (deleted)" > "$T/sys/block/loop42/loop/backing_file"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out13b" 2>&1
+echo "RC13b=$?"
+echo "ours13b=$(abk_zram_backing_dev_ours /dev/block/loop42 && echo yes || echo no)"
+echo "file13b=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
+echo "calls13b=$(tr '\n' ';' < "$T/calls")"
+
+# 14. a device the ROM owns is never released, even with writeback=off.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+printf '512\n' > "$T/sys/block/zram0/writeback_limit"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_takeover > "$T/out14" 2>&1
+echo "RC14=$?"
+echo "backing14=$(abk_zram_backing_dev)"
+echo "calls14=$(tr '\n' ';' < "$T/calls")"
+
+# 15. the file an older build left behind goes at the first pass, not at the next
+#     rewrite: writeback=off and nothing attached, so the file is nobody's and
+#     would otherwise sit in /data/per_boot until init's wipe at boot_completed.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf 'none\n' > "$T/sys/block/zram0/backing_dev"
+mkdir -p "$T/wb"
+: > "$T/wb/zram_swap"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_ensure > "$T/out15" 2>&1
+echo "RC15=$?"
+echo "file15=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
+
+# 16. ... but not while a device is attached: then the file belongs to the
+#     attachment and is the rewrite's release path's business, not a bare rm -f.
+reset_fixture
+: > "$T/sys/block/zram0/writeback"
+printf '/dev/block/loop7\n' > "$T/sys/block/zram0/backing_dev"
+mkdir -p "$T/wb"
+: > "$T/wb/zram_swap"
+printf 'zram.recomp.enable=1\nzram.writeback=off\n' > "$T/tunables.conf"
+abk_zram_ensure > "$T/out16" 2>&1
+echo "file16=$([ -e "$T/wb/zram_swap" ] && echo present || echo removed)"
 
 # 6. a kernel that locks the compressors: the policy is in force by definition,
 #    so nothing is rewritten (this is the path that lets writeback and the ROM's
@@ -4032,7 +4121,7 @@ printf 'zram.recomp.enable=1\nvm.swappiness=\nbogus.key=7\n' > "$T/tunables.conf
 echo "cfg_default=$(abk_cfg zram.recomp.idle_age_sec 3600)"
 echo "cfg_empty=$(abk_cfg vm.swappiness '')"
 echo "cfg_clamped=$(abk_clamp_uint 999 0 300)"
-echo "cfg_writeback=$(abk_cfg zram.writeback auto)"
+echo "wb_mode_unset=$(abk_zram_writeback_mode)"
 echo "ram_bytes=$(abk_mem_total_bytes)"
 echo "ram_25pct=$(abk_mem_pct_bytes 25)"
 echo "ram_half=$(abk_mul_div "$(abk_mem_total_bytes)" 1 2)"
@@ -4213,7 +4302,7 @@ rm -rf "$T"
           and "--no-mark" in got.get("supervisor_args2", ""),
           (got.get("supervisor_args"), got.get("supervisor_args2")))
     check("the supervisor up line carries the mark cadence",
-          got.get("supervisor_mark") == "mark=10800s", r.stdout)
+          got.get("supervisor_mark") == "mark=3600s", r.stdout)
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
 
@@ -4261,8 +4350,41 @@ rm -rf "$T"
           got.get("cfg_empty") == "", r.stdout)
     check("numeric knobs are clamped to their safe range",
           got.get("cfg_clamped") == "300", r.stdout)
-    check("the writeback policy defaults to auto", got.get("cfg_writeback") == "auto",
-          r.stdout)
+    check("the writeback policy defaults to off and auto is opt-in",
+          got.get("wb_mode_unset") == "off", r.stdout)
+    check("the shipped tunables.conf carries that off default",
+          any(line.strip() == "zram.writeback=off" for line in tunables.splitlines()),
+          tunables)
+    # 12: the boot gate.  Nothing may attach before sys.boot_completed, because
+    # init empties /data/per_boot at that property (init.rc).
+    check("writeback is not wanted before the boot completes",
+          got.get("want12") == "no", r.stdout)
+    # abk_zram_backing_dev() reports the kernel's "none" as an empty string.
+    check("... and no backing file is created either",
+          got.get("RC12") == "0" and not got.get("backing12")
+          and "dd if=/dev/zero" not in got.get("calls12", "")
+          and "losetup" not in got.get("calls12", ""),
+          (got.get("RC12"), got.get("backing12"), got.get("calls12")))
+    # 13: after the boot it attaches, and with the policy off it releases its own
+    # file instead of preserving a device nothing can use.
+    check("after boot_completed the same policy attaches a backing file",
+          got.get("RC13") == "0" and got.get("backing13") == "/dev/block/loop42"
+          and "dd if=/dev/zero" in got.get("calls13", ""), got.get("calls13"))
+    check("a stranded attachment of the module's own is recognised after unlink",
+          got.get("ours13b") == "yes", r.stdout)
+    check("... and released when the policy says off",
+          got.get("RC13b") == "0" and got.get("file13b") == "removed"
+          and "losetup -d /dev/block/loop42" in got.get("calls13b", ""),
+          (got.get("calls13b"), got.get("file13b")))
+    check("a backing device the ROM owns is never released",
+          got.get("RC14") == "0" and got.get("backing14") == "/dev/block/loop7"
+          and "losetup -d" not in got.get("calls14", ""), got.get("calls14"))
+    # 15/16: what an older build left behind has to go at the first pass, without
+    # waiting for a rewrite that may never come -- but never while it is in use.
+    check("a stale backing file is removed at the first pass",
+          got.get("RC15") == "0" and got.get("file15") == "removed", r.stdout)
+    check("... but not while a backing device is attached",
+          got.get("file16") == "present", r.stdout)
     # 15561024 KiB is past 2^31 bytes; a 32-bit shell would wrap it negative.
     check("byte counts survive the 32-bit shell arithmetic limit",
           got.get("ram_bytes") == "15934488576"
@@ -6495,12 +6617,20 @@ def main():
     test_batch67_uclamp_policy()
     test_batch68_arm64_selftest()
     test_batch69_tier_de_verdict()
+    test_batch70_smaps_migration_guard()
+    test_batch71_kcompressd_wb_pin()
+    test_fetch_decode_roundtrip()
 
     print()
     if FAILURES:
-        print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")
+        print(f"FAILED: {len(FAILURES)} of {len(CHECKS_RUN)} check(s): {FAILURES}")
         sys.exit(1)
-    print("all checks passed")
+    # The count is part of the result.  CHANGELOG.md quotes "N checks" per batch
+    # and plan.md quotes it as the suite total, so the number has to come out of
+    # the runner rather than out of someone's arithmetic over the check sites --
+    # a check inside a loop runs once per iteration and a static count of `check(`
+    # is not the same number.
+    print(f"all checks passed ({len(CHECKS_RUN)} checks)")
 
 
 def test_batch42_schedutil_smart_cap():
@@ -8275,6 +8405,679 @@ def test_sched_ext_wiring():
     for rel in ("kernel/Kconfig.preempt", "include/uapi/linux/sched.h",
                 "kernel/sched/Makefile", "include/asm-generic/vmlinux.lds.h"):
         check(f"FETCH_FILES carries {rel}", rel in fetch)
+
+
+# ---------------------------------------------------------------------------
+# Batch 70 / Batch 71: the two minidump fragments.
+# ---------------------------------------------------------------------------
+
+# The fs/proc/task_mmu.c regions Batch 70 rewrites, copied from the 5.15.220
+# tree (android13-5.15-lts).  Only the statements the anchors need are kept,
+# but every anchor must be byte-identical to the tree's text or the fixture
+# would prove nothing.
+TASK_MMU_FIXTURE = (
+    "static void smaps_pte_entry(pte_t *pte, unsigned long addr,\n"
+    "\t\tstruct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false, young = false, dirty = false;\n"
+    "\n"
+    "\tif (pte_present(*pte)) {\n"
+    "\t\tpage = vm_normal_page(vma, addr, *pte);\n"
+    "\t\tyoung = pte_young(*pte);\n"
+    "\t\tdirty = pte_dirty(*pte);\n"
+    "\t} else if (is_swap_pte(*pte)) {\n"
+    "\t\tswp_entry_t swpent = pte_to_swp_entry(*pte);\n"
+    "\n"
+    "\t\tif (!non_swap_entry(swpent)) {\n"
+    "\t\t\tmss->swap += PAGE_SIZE;\n"
+    "\t\t} else if (is_pfn_swap_entry(swpent)) {\n"
+    "\t\t\tif (is_migration_entry(swpent))\n"
+    "\t\t\t\tmigration = true;\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+    "\tif (!page)\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tsmaps_account(mss, page, false, young, dirty, locked, migration);\n"
+    "}\n"
+    "\n"
+    "static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,\n"
+    "\t\tstruct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false;\n"
+    "\n"
+    "\tif (pmd_present(*pmd)) {\n"
+    "\t\tpage = follow_trans_huge_pmd(vma, addr, pmd, FOLL_DUMP);\n"
+    "\t} else if (unlikely(thp_migration_supported() && is_swap_pmd(*pmd))) {\n"
+    "\t\tswp_entry_t entry = pmd_to_swp_entry(*pmd);\n"
+    "\n"
+    "\t\tif (is_migration_entry(entry)) {\n"
+    "\t\t\tmigration = true;\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\tif (IS_ERR_OR_NULL(page))\n"
+    "\t\treturn;\n"
+    "\n"
+    "\tsmaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd),\n"
+    "\t\t      locked, migration);\n"
+    "}\n"
+    "\n"
+    "static int smaps_hugetlb_range(pte_t *pte, unsigned long hmask,\n"
+    "\t\t\t\t unsigned long addr, unsigned long end,\n"
+    "\t\t\t\t struct mm_walk *walk)\n"
+    "{\n"
+    "\tstruct page *page = NULL;\n"
+    "\n"
+    "\tif (pte_present(*pte)) {\n"
+    "\t\tpage = vm_normal_page(vma, addr, *pte);\n"
+    "\t} else if (is_swap_pte(*pte)) {\n"
+    "\t\tswp_entry_t swpent = pte_to_swp_entry(*pte);\n"
+    "\n"
+    "\t\tif (is_pfn_swap_entry(swpent))\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+    "\t}\n"
+    "\tif (page) {\n"
+    "\t\tif (page_mapcount(page) >= 2 || hugetlb_pmd_shared(pte))\n"
+    "\t\t\tseq_putc(m, '\\n');\n"
+    "\t}\n"
+    "\treturn 0;\n"
+    "}\n"
+    "\n"
+    # The pagemap PTE path is pte_to_pagemap_entry(), this file's
+    # per-entry helper; there is no pagemap_pte_range() in task_mmu.c.
+    "static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,\n"
+    "\t\tstruct vm_area_struct *vma, unsigned long addr, pte_t pte)\n"
+    "{\n"
+    "\tu64 frame = 0, flags = 0;\n"
+    "\tstruct page *page = NULL;\n"
+    "\tbool migration = false;\n"
+    "\n"
+    "\tif (pte_present(pte)) {\n"
+    "\t\tpage = pte_page(pte);\n"
+    "\n"
+    "\t\tflags |= PM_PRESENT;\n"
+    "\t} else if (is_swap_pte(pte)) {\n"
+    "\t\tswp_entry_t entry;\n"
+    "\n"
+    "\t\tif (pte_swp_soft_dirty(pte))\n"
+    "\t\t\tflags |= PM_SOFT_DIRTY;\n"
+    "\t\tentry = pte_to_swp_entry(pte);\n"
+    "\t\tif (pm->show_pfn)\n"
+    "\t\t\tframe = swp_type(entry) |\n"
+    "\t\t\t\t(swp_offset(entry) << MAX_SWAPFILES_SHIFT);\n"
+    "\t\tflags |= PM_SWAP;\n"
+    "\t\tmigration = is_migration_entry(entry);\n"
+    "\t\tif (is_pfn_swap_entry(entry))\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t}\n"
+    "\n"
+    "\tif (page && !PageAnon(page))\n"
+    "\t\tflags |= PM_FILE;\n"
+    "\tif (page && !migration && page_mapcount(page) == 1)\n"
+    "\t\tflags |= PM_MMAP_EXCLUSIVE;\n"
+    "\n"
+    "\treturn make_pme(frame, flags);\n"
+    "}\n"
+    "\n"
+    "static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr,\n"
+    "\t\t\t     unsigned long end, struct mm_walk *walk)\n"
+    "{\n"
+    "\tspinlock_t *ptl;\n"
+    "\tint err = 0;\n"
+    "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
+    "\tbool migration = false;\n"
+    "#endif\n"
+    "\n"
+    "\tptl = pmd_trans_huge_lock(pmdp, walk->vma);\n"
+    "\tif (ptl) {\n"
+    "\t\tu64 flags = 0, frame = 0;\n"
+    "\t\tpmd_t pmd = *pmdp;\n"
+    "\t\tstruct page *page = NULL;\n"
+    "\n"
+    "\t\tif (pmd_present(pmd)) {\n"
+    "\t\t\tpage = pmd_page(pmd);\n"
+    "\n"
+    "\t\t\tflags |= PM_PRESENT;\n"
+    "\t\t}\n"
+    "#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION\n"
+    "\t\telse if (is_swap_pmd(pmd)) {\n"
+    "\t\t\tswp_entry_t entry = pmd_to_swp_entry(pmd);\n"
+    "\t\t\tunsigned long offset;\n"
+    "\n"
+    "\t\t\tif (pm->show_pfn) {\n"
+    "\t\t\t\toffset = swp_offset(entry) +\n"
+    "\t\t\t\t\t((addr & ~PMD_MASK) >> PAGE_SHIFT);\n"
+    "\t\t\t\tframe = swp_type(entry) |\n"
+    "\t\t\t\t\t(offset << MAX_SWAPFILES_SHIFT);\n"
+    "\t\t\t}\n"
+    "\t\t\tflags |= PM_SWAP;\n"
+    "\t\t\tVM_BUG_ON(!is_pmd_migration_entry(pmd));\n"
+    "\t\t\tmigration = is_migration_entry(entry);\n"
+    "\t\t\tpage = pfn_swap_entry_to_page(entry);\n"
+    "\t\t}\n"
+    "#endif\n"
+    "\n"
+    "\t\tif (page && !PageAnon(page))\n"
+    "\t\t\tflags |= PM_FILE;\n"
+    "\t\tif (page && !migration && page_mapcount(page) == 1)\n"
+    "\t\t\tflags |= PM_MMAP_EXCLUSIVE;\n"
+    "\n"
+    "\t\tspin_unlock(ptl);\n"
+    "\t\treturn err;\n"
+    "\t}\n"
+    "\treturn 0;\n"
+    "}\n"
+)
+
+
+def test_batch70_smaps_migration_guard():
+    """Batch 70: the smaps/pagemap walkers stop tripping swapops.h:267.
+
+    Field panic MD_RST_STAT.BIN.txt:777:
+    smaps_rollup -> smaps_pte_range -> smaps_pte_entry ->
+    pfn_swap_entry_to_page -> BUG at include/linux/swapops.h:267.  The walkers
+    never hold the target page lock, so a migration that completes between the
+    PTE snapshot and the PageLocked() check is a panic.
+
+    What the test pins is the whole guard, not just its presence: a helper that
+    exists while one caller keeps the direct call still panics on that path,
+    so each of the five call sites is counted, and the direct calls that must
+    stay direct (device-private / device-exclusive entries, whose contract is
+    not PageLocked) are pinned as still-direct.
+    """
+    print("Batch 70: smaps_migration_guard (migration-entry PageLocked race)")
+    import abk_stable_core as core
+    import batch70_core_smaps_migration_guard as b70
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "smaps_migration_guard"), None)
+    check("smaps_migration_guard group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly fs/proc/task_mmu.c",
+          group.files == [b70.TASK_MMU], group.files)
+    check("fs/proc/task_mmu.c is the module's first fs/proc target",
+          b70.TASK_MMU == "fs/proc/task_mmu.c", b70.TASK_MMU)
+
+    # fs/proc/task_mmu.c carries no other group: the guard is a single-writer
+    # file, which is also why its own helper doubles as the idempotency probe.
+    owners = [g.key for g in core.PATCH_GROUPS if b70.TASK_MMU in g.files]
+    check("no other group writes fs/proc/task_mmu.c",
+          owners == ["smaps_migration_guard"], owners)
+
+    steps = b70.build_steps()
+    check("six required steps (one helper + five caller guards), all in "
+          "fs/proc/task_mmu.c",
+          [rel for rel, _o, _n, req in steps] == [b70.TASK_MMU] * 6
+          and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+
+    fixture = TASK_MMU_FIXTURE
+    # Trap 1: a replacement block that already exists in the pristine file is
+    # short-circuited by replace_once's idempotency pre-check while the group
+    # still reports applied -- the graft never lands.
+    for index, (_rel, _old, new, _req) in enumerate(steps):
+        check(f"step {index}'s replacement is not already in the pristine file",
+              new not in fixture)
+        check(f"step {index}'s replacement does not start with its own anchor",
+              not new.startswith(_old))
+    # Trap 2: no step may build its replacement out of a later step's.
+    for i, (_rel, _o, new_i, _req) in enumerate(steps):
+        for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
+            if i == j or new_i in old_j:
+                continue
+            check(f"step {i} does not pre-create step {j}'s replacement",
+                  new_j not in new_i)
+
+    # Every anchor is byte-identical pristine text: the fixture is taken from
+    # the 5.15.220 tree, so these are real upstream anchors.
+    for index, (_rel, old, _n, _req) in enumerate(steps):
+        check(f"step {index}'s anchor occurs exactly once in the fixture",
+              fixture.count(old) == 1, fixture.count(old))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b70.TASK_MMU: fixture})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("the group applies on the tree's shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b70.TASK_MMU)
+
+        # The helper: the whole point is that it does NOT carry the BUG_ON
+        # contract, so it may never call pfn_swap_entry_to_page() itself.
+        helper = text[text.index("/*\n * sailboat_smaps_migration_guard:"):
+                      text.index(b70._HELPER_OLD)]
+        check("the helper resolves the page itself",
+              "p = pfn_to_page(swp_offset(entry));" in helper, helper)
+        # The comment names the form it replaces, so the assertion is over
+        # the helper's code lines only -- "no call", not "no mention".
+        helper_code = [ln for ln in helper.split("\n")
+                       if not ln.lstrip().startswith(("*", "/*", "//"))]
+        check("the helper never calls the BUG_ON form",
+              not [ln for ln in helper_code
+                   if "pfn_swap_entry_to_page" in ln],
+              helper_code)
+        check("the helper keeps the pfn-before-flags ordering",
+              "smp_rmb();" in helper)
+        check("the helper gates on PageLocked (the BUG_ON's own predicate)",
+              "if (!PageLocked(p))" in helper
+              and helper.count("if (!is_migration_entry(entry))") == 1,
+              helper)
+        check("the helper returns NULL rather than panicking",
+              helper.count("return NULL;") == 2, helper)
+
+        # All five callers route through it: a helper nobody calls changes
+        # nothing, and a caller left on the direct call still panics.
+        check("the smaps PTE and hugetlb callers are guarded",
+              text.count(b70.PTE_GUARD) == 2, text.count(b70.PTE_GUARD))
+        check("the smaps PMD and both pagemap callers are guarded",
+              text.count(b70.PMD_GUARD) == 3, text.count(b70.PMD_GUARD))
+
+        # ...and the device-private / device-exclusive entries keep the direct
+        # call, whose contract really is not PageLocked.
+        check("the smaps PTE non-migration path keeps the direct call",
+              "\t\t\tif (is_migration_entry(swpent)) {\n"
+              "\t\t\t\tmigration = true;\n"
+              "\t\t\t\tpage = abk_smaps_migration_page(swpent);\n"
+              "\t\t\t} else {\n"
+              "\t\t\t\tpage = pfn_swap_entry_to_page(swpent);\n"
+              "\t\t\t}\n" in text)
+        check("the hugetlb non-migration path keeps the direct call",
+              "\t\tif (is_migration_entry(swpent))\n"
+              "\t\t\tpage = abk_smaps_migration_page(swpent);\n"
+              "\t\telse if (is_pfn_swap_entry(swpent))\n"
+              "\t\t\tpage = pfn_swap_entry_to_page(swpent);\n" in text)
+        check("the pagemap PTE non-migration path keeps the direct call",
+              "\t\tif (is_migration_entry(entry))\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n"
+              "\t\telse if (is_pfn_swap_entry(entry))\n"
+              "\t\t\tpage = pfn_swap_entry_to_page(entry);\n" in text)
+        # pagemap_pmd_range's guard sits behind the tree's own VM_BUG_ON: the
+        # migration-entry precondition still has to be asserted there, or a
+        # batch that dropped it would swap the panic for a silent wrong path.
+        check("the pagemap PMD guard keeps the tree's own VM_BUG_ON",
+              "\t\t\tVM_BUG_ON(!is_pmd_migration_entry(pmd));\n"
+              "\t\t\tmigration = is_migration_entry(entry);\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n" in text)
+        # Indexed from the gate, not from the top of the file: the smaps PMD
+        # guard carries the same three-tab text and would otherwise answer.
+        gate = text.index("#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION")
+        check("the pagemap PMD guard stays inside its CONFIG gate",
+              "\t\telse if (is_swap_pmd(pmd)) {" in text
+              and gate < text.index("\t\t\tpage = abk_smaps_migration_page(entry);",
+                                   gate)
+              < text.index("#endif", gate))
+
+        # Ordering: a file-static helper must exist before its first caller.
+        first_guard = min(text.index(b70.PTE_GUARD), text.index(b70.PMD_GUARD))
+        check("the helper is defined before its first caller",
+              text.index(b70.HELPER_DEF) < first_guard)
+
+        # The migration flag is still raised on the guarded paths: the guard
+        # replaces the page resolution, not the smaps accounting contract.
+        check("the smaps PMD caller still raises the migration flag",
+              "\t\tif (is_migration_entry(entry)) {\n"
+              "\t\t\tmigration = true;\n"
+              "\t\t\tpage = abk_smaps_migration_page(entry);\n" in text)
+        check("the smaps PTE caller still raises the migration flag",
+              "\t\t\tif (is_migration_entry(swpent)) {\n"
+              "\t\t\t\tmigration = true;\n"
+              "\t\t\t\tpage = abk_smaps_migration_page(swpent);\n" in text)
+        # Every caller of the helper already tolerates a NULL page, which is
+        # what makes "skip the entry" the safe outcome instead of a new NULL
+        # dereference.
+        check("the NULL contract is satisfied by the callers' own code",
+              "\tif (!page)\n\t\treturn;\n" in text
+              and "\tif (IS_ERR_OR_NULL(page))\n\t\treturn;\n" in text
+              and "\tif (page && !PageAnon(page))\n" in text)
+
+        # No new translation-unit dependency: pfn_to_page() and smp_rmb() are
+        # already visible in this file, so the group must add no include and
+        # open no CONFIG gate.
+        check("the guard adds no include",
+              text.count("#include") == fixture.count("#include"),
+              text.count("#include"))
+        check("the guard opens no preprocessor gate",
+              text.count("#if") == fixture.count("#if"))
+
+        # The marker is part of the idempotency match, not decoration: a tree
+        # that kept the helper but lost the comment must NOT be skipped as
+        # already_present -- it has to fall through and report blocked_by_shape,
+        # so that a grep for the marker is never the only thing that can find
+        # this graft.
+        markerless = text.replace(b70.HELPER_MARKER, "no marker here")
+        check("the probe requires the marker, not just the helper",
+              b70.HELPER_MARKER in text and b70.HELPER_MARKER not in markerless,
+              b70.HELPER_MARKER)
+        with tempfile.TemporaryDirectory() as tmp_m:
+            ctx_m = make_ctx(tmp_m, {b70.TASK_MMU: markerless})
+            status_m, detail_m = b70._smaps_migration_guard_apply(ctx_m)
+            check("a tree whose marker is gone is refused, not skipped",
+                  status_m == "blocked_by_shape", (status_m, detail_m))
+            check("the refusal names the missing marker",
+                  b70.HELPER_MARKER in detail_m, detail_m)
+            # The teeth of the refusal: falling through to apply_steps instead
+            # would insert a second copy of a static function, because the helper
+            # step's `old` anchor still matches below the grafted helper while
+            # its `new` block no longer does.  That is a redefinition -- a
+            # compile error on a tree that used to build.
+            check("the marker-less tree is not written",
+                  ctx_m.pending_writes() == [],
+                  ctx_m.pending_writes())
+        check("a second pass cannot duplicate the helper",
+              text.count(b70.HELPER_DEF) == 1, text.count(b70.HELPER_DEF))
+        # No WARN-family: a WARN is an oops, and panic_on_oops turns it into
+        # the very panic this batch exists to remove.
+        code_lines = [ln for ln in text.split("\n")
+                      if not ln.lstrip().startswith(("*", "/*", "//"))]
+        warns = [ln.strip() for ln in code_lines
+                 if "WARN_ON" in ln or "WARN(" in ln]
+        # VM_BUG_ON is not WARN-family (it is a BUG, and its precondition is
+        # the tree's own), so the only expectation here is "no WARN at all".
+        check("no WARN in the guarded code", warns == [], warns)
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            ctx2 = make_ctx(tmp2, {b70.TASK_MMU: text})
+            status2, detail2 = b70._smaps_migration_guard_apply(ctx2)
+            check("second pass is already_present",
+                  status2 == "already_present", (status2, detail2))
+            check("second pass is byte-identical",
+                  ctx2.read(b70.TASK_MMU) == text)
+
+    # An unknown shape must stop the group rather than half-patch the file.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b70.TASK_MMU: "static void other(void)\n"})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("an unknown shape reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the unknown-shape tree is not written",
+              ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = b70._smaps_migration_guard_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written",
+              ctx.pending_writes() == [])
+
+
+def test_fetch_decode_roundtrip():
+    """The tree fetcher's decode() must refuse a body that is not clean base64.
+
+    A gitiles body carrying a byte outside the base64 alphabet has to fail
+    loudly.  The failure it guards is silent by construction: the shifted text
+    still looks like source, so it passes all three of acceptable()'s checks
+    (size, NUL-free, not-HTML) and lands in the tree as a file nobody
+    questions -- which is how one broken fetch read as anchor drift for a whole
+    batch (fs/erofs/compress.h landing as "DD..X-License-Identifier").
+
+    The two backends fail differently, which is why both are driven here:
+    python3's b64decode() without validate=True silently DISCARDS the stray
+    byte and exits 0 (measured: correct 40 bytes, rc=0), while GNU coreutils
+    >= 9 refuses the same body.  Asserting only through whichever backend the
+    host happens to have is what let that divergence hide in the first place.
+    """
+    print("fetch_sublevel_tree.sh: decode() refuses a non-canonical body")
+    tool = Path(__file__).resolve().parent / "fetch_sublevel_tree.sh"
+    check("the fetcher is present", tool.is_file(), tool)
+
+    bash = shutil.which("bash")
+    if bash is None:
+        check("bash is available for the fetcher self-test", False, "no bash")
+        return
+    quoted = str(tool).replace("\\", "/")
+
+    def run_decode(body_b64, backend=None):
+        # The body goes through a file, never through argv.  A 76-column
+        # wrapped body is full of newlines, and argv does not reliably carry
+        # them on this platform -- passing one inline made bash treat a chunk
+        # of base64 as a script name (exit 127, "No such file or directory").
+        env = dict(os.environ)
+        if backend:
+            env["ABK_FETCH_DECODER"] = backend
+        else:
+            env.pop("ABK_FETCH_DECODER", None)
+        with tempfile.NamedTemporaryFile("w", suffix=".b64", delete=False) as fh:
+            fh.write(body_b64 if body_b64.endswith("\n") else body_b64 + "\n")
+            body_path = fh.name
+        try:
+            return subprocess.run(
+                [bash, quoted, "--decode-only"],
+                stdin=open(body_path, "rb"), capture_output=True, timeout=180,
+                env=env)
+        finally:
+            os.unlink(body_path)
+
+    raw = b"/* SPDX-License-Identifier: GPL-2.0 */\nint x;\n"
+    clean_b64 = base64.b64encode(raw).decode()
+    corrupt_b64 = clean_b64[:8] + "!" + clean_b64[8:]
+
+    for backend in ("base64", "python3"):
+        if shutil.which(backend) is None:
+            check(f"the {backend} backend is available", False, "missing")
+            continue
+
+        # Positive half: the good body must still decode to its exact source,
+        # so the check cannot be "fixed" by refusing everything.
+        good = run_decode(clean_b64, backend)
+        check(f"{backend}: a clean body decodes to its exact source",
+              good.returncode == 0 and good.stdout == raw,
+              (good.returncode, good.stdout[:60]))
+
+        # Negative half, and the one with teeth: a non-zero exit, not a look at
+        # what the self-test said about itself.
+        bad = run_decode(corrupt_b64, backend)
+        check(f"{backend}: a corrupted body is refused (non-zero exit)",
+              bad.returncode != 0,
+              (bad.returncode, bad.stdout[:60]))
+        if backend == "python3":
+            # validate=True raises before writing anything.  GNU base64 -d
+            # instead emits a short prefix and then fails, so "no bytes" is
+            # not its contract -- the caller's non-zero exit is, and the
+            # caller rm -f's the partial file (the FAILED branch in
+            # fetch_sublevel_tree.sh's fetch loop).
+            check("python3: a corrupted body yields no bytes at all",
+                  bad.stdout == b"", bad.stdout[:60])
+
+        # And the wrapped form gitiles actually sends, which validate=True
+        # rejects outright unless the CR/LF strip has done its job.
+        wrapped = base64.b64encode(raw * 40).decode()
+        wrapped = "\n".join(wrapped[i:i + 76] for i in range(0, len(wrapped), 76))
+        wr = run_decode(wrapped, backend)
+        check(f"{backend}: a 76-column wrapped body still decodes",
+              wr.returncode == 0 and wr.stdout == raw * 40,
+              (wr.returncode, wr.stdout[:40]))
+
+    # The script's own self-test must agree, and must have exercised BOTH
+    # backends rather than only the default one.
+    st = subprocess.run([bash, quoted, "--self-test-decode"],
+                        capture_output=True, text=True, timeout=180)
+    check("the fetcher self-test passes", st.returncode == 0,
+          (st.returncode, st.stdout[-300:], st.stderr[-300:]))
+    for backend in ("base64", "python3"):
+        check(f"the self-test drove the {backend} backend",
+              f"{backend} refused the corrupted body" in st.stdout,
+              st.stdout[-300:])
+
+
+def test_batch71_kcompressd_wb_pin():
+    """Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO.
+
+    Device A/B (verify_swap) on SM8550 vermeer: kcompressd's deferred swap-out
+    corrupted 10/614400 swapped pages with the offload on, 0/614400 off.  Root
+    cause: the offload branch left the page unlocked and NOT under writeback for
+    the whole FIFO residency, so try_to_free_swap() (which bails only on
+    PageWriteback) freed and reused the swap slot mid-queue and the deferred
+    write landed in the wrong slot.  The fix restores the async-writeback
+    contract: set_page_writeback at enqueue (pins the slot), end_page_writeback
+    once the drain holds the lock.
+
+    The test runs the real two-group chain (Batch 41 then Batch 71) on both
+    engine shapes, because the anchors are text Batch 41 generates.
+    """
+    print("Batch 71: kcompressd_writeback_pin (swap slot pinned under writeback)")
+    import abk_stable_core as core
+    import batch41_core_vm_kcompressd as b41
+    import batch71_core_kcompressd_wb_pin as b71
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "kcompressd_writeback_pin"), None)
+    check("kcompressd_writeback_pin group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly mm/page_io.c",
+          group.files == [b71.PAGE_IO], group.files)
+
+    keys = [g.key for g in core.PATCH_GROUPS]
+    # Trap 5: this group rewrites text vm_kcompressd_swapout generates, so it
+    # must be registered after it.
+    check("the writeback pin is registered after vm_kcompressd_swapout",
+          keys.index("kcompressd_writeback_pin")
+          > keys.index("vm_kcompressd_swapout"),
+          keys[keys.index("kcompressd_writeback_pin") - 1:
+               keys.index("kcompressd_writeback_pin") + 1])
+
+    steps = b71.build_steps()
+    check("three required steps, all in mm/page_io.c",
+          [(rel, req) for rel, _o, _n, req in steps]
+          == [(b71.PAGE_IO, True), (b71.PAGE_IO, True), (b71.PAGE_IO, True)],
+          [(rel, req) for rel, _o, _n, req in steps])
+    for i, (_rel, old, new, _req) in enumerate(steps):
+        check(f"step {i}'s replacement does not start with its own anchor (trap 1)",
+              not new.startswith(old))
+
+    # Refuses without the Batch 41 engine: an unknown tree must never be
+    # half-patched, and the refusal writes nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b71.PAGE_IO: "int swap_writepage(void)\n"})
+        status, detail = b71._kcompressd_wb_pin_apply(ctx)
+        check("a tree without the Batch 41 engine reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the refusal names the missing engine",
+              "vm_kcompressd_swapout" in detail, detail)
+        check("the refused tree is not written",
+              ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = b71._kcompressd_wb_pin_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written",
+              ctx.pending_writes() == [])
+
+    def b41_pristine(frontswap):
+        return (
+            "#include <linux/sched/task.h>\n"
+            "\n"
+            "/*\n"
+            " * We may have stale swap cache pages in memory: notice\n"
+            " * them here and get rid of the unnecessary final write.\n"
+            " */\n"
+            "int swap_writepage(struct page *page, struct writeback_control *wbc)\n"
+            "{\n"
+            "\tint ret = 0;\n"
+            "\n"
+            + frontswap +
+            "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n"
+            "out:\n"
+            "\treturn ret;\n"
+            "}\n"
+            "\n"
+            + b41._ENGINE_ANCHOR_OLD
+        )
+
+    for label, frontswap in (("plain", b41.PLAIN_PROBE),
+                             ("hook", b41.HOOK_PROBE)):
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = make_ctx(tmp, {b41.PAGE_IO: b41_pristine(frontswap)})
+            status, detail = core._vm_kcompressd_swapout_apply(ctx)
+            check(f"{label} shape: Batch 41 applies first",
+                  status == "applied", (status, detail))
+            # Both anchors really are text Batch 41 generates.
+            text = ctx.read(b71.PAGE_IO)
+            for _rel, anchor, _new, _req in steps:
+                check(f"{label} shape: an anchor occurs exactly once in "
+                      "Batch 41's output", text.count(anchor) == 1,
+                      text.count(anchor))
+
+            status, detail = b71._kcompressd_wb_pin_apply(ctx)
+            check(f"{label} shape: the writeback pin applies on top",
+                  status == "applied", (status, detail))
+            text = ctx.read(b71.PAGE_IO)
+
+            # Enqueue side (swap_writepage offload branch): set_page_writeback
+            # before unlock_page + return 0, so the slot is pinned across the
+            # queue.  Pinned by sequence to prove ordering.
+            check(f"{label} shape: enqueue sets writeback before unlocking",
+                  "\t\tset_page_writeback(page);\n"
+                  "\t\tunlock_page(page);\n"
+                  "\t\treturn 0;\n" in text, "offload branch")
+
+            do_swapout = text[text.index("static void abk_kcompressd_do_swapout("):
+                              text.index("static bool abk_kcompressd_enqueue(")]
+            # Drain side: lock_page (Batch 41) then end_page_writeback (Batch 71),
+            # before the body.  The drain's end is the one followed by the blank
+            # line + body (`end_page_writeback(page);\n\n`), distinct from the
+            # drop-path end below (which is followed by put_page), so these
+            # checks cannot be satisfied by the wrong occurrence.
+            check(f"{label} shape: the drain takes the page lock",
+                  "\tlock_page(page);\n" in do_swapout)
+            check(f"{label} shape: the drain ends the writeback it inherited",
+                  "end_page_writeback(page);\n\n" in do_swapout)
+            drain_end = do_swapout.index("end_page_writeback(page);\n\n")
+            check(f"{label} shape: lock precedes the drain end precedes body",
+                  do_swapout.index("\tlock_page(page);\n") < drain_end
+                  < do_swapout.index("frontswap_store(page)"))
+            # Drop path (!PageSwapCache early return): it must also end the
+            # writeback the enqueue set, before put_page -- else the dropped
+            # page is stuck under PG_writeback forever.  This end sits BEFORE
+            # lock_page, since the guard returns above the drain's own end.
+            check(f"{label} shape: the drop path ends writeback before put_page",
+                  "end_page_writeback(page);\n\t\tput_page(page);" in do_swapout)
+            check(f"{label} shape: the drop-path end precedes the drain lock",
+                  do_swapout.index("end_page_writeback(page);\n\t\tput_page(page);")
+                  < do_swapout.index("\tlock_page(page);\n"))
+            # The superseded trylock-skip must be gone.
+            check(f"{label} shape: no trylock-skip remains",
+                  "if (!trylock_page(page)) {" not in text
+                  and "skipping a locked page" not in text, "trylock remnants")
+            # The marker rides in all three edits (enqueue, drain, drop path).
+            check(f"{label} shape: the marker is on all three edits",
+                  text.count("sailboat_kcompressd_wb_pin") == 3,
+                  text.count("sailboat_kcompressd_wb_pin"))
+            # No WARN-family added by the pin.
+            code_lines = [ln for ln in do_swapout.split("\n")
+                          if not ln.lstrip().startswith(("*", "/*", "//"))]
+            warns = [ln.strip() for ln in code_lines
+                     if "WARN_ON" in ln or "WARN(" in ln]
+            check(f"{label} shape: no WARN in the drain's code", not warns, warns)
+
+            # Both groups idempotent together: the successor probe on Batch 41
+            # keeps its second pass already_present over the rewritten text.
+            ctx2 = make_ctx(tmp + "-b", {b71.PAGE_IO: text})
+            status2, detail2 = core._vm_kcompressd_swapout_apply(ctx2)
+            check(f"{label} shape: Batch 41's second pass is already_present",
+                  status2 == "already_present", (status2, detail2))
+            check(f"{label} shape: Batch 41's second pass is byte-identical",
+                  ctx2.read(b71.PAGE_IO) == text)
+            status3, detail3 = b71._kcompressd_wb_pin_apply(ctx2)
+            check(f"{label} shape: the writeback pin's second pass is "
+                  "already_present", status3 == "already_present",
+                  (status3, detail3))
+            check(f"{label} shape: the second pass is byte-identical",
+                  ctx2.read(b71.PAGE_IO) == text)
+            for key in ("vm_kcompressd_swapout", "kcompressd_writeback_pin"):
+                st = next(g for g in core.PATCH_GROUPS
+                          if g.key == key).run(ctx2)["status"]
+                check(f"{label} shape: {key} is idempotent",
+                      st == "already_present", (key, st))
+
 
 
 if __name__ == "__main__":

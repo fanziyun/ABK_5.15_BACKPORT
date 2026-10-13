@@ -26,8 +26,9 @@
 # Writeback and the algorithm policy used to exclude each other, because the
 # backing device is written in the same pre-`disksize` window and `reset_bdev()`
 # drops it on a reset.  Now the module restores the attachment it found instead
-# of sacrificing it, and attaches one itself when the kernel supports it and
-# nobody owns it (zram.writeback=auto).
+# of sacrificing it; it attaches one itself only under zram.writeback=auto
+# (opt-in -- the shipped default is off), with the kernel supporting writeback,
+# nobody else owning it and the boot already completed.
 #
 # Interlock that stays: a device whose swap area is in use is never rewritten
 # just to rearrange algorithms -- `swapoff` pulls every swapped page back into
@@ -140,10 +141,13 @@ abk_zram_writeback_owned() {
   return 1
 }
 
-# auto: attach one during the module's own bring-up when the kernel supports it
-# and nobody owns it.  off: never attach one (an existing one is still kept).
+# auto: attach one during the module's own bring-up when the kernel supports it,
+# nobody owns it and the boot has completed.  off (the shipped default, and the
+# fallback here so a missing key cannot re-enable it): never attach one.  An
+# existing device is still preserved either way, except a backing file this
+# module created itself, which is released (see abk_zram_release_backing_dev).
 abk_zram_writeback_mode() {
-  case "$(abk_cfg zram.writeback auto)" in
+  case "$(abk_cfg zram.writeback off)" in
     off|0|no) printf 'off\n' ;;
     *) printf 'auto\n' ;;
   esac
@@ -175,11 +179,35 @@ abk_zram_wb_backoff_clear() {
   rm -f "$(abk_state_path zram_wb_retry_after)" 2>/dev/null || true
 }
 
+# A backing device may only be attached in the pre-`disksize` window, so the
+# attach is the one thing that has to be ordered against Android's own bring-up:
+# init wipes /data/per_boot and re-creates it under the per-boot key exactly at
+# sys.boot_completed (init.rc), and AOSP's mmd starts its own setup off a
+# property its rc sets at that same point.  Attaching earlier puts the backing
+# file in a directory init is about to empty: the file is unlinked, the loop
+# device keeps the orphan inode, and backing_dev is still non-none so the module
+# never rebuilds it -- writeback is dead for the rest of the boot.  Gate on the
+# property, fail closed when a ROM never sets it.
+abk_boot_completed() {
+  [ "$(abk_getprop sys.boot_completed)" = "1" ]
+}
+
+# Is a backing device this module owns unwanted?  Only when the policy says off
+# (or the kernel cannot write back at all): with `auto` a device that reads as
+# "owned" is the normal re-attach case, not an unwanted one.
+abk_zram_writeback_unwanted() {
+  abk_zram_writeback_capable || return 0
+  [ "$(abk_zram_writeback_mode)" = "off" ] && return 0
+  return 1
+}
+
 abk_zram_writeback_wanted() {
   abk_zram_writeback_capable || return 1
   [ "$(abk_zram_writeback_mode)" = "auto" ] || return 1
+  # A device somebody else owns is never traded away, before or after boot.
   abk_zram_writeback_owned && return 1
   abk_zram_wb_backoff_active && return 1
+  abk_boot_completed || return 1
   return 0
 }
 
@@ -229,6 +257,67 @@ abk_zram_create_backing_dev() {
     return 1
   fi
   printf '%s\n' "$_cb_loop"
+  return 0
+}
+
+# Is this backing device one the module attached itself?  The kernel records the
+# file a loop device came from and keeps reporting that path after the file is
+# gone -- as "<path> (deleted)", which is exactly the shape a per-boot wipe
+# leaves behind (init deletes /data/per_boot while zram still holds the inode).
+# Matching both forms is what lets the module recognise its own stranded
+# attachment and release it instead of preserving a device nothing can use.
+abk_zram_backing_dev_ours() {
+  _bo_dev="$1"
+  [ -n "$_bo_dev" ] || return 1
+  _bo_val="$(abk_read "$ABK_SYS_ROOT/block/${_bo_dev##*/}/loop/backing_file" | tr -d '\n')"
+  case "$_bo_val" in
+    "$ABK_ZRAM_WB_FILE"|"$ABK_ZRAM_WB_FILE (deleted)") return 0 ;;
+  esac
+  return 1
+}
+
+# Drop an attachment this module owns once the policy no longer wants one.
+# Only ever called after `reset` (backing_dev_store() refuses an initialized
+# device, and reset_bdev() has just closed whatever was attached), and only for
+# the module's own backing file: a device the ROM attached is never touched.
+abk_zram_release_backing_dev() {
+  _rb_dev="$1"
+  abk_zram_backing_dev_ours "$_rb_dev" || return 0
+  if [ "${ABK_DRY_RUN:-0}" = "1" ]; then
+    abk_log "[dry-run] $ABK_LOSETUP -d $_rb_dev; rm -f $ABK_ZRAM_WB_FILE"
+    return 0
+  fi
+  if "$ABK_LOSETUP" -d "$_rb_dev" >/dev/null 2>&1; then
+    abk_log "writeback: released $_rb_dev ($ABK_ZRAM_WB_FILE)"
+  else
+    abk_warn "writeback: cannot detach $_rb_dev"
+  fi
+  rm -f "$ABK_ZRAM_WB_FILE" 2>/dev/null || true
+  return 0
+}
+
+# Drop a backing file this module created that nothing is attached to any more.
+# abk_zram_release_backing_dev() cannot cover it: that one runs inside a rewrite,
+# and a rewrite only happens when the device needs rebuilding, so a file an older
+# build -- or a boot that ended between the attach and the reset -- left behind
+# would sit in /data/per_boot until init empties that directory at
+# sys.boot_completed, which is the window this module is trying to get out of.
+# Only the module's own path is removed, and only while zram has no backing
+# device at all: with one attached the file belongs to that attachment and goes
+# through the rewrite's release path (or, for the ROM's file, is left alone).
+abk_zram_drop_stale_backing_file() {
+  abk_zram_writeback_unwanted || return 0
+  [ -z "$(abk_zram_backing_dev)" ] || return 0
+  [ -e "$ABK_ZRAM_WB_FILE" ] || return 0
+  if [ "${ABK_DRY_RUN:-0}" = "1" ]; then
+    abk_log "[dry-run] rm -f $ABK_ZRAM_WB_FILE"
+    return 0
+  fi
+  if rm -f "$ABK_ZRAM_WB_FILE" 2>/dev/null; then
+    abk_log "writeback: removed the stale backing file $ABK_ZRAM_WB_FILE"
+  else
+    abk_warn "writeback: cannot remove $ABK_ZRAM_WB_FILE"
+  fi
   return 0
 }
 
@@ -395,10 +484,23 @@ abk_zram_takeover() {
   _to_wb_dev=""
   _to_wb_limit=""
   _to_wb_enable=""
+  _to_wb_release=""
   if abk_zram_writeback_capable; then
     _to_wb_dev="$(abk_zram_backing_dev)"
     _to_wb_limit="$(abk_read "$ABK_ZRAM_DIR/writeback_limit" | tr -d ' \n')"
     _to_wb_enable="$(abk_read "$ABK_ZRAM_DIR/writeback_limit_enable" | tr -d ' \n')"
+  fi
+  # A backing file this module created is dropped, not put back, once the policy
+  # says off: `reset` below is the only place the attachment can be closed, and
+  # preserving a device nothing will use is what strands a loop over an unlinked
+  # inode when init wipes /data/per_boot.  A device the ROM owns is never
+  # released -- abk_zram_backing_dev_ours only matches this module's own file.
+  if [ -n "$_to_wb_dev" ] && abk_zram_writeback_unwanted \
+     && abk_zram_backing_dev_ours "$_to_wb_dev"; then
+    _to_wb_release="$_to_wb_dev"
+    _to_wb_dev=""
+    _to_wb_limit=""
+    _to_wb_enable=""
   fi
 
   if ! abk_zram_swap_idle_enough; then
@@ -434,6 +536,12 @@ abk_zram_takeover() {
       sleep 1
       _to_n=$(( _to_n + 1 ))
     done
+  fi
+
+  # The reset above closed the old attachment, so this is the one place a
+  # stranded backing device of our own can be detached and its file removed.
+  if [ -n "$_to_wb_release" ]; then
+    abk_zram_release_backing_dev "$_to_wb_release"
   fi
 
   if ! abk_zram_set_algorithms; then
@@ -514,6 +622,10 @@ abk_zram_ensure() {
     abk_warn "no $ABK_ZRAM_DIR; nothing to configure"
     return 1
   fi
+
+  # Before the rewrite decision, deliberately: a stale file must not have to wait
+  # for a rewrite that may never come (abk_zram_drop_stale_backing_file).
+  abk_zram_drop_stale_backing_file
 
   if ! abk_zram_need_rewrite; then
     abk_zram_set_mem_limit
@@ -772,10 +884,13 @@ abk_zram_supervisor_main() {
   # the mark runs on its own, much longer clock and every sweep in between
   # passes --no-mark.
   #
-  # 10800 s, not a day: a daily mark never reaches a cold set that turns over
-  # every few hours; six sweeps between marks still drain ~3 GiB per cycle.
-  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 10800)"
-  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=10800
+  # 3600 s (one hour): the drain rate is bounded by sweep cadence x budget
+  # (2 x 512 MiB per hour), not by the mark clock -- Batch 47's skip predicate
+  # makes re-armed already-optimal pages free -- so an hourly mark only changes
+  # how soon newly cold pages enter the sweep.  It must stay slower than the
+  # sweep itself: re-marking between passes would hand the set straight back.
+  _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 3600)"
+  abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=3600
   [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
   # _zs_mark_tick counts sweeps, so _zs_per_mark divides by the SWEEP interval
   # -- dividing by _zs_reassert once made a "24 h" mark land 30 days out.

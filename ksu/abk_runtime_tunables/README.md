@@ -97,17 +97,35 @@ Posture:
   backing device is written in the same pre-`disksize` window and `reset` drops
   it (`reset_bdev()`), which is why the old module traded one for the other. The
   rewrite now remembers the attachment before the reset and puts it back in the
-  same window, with the ROM's own `writeback_limit` preserved; when the kernel
-  exposes writeback and nobody owns it, the module attaches a sparse backing
-  file itself (`zram.writeback=auto`: `/data/per_boot/zram/zram_swap` -- the
-  same place Android's `mmd_setup` uses -- behind a loop device, limit bounded,
-  compressed writeback on where the kernel has it).
+  same window, with the ROM's own `writeback_limit` preserved.
+* **The module does not attach one by default (`zram.writeback=off`).** The
+  destination is a per-boot directory and the owner of this path is Android's
+  own `mmd_setup`, not a module. AOSP's init.rc runs, on every boot,
+  `on property:sys.boot_completed=1` -> `exec ... /bin/rm -rf /data/per_boot`
+  -> `mkdir /data/per_boot 0700 system system encryption=Require key=per_boot_ref`,
+  so /data/per_boot is emptied at every boot and re-keyed with a fresh per-boot
+  key (vold writes the reference to `/data/.fscrypt_key_per_boot_ref`). AOSP's
+  own mmd uses `/data/per_boot/zram_swap` -- the directory root, not
+  `/data/per_boot/zram/zram_swap` -- and is started off a property its own rc
+  sets at `sys.boot_completed`, i.e. deliberately after that wipe. An attach
+  that races the wipe loses its file and leaves the loop device over an unlinked
+  inode: measured on the target device, `losetup -a` showed the ROM's loop49
+  with an empty backing filename while `/data/per_boot/zram/` no longer held the
+  file. `zram.writeback=auto` is therefore opt-in, only attaches after
+  `sys.boot_completed=1`, and releases a backing file this module created
+  itself once the policy says `off` (`losetup -d` plus `rm -f` during the next
+  rewrite, which is the only window in which the kernel lets `backing_dev` be
+  closed). A backing device attached from any other file is never released, and
+  a file left behind with nothing attached to it is removed at the first pass,
+  before init's wipe at `sys.boot_completed`.
 * Writeback is **not** enabled on the reference device's stock kernel: that
   build has no `CONFIG_ZRAM_WRITEBACK`, the ROM sets `vendor.zram.disable=1`
   and its `mmd` never completes. `zram.writeback=auto` therefore only acts if
   you turn the feature on in the kernel (`ABK_515_DEFCONFIG_ROM=1` adds
   `CONFIG_ZRAM_WRITEBACK=y`) -- and once it is on, the SELinux rule below
-  decides whether a writeback moves anything at all.
+  decides whether a writeback moves anything at all. Attaching a device is not
+  worth anything on its own here: nothing on this ROM writes the `writeback`
+  node, so `zram.writeback.trigger` has to be set as well.
 
 ## SELinux: the kernel-domain rules writeback needs
 
@@ -189,14 +207,14 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `zram.recomp.enable` | `1` | drive age-marked recompression sweeps (on by default, together with the compaction gate below -- both ride this clock) |
 | `zram.recomp.idle_age_sec` | `900` | mark only pages untouched this long. Must be shorter than the boot time of the first sweep (~30 min after the supervisor starts), or the boot mark that collects the initial cold set is empty |
 | `zram.recomp.interval_sec` | `1800` | seconds between sweeps |
-| `zram.recomp.mark_interval_sec` | `10800` | seconds between **mark** steps. Only a mark makes new cold pages eligible; the sweeps in between pass `--no-mark`, because a mark sets `ZRAM_IDLE` on every page older than the age cutoff and a recompressed page never has its age refreshed (`zram_recompress()` reads through `zram_read_from_zspool()`, not `zram_accessed()`), so marking before every pass would hand a capped sweep the same prefix forever. This is the knob that bounds what a capped sweep can reach: one cycle drains `mark_interval_sec / interval_sec` sweeps × `max_pages` entries -- 3 GiB of cold pages at the defaults. |
+| `zram.recomp.mark_interval_sec` | `3600` | seconds between **mark** steps. Only a mark makes new cold pages eligible; the sweeps in between pass `--no-mark`, because a mark sets `ZRAM_IDLE` on every page older than the age cutoff and a recompressed page never has its age refreshed (`zram_recompress()` reads through `zram_read_from_zspool()`, not `zram_accessed()`), so marking before every pass would hand a capped sweep the same prefix forever. Batch 47's skip predicate makes re-armed already-optimal pages free, so the drain rate is sweep-cadence × `max_pages` -- 1 GiB per hour at the defaults, and the mark clock only decides how soon a newly cold page enters the sweep. |
 | `zram.recomp.threshold` | `0` | only recompress entries at least this large |
 | `zram.recomp.max_pages` | `131072` | how many entries **one** sweep may attempt (0 = no cap). An uncapped pass walks every idle entry in index order -- tens of seconds of one core on a full device; 131072 attempted entries is 512 MiB of pages, measured at 0.58 s to enqueue plus 4.2 s of worker on the target device. Requires the kernel's `max_pages` parameter (module Batch 24): on a kernel without it the parameter is ignored and the sweep stays unbounded, exactly as before that batch. |
 | `zram.recomp.mode` | `async` | `async` (kernel worker) or `sync` |
 | `zram.compact.enable` | `1` | after each sweep tick, run one gated `compact` pass (rides the sweep clock, so `zram.recomp.enable=0` stops it too) |
 | `zram.compact.min_waste_mb` | `50` | only compact when `mem_used_total − compr_data_size` exceeds this many MiB; 1..1024 |
 | `zram.compact.waste_pct` | `15` | ... and the overhead exceeds this percentage of the compressed size (both gates must agree); 1..500 |
-| `zram.writeback` | `auto` | `auto` attaches a backing file when the kernel supports writeback and nobody owns it; `off` only preserves an existing one |
+| `zram.writeback` | `off` | `off` (default) never attaches one and releases a backing file this module created; `auto` attaches one when the kernel supports writeback, nobody owns it and `sys.boot_completed=1` (an attach before that property loses the file to init's per-boot wipe). A backing device attached from another file is always preserved |
 | `zram.writeback.size_mb` | `1024` | backing file size, sparse, 64..8192 |
 | `zram.writeback.trigger` | `off` | the sweep the kernel does not run by itself: `off` touches nothing, `huge` moves incompressible pages only (frees 1:1 against the flash it spends -- the cheap mode), `idle` also moves cold compressed pages (about a third of the flash back, so only for a device against its `mem_limit`) |
 | `zram.writeback.budget_mb` | `256` | flash a sweep may spend, in MiB, re-armed before every pass and clamped down to the backing device's size so a pass cannot run it out of space; 1..65536 |
@@ -207,7 +225,7 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `vm.page_cluster` | *(empty)* | 0..8 |
 | `vm.watermark_scale_factor` | *(empty)* | 1..3000 |
 | `vm.min_free_kbytes` | *(empty)* | 1024..1048576 |
-| `lru_gen.enable` | `1` | `1` turns MGLRU on. Since Batch 38 the module's kernel tier already sets `CONFIG_LRU_GEN_ENABLED=y`, so this re-asserts the same default rather than deciding it — `0` here is a no-op (`abk_apply_lru_gen()` only ever writes), not an override. Re-asserted on a timer, because this ROM's init writes the node back to 0 from its `SmartCacheEnable` trigger after post-fs-data |
+| `lru_gen.enable` | `0` | `1` turns MGLRU on. Default `0`: MGLRU is off because this module's reclaim-loop rewrite wedges SM8550 vermeer under sustained thrash and SIGSEGVs a third-party app on launch (see the note below). `abk_apply_lru_gen()` only ever writes on `1`, so `0` means "do not re-assert MGLRU on", not a forced-off override. Opt in by building with `ABK_515_DEFCONFIG_ALIGN=1` and setting this to `1` |
 | `lru_gen.min_ttl_ms` | *(empty)* | MGLRU min TTL |
 | `vm.reassert_interval_sec` | `60` | seconds between lru_gen re-asserts (min 5); a repair is logged, a quiet tick writes nothing |
 | `thp.mode` | *(empty)* | `always`/`madvise`/`never`; `madvise` is what makes `MADV_COLLAPSE` reachable |
@@ -221,14 +239,23 @@ keys are reported in logcat (`ABK-Tunables`) and ignored.
 | `cfr.freeze` | `0` | quiesce a group during its sweep (undone in the same sweep) |
 | `cfr.quota_mb` | *(empty)* | cap the reclaimed bytes per group |
 | `cfr.group` | *(empty)* | group names to sweep; empty = every `uid_*` group (this ROM names its groups: `cfr.group=freeze-app game`) |
+| `iorap.watch` | `1` | **the iorapd replacement (Stage 2b)**: a `/proc` watcher that drives the kernel's launch record/prefetch knobs as apps spawn. Economics: a uid is **recorded once per generation**, **kicked on every other launch** — a kick-only launch never touches the record table, which is what lets a hot app's records survive the apps launched in between (recording on every launch churned the table and killed every kick but the most recent app's — measured). Requires the v0.54+ kernel (`/sys/module/filemap/parameters/abk_lp_enable`); on an older kernel the watcher logs and exits |
+| `iorap.min_uid` | `10000` | app-UID floor; system/systemui spawns (1000-9999) are never triggered |
+| `iorap.record_cool_min` | `360` | minutes between record generations of one uid (matches how often an app's on-disk files actually change) |
+| `iorap.kick_cool_sec` | `60` | seconds between kicks of the same uid; a spawn burst of one app counts once |
+| `iorap.global_gap_sec` | `2` | seconds between any two triggers; a launcher fan-out triggers one at a time, the rest are picked up on their next spawn |
 | `report.logcat` | `1` | `0` silences the logcat mirror |
 
 **Measure before you enable the opt-in knobs.** `thp` and `swappiness` change
-global reclaim behaviour. `lru_gen` is no longer opt-in: since Batch 38 the
-kernel ships MGLRU enabled (`CONFIG_LRU_GEN_ENABLED=y` in the module tier) and
-this companion re-asserts it, so `lru_gen.enable` is a consistency knob, not a
-switch. That also means Batch 37's six MGLRU performance groups run for the
-first time on a build from this module — no device-side A/B exists yet.
+global reclaim behaviour. `lru_gen` (MGLRU) is **off by default**: on SM8550
+vermeer this module's MGLRU reclaim-loop rewrite does not converge under
+sustained memory thrash — two `kworker/*:*H` pin at 100% kernel CPU in
+`lru_gen_shrink_lruvec`, lmkd starves, the QCOM watchdog cold-resets the
+device, and a third-party app SIGSEGVs on launch. The identical load with
+MGLRU off rode out. So `LRU_GEN_ENABLED` is in the opt-in align tier
+(`ABK_515_DEFCONFIG_ALIGN=1`), the companion no longer re-asserts MGLRU on
+(`lru_gen.enable=0`), and Batch 37/49's MGLRU groups stay compiled-in but
+runtime-inert until the shrink loop is made to converge (a dedicated PR).
 
 **The cpufreq/scheduler half moved to sailboat addon 2.**  The `abk_sf_*`
 floor, the `abk_sc_*` cap, the governor held on `schedutil`, the DVFS ownership
@@ -488,9 +515,10 @@ remove.
   node the module writes was verified writable from KernelSU's root context with
   no `avc: denied`, so no other rule is needed -- and none is added.
 * Nothing outside `/sys`, `/proc`, `/dev`, `/data/per_boot/zram` (the writeback
-  backing file, and only when the kernel supports writeback and
-  `zram.writeback` is not `off`) and the module's own directory is written. No
-  system/vendor file is replaced.
+  backing file, and only under `zram.writeback=auto` and only after
+  `sys.boot_completed=1`) and the module's own directory is written. With the
+  shipped `zram.writeback=off` the module creates nothing there at all, and it
+  removes a file it created earlier. No system/vendor file is replaced.
 * The one node the module writes whose effect lands outside `/sys` is
   `zram0/writeback`, and only under `zram.writeback.trigger`. It writes into
   the backing device that is already attached -- the ROM's own extm file
@@ -498,7 +526,8 @@ remove.
   `trigger=off` the module never writes that node.
 * `ABK_SYS_ROOT`, `ABK_MEMCG_ROOT`, `ABK_PROC_SWAPS`, `ABK_MEMINFO`,
   `ABK_SWAPON`, `ABK_SWAPOFF`, `ABK_MKSWAP`, `ABK_LOSETUP`, `ABK_DD`,
-  `ABK_ZRAM_NODE`, `ABK_ZRAM_WB_DIR`, `ABK_ZRAM_WB_FILE`, `ABK_STATE_DIR`,
+  `ABK_GETPROP`, `ABK_ZRAM_NODE`, `ABK_ZRAM_WB_DIR`, `ABK_ZRAM_WB_FILE`,
+  `ABK_STATE_DIR`,
   `ABK_RUN_DIR`, `ABK_CONF`, `ABK_RECOMP_TOOL`, `ABK_CFR_TOOL` and `ABK_STDOUT`
   exist so the policy can be exercised against a fixture tree by the
   repository's tests. They are not user-facing knobs.
@@ -527,6 +556,9 @@ remove.
   writeback through a module-shaped attachment moves exactly the pages it should
   with the payload verified identical before and after. What that same run also
   exposed is the SELinux dependency above -- without the rule the numbers are
-  bit-identical to "no writeback at all". Every step stays best-effort: a
-  failure logs and continues without writeback rather than blocking the swap
-  bring-up.
+  bit-identical to "no writeback at all". The part of that attachment that did
+  not survive a reboot is the destination itself: /data/per_boot is emptied at
+  every `sys.boot_completed`, which is why the auto path now waits for that
+  property and why `off` releases the module's own file. Every step stays
+  best-effort: a failure logs and continues without writeback rather than
+  blocking the swap bring-up.
