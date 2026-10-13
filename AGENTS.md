@@ -239,11 +239,11 @@ required strings.
   a field it does not own (`cgroup.pressure` uses the cgroup's own `flags` word,
   because `struct psi_group` is embedded in `struct cgroup` on 5.15 and the ACK's
   `psi_group::enabled` member would move every member after it). This module uses
-  `task_struct` slot 8 (Batch 16's `kstack_offset`) and slot 7 (Batch 77's
-  `struct sched_ext_entity *scx`); if ABK's kernel-specific patch has reused
-  slots 6/7/8 (SysVIPC), the kstack group moves to the still-free slot 5, while
-  the SCX claim has no slot to move to and reports `blocked_by_missing_anchor`
-  on that shape. From
+  `task_struct` slot 8 (Batch 16's `kstack_offset`) and one reserve slot for SCX's
+  `struct sched_ext_entity *scx`, whose number is **read from the tree** rather
+  than hard-coded (Batch 77): slot 7 on the plain shape, slot 2 when ABK's
+  kernel-specific patch has spent 6/7/8 on SysVIPC -- the shape on which the
+  kstack group moves to the still-free slot 5. From
   Batch 15 this module **owns** `sched_entity` slots 1–4 (the absorbed EEVDF
   family) and `request_queue` slot 1 (the absorbed `blk_mq_async_depth`): the
   old "never claim these — ABI-suite territory" rule is retired, so they are
