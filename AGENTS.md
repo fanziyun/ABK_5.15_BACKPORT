@@ -101,12 +101,12 @@ requires the symbol to be on already) and builds
 `kernel/sched/sched_ext_glue.o` plus `core.o`/`fair.o`/`idle.o`/`debug.o`/`fork.o`/`bpf_struct_ops.o`,
 reporting the distinct error lines. It is a build-host helper like
 `tools/hunks.py`, absent from `embed.conf`, and it is what found the SCX payload's
-real failures in Batch 56. Run it whenever a batch adds C -- `step_audit` proves
+real failures in Batch 78. Run it whenever a batch adds C -- `step_audit` proves
 an anchor landed, only the compiler proves the C is valid.  When a batch changes a
 header most of the tree includes (the SCX work touches
 `include/linux/sched.h`, `kernel/sched/sched.h` and
 `include/linux/sched/ext.h`), the strongest form is a full
-`make ARCH=arm64 LLVM=1 vmlinux` on the grafted tree: Batch 61 ran it, and it is
+`make ARCH=arm64 LLVM=1 vmlinux` on the grafted tree: Batch 83 ran it, and it is
 also what produces the post-graft BTF that `tools/build_scx_artifacts.sh`
 compiles the sched_ext scheduler against.
 
@@ -239,7 +239,7 @@ required strings.
   a field it does not own (`cgroup.pressure` uses the cgroup's own `flags` word,
   because `struct psi_group` is embedded in `struct cgroup` on 5.15 and the ACK's
   `psi_group::enabled` member would move every member after it). This module uses
-  `task_struct` slot 8 (Batch 16's `kstack_offset`) and slot 7 (Batch 55's
+  `task_struct` slot 8 (Batch 16's `kstack_offset`) and slot 7 (Batch 77's
   `struct sched_ext_entity *scx`); if ABK's kernel-specific patch has reused
   slots 6/7/8 (SysVIPC), the kstack group moves to the still-free slot 5, while
   the SCX claim has no slot to move to and reports `blocked_by_missing_anchor`
@@ -433,20 +433,20 @@ headers, does not re-include the unguarded `kernel/sched/ext.h`, and does not pu
 in the policy `.c` files OPPO's build_policy.c does; `kernel/sched/Makefile`
 builds `sched_ext_glue.o` rather than `ext.o`, and subtracts `autogroup.h` and
 `stats.h` from the 6.6 header set (5.15's `sched.h` already includes both and
-neither has a guard; listing them again is 20 redefinition errors). Batch 54
-shipped the three engine files inert; Batch 55 added the glue unit and the
+neither has a guard; listing them again is 20 redefinition errors). Batch 76
+shipped the three engine files inert; Batch 77 added the glue unit and the
 wiring (the `CONFIG_SCHED_CLASS_EXT` symbol, the Makefile rule, `struct scx_rq`
 and `rq->scx`, the `task_struct` slot, the `SCHED_DATA` slot and the
 `init_sched_ext_class()` call). **That wiring puts the engine in the build but
-does not make the vendored bytes compile**: Batch 56 ran the first real
+does not make the vendored bytes compile**: Batch 78 ran the first real
 compiler over them (`tools/compile_probe.sh`) and measured 12 classes of
 5.15/6.6 interface drift -- surveyed in `docs/survey_sched_ext_gap.md` §2c,
 several of them function-pointer or language-level constructs no preprocessor
-shim can bridge. **Batch 57 landed that marked 5.15 adaptation** and the probe
+shim can bridge. **Batch 79 landed that marked 5.15 adaptation** and the probe
 now builds all seven objects on a configured 5.15.220 tree (`OK (7 object(s)
 built)`): five shims live in the glue unit (the cgroup weight helper,
 `for_each_cpu_andnot()`, the BTF bit-offset alias and the diag suppression),
-and three registry groups `batch57_perf_sched_ext_adapt` carry the rest --
+and three registry groups `batch79_perf_sched_ext_adapt` carry the rest --
 making core.c's `__setscheduler_prio()`/`check_class_changed()` visible,
 re-carrying 6.2's `SCHED_CHANGE_BLOCK` guard into core.c (where the tree's own
 `dequeue_task()`/`enqueue_task()` are), and editing the archived `ext.c` at
@@ -457,17 +457,17 @@ carrying one of the adaptation markers as installed so a second run does not
 mistake this module's own edit for a foreign `ext.c`. **A new group that
 adapts a payload file must add its marker to that allow-list**, or the second
 overlay call never writes the file's empty `.abk-orig` diff base. Two payload
-files are adapted in-tree today: `kernel/sched/ext.c` (Batch 57's eight sites
-plus Batch 58's per-task guard) and `kernel/sched/ext.h` (Batch 59's
+files are adapted in-tree today: `kernel/sched/ext.c` (Batch 79's eight sites
+plus Batch 80's per-task guard) and `kernel/sched/ext.h` (Batch 81's
 active-class walk).
 
-Since then the functional hooks landed -- Batch 58 the task lifecycle, Batch 59
-the pick path, the tick watchdog and the idle transition, Batch 60 the
+Since then the functional hooks landed -- Batch 80 the task lifecycle, Batch 81
+the pick path, the tick watchdog and the idle transition, Batch 82 the
 reachability gates (`normal_policy()`/fair_policy(), the priority-range
 syscalls, `BPF_STRUCT_OPS_TYPE(sched_ext_ops)` in
 `kernel/bpf/bpf_struct_ops_types.h` and the `ext` debugfs file), which is why
 the probe's object set now also carries `kernel/bpf/bpf_struct_ops.o`. The class
-is selectable and bindable after Batch 60; what it still lacks is the userspace
+is selectable and bindable after Batch 82; what it still lacks is the userspace
 loader that attaches a BPF scheduler (S3) and any device verification.
 
 The rationale, the gate probes, both snapshot conventions and the rollback paths

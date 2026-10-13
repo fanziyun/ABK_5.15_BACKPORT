@@ -66,7 +66,7 @@ def write_text(path, text, eol=None, backup=True):
         # empty: snapshotting the current bytes here would fill the diff base
         # with the pre-adaptation payload, so tests/config_gate_audit.py would
         # see only the adaptation as added code and stop auditing the
-        # whole-file gates inside it (Batch 57 -- sched_ext_payload_adapt is the
+        # whole-file gates inside it (Batch 79 -- sched_ext_payload_adapt is the
         # first group to write a file the overlay created).
         if not backup_path.exists() and not marker.exists():
             backup_path.write_bytes(target.read_bytes())

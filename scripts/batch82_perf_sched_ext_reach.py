@@ -1,6 +1,6 @@
-"""Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.
+"""Batch 82 (sched_ext S2b-2b, second half, part 2): reachability.
 
-Batch 58 landed the task-lifecycle hooks and Batch 59 the scheduling-core ones,
+Batch 80 landed the task-lifecycle hooks and Batch 81 the scheduling-core ones,
 but none of it can be reached: `SCHED_EXT` is still rejected by
 `valid_policy()`, the BPF syscall has no `sched_ext_ops` value type to bind a
 scheduler to, and the engine cannot report itself.  This batch closes the three
@@ -264,7 +264,7 @@ def build_groups(PatchGroup):
              "syscall's valid_policy() check accepts it and "
              "__setscheduler_params() gives the task its static priority and "
              "load weight.  This is the gate that made the class unreachable "
-             "through Batch 59."),
+             "through Batch 81."),
             ["no upstream commit: 6.6's normal_policy()/fair_policy() split "
              "re-expressed on the 5.15 helper set"],
             [SCHED_H],

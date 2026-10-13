@@ -6,7 +6,7 @@
 #
 #   1. scx.enabled=1 in tunables.conf;
 #   2. the running kernel has the class -- /sys/kernel/debug/sched/ext exists
-#      (Batch 60's debugfs file) or, when debugfs is not mounted,
+#      (Batch 82's debugfs file) or, when debugfs is not mounted,
 #      /proc/config.gz says CONFIG_SCHED_CLASS_EXT=y;
 #   3. both artefacts are present in bin/: scx_loader and abk_scx_min.bpf.o.
 #      They are built on a build host by tools/build_scx_artifacts.sh against a

@@ -255,27 +255,27 @@ own upstream attribution:
   mainline v6.18/v6.6/v7.x source snapshots.
 - `research/popsicle_w_oss/` — the popsicle-w-oss branch extraction, including the
   Qualcomm WALT files quoted above.
-- `research/mainline-v6.1/` — the arm64 BPF trampoline series grafted as Batch 51
-  and Batch 52 (`b2ad54e1533e` text_poke, `efc9909fdce0` trampoline, and the five
+- `research/mainline-v6.1/` — the arm64 BPF trampoline series grafted as Batch 73
+  and Batch 74 (`b2ad54e1533e` text_poke, `efc9909fdce0` trampoline, and the five
   follow-ups `aada47665546`, `33f32e5072b6`, `339ed900b307`, `19f68ed6dc90`,
   `eb707dde264a`; authors Xu Kuohai, Nathan Chancellor, Yonghong Song, all
   GPL-2.0).  Two of the follow-ups are recorded as deliberately not carried
-  (`19f68ed6dc90` in Batch 51, `eb707dde264a` in Batch 52) — see
-  `CHANGELOG.md#batch-51` / `#batch-52`.  The same directory holds the v6.1
+  (`19f68ed6dc90` in Batch 73, `eb707dde264a` in Batch 74) — see
+  `CHANGELOG.md#batch-73` / `#batch-74`.  The same directory holds the v6.1
   generic trampoline interface (`trampoline.c`, `bpf.h`) the port was re-authored
   against; `research/mainline-v5.18/` holds the kfunc registration API measured
   there for S1b (`dee872e124e8`, the registry and the hook, and `b202d8442222`,
   the callback removal that was deliberately NOT carried), and
-  `research/mainline-v5.19/` the three commits that decide the shape Batch 53
+  `research/mainline-v5.19/` the three commits that decide the shape Batch 75
   actually uses: `ab21d6063c01` (the 8-byte set and `BTF_ID_FLAGS`),
   `a4703e318432` (the single `.set` member and the flag semantics that are not
   carried) and `b5e975d256db` (arm64 `bpf_jit_supports_kfunc_call()`, carried
   verbatim).
 - `OnePlusOSS/android_kernel_common_oneplus_sm8750`, branch
   `oneplus/sm8750_b_16.0.0_oneplus_13` (6.6) — the sched_ext payload shipped as
-  Batch 54 (`files/include/linux/sched/ext.h`, `files/kernel/sched/ext.h`,
+  Batch 76 (`files/include/linux/sched/ext.h`, `files/kernel/sched/ext.h`,
   `files/kernel/sched/ext.c`; 143,044 B, sha256 pinned in
-  `tests/stable_5_15_test.py`).  Batch 55 added a fourth file in that path,
+  `tests/stable_5_15_test.py`).  Batch 77 added a fourth file in that path,
   `files/kernel/sched/sched_ext_glue.c`, which is **this module's own work, not
   vendor code**: `ext.c` carries no include block (the 6.6 tree textually
   includes it from `kernel/sched/build_policy.c`, which 5.15 does not have), so

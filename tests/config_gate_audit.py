@@ -147,7 +147,7 @@ DARK_GATES = {
         "the added one"
     ),
     "SIS_PROP": (
-        "Batch 50 sched_sis_util: default-off by construction, and upstream "
+        "Batch 72 sched_sis_util: default-off by construction, and upstream "
         "ships it that way.  70fb5ccf2ebb turns SIS_PROP off in the same patch "
         "that adds SIS_UTIL, and the android15-6.6 line this group is taken "
         "from carries exactly the pair SIS_PROP=false / SIS_UTIL=true.  In "
@@ -165,7 +165,7 @@ DARK_GATES = {
         "switch, not flip the switch back on"
     ),
     "CONFIG_SCHED_CLASS_EXT": (
-        "Batch 55 introduces the symbol and turns it on from the module tier, "
+        "Batch 77 introduces the symbol and turns it on from the module tier, "
         "so a build from the current defconfig has it and compiles the whole "
         "SCX payload; the reference .config is a device config taken before "
         "that batch and therefore cannot contain a symbol that did not exist "

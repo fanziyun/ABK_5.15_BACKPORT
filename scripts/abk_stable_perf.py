@@ -400,7 +400,7 @@ def _kstack_pertask_apply(ctx):
     text = ctx.read("include/linux/sched.h")
     steps = []
     # Shape probe on this group's own added member, not on the reserve run it
-    # consumed: a later group (Batch 55's sched_ext_task_slot) claims the next
+    # consumed: a later group (Batch 77's sched_ext_task_slot) claims the next
     # free slot and therefore rewrites that run, which would otherwise leave
     # this step anchoring on text no longer present on the second pass --
     # group_recipe trap 5.  The member reads "kstack_offset);" (the macro call
@@ -2557,7 +2557,7 @@ PATCH_GROUPS = PATCH_GROUPS + _b15_blkdepth.build_groups(PatchGroup)
 
 
 # ---------------------------------------------------------------------------
-# Batch 50 (Tier A1): sched_sis_util.  Source: 70fb5ccf2ebb "sched/fair:
+# Batch 72 (Tier A1): sched_sis_util.  Source: 70fb5ccf2ebb "sched/fair:
 # Introduce SIS_UTIL to search idle CPU based on sum of util_avg" (mainline
 # v6.0; shipped on android15-6.6).  Registered after the Batch 15 appends on
 # purpose: batch15_perf_sched_refinements rewrites select_idle_cpu() in place,
@@ -4003,7 +4003,7 @@ PATCH_GROUPS = PATCH_GROUPS + [
 
 
 # ============================================================================
-# Batch 53 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
+# Batch 75 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
 # consults it, and the arm64 override that lets a kfunc be called at all.
 # Registered after every arm64 group on purpose: arm64_bpf_text_poke appends a
 # whole poking payload after bpf_jit_free_exec() and arm64_bpf_trampoline
@@ -4013,70 +4013,70 @@ PATCH_GROUPS = PATCH_GROUPS + [
 # group appends its payload again.  arm64_jit_kfunc_call therefore anchors well
 # above them, on bpf_jit_alloc_exec_limit(), which neither group touches.
 # ============================================================================
-import batch53_perf_btf_kfunc as _b53_kfunc  # noqa: E402
+import batch75_perf_btf_kfunc as _b53_kfunc  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b53_kfunc.build_groups(PatchGroup)
 
 
 # ============================================================================
-# Batch 55 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
+# Batch 77 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
 # a compiled subsystem.  Registered last on purpose: sched_ext_task_slot claims
 # a task_struct KABI reserve slot (7 on a clean tree, 2 when ABK's SysVIPC
 # patch has spent 6/7/8) and anchors on the post-randomize_kstack_pertask run
 # (which appended to slot 8), so the two must run in that order.
 # ============================================================================
-import batch55_perf_sched_ext_wiring as _b55_scx  # noqa: E402
+import batch77_perf_sched_ext_wiring as _b55_scx  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b55_scx.build_groups(PatchGroup)
 
 
 # ============================================================================
-# Batch 57 (sched_ext S2b-2a): the 5.15 adaptation layer for the Batch-54
-# payload.  Registered after Batch 55 on purpose: sched_ext_task_slot anchors on
+# Batch 79 (sched_ext S2b-2a): the 5.15 adaptation layer for the Batch-54
+# payload.  Registered after Batch 77 on purpose: sched_ext_task_slot anchors on
 # the post-randomize_kstack_pertask run and sched_ext_rq_state appends to
 # kernel/sched/sched.h, while these two groups edit kernel/sched/core.c,
 # kernel/sched/sched.h and the overlaid payload -- and the overlay runs before
 # this child (scripts/stable_backport.sh), because sched_ext_payload_adapt edits
 # kernel/sched/ext.c, which the overlay is what creates.
 # ============================================================================
-import batch57_perf_sched_ext_adapt as _b57_adapt  # noqa: E402  (three groups)
+import batch79_perf_sched_ext_adapt as _b57_adapt  # noqa: E402  (three groups)
 
 PATCH_GROUPS = PATCH_GROUPS + _b57_adapt.build_groups(PatchGroup)
 
 
 # ============================================================================
-# Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  Registered
-# last, and after Batch 57 in particular: sched_ext_setscheduler_hooks edits the
+# Batch 80 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  Registered
+# last, and after Batch 79 in particular: sched_ext_setscheduler_hooks edits the
 # __setscheduler_prio() body sched_ext_core_visibility generates (that group
 # therefore probes for its own marker first), and these groups edit
 # kernel/sched/ext.c, which the overlay creates before this child runs.
 # ============================================================================
-import batch58_perf_sched_ext_hooks as _b58_hooks  # noqa: E402  (five groups)
+import batch80_perf_sched_ext_hooks as _b58_hooks  # noqa: E402  (five groups)
 
 PATCH_GROUPS = PATCH_GROUPS + _b58_hooks.build_groups(PatchGroup)
 
 
 # ============================================================================
-# Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
-# Registered after Batch 58 for the same reason: the consumers of
+# Batch 81 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+# Registered after Batch 80 for the same reason: the consumers of
 # for_each_active_class() must see the materialised payload, and
 # sched_ext_active_class rewrites that macro in the tree copy of
 # kernel/sched/ext.h, which the overlay creates before this child runs.
 # ============================================================================
-import batch59_perf_sched_ext_pick as _b59_pick  # noqa: E402  (four groups)
+import batch81_perf_sched_ext_pick as _b59_pick  # noqa: E402  (four groups)
 
 PATCH_GROUPS = PATCH_GROUPS + _b59_pick.build_groups(PatchGroup)
 
 
 # ============================================================================
-# Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.  Registered
+# Batch 82 (sched_ext S2b-2b, second half, part 2): reachability.  Registered
 # last: sched_ext_policy_valid opens the syscall gate the earlier batches' hooks
 # sit behind, and the struct_ops type entry is what lets a BPF scheduler bind at
 # all.  Two files enter the fixture lists here (kernel/bpf/
 # bpf_struct_ops_types.h and kernel/sched/debug.c), so the reference trees were
 # re-fetched before the audits were run.
 # ============================================================================
-import batch60_perf_sched_ext_reach as _b60_reach  # noqa: E402  (four groups)
+import batch82_perf_sched_ext_reach as _b60_reach  # noqa: E402  (four groups)
 
 PATCH_GROUPS = PATCH_GROUPS + _b60_reach.build_groups(PatchGroup)
 

@@ -805,7 +805,7 @@ earlier build with the pre-rename comments was flashed first, and although its
 emitted C differs only in comments, it was replaced rather than described as
 equivalent.
 
-## 10. Tier D/E verdict — both items are closed (Batch 69)
+## 10. Tier D/E verdict — both items are closed (Batch 91)
 
 The plan carried two device-gated candidates:
 

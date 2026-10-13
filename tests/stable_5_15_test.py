@@ -3180,9 +3180,9 @@ def test_runtime_tunables_module():
     required = ("module.prop", "common.sh", "zram-policy.sh", "post-fs-data.sh",
                 "service.sh", "action.sh", "iorap-watch.sh", "tunables.conf",
                 "embed.conf", "sepolicy.rule", "README.md",
-                # Batch 63: the sched_ext half of the policy (off by default).
+                # Batch 85: the sched_ext half of the policy (off by default).
                 "scx-policy.sh",
-                # Batch 67: the uclamp floor (off by default).
+                # Batch 89: the uclamp floor (off by default).
                 "uclamp-policy.sh")
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
@@ -3264,7 +3264,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.74.0", "0.74.0"], _versions)
+          _versions == ["0.95.0", "0.95.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -3746,7 +3746,7 @@ def test_runtime_tunables_module():
                   and "* 10000 / _on_tot" not in _psi_bench_code)
             # Installed under bin/, these are module code as much as service.sh
             # is, so the same two invariants apply to them.  The sched_ext pair
-            # is ELF, not script (Batch 65), so the text invariants cover the
+            # is ELF, not script (Batch 87), so the text invariants cover the
             # .sh entries and the pair's presence is asserted on its own.
             for _bin in sorted(n for n in names
                                if n.startswith("bin/") and n.endswith(".sh")):
@@ -6618,20 +6618,20 @@ def main():
     test_batch42_schedutil_smart_cap()
     test_sched_ext_payload()
     test_sched_ext_wiring()
-    test_batch56_compile_gate()
-    test_batch57_payload_adapt()
-    test_batch58_sched_ext_hooks()
-    test_batch59_sched_ext_pick()
-    test_batch60_sched_ext_reach()
-    test_batch61_scx_scheduler()
-    test_batch62_scx_loader()
-    test_batch63_scx_companion()
-    test_batch64_libelf_shim()
-    test_batch65_scx_prebuilt()
-    test_batch66_scx_check_tool()
-    test_batch67_uclamp_policy()
-    test_batch68_arm64_selftest()
-    test_batch69_tier_de_verdict()
+    test_batch78_compile_gate()
+    test_batch79_payload_adapt()
+    test_batch80_sched_ext_hooks()
+    test_batch81_sched_ext_pick()
+    test_batch82_sched_ext_reach()
+    test_batch83_scx_scheduler()
+    test_batch84_scx_loader()
+    test_batch85_scx_companion()
+    test_batch86_libelf_shim()
+    test_batch87_scx_prebuilt()
+    test_batch88_scx_check_tool()
+    test_batch89_uclamp_policy()
+    test_batch90_arm64_selftest()
+    test_batch91_tier_de_verdict()
     test_batch70_smaps_migration_guard()
     test_batch71_kcompressd_wb_pin()
     test_fetch_decode_roundtrip()
@@ -6907,7 +6907,7 @@ def test_batch42_schedutil_smart_cap():
               (st_o, d_o, ctx3.pending_writes()))
 
 def test_sched_ext_payload():
-    """Batch 54 (sched_ext S2a): the payload, its overlay and its rollback.
+    """Batch 76 (sched_ext S2a): the payload, its overlay and its rollback.
 
     This batch registers no PatchGroup, so nothing here is visible in a graft
     status and the test is the only thing holding the three structural facts:
@@ -6923,7 +6923,7 @@ def test_sched_ext_payload():
       gates against, and .abk-new is what tells the rollback to delete the
       target rather than restore a zero-byte file over it.
     """
-    print("Batch 54: sched_ext S2a payload + overlay + created-file rollback")
+    print("Batch 76: sched_ext S2a payload + overlay + created-file rollback")
     repo = Path(__file__).resolve().parent.parent
 
     payloads = {
@@ -7055,9 +7055,9 @@ def test_sched_ext_payload():
 
     registered = {rel for module in (core_mod, perf_mod, display_mod)
                   for group in module.PATCH_GROUPS for rel in group.files}
-    # Batch 57 made kernel/sched/ext.c an edit target, but only through the
-    # adaptation group, and only after the wiring; Batch 58's payload guard is
-    # the second, and it is registered after the first.  Batch 59 makes
+    # Batch 79 made kernel/sched/ext.c an edit target, but only through the
+    # adaptation group, and only after the wiring; Batch 80's payload guard is
+    # the second, and it is registered after the first.  Batch 81 makes
     # kernel/sched/ext.h the third edit target, also after both.  The
     # arch-independent header must still be untouched by every group, and each
     # edited payload file only by the groups named here, in that order -- two
@@ -7080,10 +7080,10 @@ def test_sched_ext_payload():
           owners)
 
 
-def test_batch57_payload_adapt():
-    """Batch 57 (sched_ext S2b-2a): the 5.15 adaptation that makes it compile.
+def test_batch79_payload_adapt():
+    """Batch 79 (sched_ext S2b-2a): the 5.15 adaptation that makes it compile.
 
-    Batch 56 proved the archived payload does not compile; this batch is the
+    Batch 78 proved the archived payload does not compile; this batch is the
     adaptation, and the facts worth pinning mechanically are the ones a later
     batch could quietly undo:
 
@@ -7102,12 +7102,12 @@ def test_batch57_payload_adapt():
     * the audits can see the payload: tests/audit_fixture.py supplies the created
       files, and the group counts match the registry.
     """
-    print("Batch 57: sched_ext S2b-2a payload 5.15 adaptation")
+    print("Batch 79: sched_ext S2b-2a payload 5.15 adaptation")
     repo = Path(__file__).resolve().parent.parent
 
     import abk_stable_perf as perf_mod
     import audit_fixture
-    import batch57_perf_sched_ext_adapt as w57
+    import batch79_perf_sched_ext_adapt as w57
 
     keys = [g.key for g in perf_mod.PATCH_GROUPS]
     for key in ("sched_ext_core_visibility", "sched_ext_change_guard",
@@ -7118,7 +7118,7 @@ def test_batch57_payload_adapt():
     start = keys.index(adapt[0])
     check("the three adaptation groups run as one block",
           keys[start:start + 3] == adapt, keys[start:start + 3])
-    check("Batch 58's hook groups follow the adaptation groups",
+    check("Batch 80's hook groups follow the adaptation groups",
           keys[start + 3:start + 8] == [
               "sched_ext_fork_hooks", "sched_ext_fork_failure_path",
               "sched_ext_task_teardown", "sched_ext_setscheduler_hooks",
@@ -7231,15 +7231,15 @@ def test_batch57_payload_adapt():
 
     survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
     check("the survey records the adaptation batch",
-          "Batch 57" in survey and "sched_ext_change_guard" in survey)
+          "Batch 79" in survey and "sched_ext_change_guard" in survey)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    check("the changelog records Batch 57", '<a id="batch-57"></a>' in changelog)
+    check("the changelog records Batch 79", '<a id="batch-79"></a>' in changelog)
 
 
-def test_batch58_sched_ext_hooks():
-    """Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.
+def test_batch80_sched_ext_hooks():
+    """Batch 80 (sched_ext S2b-2b, first half): the task-lifecycle hooks.
 
-    Batch 57 made the payload compile; this batch is the first thing that can
+    Batch 79 made the payload compile; this batch is the first thing that can
     actually put a task on the BPF class or take it off.  What is worth pinning
     mechanically:
 
@@ -7257,12 +7257,12 @@ def test_batch58_sched_ext_hooks():
       SCHED_EXT is still refused and this batch cannot be mistaken for the one
       that turns SCX on.
     """
-    print("Batch 58: sched_ext S2b-2b task-lifecycle hooks")
+    print("Batch 80: sched_ext S2b-2b task-lifecycle hooks")
     repo = Path(__file__).resolve().parent.parent
 
     import abk_stable_perf as perf_mod
-    import batch57_perf_sched_ext_adapt as w57
-    import batch58_perf_sched_ext_hooks as w58
+    import batch79_perf_sched_ext_adapt as w57
+    import batch80_perf_sched_ext_hooks as w58
 
     keys = [g.key for g in perf_mod.PATCH_GROUPS]
     hooks = ["sched_ext_fork_hooks", "sched_ext_fork_failure_path",
@@ -7321,7 +7321,7 @@ def test_batch58_sched_ext_hooks():
     check("sched_ext_core_visibility probes its own marker first",
           "sailboat_sched_ext_core_visibility:" in w57._SCHED_EXT_CORE_VISIBILITY_PROBE
           and "if _SCHED_EXT_CORE_VISIBILITY_PROBE in probe:" in
-          (repo / "scripts/batch57_perf_sched_ext_adapt.py").read_text(
+          (repo / "scripts/batch79_perf_sched_ext_adapt.py").read_text(
               encoding="utf-8"))
 
     # The payload guard: every dereference the fork hooks newly reach is
@@ -7374,19 +7374,19 @@ def test_batch58_sched_ext_hooks():
 
     survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
     check("the survey records the hook batch",
-          "Batch 58" in survey and "sched_ext_fork_hooks" in survey)
+          "Batch 80" in survey and "sched_ext_fork_hooks" in survey)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    check("the changelog records Batch 58", '<a id="batch-58"></a>' in changelog)
+    check("the changelog records Batch 80", '<a id="batch-80"></a>' in changelog)
     smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
     check("smoke asserts the fork hooks and the guard",
           "sched_ext_payload_task_guard" in smoke
           and "sailboat_sched_ext_fork_hooks" in smoke)
 
 
-def test_batch59_sched_ext_pick():
-    """Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+def test_batch81_sched_ext_pick():
+    """Batch 81 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
 
-    Batch 58 made a task enter and leave the BPF class; this batch is what picks
+    Batch 80 made a task enter and leave the BPF class; this batch is what picks
     such a task once it is on the class.  What is worth pinning mechanically:
 
     * the payload's active-class walk must step *down* 5.15's SCHED_DATA array
@@ -7405,11 +7405,11 @@ def test_batch59_sched_ext_pick():
     * the class is still unreachable -- valid_policy() is untouched and this
       batch may not touch kernel/sched/sched.h.
     """
-    print("Batch 59: sched_ext S2b-2b scheduling-core hooks")
+    print("Batch 81: sched_ext S2b-2b scheduling-core hooks")
     repo = Path(__file__).resolve().parent.parent
 
     import abk_stable_perf as perf_mod
-    import batch59_perf_sched_ext_pick as w59
+    import batch81_perf_sched_ext_pick as w59
 
     keys = [g.key for g in perf_mod.PATCH_GROUPS]
     groups = ["sched_ext_active_class", "sched_ext_pick_path",
@@ -7484,9 +7484,9 @@ def test_batch59_sched_ext_pick():
 
     survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
     check("the survey records the core-hook batch",
-          "Batch 59" in survey and "sched_ext_pick_path" in survey)
+          "Batch 81" in survey and "sched_ext_pick_path" in survey)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    check("the changelog records Batch 59", '<a id="batch-59"></a>' in changelog)
+    check("the changelog records Batch 81", '<a id="batch-81"></a>' in changelog)
     smoke = (repo / "tests/smoke.sh").read_text(encoding="utf-8")
     check("smoke asserts the core hooks and the payload walk",
           "sailboat_sched_ext_active_class" in smoke
@@ -7499,10 +7499,10 @@ def test_batch59_sched_ext_pick():
           "sailboat_sched_ext_active_class" in overlay)
 
 
-def test_batch60_sched_ext_reach():
-    """Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.
+def test_batch82_sched_ext_reach():
+    """Batch 82 (sched_ext S2b-2b, second half, part 2): reachability.
 
-    Batch 59 made an *enabled* scheduler able to pick tasks; this batch opens
+    Batch 81 made an *enabled* scheduler able to pick tasks; this batch opens
     the gates that kept one from ever being enabled or the policy from being
     set.  What is worth pinning mechanically:
 
@@ -7517,11 +7517,11 @@ def test_batch60_sched_ext_reach():
     * both new files entered the three fixture lists, which is why the
       reference trees were re-fetched before this batch's audits were run.
     """
-    print("Batch 60: sched_ext reachability")
+    print("Batch 82: sched_ext reachability")
     repo = Path(__file__).resolve().parent.parent
 
     import abk_stable_perf as perf_mod
-    import batch60_perf_sched_ext_reach as w60
+    import batch82_perf_sched_ext_reach as w60
 
     keys = [g.key for g in perf_mod.PATCH_GROUPS]
     groups = ["sched_ext_policy_valid", "sched_ext_priority_range",
@@ -7599,17 +7599,17 @@ def test_batch60_sched_ext_reach():
 
     survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
     check("the survey records the reachability batch",
-          "Batch 60" in survey and "sched_ext_policy_valid" in survey)
+          "Batch 82" in survey and "sched_ext_policy_valid" in survey)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    check("the changelog records Batch 60", '<a id="batch-60"></a>' in changelog)
+    check("the changelog records Batch 82", '<a id="batch-82"></a>' in changelog)
     smoke_txt = smoke
     check("smoke asserts the four reachability gates",
           "BPF_STRUCT_OPS_TYPE(sched_ext_ops)" in smoke_txt
           and "normal_policy" in smoke_txt)
 
 
-def test_batch61_scx_scheduler():
-    """Batch 61 (S3a): the minimal SCX scheduler and the kfunc set it may use.
+def test_batch83_scx_scheduler():
+    """Batch 83 (S3a): the minimal SCX scheduler and the kfunc set it may use.
 
     The userspace half of S3 starts with the BPF side, because that is where the
     kernel-side dependency is: whatever kfuncs a scheduler calls must already be
@@ -7628,7 +7628,7 @@ def test_batch61_scx_scheduler():
     * the loader has no business shipping before it exists: nothing in the
       companion may reference a loader binary yet.
     """
-    print("Batch 61: S3a minimal SCX scheduler and its kfunc surface")
+    print("Batch 83: S3a minimal SCX scheduler and its kfunc surface")
     repo = Path(__file__).resolve().parent.parent
 
     def strip_c_comments(text):
@@ -7709,10 +7709,10 @@ def test_batch61_scx_scheduler():
           and "abk_scx_min.bpf.o" in embed)
 
 
-def test_batch62_scx_loader():
-    """Batch 62 (S3b-1): the loader source and its build contract.
+def test_batch84_scx_loader():
+    """Batch 84 (S3b-1): the loader source and its build contract.
 
-    The scheduler compiled in Batch 61 is inert without something that binds it
+    The scheduler compiled in Batch 83 is inert without something that binds it
     to the class; this batch adds that program and the host-side gate that makes
     it more than a source file (build libbpf, link, then parse the .bpf.o with
     libbpf and describe it).  What is worth pinning mechanically:
@@ -7729,7 +7729,7 @@ def test_batch62_scx_loader():
       selftest) guarded by BUILD_HOST_LOADER, and still refuses to fake the
       aarch64-android binary (NDK has no libelf).
     """
-    print("Batch 62: S3b-1 the scx_loader and its host gate")
+    print("Batch 84: S3b-1 the scx_loader and its host gate")
     repo = Path(__file__).resolve().parent.parent
 
     def strip_c_comments(text):
@@ -7783,8 +7783,8 @@ def test_batch62_scx_loader():
               "scx_loader" not in text, name)
 
 
-def test_batch63_scx_companion():
-    """Batch 63 (S3b-2a): the companion-side SCX policy, off by default.
+def test_batch85_scx_companion():
+    """Batch 85 (S3b-2a): the companion-side SCX policy, off by default.
 
     The kernel side is complete (Batches 54-60) and the loader exists (Batch
     61/62), but nothing may start a scheduler on its own.  This batch adds the
@@ -7801,7 +7801,7 @@ def test_batch63_scx_companion():
     * the new keys are in abk_known_keys(), or abk_cfg_lint would report the
       documented knobs as unknown.
     """
-    print("Batch 63: S3b-2a companion SCX policy")
+    print("Batch 85: S3b-2a companion SCX policy")
     repo = Path(__file__).resolve().parent.parent
     mod = repo / "ksu/abk_runtime_tunables"
 
@@ -7858,8 +7858,8 @@ def test_batch63_scx_companion():
         check(f"the policy avoids {bad!r}", bad not in policy)
 
 
-def test_batch64_libelf_shim():
-    """Batch 64 (S3b-2b): the read-only libelf shim and its measured proof.
+def test_batch86_libelf_shim():
+    """Batch 86 (S3b-2b): the read-only libelf shim and its measured proof.
 
     The Android NDK ships no libelf, so the loader cannot be cross-compiled
     against it.  This batch provides the slice of the API libbpf actually uses
@@ -7878,7 +7878,7 @@ def test_batch64_libelf_shim():
       the one file needing the write side), never links -lelf, and diffs the
       two selftest outputs instead of trusting the shim.
     """
-    print("Batch 64: S3b-2b the read-only libelf shim")
+    print("Batch 86: S3b-2b the read-only libelf shim")
     repo = Path(__file__).resolve().parent.parent
     shim = repo / "tools/scx/libelf-shim"
 
@@ -7936,10 +7936,10 @@ def test_batch64_libelf_shim():
           "gelf_getshdr" in readme and "section **1**" in readme)
 
 
-def test_batch65_scx_prebuilt():
-    """Batch 65 (S3b-2b): the Android loader, built and shipped.
+def test_batch87_scx_prebuilt():
+    """Batch 87 (S3b-2b): the Android loader, built and shipped.
 
-    Batch 64 proved the libelf shim parses objects identically to libelf; this
+    Batch 86 proved the libelf shim parses objects identically to libelf; this
     batch is the cross build itself (tools/scx/build_android_loader.sh, NDK
     clang, aarch64-linux-android) and the two artefacts it produces, committed
     under tools/scx/prebuilt/ and shipped into the module's bin/ by embed.conf.
@@ -7951,12 +7951,12 @@ def test_batch65_scx_prebuilt():
     * the loader's dynamic dependencies are bionic's (libc/libdl/libz), not
       libelf: the shim is what removes that dependency;
     * the module's policy is the only consumer, it looks in bin/, and its
-      default is still off (Batch 63) -- shipping the artefacts does not arm
+      default is still off (Batch 85) -- shipping the artefacts does not arm
       anything;
     * the build recipe is published and documents the NDK, the compat headers
       and the TUs it skips.
     """
-    print("Batch 65: S3b-2b the aarch64 loader and the shipped artefacts")
+    print("Batch 87: S3b-2b the aarch64 loader and the shipped artefacts")
     repo = Path(__file__).resolve().parent.parent
     pre = repo / "tools/scx/prebuilt"
     loader = pre / "scx_loader"
@@ -8011,8 +8011,8 @@ def test_batch65_scx_prebuilt():
           and "aarch64-linux-android" in readme)
 
 
-def test_batch66_scx_check_tool():
-    """Batch 66 (S3c): the on-device verdict tool for the SCX switch.
+def test_batch88_scx_check_tool():
+    """Batch 88 (S3c): the on-device verdict tool for the SCX switch.
 
     The kernel side, the loader and the packaging are all in place; what is left
     is the device session, and that needs a tool that can tell the four states
@@ -8027,7 +8027,7 @@ def test_batch66_scx_check_tool():
       the parse starts after the last ')' (comm can contain spaces and ')');
     * the exit codes are the interface a script uses, so they are asserted.
     """
-    print("Batch 66: S3c the sched_ext on-device check tool")
+    print("Batch 88: S3c the sched_ext on-device check tool")
     repo = Path(__file__).resolve().parent.parent
     tool = repo / "tools/abk_scx_check.sh"
     text = tool.read_text(encoding="utf-8")
@@ -8053,8 +8053,8 @@ def test_batch66_scx_check_tool():
           not any(bad in text for bad in ("[[", "${!", "local ", "function ")))
 
 
-def test_batch67_uclamp_policy():
-    """Batch 67 (Tier B, landed off): the uclamp floor.
+def test_batch89_uclamp_policy():
+    """Batch 89 (Tier B, landed off): the uclamp floor.
 
     cpu.uclamp.min is a cgroup v2 file the baseline already exposes, so a
     render-boost-by-uclamp costs no kernel change -- but the value format has to
@@ -8074,7 +8074,7 @@ def test_batch67_uclamp_policy():
       only spawns the supervisor when both halves are set, and action.sh shows
       the state.
     """
-    print("Batch 67: Tier B uclamp floor (off by default)")
+    print("Batch 89: Tier B uclamp floor (off by default)")
     repo = Path(__file__).resolve().parent.parent
     mod = repo / "ksu/abk_runtime_tunables"
     policy = (mod / "uclamp-policy.sh").read_text(encoding="utf-8")
@@ -8128,10 +8128,10 @@ def test_batch67_uclamp_policy():
     check("the module README documents the switch", "boost.uclamp_min" in readme)
 
 
-def test_batch68_arm64_selftest():
-    """Batch 68 (S3d): the arm64 loader actually runs, and proves its parse.
+def test_batch90_arm64_selftest():
+    """Batch 90 (S3d): the arm64 loader actually runs, and proves its parse.
 
-    "The artefact is an AArch64 ELF" (Batch 65) is not "this code path works".
+    "The artefact is an AArch64 ELF" (Batch 87) is not "this code path works".
     This batch links a static aarch64 build of the same sources, runs it under
     qemu-user and diffs its selftest against the host x86_64 build.  What is
     pinned mechanically:
@@ -8145,7 +8145,7 @@ def test_batch68_arm64_selftest():
       exits 2, and a load on a kernel without sched_ext fails;
     * the measured output is recorded in the survey, so the claim is auditable.
     """
-    print("Batch 68: S3d arm64 loader under qemu-user")
+    print("Batch 90: S3d arm64 loader under qemu-user")
     repo = Path(__file__).resolve().parent.parent
     script = (repo / "tools/scx/run_arm64_selftest.sh").read_text(encoding="utf-8")
     survey = (repo / "docs/survey_sched_ext_gap.md").read_text(encoding="utf-8")
@@ -8178,8 +8178,8 @@ def test_batch68_arm64_selftest():
           "run_arm64_selftest.sh" in readme)
 
 
-def test_batch69_tier_de_verdict():
-    """Batch 69 (Tier D/E): both candidates closed, with evidence.
+def test_batch91_tier_de_verdict():
+    """Batch 91 (Tier D/E): both candidates closed, with evidence.
 
     The plan's last two non-device items were "only if a real scheduling effect
     can be shown".  One is already implemented (as PREEMPT_SHORT) and the other
@@ -8194,7 +8194,7 @@ def test_batch69_tier_de_verdict():
       releases, AOSP kernel_common branches, this tree), not just a conclusion;
     * the plan line is closed rather than left pending.
     """
-    print("Batch 69: Tier D/E verdict")
+    print("Batch 91: Tier D/E verdict")
     repo = Path(__file__).resolve().parent.parent
     eevdf = (repo / "scripts/batch15_perf_eevdf.py").read_text(encoding="utf-8")
     survey = (repo / "docs/survey_eevdf_gap.md").read_text(encoding="utf-8")
@@ -8226,13 +8226,13 @@ def test_batch69_tier_de_verdict():
     check("the plan line is closed, not pending",
           ("- [~] " + bt + "latency_nice" + bt) not in plan
           and ("- [-] " + bt + "latency_nice" + bt) in plan
-          and "Batch 69 \u5df2\u88c1\u51b3" in plan)
+          and "Batch 91 \u5df2\u88c1\u51b3" in plan)
     check("the device plan now scopes 'measure and decide' to Tier B",
-          "Tier D/E \u5df2\u4e8e Batch 69 \u6536\u53e3" in plan)
+          "Tier D/E \u5df2\u4e8e Batch 91 \u6536\u53e3" in plan)
 
 
-def test_batch56_compile_gate():
-    """Batch 56 (sched_ext S2b-2 prerequisite): the compile gate and its finding.
+def test_batch78_compile_gate():
+    """Batch 78 (sched_ext S2b-2 prerequisite): the compile gate and its finding.
 
     The seven repository gates are all text gates, so what this test pins is the
     *eighth* one existing and being pointed at the payload it probes.  Three
@@ -8248,7 +8248,7 @@ def test_batch56_compile_gate():
       re-assert "the payload compiles", and the two docs that did claim it are
       checked to have been corrected.
     """
-    print("Batch 56: the local compile gate and the payload 5.15 gap")
+    print("Batch 78: the local compile gate and the payload 5.15 gap")
     repo = Path(__file__).resolve().parent.parent
 
     probe = repo / "tools/compile_probe.sh"
@@ -8293,13 +8293,13 @@ def test_batch56_compile_gate():
           "tools/compile_probe.sh" in agents)
 
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    check("the changelog records Batch 56",
-          '<a id="batch-56"></a>' in changelog
-          and "Batch 56\uff08S2b-2 " in changelog)
+    check("the changelog records Batch 78",
+          '<a id="batch-78"></a>' in changelog
+          and "Batch 78\uff08S2b-2 " in changelog)
 
 
 def test_sched_ext_wiring():
-    """Batch 55 (sched_ext S2b-1): the seven build-wiring groups.
+    """Batch 77 (sched_ext S2b-1): the seven build-wiring groups.
 
     The local tree audits prove the anchors land; this test pins the facts that
     are decisions rather than mechanics:
@@ -8318,7 +8318,7 @@ def test_sched_ext_wiring():
       __sched_setscheduler's scx gate are the next batch, and landing them here
       would make a class with no fork hooks reachable.
     """
-    print("Batch 55: sched_ext S2b-1 build wiring")
+    print("Batch 77: sched_ext S2b-1 build wiring")
     repo = Path(__file__).resolve().parent.parent
 
     import abk_stable_core as core_mod
@@ -8342,7 +8342,7 @@ def test_sched_ext_wiring():
     # the required slot step missed, and being transactional it rolled the
     # whole group back, include and all, so struct scx_rq referenced a type
     # nothing had defined.  Pin both shapes so that cannot come back.
-    import batch55_perf_sched_ext_wiring as w55
+    import batch77_perf_sched_ext_wiring as w55
     check("the clean-shape step claims slot 7",
           w55._scx_slot_step("clean tree text")[1] == w55._SCHED_H_SLOT_OLD
           and "ANDROID_KABI_USE(7, struct sched_ext_entity *scx);"
@@ -8369,8 +8369,8 @@ def test_sched_ext_wiring():
     # member written without its type.
     check("the group carries the include and a slot step together",
           "#include <linux/sched/ext.h>" in w55._SCHED_H_INCLUDE_NEW)
-    # The adaptation (Batch 57), task-lifecycle (Batch 58) and scheduling-core
-    # (Batch 59) groups follow immediately: they adapt the payload this wiring
+    # The adaptation (Batch 79), task-lifecycle (Batch 80) and scheduling-core
+    # (Batch 81) groups follow immediately: they adapt the payload this wiring
     # creates, so they have to run after it.
     start = keys.index(wiring[0])
     check("the seven wiring groups open the sched_ext run",
@@ -8400,7 +8400,7 @@ def test_sched_ext_wiring():
           'kstack_offset);" not in text' in perf_src
           and 'kstack_offset;" not in text' not in perf_src)
 
-    import batch55_perf_sched_ext_wiring as w55
+    import batch77_perf_sched_ext_wiring as w55
 
     check("sched_class_above matches 5.15's downward walk",
           "sched_class_above(_a, _b)" in w55._KSCHED_H_FOREACH_NEW

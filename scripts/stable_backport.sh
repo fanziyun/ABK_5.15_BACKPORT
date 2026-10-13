@@ -165,8 +165,8 @@ abk_stable_backport_overlay_of_address() {
 # OPPO's, not upstream's and not this module's; files/README.md lists them so
 # they are not mistaken for upstream text.
 #
-# Batch 54 shipped the three engine files inert: nothing included them, so a
-# tree carrying them built exactly as before.  Batch 55 lands the wiring
+# Batch 76 shipped the three engine files inert: nothing included them, so a
+# tree carrying them built exactly as before.  Batch 77 lands the wiring
 # (Kconfig symbol, Makefile object rule, sched.h state, task_struct slot,
 # SCHED_DATA slot and the sched_init() call), which is what makes the probe
 # below fire and the empty diff base get written.  Splitting the two was
@@ -194,7 +194,7 @@ abk_stable_backport_overlay_of_address() {
 # a separate concern from installing it.
 #
 # That "already exists with different content" test is why the marker matters:
-# since Batch 57 the perf child edits kernel/sched/ext.c right after this overlay
+# since Batch 79 the perf child edits kernel/sched/ext.c right after this overlay
 # creates it (sched_ext_payload_adapt, the 5.15 adaptation the compiler needs),
 # so on every later run the file legitimately differs from the archived bytes.
 # A target carrying the group's marker is therefore treated as installed, and
@@ -226,7 +226,7 @@ abk_stable_backport_overlay_sched_ext() {
          grep -q 'sailboat_sched_ext_active_class' "$target"; }; then
       # Already installed.  The archived bytes verbatim, or any of the three
       # markers a registry group that adapts a payload file writes --
-      # sched_ext_payload_adapt (batch57_perf_sched_ext_adapt) and
+      # sched_ext_payload_adapt (batch79_perf_sched_ext_adapt) and
       # sched_ext_payload_task_guard (batch58) into kernel/sched/ext.c,
       # sched_ext_active_class (batch59) into kernel/sched/ext.h.  A new group
       # that adapts a payload file must add its marker here, or the second

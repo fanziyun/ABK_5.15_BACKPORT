@@ -54,7 +54,7 @@ SMOKE_FILES=(
   include/linux/memcontrol.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
-  # Batch 58 (sched_ext S2b-2b): the fork-hook prototypes.
+  # Batch 80 (sched_ext S2b-2b): the fork-hook prototypes.
   include/linux/sched/task.h
   include/linux/psi_types.h
   include/linux/psi.h
@@ -122,7 +122,7 @@ SMOKE_FILES=(
   include/linux/tick.h
   kernel/time/tick-sched.c
   kernel/sched/idle.c
-  # Batch 60 (sched_ext S2b-2b): the reachability batch writes the struct_ops
+  # Batch 82 (sched_ext S2b-2b): the reachability batch writes the struct_ops
   # type registry and the sched debugfs file.
   kernel/bpf/bpf_struct_ops_types.h
   kernel/sched/debug.c
@@ -157,7 +157,7 @@ SMOKE_FILES=(
   # rollback against.  Without it the group degrades to blocked_by_shape in
   # smoke only (the reference trees carry it).
   mm/page_io.c
-  # Batch 50 (Tier A1): sched_sis_util adds sched_domain_shared::nr_idle_scan,
+  # Batch 72 (Tier A1): sched_sis_util adds sched_domain_shared::nr_idle_scan,
   # so smoke needs this header too -- without it the group cannot read its
   # anchor and degrades to blocked_by_shape in smoke only.
   include/linux/sched/topology.h
@@ -171,14 +171,14 @@ SMOKE_FILES=(
   arch/arm64/net/bpf_jit.h
   arch/arm64/net/bpf_jit_comp.c
   # sched_ext S1b: the kfunc allow-list API.  These four are *written* by the
-  # Batch 53 groups (btf_ids.h gains the BTF_SET8/BTF_ID_FLAGS macros, btf.c the
+  # Batch 75 groups (btf_ids.h gains the BTF_SET8/BTF_ID_FLAGS macros, btf.c the
   # set registry, verifier.c the permission gate), so smoke needs them for the
   # same reason as the arm64 four above.
   include/linux/btf_ids.h
   include/linux/btf.h
   kernel/bpf/btf.c
   kernel/bpf/verifier.c
-  # sched_ext S2b-1 (Batch 55): the four files the build-wiring groups write.
+  # sched_ext S2b-1 (Batch 77): the four files the build-wiring groups write.
   # Kconfig.preempt (CONFIG_SCHED_CLASS_EXT), uapi/linux/sched.h (SCHED_EXT),
   # the sched Makefile (the glue object rule) and vmlinux.lds.h (the SCHED_DATA
   # slot) are all new to this module's fixture.  kernel/sched/sched.h,
@@ -839,8 +839,8 @@ else
   fi
 fi
 
-# Batch 54 (sched_ext S2a) created the payload; Batch 55 (S2b-1) wired it into
-# the build and Batch 57 (S2b-2a) adapts kernel/sched/ext.c on the way in.  Both
+# Batch 76 (sched_ext S2a) created the payload; Batch 77 (S2b-1) wired it into
+# the build and Batch 79 (S2b-2a) adapts kernel/sched/ext.c on the way in.  Both
 # halves of the created-file snapshot convention are asserted end to end, and a
 # rollback that restored the empty .abk-orig over the target instead of deleting
 # it would leave zero-byte files that build as if the payload had never been
@@ -861,7 +861,7 @@ SX_PAYLOAD=(
 for rel in "${SX_PAYLOAD[@]}"; do
   case "$rel" in
   kernel/sched/ext.c)
-    # The payload the registry adapts first (Batch 57).  The archived bytes are
+    # The payload the registry adapts first (Batch 79).  The archived bytes are
     # still the source of truth, but the tree's copy carries the marked 5.15
     # adaptation: assert both halves, because either one alone is wrong -- an
     # un-adapted file does not compile, and a marker without the 6.6 shape gone
@@ -875,7 +875,7 @@ for rel in "${SX_PAYLOAD[@]}"; do
       && fail "sched_ext payload $rel still uses the 6.2 SCHED_CHANGE_BLOCK"
     ;;
   kernel/sched/ext.h)
-    # Batch 59 adapts the active-class walk in place (the 6.12 layout re-expressed
+    # Batch 81 adapts the active-class walk in place (the 6.12 layout re-expressed
     # on 5.15's SCHED_DATA array).  Same two-sided assertion: the marker alone
     # would pass a file whose walk still counts upwards, and a rewritten walk
     # without the marker would mean files/ had drifted.
@@ -904,7 +904,7 @@ done
 grep -q 'CONFIG_SCHED_CLASS_EXT' "$KERNEL_ROOT/common/kernel/sched/Makefile" \
   || fail "sched_ext build wiring did not land in kernel/sched/Makefile"
 
-# Batch 58 (sched_ext S2b-2b) lands the task-lifecycle hooks and the payload
+# Batch 80 (sched_ext S2b-2b) lands the task-lifecycle hooks and the payload
 # guard the hooks make reachable.  Both halves are asserted: the hooks are what
 # let a task enter or leave the BPF class, and without the guard the archived
 # payload's lazy allocation is dereferenced by the first task whose fork fails.
@@ -925,7 +925,7 @@ grep -q 'sailboat_sched_ext_payload_task_guard' "$KERNEL_ROOT/common/kernel/sche
   || fail "the payload's per-task guard did not land"
 grep -q 'kfree(p->scx);' "$KERNEL_ROOT/common/kernel/sched/ext.c" \
   || fail "the payload's per-task state is still leaked"
-# Batch 60 (sched_ext S2b-2b, second half, part 2) is the reachability batch:
+# Batch 82 (sched_ext S2b-2b, second half, part 2) is the reachability batch:
 # the policy gate, the priority-range syscalls, the struct_ops value type and
 # the engine's debugfs file.  Four assertions, one per gate -- each of them is a
 # place where the class was registered but unusable.
@@ -946,7 +946,7 @@ grep -q 'debugfs_create_file("ext", 0444, debugfs_sched, NULL, &sched_ext_fops);
      "$KERNEL_ROOT/common/kernel/sched/debug.c" \
   || fail "the engine's debugfs dump is not registered"
 
-# Batch 59 (sched_ext S2b-2b, second half, part 1) lands the scheduling-core
+# Batch 81 (sched_ext S2b-2b, second half, part 1) lands the scheduling-core
 # hooks: the payload's active-class walk, __pick_next_task()/balance, the tick
 # watchdog and the idle transition.  They are inert while no BPF scheduler is
 # loaded (scx_enabled() is a static key and the walk skips ext), but each one is
@@ -1085,9 +1085,9 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
   echo "rollback verified byte-identical for fs/proc/task_mmu.c"
 fi
 
-# Batch 53 (sched_ext S1b) is the module's first write to kernel/bpf/btf.c and
+# Batch 75 (sched_ext S1b) is the module's first write to kernel/bpf/btf.c and
 # kernel/bpf/verifier.c, its first to include/linux/btf_ids.h at all, and the
-# fourth to arch/arm64/net/bpf_jit_comp.c (Batch 51/52 landed the poking side and
+# fourth to arch/arm64/net/bpf_jit_comp.c (Batch 73/74 landed the poking side and
 # the trampoline there without adding this check).  Rollback has to restore every
 # one of them: btf.c and verifier.c are the only files this module writes under
 # kernel/bpf/, and a rollback that left either patched would leave a kfunc
@@ -1105,7 +1105,7 @@ for rel in "${BATCH53_ROLLBACK[@]}"; do
   echo "rollback verified byte-identical for $rel"
 done
 
-# Batch 58 is the module's first write to include/linux/sched/task.h and the
+# Batch 80 is the module's first write to include/linux/sched/task.h and the
 # first to kernel/fork.c.  Both are pure edits, so rollback has to restore them
 # byte for byte; a leftover sched_ext_free() call would dereference state the
 # payload never allocated on an otherwise pristine tree.

@@ -6,7 +6,7 @@
 #
 # <kernel-tree> must be the *grafted* tree: the scheduler is compiled against a
 # vmlinux.h dumped from that tree's own BTF, so it only sees struct
-# sched_ext_ops if Batch 54-60's payload was applied before the kernel was
+# sched_ext_ops if Batch 76-82's payload was applied before the kernel was
 # built.  A vmlinux built before the graft has no sched_ext_ops in its BTF and
 # the BPF compile fails with "unknown type name 'struct sched_ext_ops'" -- that
 # failure is the check, not an accident.

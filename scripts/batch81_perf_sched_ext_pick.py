@@ -1,6 +1,6 @@
-"""Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+"""Batch 81 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
 
-Batch 58 landed the task lifecycle: a task can now be handed to the BPF class and
+Batch 80 landed the task lifecycle: a task can now be handed to the BPF class and
 taken out of it again.  What is still missing is everything that happens once a
 task *is* on the class -- the pick path, the stall watchdog and the idle
 transition -- so an enabled scheduler would enqueue tasks and never see them

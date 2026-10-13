@@ -76,7 +76,7 @@ FETCH_FILES=(
   include/linux/memcontrol.h
   include/linux/randomize_kstack.h
   include/linux/sched.h
-  # Batch 58 (sched_ext S2b-2b): the fork-hook prototypes this module changes
+  # Batch 80 (sched_ext S2b-2b): the fork-hook prototypes this module changes
   # live here, and kernel/fork.c includes it.
   include/linux/sched/task.h
   include/linux/psi_types.h
@@ -180,7 +180,7 @@ FETCH_FILES=(
   # frontswap_store() block the shape probe discriminates sits in the same
   # translation unit as the engine.
   mm/page_io.c
-  # Batch 50 (Tier A1): sched_sis_util -- SIS_UTIL keeps its scan-depth hint in
+  # Batch 72 (Tier A1): sched_sis_util -- SIS_UTIL keeps its scan-depth hint in
   # struct sched_domain_shared (nr_idle_scan), so this header carries an anchor
   # for the first time.  kernel/sched/sched.h (cfs_rq::idle_nr_running) and
   # kernel/sched/features.h (SCHED_FEAT(SIS_UTIL)) are already in the tree.
@@ -204,13 +204,13 @@ FETCH_FILES=(
   include/linux/bpf.h
   kernel/bpf/trampoline.c
   include/linux/btf.h
-  # Batch 53 (S1b): the kfunc allow-list API.  include/linux/btf_ids.h is where
+  # Batch 75 (S1b): the kfunc allow-list API.  include/linux/btf_ids.h is where
   # the BTF_SET8_START/END + BTF_ID_FLAGS macros kernel/sched/ext.c (S2) spells
   # have to live; btf.c holds the set registry and verifier.c consults it.
   include/linux/btf_ids.h
   kernel/bpf/btf.c
   kernel/bpf/verifier.c
-  # Batch 55 (sched_ext S2b-1): the build wiring that turns the Batch-54 payload
+  # Batch 77 (sched_ext S2b-1): the build wiring that turns the Batch-54 payload
   # from inert text into a compiled kernel subsystem.  Kconfig.preempt carries
   # the new CONFIG_SCHED_CLASS_EXT symbol, include/uapi/linux/sched.h the
   # SCHED_EXT policy id the engine compares p->policy against, the sched
@@ -221,7 +221,7 @@ FETCH_FILES=(
   include/uapi/linux/sched.h
   kernel/sched/Makefile
   include/asm-generic/vmlinux.lds.h
-  # Batch 60 (sched_ext S2b-2b, second half, part 2): the reachability batch.
+  # Batch 82 (sched_ext S2b-2b, second half, part 2): the reachability batch.
   # kernel/bpf/bpf_struct_ops_types.h is 5.15's registry of struct_ops map
   # types -- BPF_STRUCT_OPS_TYPE(sched_ext_ops) has to go into it, or the BPF
   # syscall has no sched_ext_ops value type for a scheduler to bind to.

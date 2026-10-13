@@ -568,11 +568,11 @@ gates against, and it is withheld while the payload is inert so the audit does
 not report gates for code the build never compiles.  `write_text()` therefore
 does not snapshot a target that carries the creation marker: the base must stay
 empty, or the audit would attribute only the registry's edits to the created file
-and stop auditing the whole-file gates inside it (Batch 57, whose
+and stop auditing the whole-file gates inside it (Batch 79, whose
 `sched_ext_payload_adapt` is the first group to write a file the overlay
 created).
 
-The sched_ext overlay rides the perf child, and since Batch 57 it runs **before**
+The sched_ext overlay rides the perf child, and since Batch 79 it runs **before**
 that child (the child edits the overlaid `kernel/sched/ext.c` and, since Batch
 59, `kernel/sched/ext.h`) and once more after it -- the second call is what
 writes the empty base, because the Makefile entry only exists once the child's

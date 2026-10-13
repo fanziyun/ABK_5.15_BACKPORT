@@ -1,4 +1,4 @@
-"""Batch 53 (sched_ext S1b): the kfunc allow-list API and the arm64 override.
+"""Batch 75 (sched_ext S1b): the kfunc allow-list API and the arm64 override.
 
 Three groups, all measured on the android13-5.15-lts reference tree:
 

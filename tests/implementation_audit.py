@@ -1137,7 +1137,7 @@ REQUIRED_CONTENT = {
          "if (lru_gen_in_fault())\n"
          "\t\t\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
     ],
-    # sched_ext S1a (Batch 51).  Two claims worth pinning mechanically: the
+    # sched_ext S1a (Batch 73).  Two claims worth pinning mechanically: the
     # instruction generator must be built on the matcher pair this tree already
     # has (v6.1 added a second, byte-identical pair beside it), and the prologue
     # constant must be the 5.15 recomputation -- v6.1's
@@ -1169,7 +1169,7 @@ REQUIRED_CONTENT = {
         "emit(A64_MOV(1, A64_R(9), A64_LR), ctx);",
         "\tbuild_plt(&ctx);",
     ],
-    # sched_ext S1c (Batch 52).  The trampoline is the group that makes
+    # sched_ext S1c (Batch 74).  The trampoline is the group that makes
     # struct_ops -- and therefore SCX -- attachable on arm64, and its
     # "re-authored, not copied" signature is positive content, not just
     # absence: 5.15's interface is a struct bpf_tramp_progs carrying struct
@@ -2625,7 +2625,7 @@ REQUIRED_CONTENT_IF_PRESENT = {
 
 
 # ---------------------------------------------------------------------------
-# Batch 53 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
+# Batch 75 (sched_ext S1b): the kfunc allow-list API, the verifier gate that
 # consults it, and the arm64 JIT override.
 #
 # These rows are deliberately about *shape*, because the point of the batch is
@@ -2727,7 +2727,7 @@ REQUIRED_PAIRING.update({
 
 
 # ---------------------------------------------------------------------------
-# Batch 55 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
+# Batch 77 (sched_ext S2b-1): the build wiring that makes the Batch-54 payload
 # a compiled subsystem.  These rows pin the *shape* the wiring has to have on
 # this tree, not merely that some text landed:
 #
@@ -2805,7 +2805,7 @@ REQUIRED_ABSENT.update({
 })
 
 # ---------------------------------------------------------------------------
-# Batch 57 (sched_ext S2b-2a): the 5.15 adaptation layer.  These rows pin the
+# Batch 79 (sched_ext S2b-2a): the 5.15 adaptation layer.  These rows pin the
 # shape the adaptation has to have, not merely that something landed:
 #
 # * the two core.c helpers are the *only* implementations and are now global --
@@ -2883,7 +2883,7 @@ REQUIRED_ABSENT.update({
 
 
 
-# Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  These rows
+# Batch 80 (sched_ext S2b-2b, first half): the task-lifecycle hooks.  These rows
 # pin what a later batch could silently undo:
 #
 # * the fork hooks sit at 5.15's own bodies and keep their unwind -- a tree that
@@ -2962,7 +2962,7 @@ REQUIRED_IN_FUNCTION.update({
 })
 
 # ---------------------------------------------------------------------------
-# Batch 59 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
+# Batch 81 (sched_ext S2b-2b, second half, part 1): the scheduling-core hooks.
 # These rows pin the three things that make an *enabled* scheduler actually
 # schedule, and the payload edit that lets them compile:
 #
@@ -3032,7 +3032,7 @@ REQUIRED_IN_FUNCTION.update({
 
 
 # ---------------------------------------------------------------------------
-# Batch 60 (sched_ext S2b-2b, second half, part 2): reachability.  These rows
+# Batch 82 (sched_ext S2b-2b, second half, part 2): reachability.  These rows
 # pin the four gates the earlier batches sat behind, so a later batch cannot
 # quietly re-close one:
 #
@@ -3102,7 +3102,7 @@ REQUIRED_IN_FUNCTION.update({
          []),
         ("kernel/sched/core.c", "sched_setscheduler",
          # The syscall stays a thin wrapper: the SCX guard goes in
-         # __sched_setscheduler, which Batch 58 pins by name below.  This row
+         # __sched_setscheduler, which Batch 80 pins by name below.  This row
          # stays as the "nothing was added to the wrapper" half of that claim.
          [],
          ["scx_check_setscheduler"]),

@@ -11,7 +11,7 @@
 #
 # This script writes nothing.  It reads:
 #
-#   /sys/kernel/debug/sched/ext     the engine dump (Batch 60 debugfs file); its
+#   /sys/kernel/debug/sched/ext     the engine dump (Batch 82 debugfs file); its
 #                                   "enabled" line is the attach verdict
 #   /proc/config.gz                 whether the class is compiled in, for the
 #                                   case where debugfs is not mounted

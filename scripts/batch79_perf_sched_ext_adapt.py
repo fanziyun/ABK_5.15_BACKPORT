@@ -1,6 +1,6 @@
-"""Batch 57 (sched_ext S2b-2, first half): the 5.15 adaptation layer.
+"""Batch 79 (sched_ext S2b-2, first half): the 5.15 adaptation layer.
 
-Batch 56 ran the first real compiler over the Batch-54 payload and measured what
+Batch 78 ran the first real compiler over the Batch-54 payload and measured what
 "the payload participates in the build" actually means: the SCX translation unit
 fails with 12 classes of 5.15/6.6 interface drift, and three of them are
 function-pointer signatures no preprocessor shim can bridge.  The file therefore
@@ -143,7 +143,7 @@ _KSCHED_PROTO_NEW = _KSCHED_PROTO_OLD + (
     " * sailboat_sched_ext_core_visibility: the class-change pair lives in\n"
     " * kernel/sched/core.c and is no longer translation-unit local, so that\n"
     " * kernel/sched/ext.c can re-run the class selection on the SCX enable and\n"
-    " * disable paths (batch57_perf_sched_ext_adapt; docs/survey_sched_ext_gap.md\n"
+    " * disable paths (batch79_perf_sched_ext_adapt; docs/survey_sched_ext_gap.md\n"
     " * section 2c, classes 5-6).  Without these two declarations the de-static'ed\n"
     " * definitions trip -Wmissing-prototypes under W=1.\n"
     " */\n"
@@ -154,11 +154,11 @@ _KSCHED_PROTO_NEW = _KSCHED_PROTO_OLD + (
 )
 
 
-# Batch 58 (sched_ext_setscheduler_hooks) inserts the task_on_scx() branch into
+# Batch 80 (sched_ext_setscheduler_hooks) inserts the task_on_scx() branch into
 # the __setscheduler_prio() body this group generates, so a second pass would
 # otherwise find neither the pristine old block nor this group's own new block
 # and report blocked_by_missing_anchor.  The probe is on this group's own marker
-# text (group_recipe trap 5; the Batch 49/50 remedy).
+# text (group_recipe trap 5; the Batch 49/72 remedy).
 _SCHED_EXT_CORE_VISIBILITY_PROBE = "sailboat_sched_ext_core_visibility:"
 
 

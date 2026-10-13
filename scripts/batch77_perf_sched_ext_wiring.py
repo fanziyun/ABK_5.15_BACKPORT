@@ -1,4 +1,4 @@
-"""Batch 55 (sched_ext S2b-1): the build wiring for the Batch-54 SCX payload.
+"""Batch 77 (sched_ext S2b-1): the build wiring for the Batch-54 SCX payload.
 
 Seven groups that turn the payload from inert text into a compiled part of the
 kernel.  Nothing here is a policy decision about scheduling: the groups add the
@@ -12,7 +12,7 @@ Measured against the android13-5.15-lts reference tree (5.15.220):
 
 * sched_ext_kconfig -- config SCHED_CLASS_EXT on kernel/Kconfig.preempt with the
   6.6 dependency "depends on BPF_SYSCALL && BPF_JIT" (the trampoline and the
-  kfunc allow-list are Batch 51/52/53's, and a struct_ops program needs both).
+  kfunc allow-list are Batch 73/74/75's, and a struct_ops program needs both).
   The symbol is what decides whether the 143 KB engine is in the build.
 * sched_ext_uapi -- #define SCHED_EXT 7 in include/uapi/linux/sched.h, the value
   the engine compares p->policy against.
@@ -24,7 +24,7 @@ Measured against the android13-5.15-lts reference tree (5.15.220):
   module's (the Batch 16 kstack_offset), so this group anchors on the
   post-randomize_kstack_pertask run and is registered after it; the earlier
   group's own kstack_offset); shape probe keeps the pair idempotent
-  (group_recipe trap 5 -- Batch 55 also repaired that probe, which spelled the
+  (group_recipe trap 5 -- Batch 77 also repaired that probe, which spelled the
   member without its closing parenthesis and so never fired).
 * sched_ext_rq_state -- struct scx_rq (plus enum scx_rq_flags) and the struct rq
   pointer to it, sched_class_above() (5.15 walks the class array with class--
@@ -92,7 +92,7 @@ _KCONFIG_NEW = _KCONFIG_OLD + (
     "# this symbol is what decides whether the 143 KB engine is in the build at\n"
     "# all.  The dependency is the 6.6 tree's: a SCX scheduler is a BPF struct_ops\n"
     "# program, which needs the verifier (BPF_SYSCALL) and the arm64 JIT's kfunc\n"
-    "# and trampoline support (BPF_JIT) landed by Batch 51/52/53.\n"
+    "# and trampoline support (BPF_JIT) landed by Batch 73/74/75.\n"
     "config SCHED_CLASS_EXT\n"
     "\tbool \"Extensible Scheduling Class\"\n"
     "\tdepends on BPF_SYSCALL && BPF_JIT\n"

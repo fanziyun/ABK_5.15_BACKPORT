@@ -4,7 +4,7 @@ Both audits build their fixture by copying every file a PatchGroup declares out
 of the fetched reference tree.  The sched_ext payload files do not exist in any
 upstream branch -- abk_stable_backport_overlay_sched_ext() materialises them from
 files/ during a real graft -- so a group that targets one of them
-(batch57_perf_sched_ext_adapt edits kernel/sched/ext.c) would otherwise fail the
+(batch79_perf_sched_ext_adapt edits kernel/sched/ext.c) would otherwise fail the
 audit with "source tree is missing <rel>", which reads like a broken reference
 tree instead of the legitimate created-file case it is.
 

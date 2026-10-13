@@ -5,7 +5,7 @@
 # the structure stays balanced, the behaviour-visible symbols survive and the
 # CONFIG gates resolve -- but not one of them runs a compiler.  Every SCX batch
 # therefore shipped with the compile gate unverified, and the first thing a real
-# build found was a payload that does not compile on 5.15 at all (Batch 56).
+# build found was a payload that does not compile on 5.15 at all (Batch 78).
 #
 # This is the missing gate.  It compiles the translation unit the payload is
 # built through, plus every object this module rewrites for SCX, in a

@@ -55,7 +55,7 @@
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 54 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**130 graft groups** in total (the perf child counts 54, including Batch 57's three sched_ext payload-adaptation groups, Batch 58's five task-lifecycle hook groups, Batch 59's four scheduling-core hook groups and Batch 60's four reachability groups); one injection string covers `android13-5.15-lts`.
+**130 graft groups** in total (the perf child counts 54, including Batch 79's three sched_ext payload-adaptation groups, Batch 80's five task-lifecycle hook groups, Batch 81's four scheduling-core hook groups and Batch 82's four reachability groups); one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
 keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44

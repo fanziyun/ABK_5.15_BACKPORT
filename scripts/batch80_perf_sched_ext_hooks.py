@@ -1,6 +1,6 @@
-"""Batch 58 (sched_ext S2b-2b, first half): the task-lifecycle hooks.
+"""Batch 80 (sched_ext S2b-2b, first half): the task-lifecycle hooks.
 
-Batch 57 made the 143 KB engine compile.  Compiling is not scheduling: on this
+Batch 79 made the 143 KB engine compile.  Compiling is not scheduling: on this
 baseline `valid_policy()` still rejects `SCHED_EXT` and not one of the calls
 that moves a task in or out of the BPF class exists, so the class sits in
 `SCHED_DATA` and is never selected.  This batch lands the half of those calls
@@ -337,7 +337,7 @@ def _sched_ext_task_teardown_apply(ctx):
 # ---------------------------------------------------------------------------
 # kernel/sched/core.c: the two class-selection sites.
 #
-# sched_ext_core_visibility (batch57_perf_sched_ext_adapt) generates the
+# sched_ext_core_visibility (batch79_perf_sched_ext_adapt) generates the
 # __setscheduler_prio() body this group edits, so that group now probes for its
 # own marker before running its steps: a second pass would otherwise find
 # neither its pristine old block nor its own new block (group_recipe trap 5).

@@ -753,7 +753,7 @@ def _avg_idle_apply(ctx):
         sched_h_text = ctx.read(SCHED_H)
     except FileNotFoundError as exc:
         return "blocked_by_shape", f"{exc}: file absent"
-    # The module's own SIS_UTIL group (sched_sis_util, Batch 50) inserts its
+    # The module's own SIS_UTIL group (sched_sis_util, Batch 72) inserts its
     # block into this same function, which breaks this group's verbatim
     # head/tail payload on a second pass.  The payload is still ours, so report
     # it present rather than misreading the tree as a foreign SIS_UTIL shape.

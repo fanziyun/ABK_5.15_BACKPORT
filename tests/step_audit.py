@@ -93,10 +93,10 @@ AUDIT_FILES = [
     "include/linux/memcontrol.h",
     "include/linux/randomize_kstack.h",
     "include/linux/sched.h",
-    # Batch 58 (sched_ext S2b-2b): the sched_cgroup_fork()/sched_cancel_fork()
+    # Batch 80 (sched_ext S2b-2b): the sched_cgroup_fork()/sched_cancel_fork()
     # prototypes the fork-hook groups change.
     "include/linux/sched/task.h",
-    # Batch 50 (Tier A1): sched_sis_util adds sched_domain_shared::nr_idle_scan.
+    # Batch 72 (Tier A1): sched_sis_util adds sched_domain_shared::nr_idle_scan.
     "include/linux/sched/topology.h",
     # sched_ext (S1/S1b): the arm64 BPF trampoline + bpf_arch_text_poke() and the
     # btf_kfunc_id_set allow-list API.
@@ -110,23 +110,23 @@ AUDIT_FILES = [
     "include/linux/btf_ids.h",
     "kernel/bpf/btf.c",
     "kernel/bpf/verifier.c",
-    # Batch 55 (sched_ext S2b-1): the build wiring.  Kconfig.preempt carries
+    # Batch 77 (sched_ext S2b-1): the build wiring.  Kconfig.preempt carries
     # CONFIG_SCHED_CLASS_EXT, include/uapi/linux/sched.h SCHED_EXT, the sched
     # Makefile the glue object rule, and vmlinux.lds.h the SCHED_DATA slot.
     "kernel/Kconfig.preempt",
     "include/uapi/linux/sched.h",
     "kernel/sched/Makefile",
     "include/asm-generic/vmlinux.lds.h",
-    # Batch 60 (sched_ext S2b-2b): the reachability batch.  bpf_struct_ops_types.h
+    # Batch 82 (sched_ext S2b-2b): the reachability batch.  bpf_struct_ops_types.h
     # is 5.15's struct_ops type registry (the sched_ext_ops value type), and
     # debug.c registers the engine's debugfs dump.
     "kernel/bpf/bpf_struct_ops_types.h",
     "kernel/sched/debug.c",
-    # Batch 57 (sched_ext S2b-2): sched_ext_payload_adapt edits the payload the
+    # Batch 79 (sched_ext S2b-2): sched_ext_payload_adapt edits the payload the
     # overlay creates, so this path has no source in the fetched tree --
     # tests/audit_fixture.py supplies it from files/.
     "kernel/sched/ext.c",
-    # Batch 59 (sched_ext S2b-2b): sched_ext_active_class rewrites the
+    # Batch 81 (sched_ext S2b-2b): sched_ext_active_class rewrites the
     # active-class walk in the same overlaid payload.
     "kernel/sched/ext.h",
     "include/linux/psi_types.h",

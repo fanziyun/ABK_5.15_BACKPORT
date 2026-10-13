@@ -15,11 +15,11 @@ bounded group.  Measured closure (§2, §2a, §2b): two real gaps on 5.15 — th
 registration API (S1b, additive, measured against v5.18) and arm64 BPF
 trampolines (S1, carrying a measured interface re-author, not a verbatim copy) —
 plus the SCX payload itself, the sched-core wiring, one KABI pointer slot and a
-userspace loader.  **S1 is done**: its three groups landed as Batch 51
-(`arm64_insn_load_literal`, `arm64_bpf_text_poke`) and Batch 52
+userspace loader.  **S1 is done**: its three groups landed as Batch 73
+(`arm64_insn_load_literal`, `arm64_bpf_text_poke`) and Batch 74
 (`arm64_bpf_trampoline`), so arm64 `struct_ops` is reachable from this tree.
-S1b is done too (Batch 53), and S2 is half done: the payload landed as
-Batch 54 / v0.57.0 and its build wiring (S2b-1) as Batch 55 / v0.58.0, so the
+S1b is done too (Batch 75), and S2 is half done: the payload landed as
+Batch 76 / v0.79.0 and its build wiring (S2b-1) as Batch 77 / v0.80.0, so the
 class is compiled and registered but unreachable; S2b-2 (the functional hooks)
 and S3 (the loader) remain.  Payload choice
 is OPPO's 6.6 variant (§3), the smallest one known to build on a GKI+vendor-module
@@ -147,8 +147,8 @@ one unit, because `A64_LS_IMM` expands to `aarch64_insn_gen_load_store_imm()`),
 `arm64_bpf_trampoline` (the two large hunks re-authored).  The seven upstream
 commits are one series and are carried as one batch; the prior "at most one
 `PatchGroup`" gate is withdrawn as measured-false.  All three have landed —
-`arm64_insn_load_literal` and `arm64_bpf_text_poke` as Batch 51, the trampoline
-itself as Batch 52 — and the trampoline is registered last because it is the
+`arm64_insn_load_literal` and `arm64_bpf_text_poke` as Batch 73, the trampoline
+itself as Batch 74 — and the trampoline is registered last because it is the
 only consumer of the other two.  S1 is complete; what it unblocks is arm64
 `struct_ops` (which takes the `bpf_arch_text_poke()` path), not fentry on an
 ftrace-managed target.
@@ -196,10 +196,10 @@ copy would have needed, so they are recorded rather than assumed):
   `.config` has the symbol off; the symbol `default y`s in arm64 Kconfig when
   BTI is available, and every added mention is correct-by-construction when it is
   off (no landing pad is needed, `BTI_INSNS` is 0).  `config_gate_audit` could
-  not be run locally (no build `.config`), so this is the one gate Batch 51
+  not be run locally (no build `.config`), so this is the one gate Batch 73
   leaves to the CI build; if it fires, the fix is a `DARK_GATES` entry stating
   that, not a code change.
-- the trampoline hunks themselves (Batch 52) needed three more measured adjustments, all of which would have been compile errors or silent runtime misbehaviour if the v6.1 text had been copied:
+- the trampoline hunks themselves (Batch 74) needed three more measured adjustments, all of which would have been compile errors or silent runtime misbehaviour if the v6.1 text had been copied:
   1. 5.15's `kernel/bpf/trampoline.c` hands the arch builder a `struct bpf_tramp_progs` (`progs[]` + `nr_progs`), not `struct bpf_tramp_links` (`links[]` of `struct bpf_tramp_link *`), and its `__bpf_prog_enter` / `__bpf_prog_exit` take `(prog)` / `(prog, start)` with no `bpf_tramp_run_ctx`; the port drops the run-ctx frame and the cookie slot entirely.
   2. `aada47665546` (the `__le32` + `cpu_to_le32()` fix) is not a separate concern here: 5.15's `struct jit_ctx::image` is already `__le32 *` and `emit()` already does `cpu_to_le32()`, so the commit's "before" form is a hard sparse/compile error and the fix is folded into the port.
   3. v6.1 stores the start time returned by `__bpf_prog_enter()` into x20 *after* the branch placeholder, so the `skip_exec_of_prog` path reaches the exit call with x20 holding whatever the caller left there.  This tree's `update_prog_stats()` accepts any `start > NO_START_TIME` (=1), so with bpf stats on it would book that value as the program's runtime.  The 5.15 x86 trampoline — written against this same interface — saves first; the port follows x86 and stores x20 before the branch.
@@ -249,7 +249,7 @@ delicate part is classification: the id-set path must also yield the
 `KF_ACQUIRE` / `KF_RELEASE` / `KF_RET_NULL` information that 5.15's
 bool-returning callback conflates, because `check_kfunc_call()` branches on it.
 
-**Batch 53 实测修正（落地时按 6.6 版 `ext.c` 逐行对照后重测；上面「只有注册 API 一个缺口」的估计偏小）**：
+**Batch 75 实测修正（落地时按 6.6 版 `ext.c` 逐行对照后重测；上面「只有注册 API 一个缺口」的估计偏小）**：
 闭合是三块，缺一块就编不过。① `ext.c` 用的是 `BTF_SET8_START` / `BTF_SET8_END` /
 `BTF_ID_FLAGS` 这套拼写，由 `ab21d6063c01`（bpf: Introduce 8-byte BTF set）在 **v5.19** 引入，
 5.15 的 `btf_ids.h` 只有 `BTF_SET_START/END`；② `struct btf_kfunc_id_set` 要 **v5.19**
@@ -264,7 +264,7 @@ v5.18 `dee872e124e8` 的四指针形态套不上 `ext.c` 的 `.set = &scx_kfunc_
 `ref_obj_id` 记账；而 flags 与 id 同行要求 `struct btf_id_set8`，其 `.BTF_ids` 段布局由
 `resolve_btfids` 宿主工具从裸段解析（`tools/bpf/resolve_btfids/main.c` 只认 `btf_id_set` 形状，
 格式处理全部就是 main.c:637 那一次 `qsort`），换布局必须同时改该工具，而本机没有编译门可以证明。
-所以 Batch 53 把 `BTF_SET8_*` 折到既有 `BTF_SET_*`（发出的段逐字节不变）、`BTF_ID_FLAGS`
+所以 Batch 75 把 `BTF_SET8_*` 折到既有 `BTF_SET_*`（发出的段逐字节不变）、`BTF_ID_FLAGS`
 丢弃 flag 实参：**id 注册，flag 不注册**。代价是成对释放不再被 verifier 诊断、
 `KF_TRUSTED_ARGS` 不再检查 —— 已用 `REQUIRED_ABSENT` 钉住 `btf_id_set8` /
 `enum btf_kfunc_type` / `acquire_set` / `btf_get_module_btf` / `kfunc_set_tab` 不得出现，
@@ -273,10 +273,10 @@ v5.18 `dee872e124e8` 的四指针形态套不上 `ext.c` 的 `.set = &scx_kfunc_
 
 ## 2c. 编译实测：vendored 引擎在 5.15 上编不过（2026-10-06）
 
-Batch 55 声称「载荷参与编译」，但当时没有任何一道门跑编译器——七门全是文本门。Batch 56 补上了这道门：
+Batch 77 声称「载荷参与编译」，但当时没有任何一道门跑编译器——七门全是文本门。Batch 78 补上了这道门：
 在一棵 `CONFIG_SCHED_CLASS_EXT=y` 的 `android13-5.15-lts`（5.15.220）树上用 clang 编 `kernel/sched/
 sched_ext_glue.o`，**结论是 vendored 字节直接编不过**。与此同时同一棵树上 `kernel/sched/core.o`、
-`fair.o`、`idle.o`、`debug.o`、`kernel/fork.o` 五个对象**全部编过**，所以问题不在 Batch 55 的接线，
+`fair.o`、`idle.o`、`debug.o`、`kernel/fork.o` 五个对象**全部编过**，所以问题不在 Batch 77 的接线，
 而在 `ext.c` 自身：它是对着 6.6 的 sched core 与 BPF verifier 接口写的，而本分支的 BPF 核心反而比 6.6
 更新（`btf_struct_access` / `check_member` 已是新形态）。
 
@@ -308,7 +308,7 @@ PROBE_OBJS=kernel/sched/sched_ext_glue.o sh tools/compile_probe.sh <tree>   # �
 第 1、2、8、11、12 类是纯接口垫片，可以全部放进模块自写的 glue TU（它本来就是「载荷缺的那层」）；
 第 5、6 类是接线（把 5.15 已有的两个 helper 变成可见），属于 registry 组；第 3、4 类要决定策略；
 **第 7、9、10 类是函数指针/签名不匹配，C 预处理器无法桥接，必须编辑 `ext.c`。**
-（以上「归口」是 Batch 56 的初判；Batch 57 落地后的实测落点见 §2d —— 第 1 类最终也是
+（以上「归口」是 Batch 78 的初判；Batch 79 落地后的实测落点见 §2d —— 第 1 类最终也是
 载荷编辑而不是宏垫片：函数**定义**的参数表预处理器改不了，只能改载荷或改指针类型，
 而本树 sched_class 的字段类型由 5.15 定死；第 4 类的 guard 因 gnu89 与 core.c 的两个
 static inline 依赖，落 core.c 而非 glue。）
@@ -318,9 +318,9 @@ static inline 依赖，落 core.c 而非 glue。）
 而是「载荷适配层 + 钩子」。适配层落在哪里（overlay 内的 Python 适配器，还是 registry 组 + 调整 overlay 顺序）
 见 §5 与 `plan.md` 的 S2b-2 分组。
 
-## 2d. 适配层落地：载荷首次编过（2026-10-06，Batch 57）
+## 2d. 适配层落地：载荷首次编过（2026-10-06，Batch 79）
 
-Batch 56 量出 12 类接口漂移后，Batch 57 把适配层落完，并在**同一棵已配置的
+Batch 78 量出 12 类接口漂移后，Batch 79 把适配层落完，并在**同一棵已配置的
 5.15.220 树**上用同一道编译门复测：`tools/compile_probe.sh` 在整模块已 graft 的
 树上编 6 个对象（`sched_ext_glue.o` + `core.o`/`fair.o`/`idle.o`/`debug.o`/
 `kernel/fork.o`），**6 个全部编过**（`OK (6 object(s) built)`）。至此「这份载荷
@@ -371,13 +371,13 @@ step_audit / implementation_audit —— 否则针对载荷的组会在参考树
 约定的原意；`tests/smoke.sh` 的「创建型文件 diff base 必须为空」断言就是抓到它的
 那道门。
 
-## 2e. 功能钩子落地：任务生命周期（2026-10-06，Batch 58）
+## 2e. 功能钩子落地：任务生命周期（2026-10-06，Batch 80）
 
 载荷编过之后，「类可达」还差两件事：把任务放进 class 的**调用点**，以及让
 `SCHED_EXT` 通过策略校验。后者在本树是 `kernel/sched/sched.h` 的
 `valid_policy()`（只接受 idle/fair/rt/dl），属于「可达性批次」；前者按内核路径天然
 分成两半——**任务生命周期**（fork / `sched_setscheduler()` / 销毁）与**调度核心**
-（pick 路径 / tick / idle / debugfs）。Batch 58 落前半。
+（pick 路径 / tick / idle / debugfs）。Batch 80 落前半。
 
 | 5.15 落点 | 原形 | 本批动作 |
 |---|---|---|
@@ -387,7 +387,7 @@ step_audit / implementation_audit —— 否则针对载荷的组会在参考树
 | `sched_cancel_fork()` | **不存在**（6.4 才加） | 新增，调 `scx_cancel_fork()` |
 | `copy_process()` 失败链 | 无 `bad_fork_sched_cancel_fork` 标签 | `perf_event_init_task()` 失败与 `sched_cgroup_fork()` 的拒绝都汇到新标签 |
 | `__put_task_struct()` | 只做 `io_uring_free()` 等 | 前置 `sched_ext_free(tsk)` |
-| `__setscheduler_prio()` | 只判 dl/rt/fair | 加 `task_on_scx()` 分支（该函数是 Batch 57 去静态化的那个，见下） |
+| `__setscheduler_prio()` | 只判 dl/rt/fair | 加 `task_on_scx()` 分支（该函数是 Batch 79 去静态化的那个，见下） |
 | `__sched_setscheduler()` | 只拒 `rq->stop` | 紧随其后调 `scx_check_setscheduler()` |
 
 **三处只有内核结构能证伪的东西**：
@@ -414,7 +414,7 @@ SCX」补齐四处守卫，并补 `INIT_LIST_HEAD()` 与缺失的 `kfree()`；�
 `kernel/fork.o`），七道文本门全绿。**可达性仍未改变**：`valid_policy()` 与 pick
 路径都是下一批的事，本节表格里没有一处在没有 BPF 调度器时会影响调度行为。
 
-## 2f. 功能钩子落地：调度核心（2026-10-06，Batch 59）
+## 2f. 功能钩子落地：调度核心（2026-10-06，Batch 81）
 
 任务生命周期之后，剩下的是「已经在 class 上的任务怎么被选中」。本批落 pick 路径、tick 看门狗与 idle 过渡，外加一处载荷头文件里必须改的东西 —— class 表遍历方向。
 
@@ -432,9 +432,9 @@ SCX」补齐四处守卫，并补 `INIT_LIST_HEAD()` 与缺失的 `kfree()`；�
 
 **未落地**：`ext` debugfs（`kernel/sched/debug.c` 得先进 `FETCH_FILES`/`AUDIT_FILES` 并重取参考树）、`valid_policy()`/`normal_policy()` 与 defconfig tier。类仍不可达；本批全部钩子在 `scx_enabled()` 为假时与既有行为一致 —— walk 跳过 ext，其余调用各自带 static-key 早退。
 
-## 2g. 可达性落地：策略门 / 优先级区间 / struct_ops 类型 / debugfs（2026-10-06，Batch 60）
+## 2g. 可达性落地：策略门 / 优先级区间 / struct_ops 类型 / debugfs（2026-10-06，Batch 82）
 
-Batch 58/59 把调用点接完，但类仍然**不可达**：syscall 在 `valid_policy()` 就被 `-EINVAL` 挡回，BPF 侧也没有 `sched_ext_ops` 这个 value type 可以绑定。本批把四道门一次关掉。
+Batch 80/81 把调用点接完，但类仍然**不可达**：syscall 在 `valid_policy()` 就被 `-EINVAL` 挡回，BPF 侧也没有 `sched_ext_ops` 这个 value type 可以绑定。本批把四道门一次关掉。
 
 | 5.15 落点 | 原形 | 本批动作 |
 |---|---|---|
@@ -455,13 +455,13 @@ Batch 58/59 把调用点接完，但类仍然**不可达**：syscall 在 `valid_
 
 **未落地**：S3 用户态 loader（Android 无 systemd，随 companion 下发 `service.sh`）与整条链的真机验证。
 
-## 2h. S3 用户态（一）：最小调度器先落地（2026-10-06，Batch 61）
+## 2h. S3 用户态（一）：最小调度器先落地（2026-10-06，Batch 83）
 
 S2 落地后类可达，但没有任何用户态程序能把它打开。S3 因此拆两步：先证明 **BPF 侧**编得过、且只调用本载荷注册过的 kfunc（本批），再落 loader 与随 companion 下发的打包（下一步）。
 
 **本批产物**：`tools/scx/abk_scx_min.bpf.c` + `tools/scx/abk_scx_compat.h` —— 单 DSQ（FIFO、默认 slice、无 vtime、无 per-CPU DSQ）的最小 SCX 调度器，只接 `select_cpu`/`enqueue`/`dispatch`/`init`/`exit` 五个 op，且**从不调用 `scx_bpf_switch_all()`** —— 因此默认只接管显式标为 `SCHED_EXT` 的任务。`tools/build_scx_artifacts.sh`（build-host 助手，不进 `embed.conf`）从**已嫁接**的内核树 dump `vmlinux.h` 并编 `.bpf.o`。
 
-**为什么必须用已嫁接树的 BTF**：`struct sched_ext_ops` 是载荷自带的类型，只有嫁接之后再编的内核才会把它放进 `vmlinux` 的 `.BTF`。实测：树上现存的 `vmlinux`（10-01 编，早于 Batch 54）在 `.BTF` 里 `grep sched_ext_ops` **0 命中**；本批因此重跑了整棵树的 `make ARCH=arm64 LLVM=1 vmlinux`（顺带成为一次全内核编译门，见 §2i）。
+**为什么必须用已嫁接树的 BTF**：`struct sched_ext_ops` 是载荷自带的类型，只有嫁接之后再编的内核才会把它放进 `vmlinux` 的 `.BTF`。实测：树上现存的 `vmlinux`（10-01 编，早于 Batch 76）在 `.BTF` 里 `grep sched_ext_ops` **0 命中**；本批因此重跑了整棵树的 `make ARCH=arm64 LLVM=1 vmlinux`（顺带成为一次全内核编译门，见 §2i）。
 
 **kfunc 面收口**：载荷注册 21 个 `scx_bpf_*`，最小调度器只用其中 4 个（`dispatch`/`create_dsq`/`destroy_dsq`/`consume`）。单测把「compat 头里 extern 的集合」与「载荷 `BTF_ID_FLAGS(func, ...)` 集合」做成子集断言，把 `SCX_SLICE_DFL` 的数值对齐到载荷头文件的定义，并禁止 `scx_bpf_switch_all` —— 于是调度器不可能编在「本内核没有的 kfunc」上，也不会把整机交给 SCX。
 
@@ -476,15 +476,15 @@ S2 落地后类可达，但没有任何用户态程序能把它打开。S3 因�
 
 `tools/build_scx_artifacts.sh` 把 aarch64 这一条打出来就停 —— 不伪造成「已构建」。
 
-## 2i. 整内核编译门与调度器实编（2026-10-06，Batch 61）
+## 2i. 整内核编译门与调度器实编（2026-10-06，Batch 83）
 
-Batch 56 起，编译验证只到 7 个对象（`tools/compile_probe.sh`）。本批在已嫁接的 5.15.220 树上跑完整棵树：
+Batch 78 起，编译验证只到 7 个对象（`tools/compile_probe.sh`）。本批在已嫁接的 5.15.220 树上跑完整棵树：
 
 ```
 make ARCH=arm64 -j8 LLVM=1 vmlinux   ->  rc=0，2667 个 CC，产出 vmlinux 362,184,544 B（含 BTFIDS/SORTTAB/SYSMAP）
 ```
 
-这是 Batch 54–60 的 SCX 嫁接第一次以**整内核规模**编译。三点实测：
+这是 Batch 76–82 的 SCX 嫁接第一次以**整内核规模**编译。三点实测：
 
 - **vmlinux 必须晚于嫁接**：重编前，树上那份 10-01 的 vmlinux 在 `.BTF` 里 `sched_ext_ops` 命中 **0**；重编后 `bpftool btf dump file vmlinux format c` 的输出里 `grep -c '^struct sched_ext_ops {'` = **1**。所以「对着哪一棵树编调度器」不是形式问题。
 - **`.config` 被 syncconfig 重写过**：该树 `.config` 由模块 defconfig lane 生成，首次 `make` 触发 NEW 符号提示（243 行 `Error in reading or end of file.`，即对 NEW 符号取默认 n）。事后核对 `CONFIG_SCHED_CLASS_EXT=y` 与 `CONFIG_DEBUG_INFO_BTF=y` 仍在。
@@ -501,7 +501,7 @@ make ARCH=arm64 -j8 LLVM=1 vmlinux   ->  rc=0，2667 个 CC，产出 vmlinux 362
 
 loader 的 aarch64-android 构建仍停在 §2h 记录的工具链缺口上（NDK 无 libelf）。
 
-## 2j. loader 落地与 host 门（2026-10-06，Batch 62）
+## 2j. loader 落地与 host 门（2026-10-06，Batch 84）
 
 `tools/scx/scx_loader.c`（五个子命令，默认不动作）+ `tools/build_scx_artifacts.sh` 的 `BUILD_HOST_LOADER=1`：编 libbpf → 链 loader（`-Werror`）→ 用 `selftest` 解析 `.bpf.o`。
 
@@ -509,13 +509,13 @@ loader 的 aarch64-android 构建仍停在 §2h 记录的工具链缺口上（ND
 
 - **libbpf**：`make -C <tree>/tools/lib/bpf` 直接编成（系统 libelf/zlib 都在）。
 - **loader**：链接通过。首个编译在 `-Werror` 下报 `SCHED_NORMAL undeclared` —— glibc 只有 `SCHED_OTHER`，内核/bionic 才两个名字都认；loader 因此自带 `#ifndef SCHED_NORMAL / #define SCHED_NORMAL 0`。
-- **`selftest`**：`object: abk_scx_min`；`map: abk_scx_min_ops type=26 key=4 value=336`（type 26 = `BPF_MAP_TYPE_STRUCT_OPS`，value 336 B = 段表里的 `.struct_ops` 0x150）；5 个 program 的 section 与 Batch 61 的段表逐个一致（`struct_ops/…select_cpu|enqueue|dispatch|exit` + `struct_ops.s/…init`）。这就是「这个对象 libbpf 能理解」的可执行证据 —— 没有内核、更没有设备。
+- **`selftest`**：`object: abk_scx_min`；`map: abk_scx_min_ops type=26 key=4 value=336`（type 26 = `BPF_MAP_TYPE_STRUCT_OPS`，value 336 B = 段表里的 `.struct_ops` 0x150）；5 个 program 的 section 与 Batch 83 的段表逐个一致（`struct_ops/…select_cpu|enqueue|dispatch|exit` + `struct_ops.s/…init`）。这就是「这个对象 libbpf 能理解」的可执行证据 —— 没有内核、更没有设备。
 
 设备侧仍缺 libelf（§2h），所以交叉链与 companion 打包是下一步。
 
-## 2k. S3b-2：companion 策略落地，与「二进制从哪来」的结论（2026-10-06，Batch 63）
+## 2k. S3b-2：companion 策略落地，与「二进制从哪来」的结论（2026-10-06，Batch 85）
 
-**策略已落地**（默认关，三道前置条件各自记因）：`ksu/abk_runtime_tunables/scx-policy.sh` + 三个新 tunables 键（`scx.enabled` / `scx.mark_pids` / `scx.reassert_interval_sec`）+ `service.sh`/`action.sh` 接线。细节见 CHANGELOG#batch-63。
+**策略已落地**（默认关，三道前置条件各自记因）：`ksu/abk_runtime_tunables/scx-policy.sh` + 三个新 tunables 键（`scx.enabled` / `scx.mark_pids` / `scx.reassert_interval_sec`）+ `service.sh`/`action.sh` 接线。细节见 CHANGELOG#batch-85。
 
 **一个结构性结论（它决定了二进制怎么来）**：调度器对象必须对着**已嫁接且已重编**的内核编（§2i 实测：嫁接前的 vmlinux BTF 里 `sched_ext_ops` 命中 0），而 ABK 的注入阶段（`after_patch` / `before_build`）都发生在内核构建**之前**。于是：
 
@@ -530,9 +530,9 @@ loader 的 aarch64-android 构建仍停在 §2h 记录的工具链缺口上（ND
 | ② 构建机 / CI 产出二进制 | 在 Linux 主机上编好 arm64 loader 再进 zip | 仍要一条能编 android 目标的链（同样要 libelf），只是把成本挪到 CI |
 | ③ 最小 libelf 垫片 | 只实现 libbpf 用到的那组 `elf_*`/`gelf_*`（约 300–500 行），host 上用 `selftest` 先验证，再交叉编 | 需要精确覆盖 libbpf 的调用面；验证路径清楚（host 跑通即证明垫片可用） |
 
-**共同前提**：`.bpf.o` 本身已经能产出（Batch 61 实测 617,936 B，段表与「恰好 4 个 kfunc 符号」都对），所以卡点只在 loader 的 libelf 这一环。
+**共同前提**：`.bpf.o` 本身已经能产出（Batch 83 实测 617,936 B，段表与「恰好 4 个 kfunc 符号」都对），所以卡点只在 loader 的 libelf 这一环。
 
-## 2l. loader 的 Android 路：只读 libelf 垫片（2026-10-06，Batch 64）
+## 2l. loader 的 Android 路：只读 libelf 垫片（2026-10-06，Batch 86）
 
 libbpf 要 libelf，而 NDK 里没有（§2k 的三条路线）。本批取路线 ③：`tools/scx/libelf-shim/` 实现 **libbpf 实际用到的那 17 个函数**（外加 5 个仅为链接存在的声明/写侧桩），只读、只支持 ELF64 小端、每段单块数据、写侧一律失败。
 
@@ -554,7 +554,7 @@ ops map: abk_scx_min_ops
 
 **未落地**：`aarch64-linux-android` 的交叉编译本身（NDK clang + 这个垫片）、产物随包下发、真机 A/B。
 
-## 2m. Android 交叉编译完成（2026-10-06，Batch 65）
+## 2m. Android 交叉编译完成（2026-10-06，Batch 87）
 
 垫片（§2l）之后，本批把 loader 真的编成 Android 二进制，并把两个产物接进下发链路。
 
@@ -579,7 +579,7 @@ ops map: abk_scx_min_ops
 
 **未落地**：真机。
 
-## 2n. 真机验证的入口（2026-10-06，Batch 66）
+## 2n. 真机验证的入口（2026-10-06，Batch 88）
 
 S0–S3 的代码全部落地后，剩下的判断只有设备能给出。本批把它做成两件事：一个只读 verdict 工具 `tools/abk_scx_check.sh`（随 companion 下发），和 `plan.md` 里的四步验证计划。
 
@@ -589,7 +589,7 @@ S0–S3 的代码全部落地后，剩下的判断只有设备能给出。本批
 
 四步（细节在 plan.md）：① 默认关 → 期望 exit 2 且 class/artefact 都在；② `scx.enabled=1` + 空 mark list → 期望 exit 4（只验挂载路径）；③ 点名 surfaceflinger 与目标 App 主线程 → 期望 exit 0 并记录任务数；④ 稳定后才做冷启动/帧率 A/B，且每次连同本工具输出留档，否则无法把差异归因到 SCX 还是其余旋钮。**Tier B/D/E 的取舍以此为前置**（清单与判据见 [survey §2](docs/survey_sched_ext_gap.md) 与 plan.md 的同名小节）。
 
-## 2o. Tier B 的 uclamp 旋钮（默认关，2026-10-06，Batch 67）
+## 2o. Tier B 的 uclamp 旋钮（默认关，2026-10-06，Batch 89）
 
 计划里 Tier B 唯一零内核改动的一项：用 cgroup v2 的 `cpu.uclamp.min`（`CONFIG_UCLAMP_TASK_GROUP=y`，已在该树 `.config` 核实）抬高指定 cgroup 的利用率下限。
 
@@ -599,9 +599,9 @@ S0–S3 的代码全部落地后，剩下的判断只有设备能给出。本批
 
 **未落地**：真机 A/B（设一个组 + 一个百分比，同口径冷启动/帧率，连同 `abk_scx_check.sh` 与 `abk_fas_check.sh` 的输出留档）。
 
-## 2p. arm64 产物在主机上的执行证据（2026-10-06，Batch 68）
+## 2p. arm64 产物在主机上的执行证据（2026-10-06，Batch 90）
 
-Batch 65 只证明了产物「是 AArch64 ELF」；`readelf` 看不见代码路径。本批补上执行证据。
+Batch 87 只证明了产物「是 AArch64 ELF」；`readelf` 看不见代码路径。本批补上执行证据。
 
 **命令**（WSL 侧，`NDK` 可自动探测；需要先跑过一次 `build_android_loader.sh` 以 staging 头文件）：
 
@@ -639,7 +639,7 @@ run_arm64_selftest: SELFTEST IDENTICAL ACROSS ARCH
 | mainline android16-6.12 `kernel/sched/ext.c` | 219,742 B / 7,570 lines | upstream shape, 159 `scx_bpf_*` sites, 12 `BTF_KFUNC` sets; paired header `include/linux/sched/ext.h` is 7,015 B; only chosen if a feature the OPPO variant lacks is required |
 | `Rtoax` 6.1 split (`ext.c` + `ext_idle.c` + `ext_internal.h`) | not measured | a third-party split; provenance and license headers need checking before use |
 
-**Measured at landing (Batch 54): the payload is three files, not two.**  The
+**Measured at landing (Batch 76): the payload is three files, not two.**  The
 table's `kernel/sched/ext.c` is only the engine.  `struct sched_ext_ops` and
 `struct sched_ext_entity` live in `include/linux/sched/ext.h`, and `ext.c`
 includes neither that header nor `sched.h` — OPPO compiles it from
@@ -668,7 +668,7 @@ know what a `struct rq` is.  5.15 has no `build_policy.c`, and OPPO's cannot be
 shipped verbatim either: it also `#include`s `idle.c`, `rt.c`,
 `cpudeadline.c`, `pelt.c`, `cputime.c` and `deadline.c`, which 5.15 already
 compiles as their own objects, so the duplicate symbols would collide.  The glue
-S2b-1 added (`files/kernel/sched/sched_ext_glue.c`, Batch 55) is therefore a small
+S2b-1 added (`files/kernel/sched/sched_ext_glue.c`, Batch 77) is therefore a small
 module-authored translation unit -- the 6.6 tree's header set, minus
 linux/seqlock_api.h (absent on 5.15) and minus every `#include "*.c"` line -- that
 includes `ext.c` at the end; `kernel/sched/Makefile` builds
@@ -701,11 +701,11 @@ SCX would be the **second whole-file payload** in this repository (the first is
 anchor cannot express the shape — a 113 KB new subsystem qualifies.  Required
 pieces:
 
-- **landed as Batch 54 / v0.57.0** — the three payload files, the
+- **landed as Batch 76 / v0.79.0** — the three payload files, the
   `files/README.md` entry (rationale, both gate probes, both snapshot
   conventions, the OPPO-only `slim_walt` comments) and the upstream copyright
   headers kept verbatim;
-- **measured as Batch 56 / v0.59.0** — byte-for-byte is not enough to build
+- **measured as Batch 78 / v0.81.0** — byte-for-byte is not enough to build
   it.  The first real compile of the payload's translation unit
   (`tools/compile_probe.sh`, §2c) fails with 12 classes of 5.15/6.6 interface
   drift, three of them function-pointer signatures no preprocessor shim can
@@ -716,7 +716,7 @@ pieces:
   the overlay before the perf child -- is the open decision for S2b-2, together
   with the five glue-TU shims, the two `core.c` helpers that have to become
   visible, the `SCHED_CHANGE_BLOCK` expansion and the `sched_prop` policy call;
-- **landed as Batch 57 / v0.60.0** — the adaptation, and the answer to the
+- **landed as Batch 79 / v0.82.0** — the adaptation, and the answer to the
   open decision recorded above: it is **three registry groups**
   (`sched_ext_core_visibility`, `sched_ext_change_guard`,
   `sched_ext_payload_adapt`), not a Python adapter, and
@@ -729,7 +729,7 @@ pieces:
   SS2d.  With it applied, `tools/compile_probe.sh` builds all six objects on a
   configured 5.15.220 tree; the class is still unreachable, because
   `valid_policy()` rejects `SCHED_EXT` and no functional hook is wired.
-- **landed as Batch 54** — `abk_stable_backport_overlay_sched_ext()` in
+- **landed as Batch 76** — `abk_stable_backport_overlay_sched_ext()` in
   `scripts/stable_backport.sh`, riding the perf child's dispatch exactly as
   `abk_stable_backport_overlay_of_address()` rides core.  It *creates* rather
   than rewrites, so it needs a snapshot convention the revert never did: a
@@ -739,7 +739,7 @@ pieces:
   payload is inert, an empty diff base would make `config_gate_audit` report
   every internal gate in `ext.c` as added code that never compiles).  It never
   overwrites a foreign `ext.c`;
-- **landed as Batch 54** — the payload pin in `tests/stable_5_15_test.py`
+- **landed as Batch 76** — the payload pin in `tests/stable_5_15_test.py`
   (`test_sched_ext_payload`: the sha256 of all three upstream files, the LF
   check, the glue unit's structural checks (includes ext.c, no duplicate ext.h
   inclusion, no policy .c includes), the
@@ -749,7 +749,7 @@ pieces:
   assertion just needs extending was wrong: the only `rglob` inventory in that
   file belongs to the KernelSU companion directories, and neither payload file
   was pinned by any test before this batch;
-- **landed as Batch 55 / v0.58.0, split in two** -- S2b-1 is the build wiring
+- **landed as Batch 77 / v0.80.0, split in two** -- S2b-1 is the build wiring
   (seven groups: `sched_ext_kconfig`, `sched_ext_uapi`,
   `sched_ext_task_slot`, `sched_ext_rq_state`, `sched_ext_class_order`,
   `sched_ext_build` and `sched_ext_init`).  Measured against 5.15, it
@@ -792,13 +792,13 @@ Proceed with S1 (the two infrastructure backports) only if all hold:
 
 If any fails, SCX stays at `[~]` with the S1 results recorded.
 
-Status after Batch 52: item 1 is discharged on the structure half — the three
+Status after Batch 74: item 1 is discharged on the structure half — the three
 groups landed over two files (`arch/arm64/net/bpf_jit_comp.c`,
 `arch/arm64/net/bpf_jit.h`) plus the instruction helper
 (`arch/arm64/include/asm/insn.h`, `arch/arm64/lib/insn.c`), and nothing in
 `kernel/bpf/` or `arch/x86/` was touched.  Its compile half follows the ABK CI
 build, because a local kernel compile is not part of this repository's gate set.
-Status after Batch 55: item 2 is discharged for the SCX side -- `config_gate_audit`
+Status after Batch 77: item 2 is discharged for the SCX side -- `config_gate_audit`
 now runs (each batch since 53 re-runs it against the reference device config) and
 the five gates the payload introduces are recorded in `DARK_GATES` with reasons.
 Item 3 is discharged in the tier sense: `CONFIG_SCHED_CLASS_EXT` exists (Batch
@@ -808,7 +808,7 @@ what the ABK CI run will show.  Item 4 (a device result) is still open and now
 also waits on S2b-2: the class is compiled and registered but no task can enter
 it, so there is nothing to measure on device yet.
 
-Status after Batch 56: item 1's "compiles on `android13-5.15-lts` arm64" half is
+Status after Batch 78: item 1's "compiles on `android13-5.15-lts` arm64" half is
 **discharged negatively and precisely**.  A local compile gate now exists
 (`tools/compile_probe.sh`) and was run on a configured 5.15.220 tree: the
 module's own objects (`core.o`, `fair.o`, `idle.o`, `debug.o`, `kernel/fork.o`)
@@ -819,12 +819,12 @@ distinguish -- so S2b-2 is no longer "add the fork hooks", it is "adapt the
 payload to 5.15, then add the hooks", and the `SCX_OPS_SWITCH_PARTIAL`
 coexistence argument in SS3/SS6 stays untested until that lands.
 
-Status after Batch 57: the compile half of item 1 is **discharged positively** --
+Status after Batch 79: the compile half of item 1 is **discharged positively** --
 the adaptation layer (SS2d) lands the five preprocessor shims, the two core.c
 helpers, the re-carried `SCHED_CHANGE_BLOCK` guard and the marked ext.c edits,
 and `tools/compile_probe.sh` then builds all six objects on the same configured
 5.15.220 tree (`OK (6 object(s) built)`).  Item 3 stays discharged in the tier
-sense.  Batch 58 landed the first half of S2b-2b (§2e): the fork path,
+sense.  Batch 80 landed the first half of S2b-2b (§2e): the fork path,
 `sched_setscheduler()`'s guard and task teardown, plus the payload guard those
 hooks made reachable -- and the probe still builds all six objects.  Item 4 is
 still open and now waits on the second half: `valid_policy()` in

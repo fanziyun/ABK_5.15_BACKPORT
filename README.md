@@ -49,7 +49,7 @@
 | `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 54 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **130 个移植组**（其中 `stable_perf_backport` 的 54 组含 Batch 57 的 sched_ext 载荷 5.15 适配三组、Batch 58 的任务生命周期钩子五组、Batch 59 的调度核心钩子四组与 Batch 60 的可达性四组），同一串注入在 `android13-5.15-lts` 上使用。
+共 **130 个移植组**（其中 `stable_perf_backport` 的 54 组含 Batch 79 的 sched_ext 载荷 5.15 适配三组、Batch 80 的任务生命周期钩子五组、Batch 81 的调度核心钩子四组与 Batch 82 的可达性四组），同一串注入在 `android13-5.15-lts` 上使用。
 
 支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 220）**。
 Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，

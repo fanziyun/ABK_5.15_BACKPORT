@@ -69,7 +69,7 @@
  * 5.15 baseline; the sites the C preprocessor cannot bridge (function-pointer
  * signatures, a vendor struct member, and the 6.2 SCHED_CHANGE_BLOCK whose
  * helpers are static inline in core.c) are either edited in ext.c by
- * batch57_perf_sched_ext_adapt or re-carried in core.c by
+ * batch79_perf_sched_ext_adapt or re-carried in core.c by
  * sched_ext_change_guard.  The measured list, the line numbers and the reason
  * each class is where it is: docs/survey_sched_ext_gap.md section 2c.
  * =========================================================================== */

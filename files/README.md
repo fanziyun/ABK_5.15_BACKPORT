@@ -43,12 +43,12 @@ exceptions are whole files an anchor cannot express:
   builds, and does not include `autogroup.h`/`stats.h`: 6.6 moved both into
   `build_policy.c`, but 5.15's `kernel/sched/sched.h` still includes them at
   its tail and neither header has an include guard, so listing them again
-  redefines every helper they define (measured: 20 errors, fixed in Batch 56).
+  redefines every helper they define (measured: 20 errors, fixed in Batch 78).
 
-  Batch 54 shipped the three engine files inert; Batch 55 added the glue unit
+  Batch 76 shipped the three engine files inert; Batch 77 added the glue unit
   and the build wiring (the `CONFIG_SCHED_CLASS_EXT` symbol, the Makefile
   object rule, `struct scx_rq`/`rq->scx`, the `task_struct` slot, the
-  `SCHED_DATA` slot and the `init_sched_ext_class()` call); Batch 56 ran the
+  `SCHED_DATA` slot and the `init_sched_ext_class()` call); Batch 78 ran the
   first real compiler over it (`tools/compile_probe.sh`, a configured
   android13-5.15-lts tree + clang) and measured 12 classes of 5.15/6.6 interface
   drift -- `struct affinity_context`, `set_cpus_allowed_common()`,
@@ -59,7 +59,7 @@ exceptions are whole files an anchor cannot express:
   `for_each_cpu_andnot` and `__diag_ignore_all` (full table:
   `docs/survey_sched_ext_gap.md` §2c).
 
-  **Batch 57 is the adaptation layer, and it is why the glue unit carries a
+  **Batch 79 is the adaptation layer, and it is why the glue unit carries a
   second, marked block.**  Five of the twelve classes are preprocessor-level and
   live at the bottom of this file, between the include block and
   `#include "ext.c"`: `sched_weight_to_cgroup()`,
@@ -68,7 +68,7 @@ exceptions are whole files an anchor cannot express:
   `__diag_ignore_all()` (mapped onto `__diag_ignore(clang, 11, ...)` -- this
   tree's `compiler-clang.h` defines `_11`/`_23`, so 6.6's `_13` is an
   undefined macro here).  The rest cannot go in the glue unit and is landed by
-  three registry groups (`batch57_perf_sched_ext_adapt`):
+  three registry groups (`batch79_perf_sched_ext_adapt`):
   `sched_ext_core_visibility` makes core.c's `__setscheduler_prio()` and
   `check_class_changed()` non-static for the payload's separate translation
   unit; `sched_ext_change_guard` re-carries 6.2's `SCHED_CHANGE_BLOCK` guard
@@ -82,7 +82,7 @@ exceptions are whole files an anchor cannot express:
   builds all seven objects on a configured 5.15.220 tree (`OK (7 object(s)
   built)`).
 
-  **Batch 59 adapts `kernel/sched/ext.h` the same way**, and for the same
+  **Batch 81 adapts `kernel/sched/ext.h` the same way**, and for the same
   reason: the archived `next_active_class()` walks the class table with
   `class++` between 6.12's linker-section names `__sched_class_highest` /
   `__sched_class_lowest`, which do not exist on this baseline.  5.15 hands the
@@ -105,7 +105,7 @@ exceptions are whole files an anchor cannot express:
   the empty `.abk-orig` diff base -- so the tree ends up with a payload file
   that `config_gate_audit` cannot attribute.
 
-  The class is reachable since Batch 60: `sched_ext_policy_valid` restores 6.6's
+  The class is reachable since Batch 82: `sched_ext_policy_valid` restores 6.6's
   `normal_policy()`/`fair_policy()` split so `valid_policy()` accepts
   `SCHED_EXT`, `sched_ext_priority_range` gives the policy a static priority and
   a load weight, `sched_ext_struct_ops_type` lets the BPF syscall bind
@@ -124,7 +124,7 @@ also gets an empty `<file>.abk-orig` — the diff base
 against.  The base is withheld until the wiring is present on purpose: an empty
 base on an inert payload would make the audit report every internal gate in
 `ext.c` as "added code that never compiles", which is trivially true for a file
-nothing includes.  Since Batch 55 the wiring is always there, so every created
+nothing includes.  Since Batch 77 the wiring is always there, so every created
 file gets both markers; `tests/smoke.sh` asserts that they appear on pass 1,
 are untouched on pass 2, and are gone after rollback, and that the diff base is
 empty.  `tests/stable_5_15_test.py` pins the wiring probe and the
