@@ -6591,6 +6591,7 @@ def main():
     test_batch70_smaps_migration_guard()
     test_batch71_kcompressd_wb_pin()
     test_fetch_decode_roundtrip()
+    test_workflow_expressions_are_ascii()
 
     print()
     if FAILURES:
@@ -7534,6 +7535,43 @@ def test_batch71_kcompressd_wb_pin():
                 check(f"{label} shape: {key} is idempotent",
                       st == "already_present", (key, st))
 
+
+
+def test_workflow_expressions_are_ascii():
+    """A `${{ }}` written inside a `run: |` block is live, comment or not.
+
+    GitHub interpolates expressions across the whole block *string*, so the
+    shell `#` carries no meaning to that pass: a literal interpolation written
+    in a comment as documentation is an expression like any other.  A
+    non-ASCII one makes the entire workflow unparseable, and the failure mode
+    is not "this step is wrong" but "nothing dispatches at all" -- measured
+    2026-10-13, `Line: 293 ... Unexpected symbol: '<ellipsis>'`, the line
+    number being the start of the run block rather than the comment that
+    carried it.  Expressions are ASCII by construction, so any non-ASCII byte
+    between `${{` and `}}` is a documentation-shaped bug.
+
+    The second half pins the gate's own contract probe to a **prefix** match:
+    a literal is exactly what broke it when ABK restyled its run-name line.
+    """
+    print("workflow expression hygiene (a ${{ }} in a run block is live)")
+    wf_dir = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+    files = sorted(wf_dir.glob("*.y*ml"))
+    check("workflows: the CI workflow files are present", bool(files), str(wf_dir))
+    offenders = []
+    total = 0
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\$\{\{(.*?)\}\}", text, re.S):
+            total += 1
+            if any(ord(c) > 127 for c in m.group(1)):
+                offenders.append(f"{path.name}:{text.count(chr(10), 0, m.start()) + 1}")
+    check("workflows: every interpolation is ASCII", not offenders, offenders)
+    check("workflows: the scan actually saw expressions", total > 0, total)
+    gate = (wf_dir / "abk-kernel-compile.yml").read_text(encoding="utf-8")
+    check("gate: the ;ref= probe matches the run-name prefix, not a literal",
+          "^run-name:[^A-Za-z0-9]*ABK-CI" in gate)
+    check("gate: no literal run-name probe is left behind",
+          "grep -q 'run-name: ABK-CI'" not in gate)
 
 
 if __name__ == "__main__":
