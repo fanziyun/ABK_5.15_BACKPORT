@@ -14,6 +14,11 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/uclamp-policy.sh"
 . "$MODDIR/iorap-watch.sh"
 
+# Before any re-entry dispatch: a supervisor is started as a plain `sh` script,
+# but the SCX loader is exec'd directly, and the installer drops every mode bit
+# (see abk_fix_tool_modes in common.sh).  Idempotent and cheap.
+abk_fix_tool_modes
+
 case "${1:-}" in
   --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
   --supervise-cfr) abk_cfr_supervisor_main; exit 0 ;;

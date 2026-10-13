@@ -17,6 +17,7 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
 
+abk_fix_tool_modes
 abk_log "post-fs-data: kernel $(uname -r 2>/dev/null)"
 abk_cfg_lint
 abk_apply_early_knobs

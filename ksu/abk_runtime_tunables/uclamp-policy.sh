@@ -42,8 +42,25 @@ abk_uclamp_valid() {
     { exit 1 }' 2>/dev/null
 }
 
+# Where cpu.uclamp.min lives depends on how the ROM mounted cgroups.  On a
+# pure-cgroup-v2 layout it is $ABK_CGROOT/<group>/cpu.uclamp.min.  This ROM
+# instead mounts only the memory controller on cgroup v2 and keeps the cpu
+# controller on cgroup v1, so the file is /dev/cpuctl/<group>/cpu.uclamp.min --
+# verified on the reference device, where /sys/fs/cgroup/cgroup.controllers is
+# empty and every cpu.uclamp.min sits under /dev/cpuctl.  Probe rather than
+# assume: the v2 path is used when it exists, otherwise the v1 mount.  The v1
+# root is overridable (like ABK_ZRAM_NODE) so the unit fixture can point it at
+# a fake tree.
+ABK_CPUCTL_ROOT="${ABK_CPUCTL_ROOT:-/dev/cpuctl}"
+
 abk_uclamp_path() { # <group>
-  printf '%s/fs/cgroup/%s/cpu.uclamp.min\n' "$ABK_SYS_ROOT" "$1"
+  v2="$ABK_CGROOT/$1/cpu.uclamp.min"
+  if [ -e "$v2" ]; then
+    printf '%s\n' "$v2"
+    return 0
+  fi
+  v1="$ABK_CPUCTL_ROOT/$1/cpu.uclamp.min"
+  printf '%s\n' "$v1"
 }
 
 abk_uclamp_apply() {

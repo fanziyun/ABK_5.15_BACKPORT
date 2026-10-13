@@ -20,6 +20,11 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 
 ABK_STDOUT=1
 
+# The KernelSU installer drops every entry mode (see abk_fix_tool_modes); repair
+# them before any status line reads `[ -x ... ]`, or a fresh install reports the
+# loader "absent" even though it shipped.
+abk_fix_tool_modes
+
 abk_show() {
   printf '%-26s %s\n' "$1" "$2"
 }

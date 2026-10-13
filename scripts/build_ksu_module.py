@@ -41,6 +41,26 @@ EXECUTABLE_MODE = 0o755
 REGULAR_MODE = 0o644
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
+# Files the module has to execute by name, not by suffix.  scx_loader is a
+# compiled aarch64 binary with no extension, so a "*.sh" test leaves it 0644 --
+# and scx-policy.sh's readiness check is `[ -x ... ]`, which then never passes,
+# so SCX can never attach on a device.  Match by name as well.
+#
+# Setting the mode here keeps the zip itself correct, but it is NOT sufficient:
+# KernelSU's `ksud module install` unpacks without preserving entry modes --
+# measured on the target device, a freshly installed copy lands every entry
+# 0644, .sh included.  The companion therefore re-asserts the bit at runtime
+# (abk_fix_tool_modes, ksu/abk_runtime_tunables/common.sh) on post-fs-data,
+# service and action.  Both halves are needed; neither alone fixes the device.
+EXECUTABLE_NAMES = frozenset({"bin/scx_loader"})
+
+
+def entry_mode(name: str) -> int:
+    """The mode an entry gets inside the module zip."""
+    if name.endswith(".sh") or name in EXECUTABLE_NAMES:
+        return EXECUTABLE_MODE
+    return REGULAR_MODE
+
 
 class BuildError(SystemExit):
     """A condition the caller must fix; the CLI reports it and exits non-zero."""
@@ -103,14 +123,14 @@ def module_entries(source: Path = MODULE_SOURCE) -> list[tuple[str, bytes, int]]
     for path in sorted((p for p in source.rglob("*") if p.is_file()), key=lambda p: p.as_posix()):
         name = path.relative_to(source).as_posix()
         seen.add(name)
-        mode = EXECUTABLE_MODE if name.endswith(".sh") else REGULAR_MODE
+        mode = entry_mode(name)
         entries.append((name, path.read_bytes(), mode))
 
     for embed_source, target in read_embed_manifest(source):
         if target in seen:
             raise BuildError(f"embedded entry {target!r} collides with a module file")
         seen.add(target)
-        mode = EXECUTABLE_MODE if target.endswith(".sh") else REGULAR_MODE
+        mode = entry_mode(target)
         entries.append((target, embed_source.read_bytes(), mode))
 
     entries.sort(key=lambda item: item[0])

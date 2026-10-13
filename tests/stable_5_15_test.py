@@ -3766,6 +3766,21 @@ def test_runtime_tunables_module():
                      for info in archive.infolist()}
             check("every module script is 0755",
                   all(modes[name] == 0o755 for name in names if name.endswith(".sh")))
+            # scx_loader is the one entry with no suffix, so a "*.sh" test leaves
+            # it 0644 and the packager has to match it by name.  Belt and braces
+            # with the runtime repair below: the KernelSU installer drops every
+            # mode bit, so a correct zip is necessary but not sufficient.
+            check("the suffixed-less scx_loader packs as 0755",
+                  modes.get("bin/scx_loader") == 0o755)
+            _common_src = archive.read("common.sh").decode("utf-8")
+            check("the companion repairs tool modes at runtime",
+                  "abk_fix_tool_modes() {" in _common_src
+                  and "chmod 0755" in _common_src)
+            check("the runtime repair covers bin/ and the top-level scripts",
+                  '"$_fm_t"' in _common_src and '"$MODDIR"/bin/*' in _common_src)
+            for _hook in ("post-fs-data.sh", "service.sh", "action.sh"):
+                check(f"{_hook} re-asserts the tool modes",
+                      "abk_fix_tool_modes" in archive.read(_hook).decode("utf-8"))
             check("the zip root carries module.prop (KernelSU layout)",
                   "module.prop" in names and not any("/" in name and name.count("/") > 1
                                                    for name in names))
@@ -8051,8 +8066,10 @@ def test_batch67_uclamp_policy():
     * the accepted values are the kernel's -- "max" or a decimal percent --
       and anything above 100 is refused before the write;
     * the format's provenance is recorded in the file (capacity_from_percent);
-    * the target is /sys/fs/cgroup/<group>/cpu.uclamp.min and the supervisor
-      re-asserts on a timer, because cgroup managers rewrite these nodes;
+    * the target is the group's cpu.uclamp.min, probed as the cgroup v2 path
+      first and the cgroup v1 /dev/cpuctl mount as the fallback, and the
+      supervisor re-asserts on a timer, because cgroup managers rewrite these
+      nodes;
     * the toolchain side: the three keys are known to the linter, the service
       only spawns the supervisor when both halves are set, and action.sh shows
       the state.
@@ -8080,7 +8097,18 @@ def test_batch67_uclamp_policy():
           < policy.index("printf '%s\\n' \"$_ua_val\" > \"$_ua_path\""))
     check("the valid range is asserted", "($0 + 0) <= 100" in policy)
     check("the write target is the cgroup node",
-          "fs/cgroup/%s/cpu.uclamp.min" in policy)
+          "cpu.uclamp.min" in policy and "abk_uclamp_path" in policy)
+    # The target ROM mounts only the memory controller on cgroup v2 and keeps
+    # the cpu controller on cgroup v1, so cpu.uclamp.min is /dev/cpuctl/<group>/
+    # cpu.uclamp.min -- measured on the device, where /sys/fs/cgroup/
+    # cgroup.controllers is empty and every cpu.uclamp.min sits under
+    # /dev/cpuctl.  The path is probed (v2 first, v1 fallback), not assumed.
+    check("the target falls back to the cgroup v1 cpuctl mount",
+          "/dev/cpuctl" in policy
+          and "$ABK_CPUCTL_ROOT/$1/cpu.uclamp.min" in policy)
+    check("the v2 path is probed before the v1 fallback",
+          policy.index('v2="$ABK_CGROOT/$1/cpu.uclamp.min"')
+          < policy.index('v1="$ABK_CPUCTL_ROOT/$1/cpu.uclamp.min"'))
     check("the supervisor re-asserts on a timer",
           "abk_uclamp_supervisor_main" in policy
           and "abk_clamp_uint" in policy and "sleep" in policy)
