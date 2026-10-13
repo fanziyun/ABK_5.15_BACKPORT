@@ -305,10 +305,15 @@ jobs:
           # 探针查的是 run-name 这一行**以 ABK-CI 起头**，而不是某个字面量：
           # 「Wait for the ABK run」步要靠 "ABK-CI <version>" 的子串找 run，所以这个前缀是
           # 真契约；但它的写法会漂 —— ABK 侧加过 UTC+8 时间戳回退后就成了
-          # `run-name: "ABK-CI ${{ … }}"`。旧的 `grep -q 'run-name: ABK-CI'` 会在引号上失配，
+          # 带引号的 `run-name: "ABK-CI <表达式>"`。旧探针按字面量匹配那个前缀，会在引号上失配，
           # 把一个**支持 ;ref=** 的 ref 误判成不支持（2026-10-13 实测：fork dev 因此红了 14 秒、
           # 根本没派发）。`[^A-Za-z0-9]*` 吃掉冒号后的空格与引号，同时挡住 `run-name: foo-ABK-CI`
           # 这类前缀不对的写法。
+          # ⚠️ 上面那句**故意不写完整的表达式**（只写 <表达式>），也别在这里补回来：
+          # GitHub 是把整个 `run: |` 块当字符串做表达式插值的，`#` 在它眼里没有注释语义 ——
+          # 在 shell 注释里写一个真的插值表达式也会让整个工作流**解析失败**，
+          # 连 workflow_dispatch 都发不出去（实测报 `Line: 293 … Unexpected symbol: '…'`，
+          # 行号指的是这个 run 块的起点）。tests/stable_5_15_test.py 有一条门禁钉这一点。
           # ⚠️ 这一读取**刻意不带 token**，走 raw.githubusercontent 的匿名 CDN：ABK 是公开仓库，
           # 于是 ABK_CI_TOKEN 只需要 Actions 权限，不需要 Contents —— 少一项权限就少一条被滥用的路。
           # （不要改回 gh api .../contents：那需要 Contents 读，会把凭据权限面撑大。）
