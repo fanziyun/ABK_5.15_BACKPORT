@@ -38,8 +38,8 @@
    `custom_external_modules`；每个 child 的第三字段是 `;ref=refs/pull/<N>/head`。版本名固定为
    `<ABK_CI_VERSION_BASE>-pr<N>-<sha7>`，下文叫 **marker**；同时写下 `expected_ref.txt` 供取证比对。
 3. `Cancel superseded run for this PR`：取消 ABK 里同一 PR 尚未完成的旧 run。
-4. `Dispatch ABK build`：先验「目标 ref 上的 `kernel-custom.yml` 认识 `;ref=`」（缺 `run-name: ABK-CI` 就
-   立刻红，不去白等 90 分钟），再 `workflow_dispatch`。
+4. `Dispatch ABK build`：先验「目标 ref 上的 `kernel-custom.yml` 认识 `;ref=`」（run-name 那一行不是
+   以 `ABK-CI` 起头就立刻红，不去白等 90 分钟），再 `workflow_dispatch`。
 5. `Wait for the ABK run`：按 run-name `ABK-CI <version>` 里的 marker **子串**找 run（并用派发时刻排除旧 run），
    每 60 秒轮询到 `completed`，上限 `WAIT_MINUTES=90` 分钟。
 6. `Collect evidence from the ABK log`：拉日志取证 —— `head_sha` 与 `pinned_ref` 两项自证、模块版本，以及模块
@@ -48,10 +48,17 @@
 7. `Upload debug bundle`：payload、日志、取证、结论等留 14 天（排查用）。
 8. `Report result to the PR`：写 commit status + 更新评论 + 写 Summary；结论红时**同时**让 job 失败，两条检查一致。
 
-> 第 2/5 步依赖 ABK 侧的 `;ref=` 第三字段与 `run-name: ABK-CI ${{ inputs.version }}`。上游把它放在
+> 第 2/5 步依赖 ABK 侧的 `;ref=` 第三字段与 run-name 的 `ABK-CI` 前缀（第 5 步就是拿
+> `ABK-CI <version>` 做子串匹配找 run 的，所以这是一个真契约，不是代名词）。上游把它放在
 > PR #5（分支 `ci/module-ref-pin`，比 `dev` 只多一个 commit）。所以要么把 var `ABK_CI_WORKFLOW_REF`
 > 指到那个分支（等它合进 `dev` 后删掉这个 var），要么——**推荐**——在你自己的 fork 里把那个分支合进
 > `dev`，然后 `ABK_CI_REPO` 指 fork、`ABK_CI_WORKFLOW_REF` 留空。指错了第 4 步会立刻红。
+>
+> 第 4 步的预检只认**前缀**：`^run-name:[^A-Za-z0-9]*ABK-CI`。它**不**认字面量 `run-name: ABK-CI` ——
+> ABK 侧给 run-name 加过「UTC+8 时间戳回退」后那行变成 `run-name: "ABK-CI ${{ … }}"`，带上了引号，
+> 字面量匹配会在引号处失配，把一个**支持 `;ref=`** 的 ref 误判成不支持（2026-10-13 实测：`fan221153-blip/ABK@dev`
+> 因此红了 14 秒、根本没派发）。改回字面量就是把这条误判装回去。注意 `fanziyun/ABK@dev` 上**没有** run-name 行，
+> 新预检照样拒绝它 —— 收紧是对的，松动只针对写法。
 
 ## 3. 哪些 PR 不编（跳过规则）
 
@@ -188,7 +195,7 @@ require 选 **`ABK kernel compile (android13-5.15-lts)`**（有编译结论的�
 | status 描述 | 多半是 | 处理 |
 | --- | --- | --- |
 | `没配置 ABK_CI_TOKEN（见 docs/pr_compile_gate.md）` | secret 没配 | 第 4 节第 1 条 |
-| `ABK@<ref> 的 kernel-custom.yml 不认识 ;ref=（…）` | `ABK_CI_REPO`/`ABK_CI_WORKFLOW_REF` 指到了不含 `;ref=` 补丁的 ref | 指到上游 `ci/module-ref-pin`，或把该分支合进 fork 的 `dev` 再把两个 var 指过去 |
+| `ABK@<ref> 的 kernel-custom.yml 不认识 ;ref=（…）` | 目标 ref 上那行 run-name 不以 `ABK-CI` 起头（真没有，或写法漂了） | 指到上游 `ci/module-ref-pin`，或把该分支合进 fork 的 `dev` 再把两个 var 指过去；若 fork 的 `dev` **确实**支持 `;ref=`（`build.yml` 里有 `ref=*` 解析与 `pinned_ref:` 回显）而只是 run-name 写法变了，那是预检的前缀规则要跟上，不是 var 指错了 |
 | `ABK 构建 failure（失败 job: …）` | 真的编不过；失败 job 名会写出来（同 run 还有 get-manager 等 job） | 看 ABK run 日志 / 评论里的 `error:` 段 |
 | `编的不是这份代码：ABK 日志里的 head_sha 对不上` | 日志里没有本 PR 的 head sha | 看评论取证段与 ABK 日志；多半是 ref 钉错或被顶替 |
 | `ABK 没按钉住的 ref 检出模块（日志里没有对应的 pinned_ref）` | ABK 忽略了第三字段（旧版工作流） | 同第二条 |

@@ -302,13 +302,20 @@ jobs:
           # 钉住 PR 用的是描述符第三字段 ;ref=，只有带这个补丁的 kernel-custom.yml 认识它
           # （上游分支 ci/module-ref-pin，或 fork 上合过它的 dev）。
           # 目标 ref 不认识，就会白等 90 分钟、最后报成「编的不是这份代码」，所以先验一遍契约。
+          # 探针查的是 run-name 这一行**以 ABK-CI 起头**，而不是某个字面量：
+          # 「Wait for the ABK run」步要靠 "ABK-CI <version>" 的子串找 run，所以这个前缀是
+          # 真契约；但它的写法会漂 —— ABK 侧加过 UTC+8 时间戳回退后就成了
+          # `run-name: "ABK-CI ${{ … }}"`。旧的 `grep -q 'run-name: ABK-CI'` 会在引号上失配，
+          # 把一个**支持 ;ref=** 的 ref 误判成不支持（2026-10-13 实测：fork dev 因此红了 14 秒、
+          # 根本没派发）。`[^A-Za-z0-9]*` 吃掉冒号后的空格与引号，同时挡住 `run-name: foo-ABK-CI`
+          # 这类前缀不对的写法。
           # ⚠️ 这一读取**刻意不带 token**，走 raw.githubusercontent 的匿名 CDN：ABK 是公开仓库，
           # 于是 ABK_CI_TOKEN 只需要 Actions 权限，不需要 Contents —— 少一项权限就少一条被滥用的路。
           # （不要改回 gh api .../contents：那需要 Contents 读，会把凭据权限面撑大。）
           wf_src_url="https://raw.githubusercontent.com/$ABK_REPO/refs/heads/$ABK_WORKFLOW_REF/.github/workflows/$ABK_WORKFLOW"
           if wf_src="$(curl -fsSL --max-time 30 "$wf_src_url" 2>/dev/null)"; then
-            if ! printf '%s\n' "$wf_src" | grep -q 'run-name: ABK-CI'; then
-              echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺 run-name: ABK-CI）；把 var ABK_CI_REPO / ABK_CI_WORKFLOW_REF 指到带补丁的仓库和 ref（上游 ci/module-ref-pin，或 fork 上合过补丁的 dev），见 docs/pr_compile_gate.md"
+            if ! printf '%s\n' "$wf_src" | grep -qE '^run-name:[^A-Za-z0-9]*ABK-CI'; then
+              echo "::error::$ABK_REPO@$ABK_WORKFLOW_REF 的 $ABK_WORKFLOW 不认识 ;ref= 第三字段（缺以 ABK-CI 起头的 run-name）；把 var ABK_CI_REPO / ABK_CI_WORKFLOW_REF 指到带补丁的仓库和 ref（上游 ci/module-ref-pin，或 fork 上合过补丁的 dev），见 docs/pr_compile_gate.md"
               printf '%s\n' "no-ref-support" > conclusion.txt
               exit 1
             fi
