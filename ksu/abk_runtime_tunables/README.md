@@ -487,6 +487,17 @@ remove.
   format that can print a byte count now uses `%.0f`, exact for integers below
   2^53. `abk_gt`/`abk_le` print nothing and `cap_view` prints a capacity
   (≤ 1024), so `%d` is provably safe where they keep it.
+* **`mem_limit` has no read node.** It is `DEVICE_ATTR_WO`: the kernel keeps
+  `PAGE_ALIGN(limit)` and `mm_stat` field 4 is the only way back, so a target
+  that is not a page multiple reads one page *high* forever. The policy
+  therefore floors the 25 % target to `ABK_ZRAM_MEM_LIMIT_ALIGN` (64 KiB -- a
+  common multiple of the 4K/16K/64K builds this tree can make) before writing,
+  which makes the kernel's own round an identity, and writes nothing when the
+  node already holds the target: the supervisor's 60 s reassert is silent in the
+  steady state. It still reads the value back and warns when the two disagree,
+  which now means the write really did not take. Before v0.22.0 an unaligned
+  target produced a WARN every tick (measured: 21 in two hours) and an unchanged
+  `INFO zram mem_limit=…` line every tick for the life of the boot.
 * The writeback path (backing file + loop device + `backing_dev`) is verified
   on device against the ROM-tier kernel (`ABK_515_DEFCONFIG_ROM=1`,
   `CONFIG_ZRAM_WRITEBACK=y`): the helper's half creates a sparse 1 GiB file

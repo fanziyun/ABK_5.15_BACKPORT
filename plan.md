@@ -7,6 +7,8 @@
 
 ## 交付总览（九项优化，按功能清单顺序）→ 详见 CHANGELOG.md#overview-nine — 把九项功能重排成一份交付日志并往下续写第 10 项（`8a73e95` → HEAD 的四个提交）：逐项给出批次、组名与到手证据，不新增任何批次
 
+## companion v0.22.0（mem_limit 的假 WARN 与每 tick 一条的常驻 INFO；已落地，单测 1381 项全绿，真机重启复验通过：574 条 WARN → 0、常驻 INFO 只剩开机 1 条）→ 详见 [CHANGELOG.md](#companion-v0-22-0) — 主题「读回失配是内核正常的页取整，不是故障」。`mem_limit` 是 `DEVICE_ATTR_WO`（无读节点），`mem_limit_store()` 存 `PAGE_ALIGN(limit)`、`mm_stat` f4 是唯一回读途径 ⇒ 目标只要不是页的整数倍，读回必然高一个页；模块却拿未对齐原值与读回逐字节比对，再叠加「reassert 每 tick 无条件重设并记一行」，同一份日志因此分成两段噪声：目标恰好对齐时每 tick 一条假 INFO（367 条，值一字未变），未对齐时每 tick 一条假 WARN（实测 574 条/次开机）。修复：写入前把 25% 目标向下取整到 `ABK_ZRAM_MEM_LIMIT_ALIGN=65536`（4K/16K/64K 三种构建的公共倍数，使内核自己的 `PAGE_ALIGN()` 成为恒等），取整为 0（内核语义 = 取消上限）时直接不写；节点已等于目标则不写不记 ⇒ 稳态 tick 静默，读回 WARN 只对应真实写入失败。`module.conf` 保持不动（companion-only 惯例），companion v0.21.0 → **v0.22.0**。
+
 ## companion v0.21.0（zram writeback 后备文件不再默认落在 /data/per_boot：默认关 + boot_completed 闸门 + 释放路径 + 清掉遗留后备文件；已落地，单测 1521 项全绿）→ 详见 [CHANGELOG.md](#companion-v0-21-0) — 起因：AOSP init.rc 每次 sys.boot_completed 会 rm -rf /data/per_boot 并用 per-boot key 重建，而模块在 service.sh 里往 /data/per_boot/zram/zram_swap 建稀疏 1 GiB 文件，抢在 wipe 之前就会被 unlink、loop 留在孤立 inode（仓库真机记录里 loop49 后备文件名为空即此形状，Batch 18 §10 的「mmd 从未完成」由此更正）；同批确认该路径利用率为 0（bd_stat [1 0 1]、trigger 出厂 off、模块从不写 writeback 节点），故默认 zram.writeback=off、auto 改 opt-in 且只在 boot_completed 之后 attach，off 下释放本模块自己的后备文件（外来设备永不释放）；内核 graft 与 CONFIG_ZRAM_WRITEBACK 档未动
 
 ## companion v0.17.0（二压 mark 时钟单位错 30 倍：二压其实一次都没跑过；已落地，真机复勘+过 mksh）→ 详见 [CHANGELOG.md](#companion-v0170mark-时钟的单位错-30-倍二压其实一次都没跑过)

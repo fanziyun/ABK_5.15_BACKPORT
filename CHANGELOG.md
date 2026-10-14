@@ -351,6 +351,63 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-22-0"></a>
+
+## companion v0.22.0（mem_limit 的假 WARN 与每 tick 一条的常驻 INFO）
+
+真机日志（vermeer，`5.15.220-202609202-FanZiyun-pr41`）暴露两条噪声，都是同一个 `mem_limit`
+写回路的两个面。同一份日志里它们**按 25% 目标是否恰好页对齐分成两段**，这本身就是诊断：
+
+1. `09:01–15:41`（目标 `2933764096`，`% 4096 == 0`，恰好对齐）：读回与写入相等，于是每个
+   `zram.reassert_interval_sec`（60 s）的 reassert tick 记一条
+   `INFO zram mem_limit=2933764096 bytes (25% of RAM)`——**367 条**，值从头到尾一字未变。
+2. `15:42` 重启后 `MemTotal` 微变（`11460016` → `11460012 KiB`），目标 `2933763072` 不再对齐：
+   `WARN mem_limit readback is '2933764096', wanted 2933763072`——约 20 分钟内 **21 条**。
+
+**根因**：`mem_limit` 在内核里是 `DEVICE_ATTR_WO`，没有读节点——`mem_limit_store()` 存的是
+`zram->limit_pages = PAGE_ALIGN(limit) >> PAGE_SHIFT`，`mm_stat` 第 4 个字段把它 `<< PAGE_SHIFT`
+打回来，这是唯一的回读途径。于是目标只要不是页大小的整数倍，读回就必然比写入值高一个页：
+`2933763072 % 4096 = 3072`，内核取整到 `2933764096`，差值恒为补到下一页的字节数（1024）。模块
+却拿未对齐的原值与读回做字符串比较，把内核**正常的**取整判成失配，再叠加"reassert 每 tick
+无条件重设 mem_limit、重设就记一行"，就有了上面那两段噪声——对齐时是假 INFO，未对齐时是假
+WARN。功能无影响（上限至多比目标大一个页，约 0.00003%），但这个模块的 WARN 是"读回是唯一能
+判断是否武装成功的手段"（v0.6.2 那条 32 位 awk 陷阱即由此被发现），假 WARN 会稀释它。
+
+**修复**（`abk_zram_set_mem_limit()`，v0.21.0）：
+
+- 写入前把目标向下取整到 `ABK_ZRAM_MEM_LIMIT_ALIGN=65536`。选 64 KiB 而不是 4096，是因为这棵
+  树可以按 4K/16K/64K 三种页大小构建，64 KiB 是三者共同的整数倍，内核自己的 `PAGE_ALIGN()`
+  因此在三种构建上都是恒等。代价是上限比目标低不到 64 KiB，对一个以 GB 计的上限可忽略。
+- 取整结果为 0 时直接返回，不写：内核里 `0` 是"无上限"，取整绝不能把"设上限"翻转成"取消上限"。
+- 写前先比对：节点已经等于目标就不写、不记。稳态 tick 因此完全静默，INFO 只在（重新）武装与
+  值真的变化时出现；读回失配仍然 WARN——那一行现在只对应真实故障。
+
+**验证**：单测夹具按内核语义建模 `mem_limit` 写入（存 `PAGE_ALIGN(limit)`、只回写 `mm_stat`
+第 4 字段，不动压缩/占用计数），并改用真机的 `MemTotal`（`11460012 kB`）作输入——通用夹具的
+25% 恰好页对齐，用它这段回归会空过。断言：原始目标确实未对齐、对齐后读回精确、连续两次
+reassert 零输出、上限被外部清零后重新武装并记一行、以及"内核吞掉写入"时 WARN 仍然出现。
+本机以 dash（POSIX，最接近设备 mksh）过 `sh -n` 并实调 `abk_align_down`；`bash -n` /
+`py_compile` 全绿；单测新增 3 条静态断言并做反向验证（去掉取整/零守卫/稳态跳过三者之一，
+对应断言即失败），全套 **1381 项全绿**。
+
+**真机验证**（vermeer，`5.15.220-pr41-56396cf`，无线 adb + `ksud module install` + 重启）：
+
+| | v0.20.0（重启前基线） | v0.21.0（重启后） |
+|---|---|---|
+| `WARN mem_limit readback` | 574 条（每 60 s 一条） | **0** |
+| `INFO zram mem_limit=` | 0 条 | **1**（仅开机首写） |
+| 日志总行数 | 785 | 38（开机 10 分钟、跨约 10 个 reassert tick 不再增长） |
+
+修复判据逐条成立：模块写 `3982819328`、`mm_stat` f4 读回同一个数、`action.sh status` 显示同一个
+数——写回读逐字节相等；该值 `% 65536 = 0`，内核自己的 `PAGE_ALIGN()` 成为恒等，失配不再可能发生。
+重启前现场证据比原始日志更极端：`wanted 3982869504` 的 `% 4096 = 3072`，内核取整到
+`3982872576`，正是诊断的形状。其余功能未受影响：算法 `lz4kd/zstd` 在 force、swap 已挂、
+writeback 有 backing device、SELinux Enforcing、recompression supervisor 存活、iorap-watch 照常
+`record+kick`。注意 ksud 是暂存式安装（新版落 `modules_update/`，live 目录只改 `module.prop`
+并置 `update` 标记），脚本要重启才生效；本次只动用户态伴生模块，内核无需重刷。
+
+---
+
 <a id="companion-v0-21-0"></a>
 
 ## companion v0.21.0（zram writeback 后备文件不再默认落在 /data/per_boot：默认关 + boot_completed 闸门 + 释放路径）
