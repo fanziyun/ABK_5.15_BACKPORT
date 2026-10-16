@@ -5,12 +5,8 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-# Has to track module.prop: this banner is what the module manager shows, so a
-# drift between the two makes action.sh report a version the manager never lists.
-# It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
-# -- because nothing tied the two files together; test_runtime_tunables_module
-# now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.22.0"
+# Computed from module.prop at source time so the banner cannot drift from the manager's version.
+ABK_VERSION="$(sed -n 's/^version=//p' "${MODDIR:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}/module.prop" 2>/dev/null)"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -36,12 +32,7 @@ ABK_ZRAM_DEV="0"
 ABK_ZRAM_PRIMARY="lz4kd"
 ABK_ZRAM_SECONDARY="zstd"
 ABK_ZRAM_MEM_LIMIT_PCT=25   # cap on compressed zram memory, percent of RAM
-# mem_limit is kept as PAGE_ALIGN(limit) >> PAGE_SHIFT and mm_stat prints that
-# back, so a target that is not a page multiple always reads back higher than it
-# was written (see abk_align_down).  64 KiB is a whole multiple of every page
-# size this tree can be built with -- 4K, 16K and 64K -- so flooring the target
-# to it makes the kernel's own PAGE_ALIGN() an identity on all three.  The cost
-# is under 64 KiB off a cap measured in gigabytes.
+# A whole multiple of every buildable page size (4K/16K/64K), so the kernel's PAGE_ALIGN() is an identity.
 ABK_ZRAM_MEM_LIMIT_ALIGN=65536
 # `swapoff` reads every swapped page back into RAM (no data is lost), so this
 # gate is not about data loss: it bounds the transient RAM spike.  At boot the
@@ -216,8 +207,7 @@ abk_le() {
   awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }' 2>/dev/null
 }
 
-# abk_align_down <value> <alignment> -> the largest multiple of <alignment> that
-# is not above <value>.  awk for the same 64-bit reason as abk_mul_div.
+# abk_align_down <value> <alignment>; awk for the same 64-bit reason as abk_mul_div.
 abk_align_down() {
   awk -v v="$1" -v a="$2" 'BEGIN { printf "%.0f\n", int(v / a) * a }' 2>/dev/null
 }

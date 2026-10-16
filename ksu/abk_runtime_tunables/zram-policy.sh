@@ -425,22 +425,14 @@ abk_zram_set_mem_limit() {
   # rejected by the kernel, silently leaving the cap off.
   _ml_val="$(abk_mem_pct_bytes "$ABK_ZRAM_MEM_LIMIT_PCT")" || return 0
   abk_is_uint "$_ml_val" || return 0
-  # mem_limit_store() keeps PAGE_ALIGN(limit) and mm_stat prints that back
-  # (there is no mem_limit *read* node -- it is DEVICE_ATTR_WO), so a target
-  # that is not a page multiple always reads back one page higher than it was
-  # written, and every 60 s re-check would report that as a mismatch.  Flooring
-  # the target to ABK_ZRAM_MEM_LIMIT_ALIGN makes the kernel's own round an
-  # identity, so the readback below differs only when the write really failed.
+  # Floor to the alignment so the kernel's PAGE_ALIGN() is an identity and the mm_stat readback is exact.
   _ml_val="$(abk_align_down "$_ml_val" "$ABK_ZRAM_MEM_LIMIT_ALIGN")"
   abk_is_uint "$_ml_val" || return 0
-  # 0 means "no cap at all" to the kernel, so flooring must never be allowed to
-  # produce it: leave the node alone instead of uncapping it.
+  # 0 means "no cap" to the kernel; the floor must never uncap the device.
   abk_gt "$_ml_val" 0 || return 0
 
   _ml_seen="$(abk_zram_mem_limit)"
-  # Steady state.  The supervisor re-asserts this cap every tick, and a value
-  # that has not moved is not news: one line when the cap is (re)armed, nothing
-  # for the thousands of ticks after it.
+  # Steady state: an unchanged cap is neither rewritten nor logged.
   if [ "$_ml_seen" = "$_ml_val" ]; then
     return 0
   fi

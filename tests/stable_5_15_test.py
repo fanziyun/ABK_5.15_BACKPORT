@@ -3328,12 +3328,10 @@ def test_runtime_tunables_module():
 
     policy = (module_dir / "zram-policy.sh").read_text(encoding="utf-8")
     common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
-    # The banner action.sh prints has to be the version the module manager
-    # lists, and nothing used to tie the two files together -- so they drifted:
-    # common.sh sat at v0.11.0 while module.prop moved on to v0.12.0, and
-    # `action.sh status` reported a version that had not existed for a release.
-    check("common.sh ABK_VERSION tracks module.prop's version",
-          f'ABK_VERSION="{props.get("version")}"' in common_sh,
+    # ABK_VERSION is computed from module.prop at source time, so pin the computation itself (the two had drifted: v0.11.0 vs v0.12.0).
+    check("common.sh ABK_VERSION is computed from module.prop",
+          "ABK_VERSION=\"$(sed -n 's/^version=//p'" in common_sh
+          and "module.prop" in common_sh,
           re.findall(r"(?m)^ABK_VERSION=.*", common_sh))
     check("policy hardcodes the measured primary",
           'ABK_ZRAM_PRIMARY="lz4kd"' in common_sh)
@@ -3485,11 +3483,7 @@ def test_runtime_tunables_module():
     check("cfr.group is a known tunables.conf key",
           "cfr.group" in common_sh
           and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
-    # mem_limit has no read node, so the target must be floored to a page
-    # multiple before the write or every reassert reports the kernel's own
-    # rounding as a mismatch (v0.21.0, see CHANGELOG).  Pin the helper, its use
-    # in the setter, and the two guards that keep the floor honest: an
-    # is_uint re-check and the never-write-zero rule (0 = no cap in the kernel).
+    # mem_limit has no read node, so the target must be floored to a page multiple before the write or every reassert reports the kernel's own rounding as a mismatch (v0.22.0).
     setter = policy[policy.index("abk_zram_set_mem_limit() {"):
                     policy.index("abk_zram_mount_swap() {")]
     check("the mem_limit target is floored to the alignment constant",
@@ -3605,18 +3599,7 @@ def test_runtime_tunables_module():
     # supervisor did not start" while the supervisor was in fact running, and
     # every pid-file-based check of it was blind.  zram and cfr already passed
     # "$$"; the psi one was a typo.  Pin the whole class, not the one line.
-    #
-    # The typo is only half the class, and this file pinned only that half.  The
-    # other half is a supervisor that never writes its pid file *at all*: on
-    # 2026-10-16 the shipped iorap-watch.sh was missing its `abk_pid_write` line,
-    # so abk_spawn polled ten seconds, warned "iorap-watch supervisor did not
-    # start" every boot while the watcher ran perfectly (its `record+kick` lines
-    # were in the same log), and `action.sh status` could not report it.  A check
-    # over the calls that *exist* cannot see a call that is absent -- deleting
-    # the line left both assertions below green, verified.  So pair the two sets:
-    # every `abk_spawn --supervise-X <name>` must have a matching
-    # `abk_pid_write <name>`, which is what makes both the "started" log line and
-    # the status report true.
+    # The other half of the class is a call that is *absent*: a shipped iorap-watch.sh missing its abk_pid_write line left both checks above green, so pair the sets.
     _pid_writes = []
     for _sh in sorted(module_dir.glob("*.sh")):
         _pid_writes += re.findall(r'abk_pid_write\s+(\S+)\s+"([^"]*)"',
@@ -3633,8 +3616,7 @@ def test_runtime_tunables_module():
     check("every spawned supervisor has a pid write, so none goes unreported",
           bool(_spawns) and set(_spawns) <= _write_names,
           (sorted(_spawns), sorted(_write_names)))
-    # ... and the report has to name them, or "running" is only knowable by
-    # grepping /proc by hand.  Both new supervisors were absent from it.
+    # The report must name them too, or "running" means grepping /proc by hand.
     check("status reports every supervisor it spawns",
           all(f'abk_supervisor_state {_n} ' in action_source for _n in _spawns),
           [_n for _n in _spawns
@@ -3912,13 +3894,7 @@ export ABK_STDOUT=1
 # the reset/initstate loops sleep; make that instant
 sleep() { return 0; }
 
-# The kernel's own mem_limit behaviour, modelled where it is observable.
-# `mem_limit` is write-only (DEVICE_ATTR_WO), mem_limit_store() keeps
-# PAGE_ALIGN(limit) >> PAGE_SHIFT and mm_stat field 4 is the only way to read it
-# back.  A fixture that simply echoed the written bytes would prove nothing
-# here: the real mismatch this file guards against -- an unaligned target
-# reading back one page high -- could never appear.  With the model in place the
-# device's own 21-line WARN storm reproduces offline.
+# Model the kernel: mem_limit is write-only and mm_stat field 4 is the only readback, so a plain echo fixture could never reproduce the mismatch.
 eval "$(declare -f abk_write | sed '1s/^abk_write/abk_write_node/')"
 abk_write() {
   _kw_path="$1"
@@ -3927,16 +3903,13 @@ abk_write() {
   case "$_kw_path" in
     */mem_limit)
       if [ -e "$T/mem_limit_ignored" ]; then
-        # A kernel that takes the write and does not honour it: mm_stat reports
-        # something that is not the target, which is the one state the readback
-        # WARN exists for.
+        # A kernel that ignores the write: the one state the readback WARN is for.
         _kw_al="$(awk -v v="$_kw_val" 'BEGIN { printf "%.0f\n", v + 4096 }')"
       else
         _kw_al="$(awk -v v="$_kw_val" \
           'BEGIN { printf "%.0f\n", int((v + 4095) / 4096) * 4096 }')"
       fi
-      # Replace field 4 only: the kernel stores the rounded limit without
-      # disturbing the compressed/used counters the compaction gate reads.
+      # Replace field 4 only, like the kernel does.
       awk -v f4="$_kw_al" 'NF >= 4 { $4 = f4 } { print }' \
         "$T/sys/block/zram0/mm_stat" > "$T/mm_stat.tmp" 2>/dev/null \
         && mv "$T/mm_stat.tmp" "$T/sys/block/zram0/mm_stat"
@@ -4117,13 +4090,7 @@ echo "RC6=$?"
 echo "memlimit6=$(cat "$T/sys/block/zram0/mem_limit" 2>/dev/null)"
 echo "calls6=$(tr '\n' ';' < "$T/calls")"
 
-# 6b. mem_limit: the kernel stores PAGE_ALIGN(limit) and mm_stat prints it back
-#     (there is no read node -- it is DEVICE_ATTR_WO), so an unaligned target
-#     reads one page high forever.  Measured on device: 21
-#     `mem_limit readback is '2933764096', wanted 2933763072` lines, one per
-#     60 s reassert tick.  The fixture carries that device's MemTotal, because
-#     the generic fixture's 25 % happens to land page-aligned and would let the
-#     regression pass without exercising it.
+# 6b. mem_limit: an unaligned target reads one page high forever (kernel stores PAGE_ALIGN(limit), mm_stat f4 is the only readback); fixture uses that device's MemTotal because the generic fixture's 25 % lands aligned.
 reset_fixture
 printf 'MemTotal:       11460012 kB\n' > "$T/meminfo"
 printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
@@ -4329,13 +4296,7 @@ rm -rf "$T"
           got.get("disksize1") == "17179869184", r.stdout)
     check("takeover caps zram at 25% of RAM, floored to the mem_limit alignment",
           got.get("memlimit1") == "3983605760", r.stdout)
-    # The device run behind this: 21 `mem_limit readback is '2933764096',
-    # wanted 2933763072` lines, one per 60 s reassert tick, for an unbroken
-    # stretch -- the kernel stores PAGE_ALIGN(limit) and mm_stat prints that
-    # back, so an unaligned target reads one page high forever.  Flooring the
-    # target to a multiple of 64 KiB makes that round an identity on every page
-    # size this tree builds with (4K/16K/64K), and a cap that has not moved
-    # stops being logged every tick.
+    # The device run behind this: an unaligned target read one page high every tick; flooring to 64 KiB makes the kernel's round an identity.
     check("the regression fixture reproduces the device's unaligned target",
           got.get("ml0_raw") == "2933763072" and got.get("ml0_mod") != "0",
           (got.get("ml0_raw"), got.get("ml0_mod")))
