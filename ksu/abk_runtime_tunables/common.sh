@@ -196,23 +196,6 @@ abk_clamp_uint() {
   return 0
 }
 
-# abk_mul_div <a> <b> <c> -> a * b / c, 64-bit.
-#
-# Shell arithmetic is NOT portable here: /system/bin/sh is Android's mksh and on
-# the target ROM wraps at 2^31 (measured: `15561024 * 1024` -> -1245380608),
-# while KernelSU's busybox ash does not.  Every byte count the policy touches is
-# already past that limit on any >= 2 GiB device, and a wrapped value silently
-# turns the compressed-memory cap into a negative one -- which the kernel then
-# refuses, leaving the cap off with only a warning in the log.  awk is 64-bit
-# everywhere, so the arithmetic goes through it.
-#
-# The output format matters as much as the arithmetic: printf "%d" casts through
-# the awk build's int, and the first on-device boot of the -202609202 build
-# caught one service-context awk clamping 15889203200 (MemTotal bytes) to
-# 2147483647 there -- the cap briefly landed as 512 MiB-1 (rounded to 512 MiB by
-# the kernel) before the 60 s re-check wrote the true 25 %.  "%.0f" converts
-# straight from the double, which is exact for any integer below 2^53, and no
-# byte count this module touches comes near that.
 abk_mul_div() {
   awk -v a="$1" -v b="$2" -v c="$3" \
     'BEGIN { printf "%.0f\n", a * b / c }' 2>/dev/null
