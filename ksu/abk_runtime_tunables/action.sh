@@ -175,6 +175,8 @@ abk_status_report() {
   abk_supervisor_state zram "zram sweeps"
   abk_supervisor_state cfr "proactive reclaim"
   abk_supervisor_state psi "per-cgroup PSI policy"
+  abk_supervisor_state lru_gen "MGLRU reassert"
+  abk_supervisor_state iorap-watch "launch record/prefetch"
 
   # logcat is best-effort on some ROMs, so the module keeps its own log.
   echo "-- module log --"

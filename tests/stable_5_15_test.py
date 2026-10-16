@@ -3596,15 +3596,27 @@ def test_runtime_tunables_module():
     check("status prints what the tree says, not what the config intends",
           "--status --cgroot" in action_source
           and "abk_supervisor_state psi" in action_source)
-    check("the companion README records the two-boot rule and the third supervisor",
+    check("the companion README records the two-boot rule and every supervisor",
           "two boots" in readme_source
-          and "three supervisors" in readme_source)
+          and "five supervisors" in readme_source)
     # Measured on the target device (2026-09-15): the psi supervisor wrote a
     # literal "$" into its pid file -- `abk_pid_write psi "$"` is a quoted dollar
     # sign, not the pid -- so abk_spawn polled for ten seconds and logged "psi
     # supervisor did not start" while the supervisor was in fact running, and
     # every pid-file-based check of it was blind.  zram and cfr already passed
     # "$$"; the psi one was a typo.  Pin the whole class, not the one line.
+    #
+    # The typo is only half the class, and this file pinned only that half.  The
+    # other half is a supervisor that never writes its pid file *at all*: on
+    # 2026-10-16 the shipped iorap-watch.sh was missing its `abk_pid_write` line,
+    # so abk_spawn polled ten seconds, warned "iorap-watch supervisor did not
+    # start" every boot while the watcher ran perfectly (its `record+kick` lines
+    # were in the same log), and `action.sh status` could not report it.  A check
+    # over the calls that *exist* cannot see a call that is absent -- deleting
+    # the line left both assertions below green, verified.  So pair the two sets:
+    # every `abk_spawn --supervise-X <name>` must have a matching
+    # `abk_pid_write <name>`, which is what makes both the "started" log line and
+    # the status report true.
     _pid_writes = []
     for _sh in sorted(module_dir.glob("*.sh")):
         _pid_writes += re.findall(r'abk_pid_write\s+(\S+)\s+"([^"]*)"',
@@ -3614,6 +3626,19 @@ def test_runtime_tunables_module():
           _pid_writes)
     check("the psi supervisor is one of them",
           any(name == "psi" for name, _arg in _pid_writes), _pid_writes)
+
+    _spawns = re.findall(r'abk_spawn\s+--supervise-\S+\s+(\S+)',
+                         (module_dir / "service.sh").read_text(encoding="utf-8"))
+    _write_names = {name for name, _arg in _pid_writes}
+    check("every spawned supervisor has a pid write, so none goes unreported",
+          bool(_spawns) and set(_spawns) <= _write_names,
+          (sorted(_spawns), sorted(_write_names)))
+    # ... and the report has to name them, or "running" is only knowable by
+    # grepping /proc by hand.  Both new supervisors were absent from it.
+    check("status reports every supervisor it spawns",
+          all(f'abk_supervisor_state {_n} ' in action_source for _n in _spawns),
+          [_n for _n in _spawns
+           if f'abk_supervisor_state {_n} ' not in action_source])
 
     # --- packaging: the module zip and the AK3 ride-along ---
     sys.path.insert(0, str(repo / "scripts"))

@@ -383,13 +383,17 @@ mislabel a whole run. The protocol, and what decides the shipped default, is
   `u:r:ksu:s0` writer), so the file is the source of truth. `report.logcat=0`
   silences only the logcat mirror.
 
-The long-running parts are three supervisors started by `service.sh`
-(`--supervise-zram`, `--supervise-cfr`, `--supervise-psi`), each recording its
-own pid under `state/`. The PSI one is not started at all when `psi.cgroup=keep`
+The long-running parts are five supervisors started by `service.sh`
+(`--supervise-zram`, `--supervise-cfr`, `--supervise-psi`, `--supervise-lru-gen`,
+`--supervise-iorap`), each recording its own pid under `state/` and each named in
+`action.sh status`. The PSI one is not started at all when `psi.cgroup=keep`
 -- one decision, no idle loop -- and it stops itself after its first pass if every
 write was refused, because re-walking hundreds of nodes every five minutes to be
 told `EACCES` again is a supervisor that has become the cost it was meant to
-remove.
+remove. The other three are opt-in and spawn nothing unless their key asks for
+them (`cfr.enable`, `lru_gen.enable`, and the kernel's own `abk_lp_enable` node
+plus `iorap.watch`); `lru_gen` and `iorap` also do not start on a kernel that
+does not carry their graft, so "not running" there is the intended state.
 
 ## Notes, limits and testing seams
 

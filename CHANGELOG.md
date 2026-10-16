@@ -406,6 +406,45 @@ writeback 有 backing device、SELinux Enforcing、recompression supervisor 存�
 `record+kick`。注意 ksud 是暂存式安装（新版落 `modules_update/`，live 目录只改 `module.prop`
 并置 `update` 标记），脚本要重启才生效；本次只动用户态伴生模块，内核无需重刷。
 
+### 同批：`iorap-watch supervisor did not start` 是"整段 pid 写入缺失"，以及它暴露的测试漏洞
+
+同一份设备日志里还有 `WARN iorap-watch supervisor did not start`（2026-10-14 12:54:46），
+而**同一份日志的后续几十行里 `iorap-watch: uid N record+kick` 一直在打**——watcher 明明在跑。
+设备上的 `iorap-watch.sh`（81 行）与仓库版本（86 行）逐字节比对，差异只有一处关键缺失：
+
+```diff
+ abk_iorap_main() {
++  abk_pid_write iorap-watch "$$"
+```
+
+`abk_spawn` 的启动确认是**轮询 pid 文件**（`abk_pid_live "$_sp_name"` 读
+`state/<name>.pid` 再查 `/proc/<pid>`），旧版从不写这个文件 ⇒ 10 秒轮询全落空 ⇒ 报
+`did not start`。设备现场印证了这个矛盾：`--supervise-iorap` 进程活着（pid 32240），但
+`state/` 里只有 `zram.pid` 和 `lru_gen.pid`，**没有 `iorap-watch.pid`**。
+
+**这是真缺陷、修复也是真的**：那份 pid 文件被三处消费——`action.sh` 的
+`abk_supervisor_state`（报 running / dead-stale / not running）、`service.sh` 的
+"already running" 判定、以及 spawn 的启动确认。`zram`/`cfr`/`psi`/`lru_gen` 四个
+supervisor 都写它，`iorap-watch` 是唯一的例外。假 WARN 只是这份状态缺失被暴露出来的
+**症状**，不是把告警删掉——`e0fe026f`（PR #41）已经带上那行，设备之所以还在报，是因为
+它的 `iorap-watch.sh` 是更早的快照（同目录 8 个文件里 6 个与仓库不同）。
+
+**但这条缺陷暴露出测试的一个漏洞，且它是被真机咬出来的**：原有断言只扫**已存在的**
+`abk_pid_write` 调用，检查参数是否为 `"$$"`：
+
+```python
+_pid_writes = [...所有 abk_pid_write 的 (name, arg)...]
+check(..., bool(_pid_writes) and all(arg == "$$" for _n, arg in _pid_writes))
+```
+
+它抓的是 psi 那种**写错**的笔误（`abk_pid_write psi "$"`），**抓不住"整段调用缺失"**——
+实测删掉 `iorap-watch` 那行，两条断言**依旧全绿**。所以新增按集合配对的断言：每个
+`abk_spawn --supervise-X <name>` 必须有对应的 `abk_pid_write <name>`；并新增一条把
+`action.sh` 的 `-- supervisors --` 段与 spawn 集合配对（`iorap-watch` 与 `lru_gen`
+此前都**没有**出现在状态报告里，这是同一次排查顺带发现的第二个缺口）。两条都做了反向
+验证（删掉对应行即失败，并精确点名 `iorap-watch`）。README 的 "three supervisors" 同步
+改为 "five supervisors" 并列出后三个的 opt-in 条件。单测 **1539 → 1541 项全绿**。
+
 ---
 
 <a id="companion-v0-21-0"></a>
