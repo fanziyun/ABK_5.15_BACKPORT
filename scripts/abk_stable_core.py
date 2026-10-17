@@ -3589,6 +3589,14 @@ _MODULE_CONFIGS = [
     # MGLRU grafts stay compiled-in but runtime-inert until the shrink loop is
     # made to converge (a dedicated follow-up PR); ABK_515_DEFCONFIG_ALIGN=1
     # turns the symbol on for testing.
+    # SCHED_CLASS_EXT (Batch 77): the sched_ext class.  The symbol is introduced
+    # by this module's Kconfig group, so without a tier entry nothing would ever
+    # compile the three-file payload or its glue translation unit -- the exact
+    # Batch 8 RCU failure mode, one config layer down.  Enabled by default
+    # because it is also the only compile gate the payload gets between CI runs:
+    # the class is registered but unreachable until the functional wiring batch
+    # makes valid_policy() accept SCHED_EXT, so no task can enter it yet.
+    ("SCHED_CLASS_EXT", "y"),
 ]
 
 _ALIGN_CONFIGS = [
@@ -3648,6 +3656,10 @@ _INTRODUCED_KCONFIG = {
     "LRU_GEN_ENABLED": "align",
     "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
     "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
+    # Introduced by Batch 77's Kconfig group and enabled by the module tier, so
+    # the 143 KB SCX payload is compiled in every build rather than sitting
+    # behind a symbol no tier sets.
+    "SCHED_CLASS_EXT": "module",
 }
 
 

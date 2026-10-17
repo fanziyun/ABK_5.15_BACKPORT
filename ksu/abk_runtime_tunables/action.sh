@@ -15,8 +15,15 @@ set -u
 MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/common.sh"
 . "$MODDIR/zram-policy.sh"
+. "$MODDIR/scx-policy.sh"
+. "$MODDIR/uclamp-policy.sh"
 
 ABK_STDOUT=1
+
+# The KernelSU installer drops every entry mode (see abk_fix_tool_modes); repair
+# them before any status line reads `[ -x ... ]`, or a fresh install reports the
+# loader "absent" even though it shipped.
+abk_fix_tool_modes
 
 abk_show() {
   printf '%-26s %s\n' "$1" "$2"
@@ -253,11 +260,17 @@ case "${1:-status}" in
   unlock)
     abk_action_unlock
     ;;
+  scx)
+    abk_scx_status
+    ;;
+  uclamp)
+    abk_uclamp_status
+    ;;
   launch)
     abk_action_launch "$@"
     ;;
   *)
-    echo "usage: action.sh [status|pass|takeover|unlock|launch [warm|drop] [iters]]" >&2
+    echo "usage: action.sh [status|pass|takeover|unlock|scx|uclamp|launch [warm|drop] [iters]]" >&2
     exit 2
     ;;
 esac

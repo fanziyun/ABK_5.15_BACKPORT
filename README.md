@@ -45,11 +45,11 @@
 
 | child id | 内容 | 组数 |
 |---|---|---:|
-| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 73 |
-| `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 24 |
+| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 75 |
+| `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 54 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **98 个移植组**，同一串注入在 `android13-5.15-lts` 上使用。
+共 **130 个移植组**（其中 `stable_perf_backport` 的 54 组含 Batch 79 的 sched_ext 载荷 5.15 适配三组、Batch 80 的任务生命周期钩子五组、Batch 81 的调度核心钩子四组与 Batch 82 的可达性四组），同一串注入在 `android13-5.15-lts` 上使用。
 
 支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 220）**。
 Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，
@@ -122,7 +122,7 @@ bash tests/smoke.sh build/abk-trees/216                        # 端到端 + 回
 | `scripts/` | **移植本体**：锚点引擎 + 三个 child 的组注册表 |
 | `tests/` | 单测、参考树抓取脚本                    |
 | `docs/` | 项目文档、开源声明                     |
-| `tools/` | 5 个设备侧 CLI                    |
+| `tools/` | 6 个设备侧 CLI + build-host 助手 + `scx/` 用户态调度器源码 |
 | `ksu/` | KernelSU 模块源码                 |
 | `plan.md` | 实现清单                          |
 | `CHANGELOG.md` | 各批次报告                         |

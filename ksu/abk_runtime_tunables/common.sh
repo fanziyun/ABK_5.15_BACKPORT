@@ -227,6 +227,25 @@ abk_write() {
   return 0
 }
 
+# Re-assert the executable bit on the entries that must be executed, not
+# sourced.  KernelSU's own installer (`ksud module install`) unpacks the module
+# zip without preserving entry modes: measured on the target device, a freshly
+# installed copy lands EVERY entry 0644 -- the .sh scripts included.  The
+# scripts survive that because the module only ever runs them as `sh <path>`,
+# but the SCX loader is a compiled aarch64 ELF that has to be exec'd directly,
+# and scx-policy.sh's readiness gate is `[ -x ... ]`.  Without this the loader
+# is present but never runnable, so SCX could never attach -- not because the
+# graft is wrong, but because the installer dropped a mode bit.  Fix the bit
+# here instead of trusting the installer; the packager sets it too (so the zip
+# itself is correct), but that alone is not enough.
+abk_fix_tool_modes() {
+  for _fm_t in "$MODDIR"/*.sh "$MODDIR"/bin/*; do
+    [ -f "$_fm_t" ] || continue
+    chmod 0755 "$_fm_t" 2>/dev/null
+  done
+  return 0
+}
+
 # --- tunables.conf --------------------------------------------------------
 # The keys the module understands.  Unknown keys are reported once and ignored
 # so a typo cannot change behaviour silently.
@@ -270,6 +289,12 @@ cfr.cgroup_root
 cfr.frozen_only
 cfr.freezer_root
 cfr.cached_only
+scx.enabled
+scx.mark_pids
+scx.reassert_interval_sec
+boost.uclamp_min
+boost.groups
+boost.interval_sec
 iorap.watch
 iorap.min_uid
 iorap.record_cool_min
