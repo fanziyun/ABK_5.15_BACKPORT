@@ -425,6 +425,18 @@ abk_zram_set_mem_limit() {
   # rejected by the kernel, silently leaving the cap off.
   _ml_val="$(abk_mem_pct_bytes "$ABK_ZRAM_MEM_LIMIT_PCT")" || return 0
   abk_is_uint "$_ml_val" || return 0
+  # Floor to the alignment so the kernel's PAGE_ALIGN() is an identity and the mm_stat readback is exact.
+  _ml_val="$(abk_align_down "$_ml_val" "$ABK_ZRAM_MEM_LIMIT_ALIGN")"
+  abk_is_uint "$_ml_val" || return 0
+  # 0 means "no cap" to the kernel; the floor must never uncap the device.
+  abk_gt "$_ml_val" 0 || return 0
+
+  _ml_seen="$(abk_zram_mem_limit)"
+  # Steady state: an unchanged cap is neither rewritten nor logged.
+  if [ "$_ml_seen" = "$_ml_val" ]; then
+    return 0
+  fi
+
   abk_write "$ABK_ZRAM_DIR/mem_limit" "$_ml_val" || return 0
   _ml_seen="$(abk_zram_mem_limit)"
   if [ "$_ml_seen" = "$_ml_val" ]; then

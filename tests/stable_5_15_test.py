@@ -3328,12 +3328,10 @@ def test_runtime_tunables_module():
 
     policy = (module_dir / "zram-policy.sh").read_text(encoding="utf-8")
     common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
-    # The banner action.sh prints has to be the version the module manager
-    # lists, and nothing used to tie the two files together -- so they drifted:
-    # common.sh sat at v0.11.0 while module.prop moved on to v0.12.0, and
-    # `action.sh status` reported a version that had not existed for a release.
-    check("common.sh ABK_VERSION tracks module.prop's version",
-          f'ABK_VERSION="{props.get("version")}"' in common_sh,
+    # ABK_VERSION is computed from module.prop at source time, so pin the computation itself (the two had drifted: v0.11.0 vs v0.12.0).
+    check("common.sh ABK_VERSION is computed from module.prop",
+          "ABK_VERSION=\"$(sed -n 's/^version=//p'" in common_sh
+          and "module.prop" in common_sh,
           re.findall(r"(?m)^ABK_VERSION=.*", common_sh))
     check("policy hardcodes the measured primary",
           'ABK_ZRAM_PRIMARY="lz4kd"' in common_sh)
@@ -3485,6 +3483,19 @@ def test_runtime_tunables_module():
     check("cfr.group is a known tunables.conf key",
           "cfr.group" in common_sh
           and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
+    # mem_limit has no read node, so the target must be floored to a page multiple before the write or every reassert reports the kernel's own rounding as a mismatch (v0.22.0).
+    setter = policy[policy.index("abk_zram_set_mem_limit() {"):
+                    policy.index("abk_zram_mount_swap() {")]
+    check("the mem_limit target is floored to the alignment constant",
+          "abk_align_down() {" in common_sh
+          and 'ABK_ZRAM_MEM_LIMIT_ALIGN=65536' in common_sh
+          and 'abk_align_down "$_ml_val" "$ABK_ZRAM_MEM_LIMIT_ALIGN"' in setter)
+    check("the floor can never turn the cap off (0 means uncapped)",
+          'abk_gt "$_ml_val" 0 || return 0' in setter)
+    check("an unchanged cap is neither rewritten nor logged",
+          'if [ "$_ml_seen" = "$_ml_val" ]; then' in setter
+          and setter.index('"$_ml_seen" = "$_ml_val"')
+          < setter.index('abk_write "$ABK_ZRAM_DIR/mem_limit"'))
     # A per-UID tree on this ROM is one level below the root the tool searches
     # (/dev/memcg/mimd), and it holds the app on screen as well as the cached
     # ones -- so reaching it and restricting it are one change, not two: an
@@ -3579,15 +3590,16 @@ def test_runtime_tunables_module():
     check("status prints what the tree says, not what the config intends",
           "--status --cgroot" in action_source
           and "abk_supervisor_state psi" in action_source)
-    check("the companion README records the two-boot rule and the third supervisor",
+    check("the companion README records the two-boot rule and every supervisor",
           "two boots" in readme_source
-          and "three supervisors" in readme_source)
+          and "five supervisors" in readme_source)
     # Measured on the target device (2026-09-15): the psi supervisor wrote a
     # literal "$" into its pid file -- `abk_pid_write psi "$"` is a quoted dollar
     # sign, not the pid -- so abk_spawn polled for ten seconds and logged "psi
     # supervisor did not start" while the supervisor was in fact running, and
     # every pid-file-based check of it was blind.  zram and cfr already passed
     # "$$"; the psi one was a typo.  Pin the whole class, not the one line.
+    # The other half of the class is a call that is *absent*: a shipped iorap-watch.sh missing its abk_pid_write line left both checks above green, so pair the sets.
     _pid_writes = []
     for _sh in sorted(module_dir.glob("*.sh")):
         _pid_writes += re.findall(r'abk_pid_write\s+(\S+)\s+"([^"]*)"',
@@ -3597,6 +3609,18 @@ def test_runtime_tunables_module():
           _pid_writes)
     check("the psi supervisor is one of them",
           any(name == "psi" for name, _arg in _pid_writes), _pid_writes)
+
+    _spawns = re.findall(r'abk_spawn\s+--supervise-\S+\s+(\S+)',
+                         (module_dir / "service.sh").read_text(encoding="utf-8"))
+    _write_names = {name for name, _arg in _pid_writes}
+    check("every spawned supervisor has a pid write, so none goes unreported",
+          bool(_spawns) and set(_spawns) <= _write_names,
+          (sorted(_spawns), sorted(_write_names)))
+    # The report must name them too, or "running" means grepping /proc by hand.
+    check("status reports every supervisor it spawns",
+          all(f'abk_supervisor_state {_n} ' in action_source for _n in _spawns),
+          [_n for _n in _spawns
+           if f'abk_supervisor_state {_n} ' not in action_source])
 
     # --- packaging: the module zip and the AK3 ride-along ---
     sys.path.insert(0, str(repo / "scripts"))
@@ -3870,6 +3894,30 @@ export ABK_STDOUT=1
 # the reset/initstate loops sleep; make that instant
 sleep() { return 0; }
 
+# Model the kernel: mem_limit is write-only and mm_stat field 4 is the only readback, so a plain echo fixture could never reproduce the mismatch.
+eval "$(declare -f abk_write | sed '1s/^abk_write/abk_write_node/')"
+abk_write() {
+  _kw_path="$1"
+  _kw_val="$2"
+  abk_write_node "$_kw_path" "$_kw_val" || return 1
+  case "$_kw_path" in
+    */mem_limit)
+      if [ -e "$T/mem_limit_ignored" ]; then
+        # A kernel that ignores the write: the one state the readback WARN is for.
+        _kw_al="$(awk -v v="$_kw_val" 'BEGIN { printf "%.0f\n", v + 4096 }')"
+      else
+        _kw_al="$(awk -v v="$_kw_val" \
+          'BEGIN { printf "%.0f\n", int((v + 4095) / 4096) * 4096 }')"
+      fi
+      # Replace field 4 only, like the kernel does.
+      awk -v f4="$_kw_al" 'NF >= 4 { $4 = f4 } { print }' \
+        "$T/sys/block/zram0/mm_stat" > "$T/mm_stat.tmp" 2>/dev/null \
+        && mv "$T/mm_stat.tmp" "$T/sys/block/zram0/mm_stat"
+      ;;
+  esac
+  return 0
+}
+
 reset_fixture() {
   printf '17179869184\n' > "$T/sys/block/zram0/disksize"
   printf '1\n' > "$T/sys/block/zram0/initstate"
@@ -3880,6 +3928,7 @@ reset_fixture() {
   rm -f "$T/sys/block/zram0/compact"
   rm -f "$T/sys/block/zram0/writeback" "$T/sys/block/zram0/backing_dev"
   rm -f "$T/sys/block/zram0/writeback_limit" "$T/sys/block/zram0/writeback_limit_enable"
+  rm -f "$T/mem_limit_ignored"
   rm -rf "$T/sys/module" "$T/wb"
   : > "$T/calls"
 }
@@ -4040,6 +4089,35 @@ abk_zram_ensure > "$T/out6" 2>&1
 echo "RC6=$?"
 echo "memlimit6=$(cat "$T/sys/block/zram0/mem_limit" 2>/dev/null)"
 echo "calls6=$(tr '\n' ';' < "$T/calls")"
+
+# 6b. mem_limit: an unaligned target reads one page high forever (kernel stores PAGE_ALIGN(limit), mm_stat f4 is the only readback); fixture uses that device's MemTotal because the generic fixture's 25 % lands aligned.
+reset_fixture
+printf 'MemTotal:       11460012 kB\n' > "$T/meminfo"
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+echo "ml0_raw=$(abk_mem_pct_bytes 25)"
+echo "ml0_mod=$(awk -v v="$(abk_mem_pct_bytes 25)" 'BEGIN { print v % 4096 }')"
+abk_zram_ensure > "$T/out6b1" 2>&1
+echo "ml1_state=$(abk_zram_mem_limit)"
+echo "ml1_warn=$(grep -c 'readback is' "$T/out6b1" 2>/dev/null)"
+echo "ml1_log=$(grep -c 'zram mem_limit=' "$T/out6b1" 2>/dev/null)"
+# steady state: the same reassert the supervisor runs every tick, twice
+abk_zram_ensure > "$T/out6b2" 2>&1
+abk_zram_ensure > "$T/out6b3" 2>&1
+echo "ml2_lines=$(cat "$T/out6b2" "$T/out6b3" 2>/dev/null | grep -c 'mem_limit')"
+# the cap is dropped behind the module's back: re-arming it must log again
+printf '4096 62 20480 0 20480 0 0 0 0\n' > "$T/sys/block/zram0/mm_stat"
+abk_zram_ensure > "$T/out6b4" 2>&1
+echo "ml3_log=$(grep -c 'zram mem_limit=' "$T/out6b4" 2>/dev/null)"
+# a kernel that ignores the write is the one case the WARN is for
+reset_fixture
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+: > "$T/mem_limit_ignored"
+abk_zram_ensure > "$T/out6b5" 2>&1
+echo "ml4_warn=$(grep -c 'readback is' "$T/out6b5" 2>/dev/null)"
+rm -f "$T/mem_limit_ignored"
+printf 'MemTotal:       15561024 kB\n' > "$T/meminfo"
 
 # 7. the supervisor keeps sweeping when a pass fails, and records its pid.  The
 #    device already carries the policy here, so each tick is a cheap re-check
@@ -4216,8 +4294,22 @@ rm -rf "$T"
           r.stdout)
     check("takeover preserves the ROM's swap size",
           got.get("disksize1") == "17179869184", r.stdout)
-    check("takeover caps zram at 25% of RAM (3983622144 bytes)",
-          got.get("memlimit1") == "3983622144", r.stdout)
+    check("takeover caps zram at 25% of RAM, floored to the mem_limit alignment",
+          got.get("memlimit1") == "3983605760", r.stdout)
+    # The device run behind this: an unaligned target read one page high every tick; flooring to 64 KiB makes the kernel's round an identity.
+    check("the regression fixture reproduces the device's unaligned target",
+          got.get("ml0_raw") == "2933763072" and got.get("ml0_mod") != "0",
+          (got.get("ml0_raw"), got.get("ml0_mod")))
+    check("the cap is written already page-aligned, so the readback is exact",
+          got.get("ml1_state") == "2933719040"
+          and got.get("ml1_warn") == "0" and got.get("ml1_log") == "1",
+          (got.get("ml1_state"), got.get("ml1_warn"), got.get("ml1_log")))
+    check("a steady-state reassert says nothing about an unchanged cap",
+          got.get("ml2_lines") == "0", got.get("ml2_lines"))
+    check("a cap dropped behind the module is re-armed and reported",
+          got.get("ml3_log") == "1", got.get("ml3_log"))
+    check("a kernel that ignores the write still trips the readback WARN",
+          got.get("ml4_warn") == "1", got.get("ml4_warn"))
     calls1 = got.get("calls1", "")
     check("takeover unmounts and remounts the swap area itself",
           "swapoff /dev/block/zram0" in calls1
@@ -4268,7 +4360,7 @@ rm -rf "$T"
           got.get("RC6") == "0" and "swapoff" not in got.get("calls6", "")
           and 'reset" 1' not in got.get("calls6", ""), got.get("calls6"))
     check("... with only the compressed-memory cap re-asserted",
-          got.get("memlimit6") == "3983622144", got.get("memlimit6"))
+          got.get("memlimit6") == "3983605760", got.get("memlimit6"))
 
     check("the supervisor sweeps repeatedly after a failing pass",
           (got.get("supervisor_runs") or "0").isdigit()

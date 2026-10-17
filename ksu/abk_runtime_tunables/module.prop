@@ -1,6 +1,6 @@
 id=abk_runtime_tunables
 name=sailboat 附加模块（一）
-version=v0.21.0
-versionCode=25
+version=v0.22.0
+versionCode=26
 author=FanZiyun
 description=Keeps the ABK 5.15 kernel grafts in force on device: zram algorithms, writeback, recompression and SELinux rules.

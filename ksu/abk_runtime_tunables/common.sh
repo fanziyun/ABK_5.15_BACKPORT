@@ -5,12 +5,8 @@
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-# Has to track module.prop: this banner is what the module manager shows, so a
-# drift between the two makes action.sh report a version the manager never lists.
-# It had drifted -- common.sh sat at v0.11.0 while module.prop moved to v0.12.0
-# -- because nothing tied the two files together; test_runtime_tunables_module
-# now does, so the next bump cannot leave one behind.
-ABK_VERSION="v0.21.0"
+# Computed from module.prop at source time so the banner cannot drift from the manager's version.
+ABK_VERSION="$(sed -n 's/^version=//p' "${MODDIR:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}/module.prop" 2>/dev/null)"
 
 # --- hardcoded zram policy -------------------------------------------------
 # Constants on purpose, not configuration.  Measured on the target device
@@ -36,6 +32,8 @@ ABK_ZRAM_DEV="0"
 ABK_ZRAM_PRIMARY="lz4kd"
 ABK_ZRAM_SECONDARY="zstd"
 ABK_ZRAM_MEM_LIMIT_PCT=25   # cap on compressed zram memory, percent of RAM
+# A whole multiple of every buildable page size (4K/16K/64K), so the kernel's PAGE_ALIGN() is an identity.
+ABK_ZRAM_MEM_LIMIT_ALIGN=65536
 # `swapoff` reads every swapped page back into RAM (no data is lost), so this
 # gate is not about data loss: it bounds the transient RAM spike.  At boot the
 # ROM's own zram owner initialises the device a few seconds before this module
@@ -189,23 +187,6 @@ abk_clamp_uint() {
   return 0
 }
 
-# abk_mul_div <a> <b> <c> -> a * b / c, 64-bit.
-#
-# Shell arithmetic is NOT portable here: /system/bin/sh is Android's mksh and on
-# the target ROM wraps at 2^31 (measured: `15561024 * 1024` -> -1245380608),
-# while KernelSU's busybox ash does not.  Every byte count the policy touches is
-# already past that limit on any >= 2 GiB device, and a wrapped value silently
-# turns the compressed-memory cap into a negative one -- which the kernel then
-# refuses, leaving the cap off with only a warning in the log.  awk is 64-bit
-# everywhere, so the arithmetic goes through it.
-#
-# The output format matters as much as the arithmetic: printf "%d" casts through
-# the awk build's int, and the first on-device boot of the -202609202 build
-# caught one service-context awk clamping 15889203200 (MemTotal bytes) to
-# 2147483647 there -- the cap briefly landed as 512 MiB-1 (rounded to 512 MiB by
-# the kernel) before the 60 s re-check wrote the true 25 %.  "%.0f" converts
-# straight from the double, which is exact for any integer below 2^53, and no
-# byte count this module touches comes near that.
 abk_mul_div() {
   awk -v a="$1" -v b="$2" -v c="$3" \
     'BEGIN { printf "%.0f\n", a * b / c }' 2>/dev/null
@@ -224,6 +205,11 @@ abk_gt() {
 
 abk_le() {
   awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }' 2>/dev/null
+}
+
+# abk_align_down <value> <alignment>; awk for the same 64-bit reason as abk_mul_div.
+abk_align_down() {
+  awk -v v="$1" -v a="$2" 'BEGIN { printf "%.0f\n", int(v / a) * a }' 2>/dev/null
 }
 
 # abk_write <path> <value>: write a whole line, report but never abort
