@@ -56,6 +56,13 @@ Scope notes:
   sits in a ``CONFIG_SWAP`` gate with the pristine ``goto keep;`` as the
   ``#else`` behaviour (AGENTS.md "Step-authoring traps" #7).  Everything else
   in the group is swap-flag-free and stays compilable with the gate off.
+* ``list_splice_tail()`` does not reinitialize its source, so after the retry
+  splice ``wb_retry_pages`` still points into the entries it just handed to
+  ``page_list``.  That list is dead from then on and the one-shot
+  ``wb_retry_done`` latch is what guarantees nothing walks it again.  Keep the
+  invariant if the latch is ever reworked: reset the list, or switch to
+  ``list_splice_tail_init()``.  Stated here rather than in the generated C, so
+  the grafted text (and the audits that pin its marker count) stay untouched.
 * Ordering: registered after ``vm_kcompressd_swapout`` (Batch 41) and
   ``kcompressd_writeback_pin`` (Batch 71).  The step-2 shape the group edits
   is pristine text, but the state it acts on (a swap-cache page under
@@ -200,6 +207,9 @@ DECL_LIST = "LIST_HEAD(wb_retry_pages);"
 DECL_FLAG = "bool wb_retry_done = false;"
 PARK = "list_add(&page->lru, &wb_retry_pages);"
 PRE_FILTER = "list_move(&page->lru, &ret_pages);"
+# list_splice_tail() leaves its source list pointing into the entries it just
+# spliced; nothing reads wb_retry_pages after this call and the wb_retry_done
+# latch is what keeps it that way (docstring "Scope notes").
 SPLICE = "list_splice_tail(&wb_retry_pages, page_list);"
 RETRY_LATCH = "\t\twb_retry_done = true;"
 SWAP_GATE = "#ifdef CONFIG_SWAP"
