@@ -32,13 +32,17 @@ namespace then owns the knobs) as two helpers:
 
   * ``abk_swapin_window_clamp(pages)`` -- pure arithmetic, no lock, no sleep, no
     allocation, so it is safe from the page-fault path:
-      - boost: ``pages = roundup_pow_of_two(swapin_boost_pages)`` when the
-        configured floor is above the computed window and boost is enabled; the
-        window must stay a power of two because ``swap_cluster_readahead()``
-        derives its alignment mask as ``pages - 1`` and the vma path aligns on
-        it too.  Capped at ``1 << SWAP_RA_ORDER_CEILING``, the largest window
+      - boost: ``pages = roundup_pow_of_two(boost)`` when the configured floor is
+        above the computed window and boost is enabled; the window must stay a
+        power of two because ``swap_cluster_readahead()`` derives its alignment
+        mask as ``pages - 1`` and the vma path aligns on it too.  The floor is
+        clamped to ``1 << SWAP_RA_ORDER_CEILING`` -- the largest window
         ``swap_ra_info()`` can represent/pack (on 32-bit that is also the size
-        of its on-stack pte cache).
+        of its on-stack pte cache) -- *before* the round-up: ``roundup_pow_of_two
+        ()`` returns ``unsigned long``, and a floor in [2^31 + 1, 2^32 - 1]
+        rounds to 2^32, which truncates to 0 in the returned ``unsigned int``
+        and would make ``mask = 0 - 1`` read the whole swap device.  A window
+        the kernel already produced above the ceiling is left alone.
       - shrink: ``pages = rounddown_pow_of_two(swapin_shrink_pages)`` when the
         configured ceiling is below the computed window, shrink is enabled and
         the background gate below is open.  Rounded down for the same mask
@@ -276,11 +280,23 @@ _RA_TAIL_NEW = (
         "\t * the same value.  With the stock page_cluster of 3 the kernel already\n"
         "\t * caps the window at 8, so the default boost_pages of 8 is a no-op\n"
         "\t * there and only lifts a smaller cluster setting.\n"
+        "\t *\n"
+        "\t * Clamp the floor to ABK_SWAPIN_WINDOW_MAX BEFORE the round-up, for\n"
+        "\t * two reasons.  roundup_pow_of_two() returns unsigned long, so a\n"
+        "\t * configured floor in [2^31 + 1, 2^32 - 1] rounds to 2^32, which\n"
+        "\t * truncates to 0 in this unsigned int: the cluster path would then\n"
+        "\t * derive mask = 0 - 1 = all-ones and read the whole swap device, so a\n"
+        "\t * window of 0 must be impossible.  And a window the kernel already\n"
+        "\t * produced above the ceiling (page_cluster > 5) must not be pulled\n"
+        "\t * back down by the boost, hence the boost > pages test.\n"
         "\t */\n"
         "\tif (swapin_boost_enable && pages < swapin_boost_pages) {\n"
-        "\t\tpages = roundup_pow_of_two(swapin_boost_pages);\n"
-        "\t\tif (pages > ABK_SWAPIN_WINDOW_MAX)\n"
-        "\t\t\tpages = ABK_SWAPIN_WINDOW_MAX;\n"
+        "\t\tunsigned int boost = swapin_boost_pages;\n"
+        "\n"
+        "\t\tif (boost > ABK_SWAPIN_WINDOW_MAX)\n"
+        "\t\t\tboost = ABK_SWAPIN_WINDOW_MAX;\n"
+        "\t\tif (boost > pages)\n"
+        "\t\t\tpages = roundup_pow_of_two(boost);\n"
         "\t}\n"
         "\n"
         "\t/*\n"
