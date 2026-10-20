@@ -65,6 +65,13 @@ CONFIG_GATED_REFERENCES = {
         ("CONFIG_CPUSETS",
          ("cpuset_cgrp_id",)),
     ],
+    # kcompressd_swapcache_drop (Batch 72): page_swap_info() only exists under
+    # CONFIG_SWAP, so its one reference in mm/vmscan.c must stay inside the
+    # gate; with the gate off the PAGE_SUCCESS path keeps the pristine goto keep.
+    "mm/vmscan.c": [
+        ("CONFIG_SWAP",
+         ("page_swap_info(",)),
+    ],
 }
 
 
@@ -1013,6 +1020,42 @@ REQUIRED_CONTENT = {
         # pristine tree (__swap_writepage/end_swap_bio_write and Batch 41's
         # body), so they are pinned per-function in REQUIRED_IN_FUNCTION instead.
         ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
+    ],
+    "core:kcompressd_swapcache_drop": [
+        # Batch 72: same-pass swap-cache drop for a pinned kcompressd page.
+        # The marker is the file-wide needle; the list operations are pinned
+        # because a graft that compiled but never re-queued would still apply.
+        ["mm/vmscan.c", "sailboat_kcompressd_swapcache_drop"],
+        ["mm/vmscan.c", "LIST_HEAD(wb_retry_pages);"],
+        ["mm/vmscan.c", "bool wb_retry_done = false;"],
+        ["mm/vmscan.c", "list_add(&page->lru, &wb_retry_pages);"],
+        ["mm/vmscan.c", "list_move(&page->lru, &ret_pages);"],
+        ["mm/vmscan.c", "list_splice_tail(&wb_retry_pages, page_list);"],
+        ["mm/vmscan.c", "SWP_SYNCHRONOUS_IO"],
+    ],
+    "core:swapin_readahead_window": [
+        # Batch 73: two-sided swap-in readahead window clamp.
+        ["mm/readahead.c", "sailboat_swapin_readahead_window"],
+        ["mm/readahead.c", "bool abk_swapin_shrink_gate(void)"],
+        ["mm/readahead.c", "unsigned int abk_swapin_window_clamp(unsigned int pages)"],
+        ["mm/readahead.c", "module_param_named(swapin_vma_ra, enable_vma_readahead, bool, 0644);"],
+        ["mm/swap_state.c", "pages = abk_swapin_window_clamp(pages);"],
+        ["mm/swap_state.c", "sailboat_swapin_readahead_window"],
+        ["mm/internal.h", "extern unsigned int abk_swapin_window_clamp(unsigned int pages);"],
+        ["mm/internal.h", "extern bool abk_swapin_shrink_gate(void);"],
+    ],
+    "core:fault_around_app_policy": [
+        # Batch 74: per-uid read fault-around policy.
+        "sailboat_fault_around_app_policy",
+        "\tabk_fa_adjust(&should_around);",
+        "static void abk_fa_adjust(bool *should_around)",
+        "static DEFINE_MUTEX(abk_fa_app_lock);",
+        "return from_kuid(&init_user_ns, current_uid());",
+        "module_param(fault_around_enable, bool, 0644);",
+        "module_param(fault_around_sys_uid, bool, 0644);",
+        "module_param(fault_around_app_only, bool, 0644);",
+        "module_param_cb(fault_around_app, &abk_fa_app_param_ops, NULL, 0644);",
+        "bitmap_zero(abk_fa_app_bitmap, 90000);",
     ],
     "core:vm_kcompressd_swapout": [
         "kcompressd%d",

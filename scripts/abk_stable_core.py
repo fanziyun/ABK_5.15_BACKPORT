@@ -6705,5 +6705,39 @@ import batch71_core_kcompressd_wb_pin as _b71_wb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)
 
+# ============================================================================
+# Batch 72: drop a kcompressd swap-cache page in the same reclaim pass.
+# Batch 71's PG_writeback pin makes shrink_page_list()'s PAGE_SUCCESS branch
+# see a clean, unmapped, swap-cache-owned page that is still under writeback;
+# the pristine goto keep parks it with the swap-cache entry allocated until a
+# later scan.  This group parks it and re-scans once inside the same call so
+# __remove_mapping() frees the entry now.  One-shot retry, no lock, no sleep.
+# ============================================================================
+import batch72_core_kcompressd_swapcache_drop as _b72_scd  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b72_scd.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 73: swap-in readahead window policy (boost / shrink / vma_ra).
+# Two-sided clamp applied where the kernel's own window computation is final:
+# a configurable floor (boost) and ceiling (shrink, background-gated) on the
+# window computed by __swapin_nr_pages()/swapin_nr_pages(), plus a sysfs handle
+# onto the kernel's VMA readahead switch.  Pure arithmetic, no lock, no sleep.
+# ============================================================================
+import batch73_core_swapin_window as _b73_swapin  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b73_swapin.build_groups(PatchGroup)
+
+# ============================================================================
+# Batch 74: read fault-around gated on the faulting task's uid.
+# The vendor hook can only answer per fault; this group adds the policy state
+# and the decision point after the hook: suppress for system uids (default) and
+# for an explicit app-uid exclusion list, readable/writable at runtime.
+# ============================================================================
+import batch74_core_fault_around_app_policy as _b74_fa  # noqa: E402
+
+PATCH_GROUPS = PATCH_GROUPS + _b74_fa.build_groups(PatchGroup)
+
+
 if __name__ == "__main__":
     main()

@@ -837,6 +837,36 @@ grep -A2 "set_page_writeback(page);" "$PAGE_IO" | grep -q "return 0;" \
 # Drop-path edit: end_page_writeback immediately followed by put_page.
 grep -A1 "end_page_writeback(page);" "$PAGE_IO" | grep -q "put_page(page);" \
   || fail "the drop-path writeback end is missing"
+
+# Batch 72: kcompressd swap-cache drop -- the one-shot re-scan in
+# shrink_page_list().  The pass-1 status says nothing about whether the page
+# is really re-queued, so the splice, the latch and the still-writeback
+# pre-filter are pinned here; and the re-scan must stay sleep-free.
+VMSCAN="$KERNEL_ROOT/common/mm/vmscan.c"
+grep -qF "sailboat_kcompressd_swapcache_drop" "$VMSCAN" \
+  || fail "the kcompressd swap-cache drop marker is missing in mm/vmscan.c"
+grep -qF "list_splice_tail(&wb_retry_pages, page_list);" "$VMSCAN" \
+  || fail "the one-shot swap-cache re-scan is missing in mm/vmscan.c"
+grep -qF "list_move(&page->lru, &ret_pages);" "$VMSCAN" \
+  || fail "the still-writeback pre-filter is missing in mm/vmscan.c"
+
+# Batch 73: swapin readahead window -- params+helpers in readahead.c, clamps in
+# swap_state.c, externs in internal.h; one marker per touched file.
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/readahead.c" \
+  || fail "swapin readahead window marker missing in mm/readahead.c"
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/swap_state.c" \
+  || fail "swapin readahead window marker missing in mm/swap_state.c"
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/internal.h" \
+  || fail "swapin readahead window marker missing in mm/internal.h"
+
+# Batch 74: fault-around uid policy -- marker count is 2 (policy block + call),
+# and the call must sit between the vendor hook and the if it feeds.
+MEMORY_C="$KERNEL_ROOT/common/mm/memory.c"
+[ "$(grep -c "sailboat_fault_around_app_policy" "$MEMORY_C")" = "2" ] \
+  || fail "mm/memory.c: fault-around policy marker count != 2"
+grep -A2 "trace_android_vh_should_fault_around(vmf, &should_around);" "$MEMORY_C" \
+  | grep -q "abk_fa_adjust(&should_around);" \
+  || fail "mm/memory.c: abk_fa_adjust() not after the vendor hook"
 if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
   fail "the superseded trylock-skip survived in the drain"
 fi
