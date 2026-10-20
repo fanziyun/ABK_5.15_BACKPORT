@@ -835,6 +835,81 @@ abk_zram_writeback_sweep() {
   return 0
 }
 
+# --- kcompressd invariant monitor (rides the recompression tick) ---------
+# Observability only: kcompressd is the kernel thread that takes the first
+# swap-out write off the reclaim path, and from userspace its queue is visible
+# only as `enqueued - swapped - sync` next to its threshold (see
+# abk_kcompressd_state_line in common.sh).  One state line per
+# kcompressd.monitor_interval_sec, plus the two shapes worth a warning:
+#
+#   depth >= threshold
+#     the queue is full, so the writer falls back to synchronous swapout: the
+#     thread, not compression, is the bottleneck.  Warned on every check while
+#     it holds -- a saturated queue is a standing cost, not an event.
+#
+#   depth <= threshold && SwapCached >= kcompressd.swapcached_warn_mb,
+#   for two consecutive checks
+#     the queue is NOT the backlog, yet the swap cache keeps holding pages:
+#     written-but-not-dropped.  Two checks in a row because one paired reading
+#     can hold SwapCached high for a moment (an app dying mid-pageout) without
+#     anything being wrong.  After warning, the streak starts over, so a
+#     standing leak stays visible without filling the log every single check.
+#
+# A threshold of 0 means the kernel has kcompressd switched off: the queue
+# cannot build, so neither invariant applies and only the state line is
+# written.  Absent nodes (no graft on this kernel) behave the same way.
+abk_kcompressd_monitor_tick() {
+  _kcm_line="$(abk_kcompressd_state_line)"
+  abk_log "$_kcm_line"
+
+  # Parsed back out of the line on purpose: the helper runs in the command
+  # substitution's subshell, and re-deriving depth here would be a second
+  # implementation of its two-sample rule.
+  _kcm_thr="$(printf '%s\n' "$_kcm_line" \
+    | sed -n 's/^kcompressd: .*threshold=\([0-9][0-9]*\).*$/\1/p')"
+  _kcm_depth="$(printf '%s\n' "$_kcm_line" \
+    | sed -n 's/^kcompressd: .*depth=\([0-9][0-9]*\).*$/\1/p')"
+
+  # kcompressd.depth_warn overrides the kernel's own threshold; empty or 0
+  # means "use the kernel's", which is the number the FIFO really enforces.
+  _kcm_limit="$(abk_cfg kcompressd.depth_warn '')"
+  abk_is_uint "$_kcm_limit" || _kcm_limit=""
+  if [ "$_kcm_limit" = 0 ]; then
+    _kcm_limit=""
+  fi
+  if [ -z "$_kcm_limit" ]; then
+    _kcm_limit="$_kcm_thr"
+  fi
+  if [ "$_kcm_limit" = 0 ]; then
+    _kcm_limit=""
+  fi
+
+  if [ -z "$_kcm_depth" ] || [ -z "$_kcm_limit" ]; then
+    ABK_KCD_BAD_STREAK=0
+    return 0
+  fi
+
+  if abk_le "$_kcm_limit" "$_kcm_depth"; then
+    abk_warn "kcompressd: queue saturated (depth=$_kcm_depth >= threshold=$_kcm_limit); writers are falling back to synchronous swapout"
+  fi
+
+  _kcm_swc="$(abk_meminfo_kb SwapCached)"
+  _kcm_warn_mb="$(abk_cfg kcompressd.swapcached_warn_mb 256)"
+  abk_is_uint "$_kcm_warn_mb" || _kcm_warn_mb=256
+  _kcm_warn_kb="$(abk_mul_div "$_kcm_warn_mb" 1024 1)"
+  if abk_is_uint "$_kcm_swc" && abk_le "$_kcm_depth" "$_kcm_limit" \
+    && abk_le "$_kcm_warn_kb" "$_kcm_swc"; then
+    ABK_KCD_BAD_STREAK=$(( ${ABK_KCD_BAD_STREAK:-0} + 1 ))
+    if [ "$ABK_KCD_BAD_STREAK" -ge 2 ]; then
+      abk_warn "kcompressd: written-but-not-dropped shape (depth=$_kcm_depth <= threshold=$_kcm_limit, SwapCached=${_kcm_swc}kB >= ${_kcm_warn_mb}MiB) for $ABK_KCD_BAD_STREAK consecutive checks"
+      ABK_KCD_BAD_STREAK=0
+    fi
+  else
+    ABK_KCD_BAD_STREAK=0
+  fi
+  return 0
+}
+
 # --- recompression supervisor -------------------------------------------
 # Two jobs on two different clocks: the policy is re-checked every
 # zram.reassert_interval_sec (a writer that switches the compressors behind the
@@ -909,6 +984,16 @@ abk_zram_supervisor_main() {
   _zs_per_mark=$(( _zs_mark_interval / _zs_interval ))
   [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
 
+  # kcompressd observability rides its own, slower clock: one state line per
+  # kcompressd.monitor_interval_sec (600 s default), plus its two invariants.
+  # It is a tick count like every other cadence here, so a reassert interval
+  # longer than the monitor interval still means one check per tick.
+  _zs_kcd_interval="$(abk_cfg kcompressd.monitor_interval_sec 600)"
+  abk_is_uint "$_zs_kcd_interval" || _zs_kcd_interval=600
+  [ "$_zs_kcd_interval" -ge 60 ] || _zs_kcd_interval=60
+  _zs_per_kcd=$(( _zs_kcd_interval / _zs_reassert ))
+  [ "$_zs_per_kcd" -ge 1 ] || _zs_per_kcd=1
+
   if [ ! -f "$_zs_tool" ]; then
     abk_warn "$_zs_tool is missing; recompression sweeps disabled"
     return 1
@@ -928,6 +1013,10 @@ abk_zram_supervisor_main() {
   # and stay alive -- with a log line -- when a pass fails.
   _zs_tick=0
   _zs_wb_tick=0
+  # Seeded like _zs_mark_tick below: the first tick logs the boot baseline
+  # (threshold, counters, depth) instead of waiting a full monitor interval.
+  _zs_kcd_tick="$_zs_per_kcd"
+  ABK_KCD_BAD_STREAK=0
   # The first sweep marks -- the boot mark is what finds the initial cold set --
   # and the --no-mark drain begins only after it.  Seeding the counter at
   # _zs_per_mark makes that first tick fire without a special case.
@@ -935,6 +1024,12 @@ abk_zram_supervisor_main() {
   _zs_mark_arg=""
   while :; do
     abk_zram_reassert || true
+
+    _zs_kcd_tick=$(( _zs_kcd_tick + 1 ))
+    if [ "$_zs_kcd_tick" -ge "$_zs_per_kcd" ]; then
+      _zs_kcd_tick=0
+      abk_kcompressd_monitor_tick || true
+    fi
 
     _zs_wb_tick=$(( _zs_wb_tick + 1 ))
     if [ "$_zs_wb_tick" -ge "$_zs_per_wb" ]; then

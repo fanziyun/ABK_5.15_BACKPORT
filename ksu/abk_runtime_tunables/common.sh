@@ -58,6 +58,9 @@ ABK_ZRAM_WB_RETRY_SECS=3600
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_PROC_SWAPS="${ABK_PROC_SWAPS:-/proc/swaps}"
 ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
+# kcompressd's threshold and its three counters sit next to the other vm
+# sysctls; redirectable so the sampler can be exercised against a fixture.
+ABK_KCD_VM_DIR="${ABK_KCD_VM_DIR:-/proc/sys/vm}"
 # The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
 # *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
 # not a missing feature.
@@ -275,6 +278,9 @@ iorap.min_uid
 iorap.record_cool_min
 iorap.kick_cool_sec
 iorap.global_gap_sec
+kcompressd.monitor_interval_sec
+kcompressd.swapcached_warn_mb
+kcompressd.depth_warn
 report.logcat
 EOF
 }
@@ -395,6 +401,105 @@ abk_mem_total_bytes() {
 abk_mem_pct_bytes() {
   _mp_bytes="$(abk_mem_total_bytes)" || return 1
   abk_mul_div "$_mp_bytes" "$1" 100
+  return 0
+}
+
+# --- kcompressd observability --------------------------------------------
+# kcompressd moves the first swap-out write off the reclaim path into a
+# per-node thread, and exposes its queue next to it: the threshold
+# (`vm.kcompressd`, the queue length the writer allows; 0 = the mechanism is
+# off) and three monotonic counters, in pages:
+#
+#   enqueued   pages handed to the queue
+#   swapped    pages the thread wrote out itself
+#   sync       pages the writer had to swap out synchronously (queue full, or
+#              no thread on that node)
+#
+# so depth = enqueued - swapped - sync is the queue's current length.
+#
+# These are four separate reads and the counters move under any swap load, so
+# the sampler reads swapped/sync FIRST and enqueued LAST: a completion that
+# lands between two reads can then only make the depth read high -- the
+# conservative direction -- never negative.  The state line samples twice and
+# keeps the larger depth for the same reason; the clamp at zero is only the
+# last line of defence against a counter that is not monotonic (a reset node,
+# an odd kernel).  mksh arithmetic is 32-bit on this ROM (the abk_gt trap), so
+# the difference is taken in awk.
+#
+# Missing nodes are the normal case on a kernel without the graft, not a
+# fault: every field degrades to `absent`, nothing warns, nothing exits
+# non-zero.
+
+# One sample.  Sets ABK_KCD_THRESHOLD / _ENQUEUED / _SWAPPED / _SYNC / _DEPTH,
+# each either a decimal number or the string `absent`.
+abk_kcompressd_sample() {
+  _kcs_swp="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_swapped" | tr -d ' \t\r\n')"
+  _kcs_syn="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_sync" | tr -d ' \t\r\n')"
+  _kcs_enq="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_enqueued" | tr -d ' \t\r\n')"
+  _kcs_thr="$(abk_read "$ABK_KCD_VM_DIR/kcompressd" | tr -d ' \t\r\n')"
+
+  case "$_kcs_thr" in ''|*[!0-9]*) _kcs_thr=absent ;; esac
+  case "$_kcs_enq" in ''|*[!0-9]*) _kcs_enq=absent ;; esac
+  case "$_kcs_swp" in ''|*[!0-9]*) _kcs_swp=absent ;; esac
+  case "$_kcs_syn" in ''|*[!0-9]*) _kcs_syn=absent ;; esac
+
+  _kcs_dep=absent
+  if [ "$_kcs_enq" != absent ] && [ "$_kcs_swp" != absent ] \
+    && [ "$_kcs_syn" != absent ]; then
+    _kcs_dep="$(awk -v e="$_kcs_enq" -v s="$_kcs_swp" -v y="$_kcs_syn" \
+      'BEGIN { d = e - s - y; if (d < 0) d = 0; printf "%.0f\n", d }' 2>/dev/null)"
+    case "$_kcs_dep" in ''|*[!0-9]*) _kcs_dep=absent ;; esac
+  fi
+
+  ABK_KCD_THRESHOLD="$_kcs_thr"
+  ABK_KCD_ENQUEUED="$_kcs_enq"
+  ABK_KCD_SWAPPED="$_kcs_swp"
+  ABK_KCD_SYNC="$_kcs_syn"
+  ABK_KCD_DEPTH="$_kcs_dep"
+  return 0
+}
+
+# One `kcompressd: threshold=... enqueued=... swapped=... sync=... depth=...`
+# line for the module log and `action.sh status`.  Printed (not returned)
+# because both callers want the text; the ABK_KCD_* globals above are left
+# holding the reported sample for a caller that also needs the numbers.
+abk_kcompressd_state_line() {
+  abk_kcompressd_sample
+  _kl_thr1="$ABK_KCD_THRESHOLD"
+  _kl_enq1="$ABK_KCD_ENQUEUED"
+  _kl_swp1="$ABK_KCD_SWAPPED"
+  _kl_syn1="$ABK_KCD_SYNC"
+  _kl_dep1="$ABK_KCD_DEPTH"
+
+  abk_kcompressd_sample
+  _kl_thr2="$ABK_KCD_THRESHOLD"
+  _kl_enq2="$ABK_KCD_ENQUEUED"
+  _kl_swp2="$ABK_KCD_SWAPPED"
+  _kl_syn2="$ABK_KCD_SYNC"
+  _kl_dep2="$ABK_KCD_DEPTH"
+
+  # Keep the whole sample, never a mix: the printed counters must add up to
+  # the printed depth.  A sample whose depth could not be computed loses to
+  # one that could; otherwise the larger depth wins (conservative for the
+  # saturation rule -- a queue is at least as deep as its busiest sample).
+  if [ "$_kl_dep2" = absent ] \
+    || { [ "$_kl_dep1" != absent ] && abk_le "$_kl_dep2" "$_kl_dep1"; }; then
+    ABK_KCD_THRESHOLD="$_kl_thr1"
+    ABK_KCD_ENQUEUED="$_kl_enq1"
+    ABK_KCD_SWAPPED="$_kl_swp1"
+    ABK_KCD_SYNC="$_kl_syn1"
+    ABK_KCD_DEPTH="$_kl_dep1"
+  else
+    ABK_KCD_THRESHOLD="$_kl_thr2"
+    ABK_KCD_ENQUEUED="$_kl_enq2"
+    ABK_KCD_SWAPPED="$_kl_swp2"
+    ABK_KCD_SYNC="$_kl_syn2"
+    ABK_KCD_DEPTH="$_kl_dep2"
+  fi
+
+  printf 'kcompressd: threshold=%s enqueued=%s swapped=%s sync=%s depth=%s\n' \
+    "$ABK_KCD_THRESHOLD" "$ABK_KCD_ENQUEUED" "$ABK_KCD_SWAPPED" \
+    "$ABK_KCD_SYNC" "$ABK_KCD_DEPTH"
   return 0
 }
 
