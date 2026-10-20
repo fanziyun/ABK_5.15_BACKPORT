@@ -148,6 +148,43 @@ abk_status_report() {
   abk_show_or_absent "transparent_hugepage" \
     "$ABK_SYS_ROOT/kernel/mm/transparent_hugepage/enabled"
 
+  # kcompressd is the kernel thread that takes the first swap-out write off the
+  # reclaim path; from here its queue is visible only as the difference of its
+  # three counters.  depth small while SwapCached stays large is the
+  # written-but-not-dropped shape the supervisor warns about, so the two belong
+  # in one place.  vm.page-cluster is printed by the loop above; it sizes the
+  # swap readahead window (2^value pages) that faults pages back out of here.
+  echo "-- kcompressd and swap-in --"
+  _sr_kcd="$(abk_kcompressd_state_line)"
+  abk_show "kcompressd" "${_sr_kcd#kcompressd: }"
+  _sr_swc="$(abk_meminfo_kb SwapCached)"
+  case "$_sr_swc" in
+    ''|*[!0-9]*) abk_show "SwapCached" "absent" ;;
+    *) abk_show "SwapCached" "$_sr_swc kB" ;;
+  esac
+  abk_show "kcompressd monitor" \
+    "interval=$(abk_cfg kcompressd.monitor_interval_sec 600)s swapcached_warn=$(abk_cfg kcompressd.swapcached_warn_mb 256)MiB"
+  abk_show_or_absent "swap.vma_ra_enabled" \
+    "$ABK_SYS_ROOT/kernel/mm/swap/vma_ra_enabled"
+
+  # The grafts this round added, exposed as module parameters (namespace =
+  # the object's own name, so the sysfs path is module/<name>/parameters/ and
+  # the cmdline form is <name>.<param>=...).  Absent on a kernel without the
+  # graft, printed rather than treated as an error.
+  echo "-- swap-in readahead (namespace readahead) --"
+  for _sr_ra_par in swapin_window_enable swapin_boost_enable \
+      swapin_boost_pages swapin_shrink_enable swapin_shrink_pages \
+      swapin_window_background_only swapin_vma_ra; do
+    abk_show_or_absent "$_sr_ra_par" \
+      "$ABK_SYS_ROOT/module/readahead/parameters/$_sr_ra_par"
+  done
+  echo "-- fault-around (namespace memory) --"
+  for _sr_mem_par in fault_around_enable fault_around_sys_uid \
+      fault_around_app_only fault_around_app; do
+    abk_show_or_absent "$_sr_mem_par" \
+      "$ABK_SYS_ROOT/module/memory/parameters/$_sr_mem_par"
+  done
+
   # Per-cgroup PSI: what the policy is meant to do, and what the tree says it
   # did.  The second is the honest one -- a refused write leaves the first a
   # statement of intent, which is how Batch 16's dark RCU graft looked healthy.
