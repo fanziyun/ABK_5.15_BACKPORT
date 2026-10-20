@@ -838,14 +838,17 @@ abk_zram_writeback_sweep() {
 # --- kcompressd invariant monitor (rides the recompression tick) ---------
 # Observability only: kcompressd is the kernel thread that takes the first
 # swap-out write off the reclaim path, and from userspace its queue is visible
-# only as `enqueued - swapped - sync` next to its threshold (see
-# abk_kcompressd_state_line in common.sh).  One state line per
-# kcompressd.monitor_interval_sec, plus the two shapes worth a warning:
+# only as `enqueued - swapped` next to its threshold.  A third counter, sync,
+# counts pages that bypassed the queue (the caller wrote them itself), so it is
+# a separate column and NOT part of the depth (see abk_kcompressd_state_line in
+# common.sh).  One state line per kcompressd.monitor_interval_sec, plus the two
+# shapes worth a warning:
 #
 #   depth >= threshold
-#     the queue is full, so the writer falls back to synchronous swapout: the
-#     thread, not compression, is the bottleneck.  Warned on every check while
-#     it holds -- a saturated queue is a standing cost, not an event.
+#     the queue reached the head-drain point: every new enqueue also writes its
+#     oldest page out on the caller's thread, so reclaim pays a synchronous
+#     write and the offload is no longer free.  Warned on every check while it
+#     holds -- that is a standing cost, not an event.
 #
 #   depth <= threshold && SwapCached >= kcompressd.swapcached_warn_mb,
 #   for two consecutive checks
@@ -871,7 +874,7 @@ abk_kcompressd_monitor_tick() {
     | sed -n 's/^kcompressd: .*depth=\([0-9][0-9]*\).*$/\1/p')"
 
   # kcompressd.depth_warn overrides the kernel's own threshold; empty or 0
-  # means "use the kernel's", which is the number the FIFO really enforces.
+  # means "use the kernel's", which is the head-drain depth it really applies.
   _kcm_limit="$(abk_cfg kcompressd.depth_warn '')"
   abk_is_uint "$_kcm_limit" || _kcm_limit=""
   if [ "$_kcm_limit" = 0 ]; then
@@ -890,7 +893,7 @@ abk_kcompressd_monitor_tick() {
   fi
 
   if abk_le "$_kcm_limit" "$_kcm_depth"; then
-    abk_warn "kcompressd: queue saturated (depth=$_kcm_depth >= threshold=$_kcm_limit); writers are falling back to synchronous swapout"
+    abk_warn "kcompressd: queue saturated (depth=$_kcm_depth >= threshold=$_kcm_limit); head-drain is engaged, so each enqueue also pays one synchronous write"
   fi
 
   _kcm_swc="$(abk_meminfo_kb SwapCached)"

@@ -407,15 +407,23 @@ abk_mem_pct_bytes() {
 # --- kcompressd observability --------------------------------------------
 # kcompressd moves the first swap-out write off the reclaim path into a
 # per-node thread, and exposes its queue next to it: the threshold
-# (`vm.kcompressd`, the queue length the writer allows; 0 = the mechanism is
-# off) and three monotonic counters, in pages:
+# (`vm.kcompressd`, the queue depth at which the caller starts head-draining
+# one page per enqueue -- not the ring's capacity; 0 = the mechanism is off)
+# and three monotonic counters, in pages:
 #
 #   enqueued   pages handed to the queue
-#   swapped    pages the thread wrote out itself
-#   sync       pages the writer had to swap out synchronously (queue full, or
-#              no thread on that node)
+#   swapped    pages taken back out of it and written (queue -> disk)
+#   sync       pages that never entered the queue: the caller wrote them
+#              itself (queue full, no thread on that node, or a device/shape
+#              gate refused the offload)
 #
-# so depth = enqueued - swapped - sync is the queue's current length.
+# so depth = enqueued - swapped is the queue's current length.  `sync` is
+# deliberately NOT part of that difference: it counts pages that bypassed the
+# queue, so subtracting it would measure "enqueued minus all history since
+# boot" and pin the depth at zero as soon as any sync work happened (a device
+# can have far more sync pages than enqueued ones -- that is a normal pairing,
+# not an overload).  It is printed as its own column because it answers the
+# opposite question: how much work the offload is refusing.
 #
 # These are four separate reads and the counters move under any swap load, so
 # the sampler reads swapped/sync FIRST and enqueued LAST: a completion that
@@ -431,7 +439,10 @@ abk_mem_pct_bytes() {
 # non-zero.
 
 # One sample.  Sets ABK_KCD_THRESHOLD / _ENQUEUED / _SWAPPED / _SYNC / _DEPTH,
-# each either a decimal number or the string `absent`.
+# each either a decimal number or the string `absent`.  Scratch for the two
+# functions below, not a caller interface: every shipped caller runs
+# abk_kcompressd_state_line() in a command substitution, where the variables
+# do not survive.
 abk_kcompressd_sample() {
   _kcs_swp="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_swapped" | tr -d ' \t\r\n')"
   _kcs_syn="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_sync" | tr -d ' \t\r\n')"
@@ -444,10 +455,9 @@ abk_kcompressd_sample() {
   case "$_kcs_syn" in ''|*[!0-9]*) _kcs_syn=absent ;; esac
 
   _kcs_dep=absent
-  if [ "$_kcs_enq" != absent ] && [ "$_kcs_swp" != absent ] \
-    && [ "$_kcs_syn" != absent ]; then
-    _kcs_dep="$(awk -v e="$_kcs_enq" -v s="$_kcs_swp" -v y="$_kcs_syn" \
-      'BEGIN { d = e - s - y; if (d < 0) d = 0; printf "%.0f\n", d }' 2>/dev/null)"
+  if [ "$_kcs_enq" != absent ] && [ "$_kcs_swp" != absent ]; then
+    _kcs_dep="$(awk -v e="$_kcs_enq" -v s="$_kcs_swp" \
+      'BEGIN { d = e - s; if (d < 0) d = 0; printf "%.0f\n", d }' 2>/dev/null)"
     case "$_kcs_dep" in ''|*[!0-9]*) _kcs_dep=absent ;; esac
   fi
 
@@ -460,9 +470,8 @@ abk_kcompressd_sample() {
 }
 
 # One `kcompressd: threshold=... enqueued=... swapped=... sync=... depth=...`
-# line for the module log and `action.sh status`.  Printed (not returned)
-# because both callers want the text; the ABK_KCD_* globals above are left
-# holding the reported sample for a caller that also needs the numbers.
+# line.  Its contract is stdout only -- print and forget: both call sites use
+# `$( )`, so nothing outside this function can see the sampled numbers.
 abk_kcompressd_state_line() {
   abk_kcompressd_sample
   _kl_thr1="$ABK_KCD_THRESHOLD"
@@ -478,10 +487,11 @@ abk_kcompressd_state_line() {
   _kl_syn2="$ABK_KCD_SYNC"
   _kl_dep2="$ABK_KCD_DEPTH"
 
-  # Keep the whole sample, never a mix: the printed counters must add up to
-  # the printed depth.  A sample whose depth could not be computed loses to
-  # one that could; otherwise the larger depth wins (conservative for the
-  # saturation rule -- a queue is at least as deep as its busiest sample).
+  # Keep the whole sample, never a mix: the printed enqueued/swapped must
+  # produce the printed depth (sync is a separate column, not part of it).  A
+  # sample whose depth could not be computed loses to one that could;
+  # otherwise the larger depth wins (conservative for the saturation rule -- a
+  # queue is at least as deep as its busiest sample).
   if [ "$_kl_dep2" = absent ] \
     || { [ "$_kl_dep1" != absent ] && abk_le "$_kl_dep2" "$_kl_dep1"; }; then
     ABK_KCD_THRESHOLD="$_kl_thr1"
