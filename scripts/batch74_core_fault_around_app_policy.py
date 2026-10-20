@@ -32,10 +32,12 @@ so a vendor callback that already said "no" keeps priority):
   3. otherwise ``!fault_around_app_only`` and the uid's bitmap bit set
                                              -> suppress.
 
-``fault_around_app_only`` = 1 therefore means "the exclusion list is the whole
-policy" -- everything not listed keeps the vendor hook's answer, which is what
-a build that wants fault-around to stay mostly off (with a short list of
-apps that get it) needs; 0 (default) is the performance-first direction.
+``fault_around_app_only`` reads literally in that order, and the name is the
+part that misleads: **1 skips gate 3 entirely**, so the exclusion list is not
+consulted at all and the ``uid < 10000`` rule is the whole policy.  It is not
+"only the listed apps get fault-around".  0 (default) is the
+performance-first direction -- fault-around for every uid, minus the listed
+ones.
 
 Knobs are module parameters, so they land under
 ``/sys/module/memory/parameters/`` (a built-in object's sysfs module name is
@@ -80,13 +82,20 @@ an unknown shape instead of half-patching it):
   * the ``trace_android_vh_should_fault_around()`` call site plus the ``if`` it
     feeds -- the call is inserted between them.
 
-``apply_steps`` is transactional and the group is idempotent: the second pass
-finds the ``sailboat_fault_around_app_policy`` marker (shape probe) and reports
-``already_present`` without touching the file.  The group owns no text another
-group edits and edits no text another group owns: the only other group that
-reads this call site (``bg_readahead_tune`` / ``bg_launch_prefetch``) probes it
-and rewrites ``mm/filemap.c``, and its callback's decision is consumed by the
-hook call this group inserts *after* -- so registration order does not matter.
+``apply_steps`` is transactional and the group is idempotent.  The second pass
+probes this group's own payload (``abk_fa_adjust()`` / the bitmap declaration)
+and the marker separately: payload + marker means ``already_present``, payload
+without the marker is a *refusal* (``blocked_by_shape``) rather than a re-apply
+-- step 1's replacement keeps the ``do_read_fault()`` head it is anchored on as
+its tail, so re-running it on a tree whose marker was reflowed would insert a
+second copy of every static and fail the compile with a redefinition.  That is
+Batch 70's smaps-guard contract, applied here for the same reason.
+
+The group owns no text another group edits and edits no text another group
+owns: the only other group that reads this call site (``bg_readahead_tune`` /
+``bg_launch_prefetch``) probes it and rewrites ``mm/filemap.c``, and its
+callback's decision is consumed by the hook call this group inserts *after* --
+so registration order does not matter.
 """
 
 from __future__ import annotations
@@ -150,11 +159,13 @@ _POLICY_DRAFT = r"""
  *
  *   fault_around_enable    master switch, default on.
  *   fault_around_sys_uid   suppress for uid < 10000, default on.
- *   fault_around_app_only  0 (default) = fault-around stays on for every
- *                          uid except the listed ones, which is the
- *                          performance-first direction; 1 = the list is the
- *                          whole policy and everything else keeps the hook's
- *                          answer.
+ *   fault_around_app_only  0 (default) = a listed uid loses fault-around and
+ *                          every other uid keeps the hook's answer, which is
+ *                          the performance-first direction; 1 = the exclusion
+ *                          list is not consulted at all, so the uid < 10000
+ *                          rule is the whole policy (literal reading of the
+ *                          decision order above; it is NOT "only the listed
+ *                          uids get fault-around").
  *   fault_around_app       exclusion list: write one uid in [10000, 99999]
  *                          to add it, write 0 to clear; reading prints the
  *                          first 64 listed uids, comma separated.
@@ -244,7 +255,7 @@ MODULE_PARM_DESC(fault_around_sys_uid,
     "suppress fault-around for system uids below 10000 (default 1)");
 module_param(fault_around_app_only, bool, 0644);
 MODULE_PARM_DESC(fault_around_app_only,
-    "1: the fault_around_app list is the whole policy; 0: fault-around for every uid except the listed ones (default 0)");
+    "1: the fault_around_app list is not consulted at all; 0: a listed uid loses fault-around (default 0)");
 module_param_cb(fault_around_app, &abk_fa_app_param_ops, NULL, 0644);
 MODULE_PARM_DESC(fault_around_app,
     "uid excluded from fault-around, [10000, 99999]; write 0 to clear, read the first 64");
@@ -320,8 +331,27 @@ def _fault_around_app_policy_apply(ctx):
         text = ctx.read(MEMORY_C)
     except OSError:
         return "blocked_by_shape", MEMORY_C + ": file absent"
-    if MARKER in text:
-        return "already_present", "the fault-around uid policy is already applied"
+    # The marker is part of the match, not decoration (AGENTS.md's idempotency
+    # rule), and here the failure mode is concrete rather than cosmetic: step 1
+    # builds its replacement as "policy block + the do_read_fault() head", so
+    # the head keeps matching even after the block is in place.  A tree whose
+    # marker comment was reflowed (marker gone, payload still there) would
+    # therefore match step 1's `old` *again* and get a second copy of every
+    # static in the block -- `static bool fault_around_enable`, the bitmap, the
+    # mutex, `abk_fa_adjust()` -- i.e. a redefinition, a compile error on a tree
+    # that was previously fine.
+    #
+    # So probe this group's own payload and *refuse*: do not fall through into
+    # apply_steps, which is exactly what would insert the duplicate.  Same
+    # contract as Batch 70's smaps guard (batch70_core_smaps_migration_guard.py).
+    if ADJUST_DEF in text or BITMAP_DEF in text:
+        if MARKER in text:
+            return "already_present", "the fault-around uid policy is already applied"
+        return (
+            "blocked_by_shape",
+            MEMORY_C + ": the policy block is present but its " + MARKER
+            + " marker is not; refusing rather than inserting a second copy",
+        )
     for needle in (DO_READ_FAULT_PROBE, HOOK_CALL):
         if needle not in text:
             return "blocked_by_shape", (
