@@ -17,6 +17,22 @@ The single exception to "no payload files" is `files/drivers/of/address.c` — s
 (fs/mm/cgroup), `scripts/abk_stable_perf.py` (sched/net/locking/block), or
 `scripts/abk_stable_display.py` (the single drm revert).
 
+## Where the explanation lives
+
+Source files carry no narrative comments or docstrings. A comment is allowed only
+when it records something the code cannot show (an ordering constraint, a refused
+input, a trap), and it must be **at most two lines**; anything longer is
+documentation and belongs below. Never paste test rationale, batch history or a
+design essay into code — that is what the docs are for. The "why" is
+documentation, and it is expected reading before editing a group:
+
+- `docs/porting_policy.md` — scope, KMI red lines, shape registry, report contract.
+- `docs/group_recipe.md` — the add-a-group recipe and the step-authoring traps.
+- `CHANGELOG.md` — why a landed group is shaped the way it is.
+- this file — the rules that apply to every edit.
+
+A deleted inline note is not lost: `git log -p -- <file>` recovers it.
+
 ## Gating model
 
 The engine gates purely on **text anchors**, never on `sub_level` — `ctx.sub_level`
@@ -54,7 +70,8 @@ paths under the tree.
 
 ## Adding a group (see `docs/group_recipe.md`)
 
-1. Register: source the commit in `plan.md`, save the upstream `.patch` under
+1. Register: source the commit in `CHANGELOG.md`'s backlog appendix
+   ([appendix](#appendix-plan)), save the upstream `.patch` under
    `research/upstream-5.15.y/patches/`, convert to old/new blocks with
    `python3 tools/hunks.py research/upstream-5.15.y/patches`.
    (`research/` is a **local-only, git-ignored workspace** — the `.patch` archive
@@ -65,8 +82,8 @@ paths under the tree.
    child. Split into `(rel, old, new, required)` steps. Keep rename→user chains
    `required` (transactional: a required miss writes nothing); cosmetic hunks
    `optional`.
-3. Prove it (below), then tick the `plan.md` box and bump
-   `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION` in `module.conf`.
+3. Prove it (below), then tick the batch's box in the `CHANGELOG.md` appendix and
+   bump `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION` in `module.conf`.
 
 ## Verification (exact order)
 
@@ -273,7 +290,7 @@ required strings.
   `维护者要求：…` attributions, no first person (`我` / `我们` / `笔者`), no
   "已与用户确认" / "未代用户删除". A requirement is a design fact, so write it as
   one: "目标：只维护 `android13-5.15-lts`", not "用户要求只维护 lts". The same
-  rule applies to `plan.md`'s batch index lines, `docs/survey_*` and every doc
+  rule applies to the appendix's batch index lines, `docs/survey_*` and every doc
   this repo publishes — including entries already landed (a whole-repo sweep was
   done for Batch 45, so nothing predates it; new text must simply comply).
   (「用户」 meaning *userspace* or *end user* is a technical term and is fine; so
@@ -281,8 +298,10 @@ required strings.
 - `docs/porting_policy.md` — scope, KMI red lines, shape registry, three-module
   composition, report contract.
 - `docs/group_recipe.md` — the add-a-group recipe and the traps above.
-- `plan.md` — living backlog (written in Chinese; status markers `[ ]`/`[~]`/`[x]`/
-  `[-]`). Each landed batch bumps `module.conf`'s version.
+- `plan.md` — **retired**: emptied on 2026-10-22, its whole content now lives in
+  `CHANGELOG.md`'s appendix (batch index lines, candidates, deferred items,
+  exclusion records, forbidden list; Chinese; `[ ]`/`[~]`/`[x]`/`[-]`). Do not
+  recreate it; each landed batch bumps `module.conf`'s version.
 - `docs/survey_5_15_168_218.md`, `docs/survey_6_1_ack.md`, `docs/survey_6_6_ack.md`,
   `docs/survey_7_2_mm_reclaim.md` —
   candidate inventories. Since Batch 15 absorbed the ABK_ABI_PATCH_SUITE

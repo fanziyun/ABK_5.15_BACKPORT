@@ -1,138 +1,3 @@
-"""Batch 15: scheduler refinements absorbed from ``ABK_ABI_PATCH_SUITE``.
-
-Two groups, both lifted from ``ABK_ABI_PATCH_SUITE/scripts/abk_feature_porting.py``
-and re-anchored to the android13-5.15 text shapes:
-
-* ``nohz_field_refinement`` (suite lines 2099-2290) -- normalises the legacy
-  ``struct tick_sched`` nohz state bits (``inidle`` / ``idle_active`` /
-  ``tick_stopped``) behind one named enum plus accessors, and moves every read
-  site in ``kernel/time/tick-sched.c`` onto that snapshot.
-* ``avg_idle_preemption_mode`` (suite lines 2292-2412) -- retires the
-  ``rq->wake_avg_idle`` wake-side idle prediction, moves the ``avg_idle``
-  sample onto the switch-out-of-idle path, and re-sources the ``SIS_PROP``
-  idle-scan budget from ``rq->avg_idle`` directly.
-
-Both are *suite-shaped* refactors, not backports of a named upstream commit:
-the suite's own ``PatchGroup`` declarations (lines 61-76 of that file) describe
-them as intent, and neither helper name exists in the reference trees that were
-read for this port (``update_rq_avg_idle`` occurs **0** times in both
-``common-5.15-2024-11`` and ``common-6.1-src``).  The 6.1 reference tree still
-carries the pristine ``wake_avg_idle`` / ``wake_stamp`` prediction and an empty
-``put_prev_task_idle()``, so nothing here is "restoring an upstream shape" --
-it is a deliberate policy change and is documented as such.
-
-What was deliberately NOT ported (recorded so it is not relitigated):
-
-* the suite's silent-anchor contract.  The suite guards every edit with
-  ``if <sentinel> not in text`` and then ``text.replace(old, new, 1)``, so an
-  anchor miss writes nothing and still reports success.  Every step here is
-  ``required=True``: a miss writes nothing and reports
-  ``blocked_by_missing_anchor``.  Consequence: two of the suite's hunks that
-  only ever landed by accident on the 6.1 shape were re-derived rather than
-  copied -- see the trap notes on ``_B_*`` / ``_E_*`` below.
-* the suite's ``tick_nohz_tick_stopped_cpu()`` skip.  The suite's guard is
-  ``if "return !!(abk_tick_nohz_state_flags(ts) & NOHZ_CPU_STATE_TICK_STOPPED);"
-  not in tick_sched_text`` -- a sentinel that the *previous* step already
-  installed -- so on the suite's own run the CPU-scoped variant is silently
-  skipped and the file is left half-converted.  Here the two rewrites are
-  textually distinct, so both land (that is also why ``_A_CPU_STOPPED_NEW``
-  carries its own marker line).
-* the suite's ``EXPORT_SYMBOL_GPL`` pair and its four per-state predicates
-  are **not** carried.  They were inherited verbatim in Batch 15 for "surface
-  parity", but Batch 16's empty-implementation audit measured them against the
-  full GKI tree and found no consumer at all: ``nohz_cpu_state_flags()`` was
-  reachable only from ``nohz_cpu_state_test()``, which was itself reachable only
-  from the other three predicates, and ``nohz_cpu_idle_calls()``'s only callers
-  live in the file that defines it.  Two new exported symbols plus a five-entry
-  header API with zero callers is KMI surface, not a graft.  The exports are
-  gone and ``nohz_cpu_idle_calls()`` is file-local again.
-  ``kernel/sched/cpufreq_schedutil.c:314`` keeps calling
-  ``tick_nohz_get_idle_calls_cpu()``; ``kernel/irq_work.c:58``,
-  ``kernel/sched/core.c:1106`` and ``kernel/sched/idle.c:234`` keep calling
-  ``tick_nohz_tick_stopped()``.
-* ``struct rq``'s ``wake_stamp`` / ``wake_avg_idle`` fields are **not**
-  removed.  They become dead (nothing writes or reads them after
-  ``avg_idle_preemption_mode``), but deleting them would move every field after
-  them in ``struct rq``.  ``struct rq`` is not an exported/KMI struct, so this
-  is a risk choice rather than a red line; keeping them costs 16 bytes per CPU
-  and keeps the diff anchor-local.  A later batch may reclaim them.
-* ``nohz_field_refinement``'s enum is wired into ``kernel/time/tick-sched.c``
-  only, and that is the whole header payload (Batch 16 removed the unused
-  predicate block described above).  The state mask is consumed by
-  ``abk_tick_nohz_state_flags()`` and the five tick-sched.c read sites
-  (``tick_nohz_tick_stopped()``, ``tick_nohz_tick_stopped_cpu()``,
-  ``tick_nohz_irq_exit()``, ``tick_nohz_get_sleep_length()``,
-  ``tick_nohz_idle_exit()``), all of which are live.
-
-5.15 shape adaptations that the suite's 6.1 assumption gets wrong (each one was
-checked against ``common-5.15-2024-11`` before being written):
-
-1. ``update_rq_avg_idle()`` must keep the pristine ``if (rq->idle_stamp)``
-   guard.  The suite's helper samples unconditionally:
-   ``delta = rq_clock(rq) - rq->idle_stamp``.  On 5.15 ``idle_stamp`` is armed
-   *by* ``newidle_balance()`` (``kernel/sched/fair.c:11169``), which the
-   idle-entry pick path reaches with a non-NULL ``rf`` -- so on the first
-   idle->busy switch of a CPU whose stamp was never armed (the boot CPU, or any
-   CPU that entered the idle task without passing ``pick_next_task_fair()``'s
-   idle label) ``idle_stamp`` is still 0 and the unconditional form samples
-   ``rq_clock(rq) - 0``: nanoseconds since boot, clamped straight to
-   ``2 * max_idle_balance_cost``.  The pristine wake path was guarded for
-   exactly this reason, so the guard is restored here.  This is the pinned
-   "compiles clean, behaves wrong on 5.15" class.
-2. The sample moves from ``ttwu_do_wakeup()`` to ``put_prev_task_idle()`` and
-   that *is* the right switch-out point on 5.15: for ``prev == idle``
-   ``__pick_next_task()`` takes the ``restart:`` path
-   (``kernel/sched/core.c:5782`` compares ``prev->sched_class <=
-   &fair_sched_class``, and ``idle_sched_class`` sorts below ``fair_sched_class``),
-   ``put_prev_task_balance()`` then runs an *empty* ``for_class_range``
-   (``core.c:5758``, ``_from == _to == &idle_sched_class``) and calls
-   ``put_prev_task()`` -> ``put_prev_task_idle()``.  ``newidle_balance()`` is
-   not re-entered on that path (``pick_next_task_fair(rq, NULL, NULL)`` returns
-   at its ``idle:`` label because ``rf == NULL``), so the stamp still describes
-   the whole idle period when the helper runs -- the same interval
-   ``ttwu_do_wakeup()`` used to measure, a few microseconds later.
-3. ``sched_feat(SIS_UTIL)`` / ``sd_llc_shared->nr_idle_scan`` do not exist on
-   5.15 (0 occurrences in ``kernel/sched/``), so the suite's 6.1 branch
-   (delete the ``SIS_PROP`` arms, keep ``SIS_UTIL``) cannot be used: it would
-   leave ``select_idle_cpu()`` with ``nr = INT_MAX`` and scan the entire LLC on
-   every wakeup.  This port therefore keeps the ``SIS_PROP`` arm and only
-   re-sources its budget (``avg_idle = this_rq->avg_idle / 2``) and drops the
-   decay/aging writes.  Honest limitation: the pristine predictor *decayed*
-   toward zero while the CPU stayed busy (``wake_stamp`` aging plus the
-   per-scan ``wake_avg_idle -= min(wake_avg_idle, time)``); the replacement is
-   a flat 50% of the last sampled idle period with no aging, so a CPU that has
-   been busy for a long time can still budget a scan as if it had just been
-   idle.  That is a policy tradeoff, not a correctness bug, and it is the price
-   of retiring the field at all on this baseline.
-4. ``put_prev_task_idle()`` is compiled unconditionally, but the ``struct rq``
-   fields the helper touches live inside ``#ifdef CONFIG_SMP``
-   (``kernel/sched/sched.h:1052-1059``, closed at 1064).  The helper definition
-   and its ``sched.h`` declaration are therefore ``CONFIG_SMP``-guarded, with a
-   static-inline no-op in the ``#else`` arm so ``idle.c`` needs no guard of its
-   own.  The suite's unguarded form breaks a ``!CONFIG_SMP`` build.
-
-Registration order: the two groups here are order-independent of each other
-(disjoint file sets: nohz.h + tick-sched.c vs core.c/fair.c/idle.c/sched.h) and
-of every group in ``scripts/abk_stable_perf.py``.  No anchor below occurs in any
-other registered group: ``wake_avg_idle``, ``wake_stamp``,
-``put_prev_task_idle``, ``cfs_bandwidth_usage_dec``, ``update_rq_avg_idle``,
-``SIS_PROP`` and ``idle_stamp`` do not appear anywhere under ``scripts/``, and
-no group lists ``kernel/sched/idle.c``.  ``sched_nohz_idle_balance_series``
-touches ``kernel/sched/sched.h`` too, but its anchor starts at
-``#define NOHZ_BALANCE_KICK_BIT`` (line 2786), three lines *below* this module's
-``cfs_bandwidth_usage_dec`` anchor (line 2783), and the intervening
-``#ifdef CONFIG_NO_HZ_COMMON`` belongs to neither anchor.  Register this batch
-after ``stable_perf_backport`` only for report readability; correctness does not
-depend on it.  Note that ``sched_nohz_idle_balance_series`` is already_present on
-sublevels 178/194/216 (``tests/sublevel_matrix.py``), while these two groups are
-synthetic and must never be listed in ``PRE_APPLIED``: every step's ``new``
-block was checked to be absent from the pristine file in all four reference
-trees.
-
-See ``scripts/batch15_core_swap_table.py`` for the third suite feature
-(``swap_table_phase2_large_folios``) and why it registers no group.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -144,22 +9,12 @@ FAIR_C = "kernel/sched/fair.c"
 IDLE_C = "kernel/sched/idle.c"
 SCHED_H = "kernel/sched/sched.h"
 
-# Alias the required-flag for readability (the other batch modules use T/F).
 T = True
 
 _MARK_NOHZ = "/* ABK stable_515_backport: nohz tick_sched state field consistency helpers. */"
 _MARK_AVG = "/* ABK stable_515_backport: avg_idle preemption mode simplification. */"
-# Probe form of the avg_idle marker.  The fair.c replacement carries the marker
-# as a multi-line block comment (``/*\n * ABK ... simplification.``), so a probe
-# for the one-line spelling would fail on the second pass and the shape guard
-# below would then refuse a tree this module had just grafted.  The subject
-# substring matches both spellings.
 _MARK_AVG_PROBE = "ABK stable_515_backport: avg_idle preemption mode simplification."
 
-# --- nohz_field_refinement ------------------------------------------------
-# Every block below was checked to occur exactly once in abk515_ref_{167,178,
-# 194,211} (SUBLEVELs 167/178/194/216) and to be absent from the un-grafted
-# text, which is what makes a required step safe.
 
 _A_ENUM = (
     "/*\n"
@@ -191,21 +46,7 @@ _A_ENUM_NEW = (
     "#if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)\n"
 )
 
-# Batch 16: the suite's exported accessor pair (``nohz_cpu_state_flags()`` /
-# ``nohz_cpu_idle_calls()``) and its four per-state predicates used to be
-# inserted here.  A consumer sweep over the full GKI tree found zero callers
-# for every predicate (``nohz_cpu_state_test()``'s only callers were the other
-# three) and no consumer outside ``tick-sched.c`` for either export, so the
-# block was dead KMI surface rather than a graft.  It is no longer carried:
-# the enum inserted above is the part ``tick-sched.c`` actually reads, and
-# ``nohz_cpu_idle_calls()`` survives as a file-local helper because the two
-# debugfs readers below call it.  See plan.md Batch 16.
 
-# The helper insert and the ``tick_nohz_tick_stopped()`` rewrite are one step:
-# the amendment to that function lives inside text the same anchor reproduces,
-# and splitting them would make step N's ``new`` a prefix of step N+1's ``old``
-# (step-authoring trap 1).  ``__setup("nohz=", setup_tick_nohz);`` pins the
-# insertion to the ``CONFIG_NO_HZ_COMMON`` section of the file.
 _A_TICK_STOPPED = (
     "__setup(\"nohz=\", setup_tick_nohz);\n"
     "\n"
@@ -248,10 +89,6 @@ _A_TICK_STOPPED_NEW = (
     "}\n"
 )
 
-# Trap 2 note: this replacement deliberately carries its own marker line and
-# therefore does NOT contain the whole replacement above.  A shared
-# ``return !!(abk_tick_nohz_state_flags(ts) & ...)`` sentinel is what made the
-# suite skip this function entirely.
 _A_CPU_STOPPED = (
     "bool tick_nohz_tick_stopped_cpu(int cpu)\n"
     "{\n"
@@ -295,10 +132,6 @@ _A_IRQ_EXIT_NEW = (
     "}\n"
 )
 
-# Trap 1 note: ``\tWARN_ON_ONCE(!ts->inidle);\n`` occurs TWICE in the pristine
-# file (tick_nohz_get_sleep_length() and tick_nohz_idle_exit()); the suite's
-# one-line anchor only ever hit the first one by accident of ordering.  The
-# ``*delta_next`` line following it makes this occurrence unique.
 _A_SLEEP_WARN = (
     "\tWARN_ON_ONCE(!ts->inidle);\n"
     "\n"
@@ -343,9 +176,6 @@ _A_IDLE_CALLS_NEW = (
     "}\n"
 )
 
-# The snapshot is taken before ``ts->inidle = 0`` and only ``inidle`` is
-# cleared by that store, so deriving idle_active/tick_stopped from the
-# pre-clear mask is byte-equivalent to the pristine back-to-back field reads.
 _A_IDLE_EXIT = (
     "void tick_nohz_idle_exit(void)\n"
     "{\n"
@@ -407,12 +237,6 @@ _A_IDLE_EXIT_NEW = (
 )
 
 
-# --- avg_idle_preemption_mode ---------------------------------------------
-# rq->idle_stamp lifecycle on 5.15 (verified): armed by newidle_balance()
-# (fair.c:11169) on the idle-entry path, consumed at the idle->busy switch.
-# The helper keeps the pristine ``if (rq->idle_stamp)`` guard -- see item 1 of
-# the module docstring for why dropping it is a real bug on this tree.
-
 _B_HELPER = (
     "/*\n"
     " * Mark the task runnable and perform wakeup-preemption.\n"
@@ -461,11 +285,6 @@ _B_HELPER_NEW = (
     "static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,\n"
 )
 
-# Trap 1 note: a "delete the idle_stamp block" step whose ``new`` were just
-# ``\t}\n\n#endif\n`` would be found in the pristine file hundreds of times and
-# report already_present without landing.  The replacement therefore keeps the
-# unique surrounding statements (``rq_repin_lock`` before, ``ttwu_do_activate``
-# after) and only drops the middle.
 _B_TTWU = (
     "\t\trq_repin_lock(rq, rf);\n"
     "\t}\n"
@@ -647,9 +466,6 @@ _B_IDLE_PUT_PREV_NEW = (
     "}\n"
 )
 
-# Declaring the helper on sched.h needs a CONFIG_SMP arm because the rq fields
-# it touches are inside ``#ifdef CONFIG_SMP`` in this same header, while
-# put_prev_task_idle() itself is compiled unconditionally.
 _B_SCHED_H = (
     "extern void cfs_bandwidth_usage_inc(void);\n"
     "extern void cfs_bandwidth_usage_dec(void);\n"
@@ -669,15 +485,6 @@ _B_SCHED_H_NEW = (
 
 
 def build_nohz_steps():
-    """``nohz_field_refinement``: the legacy tick_sched state triplet, named.
-
-    Order matters: the enum lands in the header (step 1) and only then does
-    tick-sched.c start using it, so every intermediate state is a compilable
-    tree.  Step 2 both inserts the implementation and rewrites
-    ``tick_nohz_tick_stopped()`` -- they share one anchor and splitting them
-    would make one ``new`` a prefix of the other step's ``old``
-    (step-authoring trap 1).
-    """
     return [
         (NOHZ_H, _A_ENUM, _A_ENUM_NEW, T),
         (TICK_SCHED_C, _A_TICK_STOPPED, _A_TICK_STOPPED_NEW, T),
@@ -691,13 +498,6 @@ def build_nohz_steps():
 
 
 def build_avg_idle_steps():
-    """``avg_idle_preemption_mode``: retire ``rq->wake_avg_idle``.
-
-    Seven steps across four files.  Every replacement is textually distinct
-    from every other one in this module (step-authoring trap 2): the helper
-    body in core.c does not repeat the fair.c scan-budget comment, and the two
-    fair.c replacements spell their markers differently.
-    """
     return [
         (CORE_C, _B_HELPER, _B_HELPER_NEW, T),
         (CORE_C, _B_TTWU, _B_TTWU_NEW, T),
@@ -715,11 +515,6 @@ def _nohz_apply(ctx):
         nohz_text = ctx.read(NOHZ_H)
     except FileNotFoundError as exc:
         return "blocked_by_shape", f"{exc}: file absent"
-    # Shape probe only: the enum is meaningless without the header's own guard,
-    # and the tick-sched.c hunks are all inside the CONFIG_NO_HZ_COMMON section
-    # that ``__setup("nohz=", ...)`` belongs to.  Nothing here probes for
-    # whether the graft already ran -- ``replace_once`` answers that per step,
-    # and the marker comments are the idempotency anchors.
     for probe, text, why in (
         ("#endif /* _LINUX_SCHED_NOHZ_H */", nohz_text, NOHZ_H),
         ("__setup(\"nohz=\", setup_tick_nohz);", tick_text, TICK_SCHED_C),
@@ -729,11 +524,6 @@ def _nohz_apply(ctx):
             return "blocked_by_shape", (
                 f"{probe!r} not found in {why}; this does not look like the "
                 "5.15 nohz header / tick-sched.c pair")
-    # A tree may already carry some *other* nohz state-helper owner.  Once this
-    # module's graft is in place the accessor exists AND its marker is in
-    # tick-sched.c; the accessor without the marker is a shape this module
-    # cannot name (re-defining it would collide), so refuse instead of
-    # half-writing the enum.
     if "enum nohz_cpu_state" in nohz_text and _MARK_NOHZ not in tick_text:
         return "blocked_by_shape", (
             "nohz.h already declares enum nohz_cpu_state without the ABK "
@@ -753,22 +543,11 @@ def _avg_idle_apply(ctx):
         sched_h_text = ctx.read(SCHED_H)
     except FileNotFoundError as exc:
         return "blocked_by_shape", f"{exc}: file absent"
-    # Shape probe: the fair.c rewrites are keyed to the 5.15 SIS_PROP-only
-    # select_idle_cpu().  sched_feat(SIS_UTIL) and sd_llc_shared->nr_idle_scan
-    # are 6.1 additions (0 occurrences anywhere in 5.15 kernel/sched/), and the
-    # suite's 6.1 branch deletes the SIS_PROP arms instead.  Applying this
-    # module's 5.15 replacements to a SIS_UTIL tree would leave the scan
-    # unbounded, so refuse the shape instead of guessing.
     if "sched_feat(SIS_UTIL)" in fair_text:
         return "blocked_by_shape", (
             "select_idle_cpu() carries SIS_UTIL (6.1+ shape), not the 5.15 "
             "SIS_PROP-only scan; this group's fair.c replacements are keyed to "
             "the 5.15 shape, so nothing was written")
-    # A tree may already carry some *other* average-idle rewrite.  Once this
-    # module's own graft is in place the prediction is gone AND the marker is
-    # present; prediction gone with no marker is a shape this module cannot
-    # name, and taking the plain path there would fail loudly on a later step
-    # anyway -- name it explicitly instead.
     if "this_rq->wake_avg_idle" not in fair_text and _MARK_AVG_PROBE not in fair_text:
         return "blocked_by_shape", (
             "select_idle_cpu() has no rq->wake_avg_idle prediction and no ABK "
@@ -789,7 +568,6 @@ def _avg_idle_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the two PatchGroup records, in registration order."""
     return [
         PatchGroup(
             "nohz_field_refinement",

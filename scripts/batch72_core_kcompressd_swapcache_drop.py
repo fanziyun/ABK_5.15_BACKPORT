@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -110,7 +108,6 @@ PAGE_SUCCESS_BLOCK = (
 
 
 def build_steps():
-    
     return [
         (VMSAN, _DECL_OLD, _DECL_NEW, T),
         (VMSAN, _PARK_OLD, _PARK_NEW, T),
@@ -145,7 +142,6 @@ def _kcompressd_swapcache_drop_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    
     return [
         PatchGroup(
             "kcompressd_swapcache_drop",

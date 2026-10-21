@@ -1,24 +1,3 @@
-"""Graft engine for the abk_5_15_backport module_set.
-
-A *patch group* is one registered backport unit (usually one upstream 5.15.y
-commit or a tightly coupled series).  Each group declares the tree shapes it
-accepts and performs bounded ``replace_once``/``ensure_after`` edits through
-:class:`GraftContext`.  Groups never expand beyond their declared regions:
-whenever an anchor is absent the group degrades to a reported status instead
-of half-patching the tree.
-
-Status vocabulary:
-    applied                  rewritten now (or would-write under dry-run)
-    partial                  some hunks applied, some degraded (see detail)
-    already_present          graft content already in the tree
-    skip_suite_processed     another graft module already rewrote this region
-    report_only              deliberately recorded, no edit performed
-                             (family gate, or a target file this tree cannot
-                             carry: still reported, never written)
-    blocked_by_missing_anchor  anchor absent from this tree
-    blocked_by_shape         tree shape not covered by any accepted variant
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -44,7 +23,6 @@ class GraftContext:
         self._shape_cache = {}
         self._defconfig_rel = self._resolve_defconfig()
 
-    # -- file access -----------------------------------------------------
     def path(self, rel):
         return self.common_dir / rel
 
@@ -62,14 +40,8 @@ class GraftContext:
     def pending_writes(self):
         return sorted(self._dirty)
 
-    # -- defconfig access --------------------------------------------------
     def _resolve_defconfig(self):
-        """Return the defconfig path relative to the common dir, or None.
-
-        A defconfig outside the common dir is refused rather than written:
-        rollback restores ``<file>.abk-orig`` snapshots found under the kernel
-        tree, so an edit outside it could never be undone.
-        """
+        # Outside common_dir is refused: rollback cannot restore it.
         if self.defconfig is None:
             return None
         try:
@@ -83,14 +55,8 @@ class GraftContext:
         return self._defconfig_rel
 
     def enable_configs(self, configs):
-        """Force ``CONFIG_<name>=<value>`` lines in the build defconfig.
-
-        Accepts the three shapes a defconfig may hold a symbol in: already at
-        the target value (no-op), present with a different value or as
-        ``# CONFIG_x is not set`` (rewritten in place), or absent entirely
-        (appended under one marker comment).  Line-based, so it is idempotent
-        whatever order the tree's own defconfig happens to be in.
-        """
+        # Three shapes: already set (no-op), set to another value or "is not
+        # set" (rewrite in place), absent (append under one marker).
         rel = self.defconfig_rel()
         if rel is None:
             reason = ("no defconfig passed" if self.defconfig is None
@@ -130,21 +96,8 @@ class GraftContext:
                 f"{appended} appended, {rewritten} rewritten in {rel}")
 
     def defconfig_drop_cmdline_token(self, token):
-        """Drop one token from ``CONFIG_CMDLINE`` in the build defconfig.
-
-        ``enable_configs()`` speaks ``CONFIG_x=y``; ``CONFIG_CMDLINE`` is a
-        string, so a lane that has to change the kernel command line needs its
-        own line-level edit.  Exactly one line is rewritten (its quoting and the
-        order of the surviving tokens are kept), and the edit is idempotent the
-        same way the rest of the lane is: a second pass finds no token and
-        reports ``already_present`` without touching the file.
-
-        A defconfig with no ``CONFIG_CMDLINE`` line is
-        ``blocked_by_missing_anchor`` rather than a silent success: a tree that
-        does not carry the line at all is not the tree this lane was written
-        against, and inventing one would change the boot command line of a kernel
-        nobody asked to change.
-        """
+        # CONFIG_CMDLINE is a string, not CONFIG_x=y; a missing line is an
+        # anchor miss, never a silent success.
         rel = self.defconfig_rel()
         if rel is None:
             reason = ("no defconfig passed" if self.defconfig is None
@@ -174,9 +127,7 @@ class GraftContext:
         self.write(rel, joiner.join(lines))
         return "applied", f"dropped {token} from CONFIG_CMDLINE in {rel}"
 
-    # -- compatibility shape probes --------------------------------------
     def suite_touched(self, rel):
-        """True when ABK_ABI_PATCH_SUITE markers appear in ``rel``."""
         text = self.read(rel)
         return common.has_any(
             text,
@@ -184,26 +135,18 @@ class GraftContext:
         )
 
     def suite_fdtable_fallback(self):
-        """True when the suite rewrote alloc_fdtable() into its own fallback."""
         text = self.read("fs/file.c")
         return common.SUITE_FD_FALLBACK_ALIGN in text or common.SUITE_FD_HELPER in text
 
     def block_rolled_back(self):
-        """True when the F2FS suite's block rollback already ran."""
         if "block" not in self._shape_cache:
             text = self.read("block/blk-mq.c")
             self._shape_cache["block"] = common.F2FS_BLOCK_MONTHLY_SENTINEL not in text
         return self._shape_cache["block"]
 
     def fdtable_upstream_shape(self):
-        """True only for the genuine upstream 5.15.191 conventions.
-
-        The suite's fallback rewrite shares the ``slots_wanted`` sizing, so the
-        suite's ALIGN capacity line disqualifies the tree.  The suite's
-        ``abk_fdtable_slots_wanted`` helper may remain defined-but-unused after
-        this module composed the upstream conventions over the suite's
-        fallback, so the helper alone does not disqualify.
-        """
+        # The suite's fallback shares the slots_wanted sizing, so its ALIGN line
+        # disqualifies; a leftover suite helper alone does not.
         text = self.read("fs/file.c")
         if "alloc_fdtable(unsigned int slots_wanted)" not in text:
             return False
@@ -224,7 +167,7 @@ class PatchGroup:
     def run(self, ctx):
         try:
             status, detail = self.apply_fn(ctx)
-        except SystemExit as exc:  # groups may abort with a precise reason
+        except SystemExit as exc:
             if self.hard:
                 raise
             status, detail = "blocked_by_shape", f"aborted: {exc}"
@@ -243,11 +186,7 @@ class PatchGroup:
 
 
 def shape_report(ctx):
-    """Tree-shape probes recorded by every run so composition can be audited.
-
-    ``block_rolled_back`` is informational: it records that the F2FS suite's
-    block rollback already ran, it gates nothing.
-    """
+    # block_rolled_back is informational and gates nothing.
     return {
         "fdtable_upstream_shape": ctx.fdtable_upstream_shape(),
         "suite_fdtable_fallback": ctx.suite_fdtable_fallback(),
@@ -256,11 +195,6 @@ def shape_report(ctx):
 
 
 def run_child(child_name, groups, ctx, args, enabled=True):
-    """Run every registered group and write the child report pair.
-
-    ``enabled`` is the family gate: on an unsupported family no group runs, the
-    report still lists them all, and nothing is read or written.
-    """
     results = []
     for group in groups:
         if not enabled:
@@ -279,11 +213,7 @@ def run_child(child_name, groups, ctx, args, enabled=True):
         changed = [rel for rel in ctx.pending_writes()
                    if ctx.read(rel) != before.get(rel, None)]
         status = results[-1]["status"]
-        # Safety nets: a degraded group must never have touched the tree, and
-        # a group claiming an edit must have changed at least one file.  The
-        # second catches a graft whose anchors all stopped matching but which
-        # still reports success.  Compare content, not path sets, so a group
-        # that rewrites a file another group already touched is a real edit.
+        # A degraded group must not have written; an applied one must have.
         if status not in ("applied", "partial", "already_present"):
             if changed:
                 raise SystemExit(
@@ -386,25 +316,13 @@ def make_context(args):
 
 
 def apply_steps(ctx, steps):
-    """Transactional anchor applier shared by every child.
-
-    ``steps`` is a list of ``(rel, old, new, required)`` tuples evaluated in
-    order against in-memory texts.  A required step that finds no anchor
-    aborts the whole group without writing anything, so chained hunks stay
-    build-safe (e.g. a rename plus all of its users).
-
-    Returns (status, results, detail) with status one of
-    "applied"/"partial"/"already_present" or None when a required anchor was
-    missing (caller decides how to degrade).
-    """
+    # Required anchors are transactional: one miss writes nothing at all.
     pending = {}
     results = []
     for rel, old, new, required in steps:
         try:
             text = pending.get(rel, ctx.read(rel))
         except FileNotFoundError:
-            # A fixture or a real tree that never gained this file is a missing
-            # anchor, not a crash.
             if required:
                 detail = f"{rel}: file absent"
                 return None, results, detail
@@ -426,9 +344,7 @@ def apply_steps(ctx, steps):
     applied = sum(1 for _r, s in results if s == "applied")
     present = sum(1 for _r, s in results if s == "already_present")
     if applied == 0 and present == 0:
-        # Nothing matched at all -- including the empty step list.  Calling
-        # that already_present is the classic silent no-op: the graft never
-        # landed but the run still looked green.
+        # No match at all is blocked_by_missing_anchor, not already_present.
         missing = "; ".join(f"{r}:{s}" for r, s in results)
         return ("blocked_by_missing_anchor", results,
                 "no step anchor matched (" + (missing or "empty step list") + ")")

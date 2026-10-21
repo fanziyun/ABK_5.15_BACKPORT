@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""Implementation audit: no phantom grafts, no missing feature content.
-
-step_audit.py proves every anchor lands with correct structure and
-idempotency; this companion proves the *content* of a graft is real:
-
-- a group that reports applied/partial must have changed at least one file
-  (content diff, not path-set diff: several groups rewrite the same file);
-- the 6.1/6.6-origin groups must leave their headline feature symbols in the
-  patched tree;
-- groups whose upstream shape is the whole point (zsmalloc chain sizing,
-  MADV_COLLAPSE) must leave their behaviour-visible symbols behind.
-
-Everything runs against a disposable copy of the source tree: the reference
-trees are never written to.
-
-Usage:
-  python tests/implementation_audit.py /path/to/android13-5.15-tree
-"""
 
 from __future__ import annotations
 
@@ -39,16 +21,6 @@ import sublevel_matrix  # noqa: E402
 
 MARKER = "ABK stable_515_backport:"
 
-# A module-introduced line may only reference a symbol the tree hides behind a
-# CONFIG gate if the line sits inside that same gate.  The zram writeback fields
-# are the case that bit (Batch 23): struct zram declares bdev / backing_dev /
-# wb_compressed -- and struct zram_stats its bd_* counters -- inside
-# CONFIG_ZRAM_WRITEBACK, and ABK's dispatch does not have to enable that symbol
-# (the module's own ROM tier is the only place that does, and it is off by
-# default).  The Batch-17 compressed-writeback helpers were first added outside
-# the guard, so every build that left the option off died with "no member named
-# 'bdev' in 'struct zram'" while all four text audits stayed green -- they only
-# ever ran against a tree, never through a preprocessor.
 CONFIG_GATED_REFERENCES = {
     "drivers/block/zram/zram_drv.c": [
         ("CONFIG_ZRAM_WRITEBACK",
@@ -57,10 +29,6 @@ CONFIG_GATED_REFERENCES = {
           "zram->nr_pages", "zram->wb_compressed", "zram->stats.bd_",
           "abk_zram_bvec_read(")),
     ],
-    # bg_readahead_tune (Batch 50): cpuset_cgrp_id only exists under
-    # CONFIG_CPUSETS (the enum entry in cgroup_subsys.h is itself gated on
-    # it), so the whole payload block sits inside #ifdef CONFIG_CPUSETS and
-    # this table enforces that mechanically instead of trusting the review.
     "mm/filemap.c": [
         ("CONFIG_CPUSETS",
          ("cpuset_cgrp_id",)),
@@ -73,12 +41,6 @@ CONFIG_GATED_REFERENCES = {
 
 
 def _ifdef_regions(lines):
-    """For each line, the conditional expressions enclosing it.
-
-    A stack of #if/#ifdef/#ifndef lines, popped on #endif.  #else/#elif are
-    ignored on purpose: what matters here is whether the gate is *anywhere*
-    around the line, and both branches of a gate are inside it.
-    """
     stack = []
     regions = []
     for line in lines:
@@ -92,7 +54,6 @@ def _ifdef_regions(lines):
 
 
 def config_gate_scope_problems(source, patched_root):
-    """Added lines that use a config-gated symbol outside that symbol's gate."""
     problems = []
     for rel, gates in CONFIG_GATED_REFERENCES.items():
         pristine = Path(source) / rel
@@ -119,35 +80,24 @@ def config_gate_scope_problems(source, patched_root):
                             f"outside the gate: {line.strip()[:90]}")
     return problems
 
-# Feature content that must survive into the patched text wherever the group
-# reports applied.  Keyed as "child:group".
 REQUIRED_CONTENT = {
     "core:zram_recompression": [
         "zram_recompress", "recompress_store", "mark_idle",
         "num_active_comps", "zs_lookup_class_index",
-        # Semantic checks to prevent empty implementation regression:
-        "for (prio = 0; prio < ZRAM_MAX_COMPS; prio++)",  # disksize_store loop
-        "zram_set_priority(zram, index, 0)",  # zram_free_page priority reset
+        "for (prio = 0; prio < ZRAM_MAX_COMPS; prio++)",
+        "zram_set_priority(zram, index, 0)",
     ],
     "core:memcg_memory_reclaim": ["memory.reclaim", "MEMCG_RECLAIM_MAY_SWAP"],
     "core:zsmalloc_chain_size": [
         "calculate_zspage_chain_size", "ZSMALLOC_CHAIN_SIZE", "is_power_of_2",
-        # The chain-size ceiling must also widen the isolated-subpage counter,
-        # or an 8-page zspage overflows it and double-adds on putback.
         "#define ISOLATED_BITS\t5",
     ],
     "core:madvise_collapse": [
         "madvise_collapse", "MADV_COLLAPSE",
         "khugepaged_scan_pmd(mm, vma, addr, &hpage, &result)",
         "khugepaged_scan_file(mm, file, pgoff, &hpage, &result)",
-        # Both scan_file definitions must have moved to the out-parameter form;
-        # the CONFIG_SHMEM-off stub is deliberately wrapped differently so it
-        # cannot pre-create this text (see abk_stable_core.py).
         "struct file *file, pgoff_t start, struct page **hpage,\n\t\tint *res)",
         "pgoff_t start, struct page **hpage, int *res)",
-        # 5.15 hugepage_vma_revalidate() returns 0 on success, so the graft must
-        # test it as a plain scan code, not with 6.1's `!= SCAN_SUCCEED`
-        # (SCAN_SUCCEED is 1 here, so that inverts the success test).
         "result = hugepage_vma_revalidate(mm, addr, &vma);\n\t\t\tif (result) {",
     ],
     "core:pagealloc_fallback_reuse": [
@@ -167,35 +117,24 @@ REQUIRED_CONTENT = {
     ],
     "core:dynamic_readahead_lowmem": [
         "config ABK_DYNAMIC_READAHEAD",
-        # Both android vendor-hook callbacks must really be registered (a graft
-        # that only adds the Kconfig entry but no policy would be a phantom).
         "register_trace_android_vh_ra_tuning_max_page(",
         "register_trace_android_vh_tune_mmap_readaround(",
         "core_initcall(abk_dra_init);",
         "abk_dra_is_background_task",
         "ABK stable_515_backport: dynamic readahead (Batch 9-1).",
     ],
-    # Batch 15 (ABK_ABI_PATCH_SUITE absorption).  The suite guarded every edit
-    # with `if old in text:` + `text.replace(old, new, 1)`, so a drifted anchor
-    # was a silent no-op reported as success.  These pin the behaviour that
-    # actually lands, so that failure mode cannot come back through this port.
     "core:pid_alloc_hotpath_phase2": [
-        # Both halves of the retry: the label it jumps to, and the latch that
-        # makes it single-shot per pid-namespace level.
         "retry_preload:",
         "retried_preload = true;",
         "retried_preload = false;",
     ],
     "core:fd_alloc_hotpath": [
-        # Only the precheck half is ported; REQUIRED_ABSENT pins the half that is
-        # deliberately not, and why.
         "abk_expand_files_needed",
     ],
     "core:close_range_hotpath": [
         "ABK stable_515_backport: close_range_hotpath.",
     ],
     "core:slab_alloc_free_hotpath": [
-        # The shared helper plus both alloc paths and the single-resolution free.
         "abk_slab_next_object",
         "c->freelist = next_object;",
         "struct page *page = virt_to_head_page(x);",
@@ -208,21 +147,9 @@ REQUIRED_CONTENT = {
         "abk_map_anon_page_pmd",
         "abk_do_huge_pmd_anonymous_zero_page",
         "abk_create_anonymous_huge_pmd",
-        # The 5.15 convention trap this port had to respect: khugepaged_enter()
-        # returns int here (non-zero = failure, include/linux/khugepaged.h:56),
-        # where 6.1 renamed it khugepaged_enter_vma() and returns void.  The
-        # int is propagated as VM_FAULT_OOM; see REQUIRED_ABSENT for the form
-        # that must not appear.
         "khugepaged_enter(vma, vma->vm_flags)",
     ],
     "perf:sched_eevdf_core_fields": [
-        # The KABI claim itself -- this is the group that takes ownership of the
-        # sched_entity slots the retired red line used to forbid.  Four scalars,
-        # so each ANDROID_KABI_USE's size/alignment static assert holds and
-        # sizeof(struct sched_entity) is unchanged.  Batch 16 released slot 4
-        # (see REQUIRED_ABSENT for the packing that must not come back); Batch 28
-        # re-claimed it for real as ``u64 slice``, which update_deadline(), the
-        # EEVDF yield and PREEMPT_SHORT all read.
         "ANDROID_KABI_USE(1, u64 deadline);",
         "ANDROID_KABI_USE(2, u64 min_vruntime);",
         "ANDROID_KABI_USE(3, s64 vlag);",
@@ -237,61 +164,29 @@ REQUIRED_CONTENT = {
         "abk_eevdf_store_rel_deadline",
         "abk_eevdf_scale_rel_deadline",
         "ABK_EEVDF_REL_DEADLINE_BIT",
-        # The Batch 28 accumulators.  Without them avg_vruntime() falls back to
-        # walking the tree, which is the quadratic cost the rebuild removed.
         "abk_entity_key",
         "abk_avg_vruntime_add",
         "abk_avg_vruntime_sub",
         "abk_avg_vruntime_update",
-        # The policy rules Batch 28 added on top of the Batch 15 payload.
         "sched_feat(RUN_TO_PARITY)",
         "abk_eevdf_preempt_short",
         "abk_eevdf_lag_limit",
-        # Definitions alone would pass even if nothing called them: these are the
-        # call sites that make the runtime state live.  They are also what
-        # sched_eevdf_core_fields' and sched_eevdf_modern_fields' anti-drift
-        # gates probe before they will claim the KABI slots / add the cfs_rq
-        # fields.
         "abk_avg_vruntime_add(cfs_rq, se);",
         "abk_eevdf_refresh_deadline(cfs_rq, curr);",
         "return abk_pick_eevdf(cfs_rq, curr);",
         "abk_eevdf_place_entity(cfs_rq, se, initial);",
         "cfs_rq->abk_pick_deadline = se->deadline;",
         "EEVDF runtime-state graft (Batch 28 shape)",
-        # Batch 28 repair: upstream nulls an ineligible curr before its
-        # run-to-parity test.  Without it run-to-parity also hands the CPU to
-        # an ineligible current, which hides the skip buddy that
-        # yield_task_fair() sets, so sched_yield() ends up weaker than stock CFS.
         "!abk_eevdf_eligible(curr, avruntime)",
-        # The null-safety guarantee, and the reason it is pinned here: ACK
-        # 1119609dce0875 ("ANDROID: if EEVDF scheduling fail, picking leftmost,
-        # to avoid NULL pointer") is the downstream mitigation for a NULL deref
-        # in pick_next_entity().  pick_next_task_fair() hands the result
-        # straight to group_cfs_rq(), so a NULL there is a fatal fault, not a
-        # fallback to idle.  The overflow that triggers it upstream
-        # (vruntime_eligible()'s ``key * load``) cannot occur here --
-        # docs/survey_eevdf_gap.md 4.3 shows abk_eevdf_eligible() is a
-        # subtraction and a sign test -- but the selector must still never
-        # return NULL when it finds no eligible entity.  This line is the whole
-        # of that guarantee, the ACK patch's hunk 1 in effect, and it is one
-        # edit away from being lost.
         "best = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);",
-        # ...and the guards that preserve a userspace-provided request size.
         "if (!se->slice)",
-        # The !EEVDF halves.  See REQUIRED_PAIRING for why they are required.
         "if (sched_feat(EEVDF))",
         "if (!sched_feat(EEVDF) && wakeup_preempt_entity(se, pse) == 1)",
     ],
     "perf:sched_eevdf_modern_fields": [
-        # The cfs_rq side of the rebuild: the two accumulators that make
-        # avg_vruntime() O(1) and the run-to-parity stash, plus the two policy
-        # switches.  struct cfs_rq is not an exported type, so these three
-        # fields cost no KMI.
         "s64\t\t\tavg_vruntime;",
         "u64\t\t\tavg_load;",
         "u64\t\t\tabk_pick_deadline;",
-        # Batch 28 repair: without a producer, se->slice can only ever hold the
-        # global default, and abk_eevdf_preempt_short() is a tautology.
         "p->se.slice = min_t(u64, max_t(u64, attr->sched_runtime,",
         "p->se.slice = 0;",
         "SCHED_FEAT(EEVDF, true)",
@@ -304,40 +199,20 @@ REQUIRED_CONTENT = {
         "NOHZ_CPU_STATE_TICK_STOPPED",
     ],
     "perf:avg_idle_preemption_mode": [
-        # wake_avg_idle is retired and the SIS_PROP scan budget is re-sourced
-        # from rq->avg_idle directly.  Both strings are absent from the pristine
-        # tree, so they prove the mode really flipped rather than the group
-        # no-op'ing.
         "ABK stable_515_backport: avg_idle preemption mode simplification.",
         "avg_idle = this_rq->avg_idle / 2;",
-        # The suite sampled unconditionally: `delta = rq_clock(rq) -
-        # rq->idle_stamp`.  On 5.15 idle_stamp is armed ONLY by
-        # newidle_balance(), so a CPU sitting in the idle task without having
-        # passed that path (boot CPU, idle->idle repick) has idle_stamp == 0 and
-        # the unconditional form samples nanoseconds-since-boot, clamping
-        # straight to 2*max_idle_balance_cost.  Pristine ttwu_do_wakeup() had
-        # exactly this guard.
         "if (!rq->idle_stamp)",
     ],
     "perf:blk_mq_async_depth": [
-        # The new limit_depth op and its routing through alloc_request.
         "static void blk_mq_limit_depth(unsigned int opf, struct blk_mq_alloc_data *data)",
         "e->type->ops.limit_depth(opf, data);",
         "limit_depth = blk_mq_limit_depth;",
-        # The two CONVERTED consumers.  Do not "simplify" these back to the
-        # suite's raw assignments: q->async_depth is a REQUEST count while
-        # kqd->async_depth / bfqd->word_depths[][] are PER-WORD BIT caps
-        # (sbitmap_queue_get_shallow() caps bits within one word), so the raw
-        # assignment is >= one word on a 256-deep queue and never throttles --
-        # dead code.  See REQUIRED_ABSENT.
         "kqd->async_depth = ((q->async_depth << shift) + q->nr_requests - 1) /",
         "depth = ((bfqd->queue->async_depth << bt->sb.shift) +",
     ],
     "perf:psi_trigger_kernfs_polling": ["psi_trigger_ext", "pending_event"],
     "perf:psi_irq_tracking": ["PSI_IRQ"],
     "perf:psi_cgroup_pressure_switch": [
-        # The switch itself: a cgroup flag bit, the query the accounting paths
-        # ask, the re-enable sync and the knob that drives them.
         "CGRP_PSI_DISABLED",
         "static bool psi_group_enabled(struct psi_group *group)",
         "&container_of(group, struct cgroup, psi)->flags",
@@ -348,26 +223,19 @@ REQUIRED_CONTENT = {
         "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of,",
         '\t\t.name = "cgroup.pressure",',
         "\t\t.seq_show = cgroup_pressure_show,",
-        # The trigger writer has to have yielded the name, or the base-file entry
-        # above would route cgroup.pressure writes into the trigger path.
         "static ssize_t pressure_write(struct kernfs_open_file *of, char *buf,",
         "\treturn pressure_write(of, buf, nbytes, PSI_IO);",
         "\treturn pressure_write(of, buf, nbytes, PSI_MEM);",
         "\treturn pressure_write(of, buf, nbytes, PSI_CPU);",
-        # User-visible, so documented.
         "  cgroup.pressure\n",
     ],
     "perf:psi_oncpu_state_mask": [
-        # ONCPU is a flag in the state mask, and the four counters are all that
-        # is left of psi_group_cpu::tasks[].
         "NR_PSI_TASK_COUNTS = 4,",
         "#define TSK_ONCPU\t(1 << NR_PSI_TASK_COUNTS)",
         "#define PSI_ONCPU\t(1 << NR_PSI_STATES)",
         "static bool test_state(unsigned int *tasks, enum psi_states state, bool oncpu)",
         "return unlikely(tasks[NR_RUNNING] > oncpu);",
         "return unlikely(tasks[NR_RUNNING] && !oncpu);",
-        # The flag is set/cleared/carried before the counts, and asked for in
-        # every place the counter used to be.
         "if (unlikely(clear & TSK_ONCPU)) {",
         "state_mask = PSI_ONCPU;",
         "state_mask = groupc->state_mask & PSI_ONCPU;",
@@ -384,8 +252,6 @@ REQUIRED_CONTENT = {
         "kthread_create_worker(0, \"zram_recompd\")",
         "recompress_async",
         "dev_attr_recompress_async.attr",
-        # The reset drain call is folded into the recompression group's reset
-        # text; make sure it really invokes the async teardown entry point.
         "abk_zram_recomp_drain(zram);",
     ],
     "perf:schedutil_smart_policy": [
@@ -394,69 +260,43 @@ REQUIRED_CONTENT = {
         "register_trace_android_vh_scheduler_tick(abk_sf_tick, NULL)",
         "register_trace_android_vh_cpufreq_resolve_freq(abk_sf_resolve_freq,",
         "late_initcall(abk_sf_init)",
-        # Sampling must be governor-independent: the util read happens in the
-        # scheduler tick, not in a schedutil-only vendor hook (the device runs
-        # the vendor walt governor, which never reaches the schedutil path).
         "cpu_util_cfs(rq)",
         "arch_scale_cpu_capacity(rq->cpu)",
-        # Batch 10-5 ownership fix.  The floor is a *ratchet* on any policy
-        # whose owner drives cpufreq by pinning min == max == its own target
-        # (vendor FAS/WALT): the clamp to policy->max turns "raise to the
-        # floor" into "keep the frequency already applied" and every downscale
-        # is swallowed.  Measured on kalama: waltgov asked for 766 MHz while
-        # the policy held 1785600 for a whole game session.  All of the
-        # following must be present or the ratchet is back.
         "static bool abk_sf_enable = false;",
         "#include <linux/string.h>",
         "static bool abk_sf_dvfs_owned(struct cpufreq_policy *policy)",
         'strcmp(policy->governor->name, "schedutil") != 0',
         "if (abk_sf_dvfs_owned(policy) || policy->min == policy->max)",
         "if (floor <= policy->min || floor >= policy->max)",
-        # The reason must expire on a wall-clock deadline as well as in the
-        # tick, and the sustained window must actually slide; plus a read-only
-        # view of the reason state so the next diagnosis is not blind.
         "unsigned long boost_release;",
         "static bool abk_sf_cpu_boosting(int cpu)",
         "module_param_cb(abk_sf_boosting, &abk_sf_boosting_ops, NULL, 0444);",
     ],
     "perf:schedutil_smart_cap": [
         "Batch 42 schedutil smart_freq cap",
-        # Ships off, and every default is an upstream constant or a no-op.
         "static bool abk_sc_enable = false;",
         "static uint abk_sc_cap_pct = 100;",
-        "static uint abk_sc_hold_ms = 300;",     # UNCAP_THRES
-        "static uint abk_sc_entry_pct = 90;",    # UTIL_THRESHOLD
+        "static uint abk_sc_hold_ms = 300;",
+        "static uint abk_sc_entry_pct = 90;",
         "static uint abk_sc_release_pct = 70;",
         "static uint abk_sc_release_ms = 250;",
-        # The clamp itself, upstream's form: min(freq, cap).
         "return mult_frac(policy->cpuinfo.max_freq, pct, 100);",
         "*target_freq = cap;",
-        # Every gate.  A cap on a range the owner has already pinned is the
-        # Batch 10-4c ratchet from this direction, and each of these is the
-        # half of the pair that stops it.
         "static bool abk_sc_dvfs_owned(struct cpufreq_policy *policy)",
         'strcmp(policy->governor->name, "schedutil") != 0',
         "if (abk_sc_dvfs_owned(policy) || policy->min == policy->max)",
         "if (c <= policy->min || c >= policy->max)",
-        # The release is request-direction driven, not the util time window
-        # whose 70-90% dead band latched smart_policy's reason on a real device.
         "ABK_SC_RELEASE IS NOT A UTIL WINDOW",
         "unsigned long high_start;",
         "p->high_start = jiffies;",
         "p->high_start = 0;",
         "p->released = false;",
-        # Per-policy state under a raw spinlock: fast_switch calls resolve_freq
-        # under rq->lock from several CPUs of one policy at once, so the ladder
-        # cannot live per-CPU and cannot be lock-free.
         "struct abk_sc_policy {",
         "raw_spinlock_t lock;",
         "raw_spin_lock_irqsave(&p->lock, flags)",
         "raw_spin_lock_init(&abk_sc_policies[cpu].lock);",
-        # The cap has to survive schedutil_smart_policy's floor, which runs
-        # after it on the same hook (registration order is execution order).
         "late_initcall_sync(abk_sc_reassert_init);",
         "if (p->capped && *target_freq > cap)",
-        # Both read-only nodes, so who owns a range is observable.
         "module_param_cb(abk_sc_boosting, &abk_sc_boosting_ops, NULL, 0444);",
         "module_param_cb(abk_sc_capped, &abk_sc_capped_ops, NULL, 0444);",
     ],
@@ -464,31 +304,17 @@ REQUIRED_CONTENT = {
         "Batch 10-4 secondary zram compressor",
         "abk_zram_recomp_algo",
         "module_param_string(abk_recomp_algo",
-        # The secondary slot must really be filled, or recompression stays the
-        # silent no-op this group exists to fix.
         "comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, abk_alg);",
-        # The secondary is zstd (measured best ratio-per-cost) and the parameter
-        # is read-only: the target ROM's own userspace daemon forced the
-        # dominated lz4hc primary before disksize, so a writable parameter
-        # would only invite the same choice back.
         'static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = "zstd";',
         "sizeof(abk_zram_recomp_algo), 0444);",
     ],
     "core:zram_algo_lock": [
         "Batch 11 - the zram algorithm lock",
-        # Read-only policy parameters: the measured primary and the lock switch.
         'static char abk_zram_comp_algo[CRYPTO_MAX_ALG_NAME] = "lz4kd";',
         "module_param_string(abk_comp_algo, abk_zram_comp_algo",
-        # Two names on purpose: the knob is zram.abk_lock_algo, the variable is
-        # abk_zram_lock_algo, and plain module_param() refuses that split --
-        # it fails the compile with "use of undeclared identifier".
         "module_param_named(abk_lock_algo, abk_zram_lock_algo, bool, 0444);",
         "static bool abk_zram_lock_algo = true;",
-        # The primary must be selected at creation, before any disksize write.
         "comp_algorithm_set(zram, ZRAM_PRIMARY_COMP,",
-        # Both nodes must really be repointed, and the locked store must accept
-        # the write (a refused algorithm write aborts Android's mmd_setup,
-        # writeback setup included -- the exclusivity this batch removes).
         "dev_attr_comp_algorithm.store = abk_zram_locked_algo_store;",
         "dev_attr_recomp_algorithm.store = abk_zram_locked_algo_store;",
         "late_initcall(abk_zram_algo_lock_init)",
@@ -496,8 +322,6 @@ REQUIRED_CONTENT = {
     ],
     "core:memcg_v1_reclaim": [
         "Batch 10-4 cgroup-v1 proactive reclaim",
-        # Forward declaration must precede the legacy table, and that table
-        # must carry the entry, or v1 devices have no memory.reclaim at all.
         "static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,",
         'static struct cftype mem_cgroup_legacy_files[] = {',
         '.name = "reclaim",',
@@ -512,9 +336,6 @@ REQUIRED_CONTENT = {
         "reclaim_options & MEMCG_RECLAIM_PROACTIVE",
     ],
     "core:customize_alloc_gfp_vh": [
-        # All three upstream hunk lines must really land (declare / call /
-        # export); a hook that is declared but never called is inert, and one
-        # that is called but not exported cannot be reached by a module.
         "DECLARE_HOOK(android_vh_customize_alloc_gfp,",
         "trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);",
         "EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_customize_alloc_gfp);",
@@ -524,69 +345,40 @@ REQUIRED_CONTENT = {
         "register_trace_android_vh_customize_alloc_gfp(",
         "*gfp |= __GFP_NORETRY | __GFP_NOWARN;",
         "late_initcall(abk_gfp_fastfail_init);",
-        # The THP-class default: order 9 on 4K-page arm64.
         "static unsigned int abk_gfp_fastfail_order = 9;",
     ],
-    # --- Batch 14: zram writeback correctness ------------------------------
     "core:zram_wb_teardown": [
-        # 74363ec674cb.  The NULL guard is the load-bearing half: zram_remove()
-        # now always reaches reset_bdev(), and zram_meta_free() may be entered
-        # for a device that never had a table/pool.
         "if (!zram->table)\n\t\treturn;",
         "zram->table = NULL;",
-        # The leak close itself, in zram_remove() -- not by deleting
-        # zram_reset_device()'s early return, which zram_recompression owns.
         "\tzram_reset_device(zram);\n\t/*\n\t * ABK stable_515_backport: 74363ec674cb.",
         "\treset_bdev(zram);\n\n\tpr_info(\"Removed device: %s\\n\"",
     ],
     "core:zram_writeback_bounds": [
-        # 894913e2d35c: the bound and the range check must both be derived under
-        # the read lock, not before it.
         "ABK stable_515_backport: 894913e2d35c",
         "\tunsigned long nr_pages;\n\tunsigned long index = 0;",
-        # The marker is load-bearing for unambiguity: the bare
-        # `nr_pages = ...; if (index >= nr_pages) {` sequence is the *upstream*
-        # 2026 shape, so a baseline that ever backports 894913e2d35c itself
-        # would satisfy a marker-less needle while this group reports
-        # already_present.  Anchor on the comment the step actually writes.
         "\t * freed table and the loop would index past the new one.\n"
         "\t */\n"
         "\tunsigned long nr_pages;",
-        # ...and the post-lock region still derives the bound and re-checks.
         "ABK stable_515_backport: 894913e2d35c -- bound and range check",
         "\tnr_pages = zram->disksize >> PAGE_SHIFT;\n"
         "\tif (index >= nr_pages) {\n"
         "\t\tret = -EINVAL;\n"
         "\t\tgoto release_init_lock;",
-        # 424d0e5828ad: the reschedule point in the sweep.
         "\t\tcond_resched();",
     ],
     "core:zram_wb_limit_align": [
-        # Mainline writeback_limit_store()'s alignment guard.
         "val = rounddown(val, PAGE_SIZE / 4096);",
     ],
-    # --- Batch 17: zram writeback batching + compressed writeback ----------
     "core:zram_writeback_batching": [
-        # f405066a1f0d.  The point of the change is the *absence* of the
-        # synchronous single-page submit (asserted in REQUIRED_ABSENT); these
-        # pin the in-flight machinery that replaces it.
         "struct zram_wb_ctl", "struct zram_wb_req",
         "zram_writeback_endio", "zram_submit_wb_request",
         "zram_complete_done_reqs", "zram_select_idle_req",
         "atomic_read(&wb_ctl->num_inflight)", "wait_event(wb_ctl->done_wait",
-        # bf62f69574b1: the UAF fix must be in the shipped shape, not "fixed
-        # later" -- kfree_rcu() plus an RCU read section in the callback.
         "kfree_rcu(wb_ctl, rcu)", "rcu_read_lock()",
-        # 3e8d8eb8d7f5: the reserved-but-unused index is released before the
-        # drain, and a recycled request cannot free the slot block twice.
         "free_block_bdev(zram, blk_idx)", "req->blk_idx = 0;",
-        # 5.15 re-anchor: ZRAM_UNDER_WB/ZRAM_IDLE are the in-flight protocol
-        # that keeps recompression and idle marking off the slot.
         "zram_set_flag(zram, index, ZRAM_UNDER_WB)",
         "zram_clear_flag(zram, index, ZRAM_UNDER_WB)",
         "zram_set_element(zram, index, req->blk_idx)",
-        # d38fab605c66 write half + 3bf1c285dc40: raw object copy with the
-        # 5.15 mapping API (no zs_obj_read_begin), trailing bytes zeroed.
         "zs_map_object(zram->mem_pool, handle, ZS_MM_RO)",
         "zs_unmap_object(zram->mem_pool, handle)",
         "memzero_page(page, size, PAGE_SIZE - size)",
@@ -598,66 +390,37 @@ REQUIRED_CONTENT = {
         "dev_attr_writeback_batch_size.attr",
     ],
     "core:zram_compressed_writeback": [
-        # d38fab605c66 read half: the dispatcher and its deferred
-        # decompression, plus the attribute of 4c1d61389e8e/ba4c3698e696.
         "abk_zram_bvec_read(", "abk_zram_decompress_bdev_page",
         "abk_zram_deferred_decompress", "system_highpri_wq",
         "bio_inc_remaining(parent)", "compressed_writeback_store",
         "zram->wb_compressed = val;",
         "dev_attr_compressed_writeback.attr",
-        # 5.15 conventions, each a compile-or-behave trap if the 6.x patch is
-        # copied verbatim: the stream put takes the comp, decompress takes
-        # four arguments, and the stale-page path zeroes instead of using
-        # 6.19's memset_page().
         "zcomp_stream_put(zram->comps[prio])",
         "zcomp_decompress(zstrm, src, size, zstrm->buffer)",
         "zero_user(page, 0, PAGE_SIZE)",
     ],
     "perf:sched_steal_time_excess_drop": [
-        # The drop is only real if the sampled value is remembered *before* the
-        # delta clamp and stored back unbounded -- the pre-5.15.179 form adds
-        # the clamped steal, which is what re-charges it to the next task.
         "steal = prev_steal = paravirt_steal_clock(cpu_of(rq));",
         "rq->prev_steal_time_rq = prev_steal;",
     ],
     "perf:randomize_kstack_pertask": [
-        # "Per-task" is the whole point: both macros must read and write
-        # current->kstack_offset instead of the per-CPU variable, and the
-        # fork-time initialiser must exist.  The per-CPU definitions the commit
-        # removes are pinned in REQUIRED_ABSENT below.
         "u32 offset = current->kstack_offset;",
         "current->kstack_offset = offset;",
         "random_kstack_task_init",
     ],
     "perf:blk_mq_suspend_wakeup_abort": [
-        # The abort path is only real if the wait loop can see a pending wakeup,
-        # can un-inactivate the hctx again, and can propagate the failure -- the
-        # upstream hunk returns -EBUSY from blk_mq_hctx_notify_offline(), whose
-        # caller is the CPUHP teardown state.
         "pm_wakeup_pending()",
         "clear_bit(BLK_MQ_S_INACTIVE, &hctx->state);",
         "ret = -EBUSY;",
         "#include <linux/suspend.h>",
     ],
     "perf:blk_mq_quiesced_elevator_switch": [
-        # The rename has to land on all three sides at once: the definition,
-        # the declaration and both call sites.  Half of it is a link error
-        # (blk.h declaring a function nobody defines) or, worse, a non-static
-        # elevator_switch_mq() that blk-mq no longer calls while the switch
-        # happens through the unquiesced path the group exists to retire.
         "static int elevator_switch_mq(struct request_queue *q,",
         "int elevator_switch(struct request_queue *q, struct elevator_type *new_e);",
         "elevator_switch(q, NULL);",
         "elevator_switch(q, t);",
     ],
     "core:zram_recompress_max_pages": [
-        # 34efe1c3b688.  The parameter has to be parsed *into* the counter, the
-        # sweep has to test the counter, and both recompress nodes have to carry
-        # it -- recompress_async advertises the same grammar, so a cap that only
-        # bounds the synchronous pass leaves the companion's default path
-        # uncapped.  2f529e73d720's type guard rides along: without it a
-        # mistyped type= value means "no filter", the opposite of what the cap
-        # is for.
         'if (!strcmp(param, "max_pages")) {',
         "ret = kstrtoull(val, 10, &num_recomp_pages);",
         "u64 num_recomp_pages = ULLONG_MAX;",
@@ -667,8 +430,6 @@ REQUIRED_CONTENT = {
         "if (!mode)",
     ],
     "core:zram_recomp_best_prio_skip": [
-        # No upstream commit to quote: pin the predicate, both call sites, and
-        # the CONFIG_ZRAM_MULTI_COMP guard (an unguarded static is -Werror).
         "static bool abk_zram_recompress_pointless(struct zram *zram,",
         "u32 abk_cur = zram_get_priority(zram, index);",
         "if (prio > abk_cur && zram->comps[prio])",
@@ -676,81 +437,39 @@ REQUIRED_CONTENT = {
         "#ifdef CONFIG_ZRAM_MULTI_COMP\n/*\n * sailboat_zram_recomp_skip:",
     ],
     "core:arm64_pte_mkwrite_clean": [
-        # 8a2375b0e9b8 / mainline 143937ca51cc.  The guard is the whole group,
-        # and it is deliberately written without an ABK marker (upstream-shape
-        # rewrite: the target form is the idempotency probe, so 216 stays
-        # byte-identical).  Pin the guarded clear itself -- the bare
-        # `pte_sw_dirty(pte))` test would also match pte_modify()'s own use of
-        # the macro further down the same file, which the pristine one has.
         "if (pte_sw_dirty(pte))\n"
         "\t\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
     ],    "core:zram_wb_slot_preserve": [
-        # b0377ee80429 / 37b72d525502.  The release has to be open-coded: the
-        # object and its compressed size go away *here* (not through the
-        # zram_free_page() that would take the slot's flags and attributes with
-        # them), the huge page is accounted here, and the guard on the other
-        # side is what keeps the slot's final release from decrementing that
-        # counter a second time.
         "ABK stable_515_backport: b0377ee80429",
         "atomic64_sub(zram_get_obj_size(zram, index),",
         "zs_free(zram->mem_pool, zram_get_handle(zram, index));",
         "if (!zram_test_flag(zram, index, ZRAM_WB))",
     ],
     "core:zsmalloc_free_zspage_out_of_lock": [
-        # The split helper, its call site outside the lock, and the marker.  A
-        # port that renamed __free_zspage() but kept calling it under
-        # class->lock satisfies every structural audit and changes nothing, so
-        # the call site is what is pinned (see REQUIRED_IN_FUNCTION for the
-        # ordering, which a whole-file substring cannot express).
         "static inline void __free_zspage_lockless(struct zs_pool *pool,",
         "zspage_to_free",
         "ABK stable_515_backport: 7ef28e8b8142",
-        # free_zspage() must keep a caller: zs_free() no longer calls it, so
-        # __zs_compact() is the only one left.  Losing that call silently turns
-        # it into an unused static function.
         "free_zspage(pool, class, src_zspage);",
     ],
-    # --- Batch 37: the memory-reclaim chain --------------------------------
-    # Six groups rewriting one path, so each entry is pinned against the blob
-    # *as it stands when that group runs* (implementation_audit applies them in
-    # registry order): 0388536ac291's cap is visible here even though the third
-    # group removes it again.
     "core:proactive_reclaim_batch_fidelity": [
-        # 0388536ac291.  The cap is the whole commit; the group's second-pass
-        # behaviour is what DECAYING_BATCH_DECL's own entry below pins.
         "min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),",
     ],
     "core:proactive_reclaim_decaying_batches": [
-        # 287d5fedb377.  Both halves: the declaration and the argument that
-        # replaced the fixed cap.  A tree with only the declaration still
-        # overreclaims; one with only the argument does not compile.
         "/* Will converge on zero, but reclaim enforces a minimum */",
         "unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
         "batch_size, GFP_KERNEL, reclaim_options);",
     ],
     "core:reclaim_swappiness_defines": [
-        # 410abb20acae.  The two constants plus the two literals they take
-        # over on 5.15; the third hunk of that commit (the MGLRU paths) has no
-        # 200 literal here and is deliberately left byte-identical.
         "#define MIN_SWAPPINESS 0",
         "#define MAX_SWAPPINESS 200",
         "\tfp = (MAX_SWAPPINESS - swappiness) * (total_cost + 1);",
         "\tif (val > MAX_SWAPPINESS)",
     ],
     "core:proactive_reclaim_swappiness_arg": [
-        # 68cd9050d871.  The value has to reach the scan balance from the
-        # request, not from the memcg's own setting: the accessor, its two
-        # callers, the field, the prototype, the definition, and the parser
-        # that fills it.  A port that only adds the argument would leave
-        # get_scan_count() reading mem_cgroup_swappiness() and the knob inert.
         "int *swappiness",
         "int *proactive_swappiness;",
         "static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)",
         "int swappiness = sc_swappiness(sc, memcg);",
-        # The bare call, not the statement around it: 194/lts carry the ACK
-        # hook in get_swappiness() and take the value into a local first, so
-        # their statement reads "swappiness = sc_swappiness(...)".  The exact
-        # per-shape text is pinned in REQUIRED_IN_FUNCTION below.
         "sc_swappiness(sc, memcg);",
         ".proactive_swappiness = swappiness,",
         "#include <linux/parser.h>",
@@ -758,31 +477,19 @@ REQUIRED_CONTENT = {
         '{ MEMORY_RECLAIM_SWAPPINESS, "swappiness=%d"},',
         "nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;",
         "swappiness == -1 ? NULL : &swappiness",
-        # The seven call sites, not just memory_reclaim()'s: a missed one is a
-        # compile error, and the NULL ones are what keeps every other caller's
-        # meaning ("no override") explicit rather than accidental.
         "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\t     NULL);",
         "gfp_mask, reclaim_options,\n\t\t\t\t\t\t    NULL);",
         "memsw ? 0 : MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL)) {",
         "MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\t\t\tNULL);",
         "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP,\n\t\t\t\t\tNULL);",
         "GFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))",
-        # ...and the manual, which is what makes the new key a documented part
-        # of the interface rather than an undocumented argument.
         "  swappiness            Swappiness value to reclaim with",
     ],
     "core:proactive_reclaim_suspend_abort": [
-        # dc37771a43d4.  Both ends: the inner-loop check and the errno the
-        # handler returns, which is what lets the syscall be restarted after
-        # resume instead of failing the suspend.
         "if (unlikely(sc->proactive && signal_pending(current)))",
         "return -ERESTARTSYS;",
     ],
     "core:lru_add_drain_dead_folios": [
-        # 9669b87065a6, in 5.15's pagevec form.  The filter, the two flags it
-        # has to clear (the page bypasses __pagevec_lru_add_fn()), the batch it
-        # is freed from, and the consumer's tolerance of the vacated slot --
-        # without the last one the drain walks a NULL pvec entry.
         "if (page_ref_freeze(page, 1)) {",
         "__ClearPageActive(page);",
         "__ClearPageUnevictable(page);",
@@ -791,12 +498,6 @@ REQUIRED_CONTENT = {
         "free_unref_page_list(&pages_to_free);",
         "/* A drained add batch may have freed this slot already. */",
     ],
-    # Batch 35.  The first pair is a two-commit change: 61c663e020d2 lands the
-    # pagevec-wide clear, d3db2c042591 then rewrites that helper into the single
-    # xas_for_each() traversal and moves the loop bound into `nr`.  Both are
-    # pinned, because a port that keeps only the first would take the lock once
-    # per pagevec but still walk the tree once per entry -- which is the half of
-    # the upstream fix that the soft-lockup report is actually about.
     "core:truncate_shadow_batch": [
         "clear_shadow_entries",
         "xa_has_values",
@@ -810,19 +511,7 @@ REQUIRED_CONTENT = {
         "int nr = pagevec_count(&pvec);",
         "ABK stable_515_backport: d3db2c042591",
     ],
-    # The MADV_DONTNEED page-table pair (madvise_pt_reclaim 6375e95f381e +
-    # madvise_batch_tlb_flush 43c4cfde7e37) was REMOVED: freeing an empty PTE
-    # page under mmap_read_lock races the smaps/reclaim page-table walkers on
-    # 5.15 (no pmdp_get_lockless()/RCU pte_offset_map*), which panicked in
-    # smaps_pte_range.  See CHANGELOG.md (Batch 35).
     "core:arm64_lse_percpu_load_atomics": [
-        # 535fdfc5a228.  The whole graft is two verbatim upstream hunks in one
-        # header: the LSE branch gains a [tmp] destination (store form -> load
-        # form) and the three non-return instantiations flip stadd/stclr/stset
-        # -> ldadd/ldclr/ldset.  The lore link rides in the same hunk and is
-        # the trail this deliberately markerless (upstream-shape) rewrite
-        # leaves behind, so it is pinned too.  The RET_OP ldadd is upstream
-        # context and must survive untouched between the flipped ops.
         '#op_lse "\\t%" #w "[val], %" #w "[tmp], %[ptr]\\n"',
         "PERCPU_OP(add, add, ldadd)",
         "PERCPU_OP(andnot, bic, ldclr)",
@@ -831,13 +520,6 @@ REQUIRED_CONTENT = {
         "e7d539ed-ced0-4b96-8ecd-048a5b803b85@paulmck-laptop",
     ],
 "core:fuse_prefault_out_of_write_path": [
-        # The pair, in the 5.15 *page* form.  Upstream's hunk is written
-        # against the 6.x folio form (__filemap_get_folio /
-        # copy_folio_from_iter_atomic), which anchors nowhere on any baseline,
-        # so the port had to be written in this spelling -- pinned because a
-        # rewrite that reads faithfully but calls the wrong helper is the one
-        # way this could land and do nothing.  Ordering and both halves are in
-        # REQUIRED_IN_FUNCTION below.
         "while not holding the page lock:",
         "\t\ttmp = copy_page_from_iter_atomic(page, offset, bytes, ii);",
     ],
@@ -854,10 +536,6 @@ REQUIRED_CONTENT = {
         "static const unsigned int memcg_stat_items[] = {",
         "static const unsigned int memcg_vm_event_items[] = {",
 
-        # The item tables, item by item: dropping any of these silently zeroes
-        # that stat.  State table = memory_stats[] + memcg1_stats[] readers
-        # (26 node items + 3 MEMCG items); events = every count_memcg_events*/
-        # writer on this baseline (13 + THP pair).
         "NR_INACTIVE_ANON,\n\tNR_ACTIVE_ANON,\n\tNR_INACTIVE_FILE,\n\tNR_ACTIVE_FILE,\n\tNR_UNEVICTABLE,",
         "NR_SLAB_RECLAIMABLE_B,\n\tNR_SLAB_UNRECLAIMABLE_B,",
         "WORKINGSET_REFAULT_ANON,\n\tWORKINGSET_REFAULT_FILE,\n\tWORKINGSET_ACTIVATE_ANON,\n\tWORKINGSET_ACTIVATE_FILE,\n\tWORKINGSET_RESTORE_ANON,\n\tWORKINGSET_RESTORE_FILE,\n\tWORKINGSET_NODERECLAIM,",
@@ -867,29 +545,15 @@ REQUIRED_CONTENT = {
         "PGPGIN,\n\tPGPGOUT,\n\tPGFAULT,\n\tPGMAJFAULT,\n\tPGREFILL,\n\tPGSCAN_KSWAPD,\n\tPGSCAN_DIRECT,\n\tPGSTEAL_KSWAPD,\n\tPGSTEAL_DIRECT,\n\tPGACTIVATE,\n\tPGDEACTIVATE,\n\tPGLAZYFREE,\n\tPGLAZYFREED,",
         "#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n\tTHP_FAULT_ALLOC,\n\tTHP_COLLAPSE_ALLOC,\n#endif",
 
-        # The header keeps every struct member: nothing may shrink the
-        # KMI-visible aggregates (the group blob spans mm/memcontrol.c and
-        # include/linux/memcontrol.h, so plain strings pin both files).
-        # lruvec_page_state_local() moved out of line, not deleted: the
-        # prototype wrapping is the header's, the longer one the .c body's.
         "struct lruvec_stats {\n\t/* Aggregated (CPU and subtree) state */\n\tlong state[NR_VM_NODE_STAT_ITEMS];",
         "struct memcg_vmstats {",
         "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx);",
         "unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n\t\t\t\t      enum node_stat_item idx)\n{",
     ],
     "core:mglru_clean_workingset": [
-        # 9cbfd1c3c83b, portable remainder: the workingset_refault() lock
-        # assertion must sit at the entry, before the MGLRU dispatch, so it
-        # covers both paths.  The test_recent()/lru_gen_test_recent() halves
-        # of the upstream commit have no 6.1-shape counterpart here and are
-        # deliberately not carried.
         "VM_BUG_ON_PAGE(!PageLocked(page), page);"
     ],
     "core:mglru_optimize_deactivation": [
-        # cc8ec7be78ff, pagevec re-authoring.  The helper must read the
-        # generation back (gen < 0 -> avoid the shuffle) and compare it
-        # against min_seq; the deactivate paths must consult it before they
-        # queue a pagevec move.
         "static bool lru_gen_clear_refs(struct page *page)",
         "return gen == lru_gen_from_seq(READ_ONCE(lruvec->lrugen.min_seq[type]));",
         "if (lru_gen_enabled() && lru_gen_clear_refs(page))\n\t\treturn;",
@@ -900,11 +564,6 @@ REQUIRED_CONTENT = {
         "\t\telse\n\t\t\tClearPageReferenced(page);",
     ],
     "core:mglru_rework_aging_feedback": [
-        # 798c0330c2ca.  The array, the walk field and the two macros are the
-        # structural core; the sentinel arithmetic (type ? ... : !swappiness)
-        # and the simplified aging verdict are the behavioural pins.  The old
-        # exact-sync rule (anon min = min(anon,file), file min = max(...)) and
-        # the can_swap walk field must be gone.
         "unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];",
         "\tint swappiness;\n\tbool full_scan;",
         "#define evictable_min_seq(min_seq, swappiness)",
@@ -920,10 +579,6 @@ REQUIRED_CONTENT = {
         "int swappiness = get_swappiness(lruvec, sc);",
     ],
     "core:mglru_rework_type_selection": [
-        # 37a260870f2c.  The summed-tier read_ctrl_pos() loop, the 2:3 margin,
-        # the total-tier type comparison and the single-pre-choice
-        # isolate_pages() loop are the content; the per-tier gain array and
-        # the shared tier_idx out-param must be gone.
         "pos->refaulted = pos->total = 0;",
         "for (i = tier % MAX_NR_TIERS; i <= min_t(typeof(tier), tier, MAX_NR_TIERS - 1); i++) {",
         "gain factor (2:3)",
@@ -935,18 +590,11 @@ REQUIRED_CONTENT = {
         "\tint scanned;\n\t\tint tier = get_tier_idx(lruvec, type);",
     ],
     "core:mglru_rework_refault_detection": [
-        # b1a71694fb00, page-shaped: the recency test must be a windowed
-        # distance against max_seq, and the internal refaulted[] counter must
-        # keep landing in the min_seq[type] history bucket the way the
-        # already-carried accounting fix (3af0191a594d) left it.
         "seq = READ_ONCE(lrugen->max_seq) & (EVICTION_MASK >> LRU_REFS_WIDTH);",
         "if (diff >= MAX_NR_GENS)\n\t\tgoto unlock;",
         "hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));",
     ],
     "core:mglru_wake_flushers": [
-        # 1bc542c6a0d1.  Both accounting feeds (sort_page's dirty page and
-        # scan_pages' isolated counts), the stat carry-out of
-        # shrink_page_list() and the end-of-cycle wake predicate.
         "\tbool dirty, writeback;",
         "sc->nr.file_taken += delta;",
         "\tif (type == LRU_GEN_FILE)\n\t\tsc->nr.file_taken += isolated;",
@@ -956,13 +604,6 @@ REQUIRED_CONTENT = {
         "if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)\n"
         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);",
     ],
-    # --- Batch 38 -------------------------------------------------------
-    # 0beeaf14e7b9 + e13f634f50d5 + 757dd8193f6c + 10228e0a5123.  The five
-    # call sites are pinned per-function in REQUIRED_IN_FUNCTION; these two
-    # are the helper they all call.  The CONFIG_MEMCG body alone is satisfied
-    # by a tree that forgot the #else stub, which breaks every
-    # !CONFIG_MEMCG build -- the stub is the whole reason the helper is
-    # worth an inline rather than a plain call.
     "core:memcg_dying_bailout": [
         "static inline bool memcg_is_dying(struct mem_cgroup *memcg)\n{\n"
         "\treturn memcg ? !!(memcg->css.flags & CSS_DYING) : false;\n}",
@@ -970,14 +611,6 @@ REQUIRED_CONTENT = {
         "{ return false; }",
     ],
     "core:erofs_readahead_relaxed_gfp": [
-        # d9281660ff3f, the module's first fs/erofs/ group.  Pinned per file
-        # because the claim spans five: the request carries the flags, the two
-        # decompressors take them, the pcluster carries the mode, and zdata.c
-        # sets, reads and clears it.  The polarity of `besteffort` is pinned by
-        # the *flags*, not by the field name -- upstream's name reads inverted
-        # against its own comment (true means must-succeed), so a port that
-        # trusted the name would ship the two sides swapped and still find every
-        # symbol present.
         ["fs/erofs/compress.h", "\tgfp_t gfp;"],
         ["fs/erofs/decompressor.c", "erofs_allocpage(pagepool, rq->gfp);"],
         ["fs/erofs/decompressor_lzma.c", "erofs_allocpage(pagepool, rq->gfp);"],
@@ -988,34 +621,17 @@ REQUIRED_CONTENT = {
         ["fs/erofs/zdata.c", "\tpcl->besteffort = false;"],
     ],
     "core:erofs_readmore_past_eof": [
-        # The whole graft is one loop condition, so what has to be pinned is the
-        # *conjunction*: dropping the extent test over-reads, dropping the EOF
-        # test leaves the group inert.  `already_present` only needs the new
-        # block in the file, so one conjunct alone would still read as applied.
         ["fs/erofs/zdata.c",
          "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n"],
         ["fs/erofs/zdata.c", "cur < i_size_read(inode)"],
     ],
     "core:smaps_migration_guard": [
-        # Batch 70: the field-panic guard (swapops.h:267 BUG_ON via
-        # smaps_rollup).  The helper must be present with its marker, and all
-        # five callers must route migration entries through it -- a tree that
-        # added the helper but left a caller on the direct call still panics
-        # on that path, so the guard is pinned per caller, not file-wide.
         ["fs/proc/task_mmu.c", "sailboat_smaps_migration_guard"],
         ["fs/proc/task_mmu.c", "static struct page *abk_smaps_migration_page("],
         ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(swpent);"],
         ["fs/proc/task_mmu.c", "page = abk_smaps_migration_page(entry);"],
     ],
     "core:kcompressd_writeback_pin": [
-        # Batch 71: the swap-slot writeback pin (device A/B verify_swap).
-        # The deferred swap-out must keep the page under PG_writeback across the
-        # FIFO: set_page_writeback at enqueue, end_page_writeback once the drain
-        # holds the lock, and end it again on the drain's !PageSwapCache drop
-        # path.  The marker is the only file-wide load-bearing needle: bare
-        # set_page_writeback(page);/end_page_writeback(page); already exist in a
-        # pristine tree (__swap_writepage/end_swap_bio_write and Batch 41's
-        # body), so they are pinned per-function in REQUIRED_IN_FUNCTION instead.
         ["mm/page_io.c", "sailboat_kcompressd_wb_pin"],
     ],
     "core:kcompressd_swapcache_drop": [
@@ -1061,32 +677,19 @@ REQUIRED_CONTENT = {
         ".procname	= \"kcompressd\"",
         "proc_dointvec_minmax",
         "SYSCTL_ZERO",
-        # The gates.
         "if (!current_is_kswapd())",
         "if (!PageAnon(page))",
         "if (memcg_is_dying(page_memcg(page)))",
         "if (!frontswap_enabled() &&",
         "SWP_SYNCHRONOUS_IO",
         "if (!abk_kcompressd_threshold || unlikely(!kcd->task))",
-        # The reference and the ordering it buys.
         "get_page(page);",
         "put_page(page);",
         "unlikely(!kfifo_out(&kcd->fifo, &head, sizeof(page)))",
         "if (head)",
-        # Safety guards: the guard that must NOT be a WARN (a WARN is an oops,
-        # and panic_on_oops/panic_on_warn would turn our own "impossible"
-        # check into a panic -- strictly worse than what it guards), the
-        # self-enqueue guard (current_is_kswapd() admits kcompressd, because
-        # kcompressd sets PF_KSWAPD), and the fail-closed knob registration.
         "pr_warn_once(\"kcompressd: dropping a queued page",
         "if (unlikely(kcd->task == current))",
         "cannot register /proc/sys/vm/kcompressd, offload disabled",
-        # Node lifecycle.  Without the teardown, every memory-hotplug removal
-        # leaks one kthread, one ring and one task_struct; without the
-        # stop-aware predicate, kthread_stop() in the teardown blocks forever
-        # on a thread that nothing wakes, holding mem_hotplug_lock in write
-        # mode.  Without the in-lock task re-check, a reclaim page that passed
-        # the (unlocked) task read can touch a ring that was just freed.
         "static void abk_kcompressd_add_node(int nid)",
         "static void abk_kcompressd_del_node(int nid)",
         "register_memory_notifier(&abk_kcompressd_memory_nb);",
@@ -1098,33 +701,12 @@ REQUIRED_CONTENT = {
         "wake_up_interruptible(&kcd->wait);",
         "kthread_stop(task);",
         "if (unlikely(!kcd->task)) {",
-        # The 5.15-specific calling convention.  `&wbc` is what separates this
-        # from the pristine call in swap_writepage().
         "__swap_writepage(page, &wbc, end_swap_bio_write);",
-        # The early return has to give the page lock back, the way
-        # __swap_writepage() does on the path it skipped: pageout() would
-        # otherwise take the 0 as PAGE_SUCCESS, fail its trylock_page()
-        # (shrink_page_list() still holds the lock it took before calling),
-        # land on `keep:` -- which comes after keep_locked:'s unlock_page()
-        # and so unlocks nothing -- and the kcompressd thread's lock_page()
-        # would sleep forever with the whole FIFO pinned.  Measured on
-        # vermeer: 26 pages queued, swapped stuck at 0, thread in D state.
-        #
-        # Anchored on either side on purpose.  page_io.c's own text already
-        # calls unlock_page() four times, so the bare call would still match
-        # with the fix deleted; this form only matches where the offload
-        # block gives the lock back immediately before the fall-through.
         "\t\tunlock_page(page);\n\t\treturn 0;\n\t}\n\n"
         "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n",
-        # The thread body.
         "current->flags |= PF_MEMALLOC | PF_KSWAPD;",
         "kfifo_out_locked(&kcd->fifo, &page, sizeof(page),",
     ],
-    # --- Batch 49 -------------------------------------------------------
-    # The MGLRU v7.2 reclaim-loop rework (0491e9f75c15 series).  The loop
-    # half is pinned on the shapes that replace the old coupling: the
-    # 4-arg pure predicate, the one-shot budget, the explicit aging step,
-    # the MIN_LRU_BATCH batch clamp and the exact isolation accounting.
     "core:mglru_reclaim_loop_rework": [
         "static unsigned long lruvec_evictable_size(struct lruvec *lruvec, int swappiness)",
         "static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,\n"
@@ -1146,14 +728,9 @@ REQUIRED_CONTENT = {
         "/* In case page deletion left empty old gens, flush them */",
         "/* Scanning may have emptied the oldest gen, flush it */",
         "static void try_to_inc_min_seq(struct lruvec *lruvec, int swappiness)",
-        # The kswapd deferral deviation: lru_gen_age_node() keeps owning the
-        # node-wide aging and this loop stops the lruvec for it.
         "if (current_is_kswapd())\n\t\t\t\tbreak;",
         "nr_batch = min_t(unsigned long, nr_to_reclaim - sc->nr_reclaimed,",
     ],
-    # The dirty/writeback half: the per-batch flusher wake is the mechanism
-    # behind the reported workingset_refault_file reduction, so the trigger
-    # and its bookkeeping retirement are pinned together.
     "core:mglru_dirty_reclaim_rework": [
         "if (stat.nr_unqueued_dirty == isolated) {\n"
         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n\t}",
@@ -1174,26 +751,15 @@ REQUIRED_CONTENT = {
     ],
     "core:bg_readahead_tune": [
         "sailboat_bg_readahead_tune",
-        # The registration is the behaviour: an initcall that never registers
-        # the four handlers is an empty implementation.
         ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
         ["mm/filemap.c", "register_trace_android_vh_do_async_mmap_readahead("],
         ["mm/filemap.c", "register_trace_android_vh_ra_tuning_max_page("],
         ["mm/filemap.c", "register_trace_android_vh_tune_mmap_readaround("],
-        # The policy's two inputs, verbatim: the cgroup test and the age
-        # test (upstream's nvcsw>99 guard).
         ["mm/filemap.c", 'task_css(current, cpuset_cgrp_id)'],
         ["mm/filemap.c", '"background"'],
         ["mm/filemap.c", "current->nvcsw <= (unsigned long)READ_ONCE(abk_bg_ra_nvcsw_min)"],
-        # module_param(NAME, ...) compiles NAME as the *identifier*: the knob
-        # name and the variable must be the same token here (Batch 12's
-        # module_param lesson).  core_param would strip the module prefix and
-        # bury the knobs under /sys/module/kernel/parameters/ -- proven live
-        # on the r1 boot, hence module_param with the same-name form.
         ["mm/filemap.c", "module_param(abk_bg_ra_suppress, int, 0644);"],
         ["mm/filemap.c", "module_param(abk_bg_ra_nvcsw_min, int, 0644);"],
-        # The four handler bodies, in enough detail that gutting one (e.g.
-        # making every handler an empty return) fails the audit.
         ["mm/filemap.c", "*should_around = false;"],
         ["mm/filemap.c", "*skip = true;"],
         ["mm/filemap.c", "ractl->ra->ra_pages >> 1"],
@@ -1201,37 +767,21 @@ REQUIRED_CONTENT = {
     ],
     "core:bg_launch_prefetch": [
         "sailboat_bg_launch_prefetch",
-        # The three registrations are the behaviour: without them the table
-        # never collects and never replays.
         ["mm/filemap.c", "register_trace_android_vh_filemap_read("],
         ["mm/filemap.c", "register_trace_android_vh_filemap_map_pages("],
         ["mm/filemap.c", "register_trace_android_vh_should_fault_around("],
-        # The collection key and its validation at replay time: records are
-        # scalars only (dev/ino/mtime/uid), so nothing can dangle.
         ["mm/filemap.c", "r->mtime_sec == host->i_mtime.tv_sec"],
         ["mm/filemap.c", "f->f_mapping->host->i_ino != ino"],
-        # The replay gate (young task) and the prefetch primitive.
         ["mm/filemap.c",
          "current->nvcsw >= (unsigned long)READ_ONCE(abk_lp_young_max)"],
         ["mm/filemap.c", "page_cache_sync_readahead("],
-        # The pre-launch kick: reopen the recorded path on a workqueue and
-        # verify it before prefetching.
         ["mm/filemap.c", "filp_open(path, O_RDONLY | O_LARGEFILE, 0)"],
         ["mm/filemap.c", "queue_work(system_long_wq, &abk_lp_kick)"],
         ["mm/filemap.c", "d_path(&file->f_path, rec->path, ABK_LP_PATH)"],
-        # Same-name module_param form (Batch 12's lesson) on the two knobs
-        # the device test toggles.
         ["mm/filemap.c", "module_param(abk_lp_young_max, int, 0644);"],
         ["mm/filemap.c", "module_param(abk_lp_replay_kb, int, 0644);"],
-        # At-fault replay is opt-in (default 0): from the fault/read hook
-        # contexts it hard-reset the vermeer SoC with no panic text -- the
-        # supported replay path is the pre-launch kick, and the pin guards
-        # the gate that keeps the hook-context readahead off by default.
         ["mm/filemap.c", "module_param(abk_lp_fault_replay, int, 0644);"],
         ["mm/filemap.c", "if (!READ_ONCE(abk_lp_fault_replay))"],
-        # The two set-with-side-effect knobs are module_param_call, not
-        # plain module_param (a plain param write could not open the
-        # window or schedule the kick).
         ["mm/filemap.c",
          "module_param_call(abk_lp_record_uid, abk_lp_record_uid_set, "
          "&param_get_int,"],
@@ -1241,31 +791,17 @@ REQUIRED_CONTENT = {
     ],
 }
 
-# Removal grafts: content that must NOT survive into the patched text wherever
-# the group reports applied.  Keyed as "child:group".  An entry is either a
-# bare string (checked against the blob of the group's files, the original
-# removal-graft shape) or a [rel, needle] pair (checked against that one
-# file only, for absence claims a *neighbouring* group's legitimate content
-# in a shared file would otherwise defeat).
 
 REQUIRED_ABSENT = {
     "perf:psi_oncpu_state_mask": [
-        # The counter and the old "identical state makes the walk safe" trick
-        # have to be gone, not merely bypassed: both were the failure mode.
         ["include/linux/psi_types.h", "NR_ONCPU"],
         ["kernel/sched/psi.c", "tasks[NR_ONCPU]"],
         ["kernel/sched/psi.c", "identical_state"],
     ],
     "perf:psi_cgroup_pressure_switch": [
-        # The ACK 6.1 shape grows struct psi_group (bool enabled) and struct
-        # cgroup (struct psi_group *psi, psi_files[]).  Both are KMI-visible
-        # layouts on android13-5.15, so this port must not have grown them: the
-        # state lives in the cgroup's flags word instead.
         ["include/linux/psi_types.h", "\tbool enabled;"],
         ["include/linux/cgroup-defs.h", "struct psi_group *psi;"],
         ["include/linux/cgroup-defs.h", "struct cgroup_file psi_files["],
-        # ... and the old trigger-writer name must be gone, or cgroup.pressure
-        # would be wired to the trigger path instead of to the switch.
         ["kernel/cgroup/cgroup.c",
          "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, "
          "char *buf,\n\t\t\t\t\t  size_t nbytes, enum psi_res res)"],
@@ -1275,93 +811,43 @@ REQUIRED_ABSENT = {
         "drm_atomic_check_valid_clones(state, crtc)",
     ],
     "core:vm_kcompressd_swapout": [
-        # No WARN family in this group.  The one "this cannot happen" guard it
-        # needs (queued page whose swap slot was freed) skips the write, which
-        # is already the safe action; a WARN_ON_ONCE() there would be an oops,
-        # and a device booted with panic_on_oops/panic_on_warn turns an oops
-        # into a panic -- strictly worse than the condition being guarded.
         "WARN_ON_ONCE",
         "WARN_ON(",
         "WARN(",
     ],
     "core:kcompressd_writeback_pin": [
-        # The writeback-pin edits add no WARN-family check (the surrounding
-        # Batch 41 body uses pr_warn_once); keep the drain WARN-free.
         "WARN_ON_ONCE",
         "WARN_ON(",
         "WARN(",
     ],
     "perf:schedutil_smart_policy": [
-        # The Batch 10-4c shapes: enabled by default, and a floor clamped *up
-        # to* policy->max -- the ceiling lock itself.
         "static bool abk_sf_enable = true;",
         "if (floor > policy->max)",
     ],
     "core:customize_alloc_gfp_vh": [
-        # Upstream-shape graft: the two files it exists to reproduce must
-        # stay marker-free -- an ABK marker on a line upstream also has
-        # breaks the already_present short-circuit on a future baseline that
-        # carries 4466afd69452 itself.  Pinned per-file on purpose: the
-        # group's third file, mm/page_alloc.c, legitimately carries markers
-        # from other batches, so a whole-blob sweep can never see this.
         ["include/trace/hooks/mm.h", "ABK stable_515_backport:"],
         ["drivers/android/vendor_hooks.c", "ABK stable_515_backport:"],
     ],
     "core:fd_alloc_hotpath": [
-        # The suite's capacity half must never be shipped from this module.
-        # `abk_fdtable_slots_wanted` is one of this repo's OWN suite-detection
-        # markers (abk_common.SUITE_FD_HELPER, consumed by
-        # GraftContext.suite_touched / suite_fdtable_fallback /
-        # fdtable_upstream_shape), so emitting it here would flip a second pass
-        # to `skip_suite_processed` instead of `already_present`.  The other half
-        # of the pair, the suite's ALIGN()-based capacity line, is what
-        # fdtable_upstream_shape() tests for.  Pinned per file because fs/file.c
-        # legitimately carries this module's other markers.
         ["fs/file.c", "abk_fdtable_slots_wanted"],
         ["fs/file.c", "ALIGN(slots_wanted"],
     ],
     "core:hugepage_fault_alloc_fastpath": [
-        # The 6.1 spelling of the khugepaged entry.  5.15 has khugepaged_enter()
-        # returning int; copying the 6.1 void-returning khugepaged_enter_vma()
-        # would silently drop the failure path (and not compile).  The needle
-        # carries the call's open paren on purpose: 5.15 legitimately contains
-        # the *different* symbol khugepaged_enter_vma_merge(vma, ...), which a
-        # bare "khugepaged_enter_vma" needle matches as a substring.
         ["mm/huge_memory.c", "khugepaged_enter_vma(vma,"],
     ],
     "perf:sched_eevdf_core_fields": [
-        # The abandoned packing the suite used to upgrade FROM.  If it survives,
-        # two fields share one 8-byte slot and the KABI size assert is wrong.
         ["include/linux/sched.h", "ANDROID_KABI_USE(3, struct {"],
         ["include/linux/sched.h", "ANDROID_KABI_USE(4, struct {"],
-        # Batch 16 released slot 4 because the suite's ``u64 slice`` was written
-        # once and read nowhere; Batch 28 re-claimed it because the rebuilt
-        # payload really does read it.  The *released* form must not come back --
-        # the needle carries the ``vlag`` line so it pins the sched_entity tail
-        # and not the identical reserve runs in sched_rt_entity / task_struct.
         ["include/linux/sched.h",
          "ANDROID_KABI_USE(3, s64 vlag);\n\tANDROID_KABI_RESERVE(4);"],
     ],
     "perf:sched_eevdf_pick_logic": [
-        # The Batch 15 consumer end of the old dead field: the helper wrote
-        # se->slice and read its own local instead.  The rebuilt slice has real
-        # readers (abk_eevdf_slice() feeds vslice, the deadline, the lag limit
-        # and PREEMPT_SHORT), so the discarded-local form must not return.
         ["kernel/sched/fair.c", "se->slice = slice;"],
-        # The Batch 15 selector refreshed deadlines while selecting, and walked
-        # the tree to do it.  Both are what the rebuild removed.
         ["kernel/sched/fair.c", "abk_eevdf_refresh_deadline(cfs_rq, se);"],
         ["kernel/sched/fair.c", "abk_eevdf_max_slice"],
         ["kernel/sched/fair.c", "abk_eevdf_total_weight"],
     ],
     "perf:nohz_field_refinement": [
-        # Batch 16 removed the suite's exported accessor pair and its four
-        # per-state predicates.  A consumer sweep over the full GKI tree (52k
-        # files) found zero callers for every predicate -- the only callers of
-        # nohz_cpu_state_test() were the other three -- and no consumer outside
-        # tick-sched.c for either export, so they were dead KMI surface rather
-        # than a graft.  The enum and abk_tick_nohz_state_flags() are the live
-        # part and stay.
         ["include/linux/sched/nohz.h", "nohz_cpu_state_test"],
         ["include/linux/sched/nohz.h", "nohz_cpu_inidle"],
         ["include/linux/sched/nohz.h", "nohz_cpu_idle_active"],
@@ -1371,112 +857,59 @@ REQUIRED_ABSENT = {
         ["kernel/time/tick-sched.c", "EXPORT_SYMBOL_GPL(nohz_cpu_idle_calls)"],
     ],
     "perf:blk_mq_async_depth": [
-        # The suite's unconverted assignments: a request count written into a
-        # per-word bit cap.  Both are the dead-code form this port replaces.
         ["block/kyber-iosched.c", "kqd->async_depth = q->async_depth;"],
         ["block/bfq-iosched.c", "depth = bfqd->queue->async_depth;"],
     ],
     "perf:avg_idle_preemption_mode": [
-        # The retired wake-side prediction must be gone from the wake path.  The
-        # struct rq fields themselves stay (removing them would move every field
-        # after them and break KMI) -- they are simply dead now.
         ["kernel/sched/fair.c", "this_rq->wake_avg_idle"],
     ],
     "core:zram_writeback_batching": [
-        # The synchronous single-page submit is exactly the shape this batch
-        # replaces.  The needle is the *assignment* form, not the bare symbol:
-        # the compressed read-back path (a later group) legitimately waits for
-        # its own read bio, so a bare "submit_bio_wait" needle would be a false
-        # positive.  The old loop comment is pinned for the same reason.
         ["drivers/block/zram/zram_drv.c", "err = submit_bio_wait(&bio);"],
         ["drivers/block/zram/zram_drv.c",
          "A single page IO would be inefficient for write"],
     ],
     "core:zram_compressed_writeback": [
-        # The 6.x spellings of the pieces 5.15 does not have.  A verbatim copy
-        # of the upstream patch would drag one of these in, and each is either
-        # a build failure here (zs_obj_read_begin/end, local_copy) or a silent
-        # behaviour difference (memset_page vs zero_user).  The needles carry
-        # their call shape so this file can still *document* the difference in
-        # a comment without tripping its own absence assertion.
         ["drivers/block/zram/zram_drv.c", "zs_obj_read_begin(zram->mem_pool"],
         ["drivers/block/zram/zram_drv.c", ", zstrm->local_copy)"],
         ["drivers/block/zram/zram_drv.c", "zcomp_stream_put(zstrm)"],
         ["drivers/block/zram/zram_drv.c", "memset_page("],
     ],
     "perf:sched_steal_time_excess_drop": [
-        # The catch-up accumulator this commit removes.
         ["kernel/sched/core.c", "rq->prev_steal_time_rq += steal;"],
     ],
     "perf:randomize_kstack_pertask": [
-        # The per-CPU offset the commit exists to remove.  Pinned per file on
-        # purpose: init/main.c legitimately keeps its DEFINE_STATIC_KEY_MAYBE_RO()
-        # next to it, so a whole-blob sweep of the group's files would be a
-        # weaker claim than "the per-CPU variable is gone from *this* file".
         ["include/linux/randomize_kstack.h", "DECLARE_PER_CPU(u32, kstack_offset);"],
         ["init/main.c", "DEFINE_PER_CPU(u32, kstack_offset);"],
     ],
     "perf:blk_mq_suspend_wakeup_abort": [
-        # The pre-5.15.198 wait loop (no escape on a pending wakeup).  The needle
-        # is the whole tryget/put block, i.e. exactly the anchor the group
-        # rewrites, so it cannot false-positive on a lookalike loop elsewhere in
-        # the file.
         ["block/blk-mq.c",
          "\tif (percpu_ref_tryget(&hctx->queue->q_usage_counter)) {\n"
          "\t\twhile (blk_mq_hctx_has_requests(hctx))\n\t\t\tmsleep(5);\n"
          "\t\tpercpu_ref_put(&hctx->queue->q_usage_counter);\n\t}"],
     ],
     "perf:blk_mq_quiesced_elevator_switch": [
-        # The pre-5.15.209 spelling must be gone from both ends that matter:
-        # the call sites in blk-mq.c and the declaration in blk.h.  (elevator.c
-        # keeps the symbol itself, demoted to static.)
         ["block/blk-mq.c", "elevator_switch_mq"],
         ["block/blk.h", "elevator_switch_mq"],
     ],
     "core:zram_recompress_max_pages": [
-        # The cap counts *attempts*.  A decrement above the candidate filters --
-        # which is what "charge it right after taking the slot" would be -- makes
-        # the sweep stop after max_pages slots were *looked at*, so on a device
-        # whose idle pages are sparse it recompresses far less than asked.
         ["drivers/block/zram/zram_drv.c",
          "\t\tnum_recomp_pages--;\n\t\tzram_slot_lock(zram, index);"],
     ],
     "core:arm64_pte_mkwrite_clean": [
-        # The unconditional clear is the defect: it makes every writable PTE
-        # hardware-dirty, which try_to_unmap() then reports as a dirty page at
-        # reclaim.  It must be gone, not merely bypassed.
         "\tpte = set_pte_bit(pte, __pgprot(PTE_WRITE));\n"
         "\tpte = clear_pte_bit(pte, __pgprot(PTE_RDONLY));",
     ],
     "core:arm64_lse_percpu_load_atomics": [
-        # The store forms must be gone, not merely bypassed: a tree that kept
-        # one of them compiles and quietly behaves like the baseline on that
-        # one op.  The bare store-form instruction string lives only in
-        # __PERCPU_OP_CASE (the RET_OP case is `[ret]`, the LL/SC branches are
-        # op_llsc), so its absence proves the macro really flipped; the three
-        # instantiations are pinned per line so a half-flip cannot pass.
         '#op_lse "\\t%" #w "[val], %[ptr]\\n"',
         "PERCPU_OP(add, add, stadd)",
         "PERCPU_OP(andnot, bic, stclr)",
         "PERCPU_OP(or, orr, stset)",
     ],    "core:zram_wb_slot_preserve": [
-        # The shape the fix removes.  The whole point is that the *absence* is
-        # load-bearing: a tree that kept the save/restore dance would still pass
-        # every "content survived" assertion while underflowing ->huge_pages and
-        # dropping ZRAM_INCOMPRESSIBLE/ac_time.  Scoped per file, and the locals
-        # carry their initialiser so a lookalike declaration elsewhere cannot
-        # false-positive.
         ["drivers/block/zram/zram_drv.c", "\tu32 size = 0, prio = 0;"],
         ["drivers/block/zram/zram_drv.c",
          "\t\tsize = zram_get_obj_size(zram, index);"],
         ["drivers/block/zram/zram_drv.c", "\t\tif (huge)"],
     ],
-    # Batch 35: the per-entry shadow machinery has to be *gone*, not merely
-    # bypassed.  Both invalidate paths used to call the wrappers that are
-    # deleted here, and a port that deleted the wrappers without moving their
-    # callers would not compile -- but one that kept the wrappers and added a
-    # second clear path would keep taking the lock per entry, which is the
-    # defect.  Scoped to mm/truncate.c: nothing else may define those names.
     "core:truncate_shadow_batch": [
         ["mm/truncate.c",
          "static int invalidate_exceptional_entry(struct address_space *mapping,"],
@@ -1486,46 +919,23 @@ REQUIRED_ABSENT = {
         ["mm/truncate.c", "count += invalidate_exceptional_entry(mapping,"],
     ],
     "core:truncate_shadow_batch_sweep": [
-        # The pagevec-shaped helper must not survive the pair: leaving it behind
-        # would mean the per-entry __clear_shadow_entry() loop is still the one
-        # the invalidate paths run.
         ["mm/truncate.c", "clear_shadow_entries(mapping, &pvec, indices);"],
         ["mm/truncate.c", "\t\t\t__clear_shadow_entry(mapping, indices[i], page);"],
     ],
 "core:fuse_prefault_out_of_write_path": [
-        # Upstream-shape graft (faa794dd2e17): the rewritten lines must stay
-        # marker-free, or a future baseline carrying the commit could not be
-        # recognised -- the module's own marker would sit *inside* the block the
-        # already_present short-circuit compares against, so that tree would
-        # report blocked_by_missing_anchor instead of already_present.  Same
-        # rule as customize_alloc_gfp_vh; pinned per file because fs/fuse/file.c
-        # is this module's only group there.
         ["fs/fuse/file.c", "ABK stable_515_backport:"],
     ],
     "core:erofs_readahead_relaxed_gfp": [
-        # The two NOFAIL allocations are the *whole* thing this group replaces;
-        # leaving one behind would leave that decompressor exactly as it was.
-        # Counted in the pristine trees: one occurrence per file.
         ["fs/erofs/decompressor.c", "GFP_KERNEL | __GFP_NOFAIL"],
         ["fs/erofs/decompressor_lzma.c", "GFP_KERNEL | __GFP_NOFAIL"],
-        # Upstream-shape graft, so the rewritten lines must stay marker-free --
-        # same reason as fuse_prefault_out_of_write_path: a marker would sit
-        # inside the block the already_present short-circuit compares against.
         ["fs/erofs/compress.h", "ABK stable_515_backport:"],
         ["fs/erofs/decompressor.c", "ABK stable_515_backport:"],
         ["fs/erofs/decompressor_lzma.c", "ABK stable_515_backport:"],
         ["fs/erofs/zdata.c", "ABK stable_515_backport:"],
         ["fs/erofs/zdata.h", "ABK stable_515_backport:"],
-        # Upstream threaded a new `bool ra` parameter because v6.9 had moved the
-        # fact off the frontend; 5.15 still has frontend->readahead, and copying
-        # the parameter would mean the group had edited a signature it need not
-        # have touched.
         ["fs/erofs/zdata.c", "bool ra)"],
     ],
     "core:erofs_readmore_past_eof": [
-        # Upstream-shape graft: a marker would sit inside the block the
-        # already_present short-circuit compares against, so a tree carrying the
-        # upstream commit would be edited instead of left byte-identical.
         ["fs/erofs/zdata.c", "ABK stable_515_backport:"],
     ],
     "core:memcg_stats_percpu_slim": [
@@ -1539,9 +949,6 @@ REQUIRED_ABSENT = {
         "alloc_percpu_gfp(struct lruvec_stats_percpu",
     ],
     "core:mglru_rework_aging_feedback": [
-        # The can_swap walk field, the exact-sync min_seq rule, the
-        # tier-minus-one protection index and the boolean swappiness call
-        # shape are all pre-798c0330c2ca and must be gone.
         ["include/linux/mmzone.h", "bool can_swap;"],
         ["include/linux/mmzone.h", "MAX_NR_TIERS - 1];"],
         ["mm/vmscan.c", "VM_WARN_ON_ONCE(!full_scan && (type == LRU_GEN_FILE || can_swap));"],
@@ -1552,23 +959,16 @@ REQUIRED_ABSENT = {
         ["mm/vmscan.c", "walk->can_swap"],
     ],
     "core:mglru_rework_type_selection": [
-        # The first-tier gain array and the tier_idx out-param are the
-        # pre-37a260870f2c shapes.
         ["mm/vmscan.c", "int gain[ANON_AND_FILE] = { swappiness, 200 - swappiness };"],
         ["mm/vmscan.c", "get_type_to_scan(lruvec, swappiness, &tier);"],
         ["mm/vmscan.c", "*tier_idx = tier - 1;"],
         ["mm/vmscan.c", "else if (swappiness == 200)"],
     ],
     "core:mglru_rework_refault_detection": [
-        # The exact min_seq token match is the misattribution being fixed.
         ["mm/workingset.c",
          "if ((token >> LRU_REFS_WIDTH) != (min_seq & (EVICTION_MASK >> LRU_REFS_WIDTH)))"],
     ],
     "core:mglru_reclaim_loop_rework": [
-        # The coupling the restructure removes: the aging/size mashup in
-        # should_run_aging(), the 0-as-aging-signal protocol, the per-
-        # iteration budget recompute and the livelock-hack return must all be
-        # gone, not merely bypassed.
         ["mm/vmscan.c", "return isolated || !remaining ? scanned : 0;"],
         ["mm/vmscan.c", "*need_aging = should_run_aging(lruvec, max_seq, min_seq,"],
         ["mm/vmscan.c", "scanned += try_to_inc_min_seq(lruvec, swappiness);"],
@@ -1581,9 +981,6 @@ REQUIRED_ABSENT = {
          "\tstruct mem_cgroup *memcg = lruvec_memcg(lruvec);"],
     ],
     "core:mglru_dirty_reclaim_rework": [
-        # All five mglru_wake_flushers payloads and the PG_reclaim dance are
-        # retired content: the accounting feeds, the once-per-loop wake and
-        # the reclaiming bit must not survive anywhere in vmscan.c.
         ["mm/vmscan.c", "\tbool dirty, writeback;"],
         ["mm/vmscan.c", "sc->nr.file_taken += delta;"],
         ["mm/vmscan.c", "sc->nr.file_taken += isolated;"],
@@ -1598,37 +995,12 @@ REQUIRED_ABSENT = {
         ["mm/vmscan.c", "/* for end_page_writeback() */"],
     ],
     "core:mglru_prefault_accessed_placement": [
-        # The unconditional WORKINGSET_ACTIVATE count is exactly the metric
-        # bug 6cbdd9726fb5 fixes: non-workingset prefaults must stop counting
-        # as activations.
         ["mm/workingset.c",
          "atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);\n"
          "\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);"],
     ],
 }
 
-# Function-scoped assertions.  REQUIRED_CONTENT above is whole-file substring
-# matching, which cannot tell *which* function a graft landed in -- a swapped
-# pair of anchors satisfies it perfectly.  These entries slice out one function
-# body and assert on that slice, so a hunk landing in the neighbouring function
-# fails the audit.  Keyed as "child:group" -> list of
-# (rel, function_name, must_contain, must_not_contain).
-# Cross-file invariants: a switch is only a switch if BOTH branches exist, and
-# a comparison is only a comparison if the thing it compares can differ.
-#
-# This table exists because nothing else in this file could see the failure it
-# catches.  Batch 28 first shipped `SCHED_FEAT(PREEMPT_SHORT, true)` wired to a
-# tautology: se->slice had two writers (both the same global constant) and a
-# reader whose zero-fallback was that same constant, so
-# `abk_eevdf_slice(pse) >= abk_eevdf_slice(se)` was X >= X and the guard always
-# rejected.  Every check passed -- the symbol existed in System.map, the feature
-# was enabled, the field was read on a hot path.  Presence is not liveness, and
-# a switch that cannot change anything is worse than an absent one because it
-# reads as a control.
-#
-# Rows are (condition_rel, condition_needle, consequence_rel, consequence_needle,
-# why).  The check fails when the condition is present and the consequence is
-# not, in a group that reported applied/partial.
 REQUIRED_PAIRING = {
     "perf:sched_eevdf_modern_fields": [
         ("kernel/sched/features.h", "SCHED_FEAT(PREEMPT_SHORT, true)",
@@ -1649,8 +1021,6 @@ REQUIRED_PAIRING = {
 
 REQUIRED_IN_FUNCTION = {
     "perf:psi_oncpu_state_mask": [
-        # The flag must be handled where the mask is built, and it must never
-        # reach the task counters.
         ("kernel/sched/psi.c", "psi_group_change",
          ["if (unlikely(clear & TSK_ONCPU)) {",
           "clear &= ~TSK_ONCPU;",
@@ -1659,8 +1029,6 @@ REQUIRED_IN_FUNCTION = {
           "test_state(groupc->tasks, s, state_mask & PSI_ONCPU)",
           "groupc->state_mask = state_mask;"],
          ["tasks[NR_ONCPU]"]),
-        # Both halves of the switch: the early stop needs the flag, and every
-        # other state difference has to keep propagating above that stop.
         ("kernel/sched/psi.c", "psi_task_switch",
          ["per_cpu_ptr(group->pcpu, cpu)->state_mask &",
           "if ((prev->psi_flags ^ next->psi_flags) & ~TSK_ONCPU) {",
@@ -1668,26 +1036,17 @@ REQUIRED_IN_FUNCTION = {
          ["tasks[NR_ONCPU]", "identical_state"]),
     ],
     "perf:psi_cgroup_pressure_switch": [
-        # Accounting off has to be handled where the state mask is derived, not
-        # in a helper the hot path never reaches, and it has to release the
-        # sequence counter it still holds.
         ("kernel/sched/psi.c", "psi_group_change",
          ["if (unlikely(!psi_group_enabled(group)))",
           "groupc->state_mask = 0;",
           "write_seqcount_end(&groupc->seq);"],
          []),
-        # Re-enabling rebuilds every CPU's mask under that CPU's rq lock, the
-        # only place the counts and cpu_curr() are stable.
         ("kernel/sched/psi.c", "psi_cgroup_restart",
          ["if (!psi_group_enabled(group))",
           "rq_lock_irq(rq, &rf);",
           "psi_group_change(group, cpu, 0, 0, cpu_clock(cpu), true);",
           "rq_unlock_irq(rq, &rf);"],
-         # Every possible CPU, not just the online ones: the masks of offline
-         # CPUs have to be rebuilt too, or they stay stale across the switch.
          ["for_each_online_cpu"]),
-        # The knob writes the flag and, only when turning accounting back on,
-        # resyncs the group; the root cgroup's files are backed by psi_system.
         ("kernel/cgroup/cgroup.c", "cgroup_pressure_write",
          ["psi_cgroup_accounting_enabled(cgrp) != enable",
           "psi_cgroup_accounting_set(cgrp, enable);",
@@ -1696,17 +1055,11 @@ REQUIRED_IN_FUNCTION = {
          ["psi_trigger_create"]),
     ],
     "perf:schedutil_smart_cap": [
-        # The ownership and headroom gates belong in the shared front both
-        # probes go through: a gate that lands in a helper nobody calls is the
-        # "compiles but behaves like the source kernel" failure this audit
-        # exists for.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sc_owns",
          ["if (abk_sc_dvfs_owned(policy) || policy->min == policy->max)",
           "c = abk_sc_cap(policy);",
           "if (c <= policy->min || c >= policy->max)"],
          ["*cap = policy->max"]),
-        # The clamp itself, on the resolve path, in the raw spinlock that the
-        # fast_switch context requires.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sc_resolve_freq",
          ["raw_spin_lock_irqsave(&p->lock, flags)",
           "if (abk_sc_cooled(policy))",
@@ -1714,26 +1067,15 @@ REQUIRED_IN_FUNCTION = {
           "p->high_start = 0;",
           "*target_freq = cap;",
           "raw_spin_unlock_irqrestore(&p->lock, flags)"],
-         # No util time window on the release: that is the 70-90% dead band
-         # that latched smart_policy's reason for a whole game session, and it
-         # is the one thing this payload must never grow back.
          ["util * 100 >= cap * abk_sc_entry_pct",
           "abk_sc_entry_pct",
-          # No print in a path the fast_switch caller runs under rq->lock, and
-          # no uclamp: the cap is this module's own budget, and uclamp wants a
-          # task and a clamp group, so pairing them double-clamps the same
-          # frequency from two owners.
           "pr_info(", "pr_err(", "pr_warn(", "pr_debug(", "printk(",
           "uclamp", "trace_printk"]),
-        # The floor yields only because this probe re-asserts after it, so its
-        # own guard matters as much as the clamp's.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sc_reassert_freq",
          ["if (!target_freq || !abk_sc_owns(policy, &cap))",
           "if (p->capped && *target_freq > cap)",
           "*target_freq = cap;"],
          ["pr_info(", "pr_err(", "pr_warn(", "printk(", "uclamp"]),
-        # The re-cap window has to expire on jiffies, not on a tick: an idle
-        # CPU stops ticking under NO_HZ_IDLE and a tick-fed window never runs.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sc_cooled",
          ["for_each_cpu(cpu, policy->cpus)",
           "time_after(jiffies, oldest + msecs_to_jiffies(abk_sc_release_ms))"],
@@ -1746,8 +1088,6 @@ REQUIRED_IN_FUNCTION = {
          ["pr_err(", "pr_debug("]),
     ],
     "perf:schedutil_smart_policy": [
-        # lands in a helper nobody calls is exactly the "compiles but behaves
-        # like the source kernel" failure this audit exists for.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sf_resolve_freq",
          ["if (abk_sf_dvfs_owned(policy) || policy->min == policy->max)",
           "floor = mult_frac(policy->cpuinfo.max_freq, abk_sf_floor_pct, 100)",
@@ -1758,41 +1098,21 @@ REQUIRED_IN_FUNCTION = {
          ['strcmp(policy->governor->name, "schedutil") != 0',
           "if (!policy->governor)"],
          []),
-        # Sliding window: any sample below the entry threshold restarts it.
-        # The dead-band form (reset only below the *exit* threshold) let a CPU
-        # bank boost time across 70-90% oscillation, which is what kept the
-        # reason latched for a whole game.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sf_sample",
          ["c->boost_start = 0;",
           "if (util * 100 < cap * ABK_SF_SUSTAINED_PCT)",
           "c->boost_release = now + msecs_to_jiffies(abk_sf_exit_ms)"],
          ["} else if (util * 100 < cap * ABK_SF_EXIT_PCT) {"]),
-        # The deadline is re-checked outside the tick, because an idle CPU stops
-        # ticking under NO_HZ_IDLE and would otherwise latch the reason.
         ("kernel/sched/cpufreq_schedutil.c", "abk_sf_cpu_boosting",
          ["time_after(jiffies, c->boost_release)", "abk_sf_clear(c)"],
          []),
     ],
     "core:pid_alloc_hotpath_phase2": [
-        # The retry must stay inside alloc_pid() and re-enter the SAME
-        # pid-namespace level.  The suite retried with `continue;` inside
-        # `for (i = ns->level; i >= 0; i--)`, which runs the loop's increment
-        # expression: it retried the PARENT level (re-running the set_tid
-        # bookkeeping), and on ns->level == 0 -- every ordinary fork -- it left
-        # the loop, hit `retval = -ENOMEM;` at the function tail and returned a
-        # fully initialised pid whose numbers[0].nr had never been written.
-        # `continue;` is absent from the pristine alloc_pid(), so this pins it.
         ("kernel/pid.c", "alloc_pid",
          ["retry_preload:", "retried_preload = false;", "retried_preload = true;"],
          ["continue;"]),
     ],
     "core:close_range_hotpath": [
-        # The bitmap walk must land in __range_close() itself, not in a helper
-        # nobody calls, and the suite's caller-locked 6.1 helpers must not appear
-        # (on 5.15 pick_file() takes files->file_lock itself, so
-        # abk_pick_file_for_close()'s lockdep assertion would be knowingly
-        # false).  Asserted on in-body text, not on the marker comment: the
-        # marker sits *above* the signature, where function_body() cannot see it.
         ("fs/file.c", "__range_close",
          ["n = last_fd(fdt);",
           "max_fd = min(max_fd, n);",
@@ -1800,32 +1120,22 @@ REQUIRED_IN_FUNCTION = {
          ["abk_pick_file_for_close", "abk_close_range_limit"]),
     ],
     "core:zram_recompression": [
-        # The read path must delegate to the shared helper, not carry its own
-        # copy of the decompress logic (two copies is how the get/put anchors
-        # got swapped in the first place).
         ("drivers/block/zram/zram_drv.c", "__zram_bvec_read",
          ["zram_read_from_zspool(zram, page, index)"],
          ["zcomp_decompress", "zcomp_stream_get"]),
-        # The helper selects the comp by the slot's stored priority.
         ("drivers/block/zram/zram_drv.c", "zram_read_from_zspool",
          ["prio = zram_get_priority(zram, index)",
           "zcomp_stream_get(zram->comps[prio])",
           "zcomp_stream_put(zram->comps[prio])"],
          ["zram->comp)"]),
-        # The write path always compresses with the primary comp.
         ("drivers/block/zram/zram_drv.c", "__zram_bvec_write",
          ["zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP])"],
          ["zram_get_priority", "zram->comp)"]),
-        # Secondary comps must actually be created, or every recompress path
-        # short-circuits on a NULL comps[prio] and the group is a no-op.
         ("drivers/block/zram/zram_drv.c", "disksize_store",
          ["for (prio = 0; prio < ZRAM_MAX_COMPS; prio++)",
           "zram->comps[prio] = comp", "zram->num_active_comps++",
           "out_free_comps"],
          []),
-        # A reused slot must not keep a stale comp priority: the next write
-        # compresses with the primary comp, so a stale priority would decompress
-        # through the wrong algorithm.
         ("drivers/block/zram/zram_drv.c", "zram_free_page",
          ["zram_set_priority(zram, index, 0)",
           "zram_clear_flag(zram, index, ZRAM_INCOMPRESSIBLE)"],
@@ -1850,21 +1160,14 @@ REQUIRED_IN_FUNCTION = {
          ["bool can_steal"]),
     ],
     "core:zram_algo_lock": [
-        # The locked store must report success rather than refuse the write:
-        # Android's mmd_setup aborts its whole zram bring-up -- writeback
-        # backing device included -- on a failed algorithm write.
         ("drivers/block/zram/zram_drv.c", "abk_zram_locked_algo_store",
          ["abk_zram_algo_lock_report(attr->attr.name, buf);",
           "return len;"],
          ["-EPERM", "-EACCES"]),
-        # The locked primary has to be chosen at device creation, or a build
-        # whose def-comp is the dominated lz4hc keeps it for the whole boot.
         ("drivers/block/zram/zram_drv.c", "zram_add",
          ["comp_algorithm_set(zram, ZRAM_PRIMARY_COMP,",
           "zcomp_available_algorithm(abk_zram_comp_algo)"],
          []),
-        # ... and the earlier groups' blocks must stay byte-identical, because
-        # a later edit inside them breaks their idempotency.
         ("drivers/block/zram/zram_drv.c", "__comp_algorithm_store",
          ["comp_algorithm_set(zram, prio, compressor);"],
          ["abk_zram_lock_algo", "abk_zram_locked_algo_store"]),
@@ -1879,19 +1182,12 @@ REQUIRED_IN_FUNCTION = {
          ["rcu_state.nocb_is_setup"]),
     ],
     "core:gfp_pressure_fastfail": [
-        # The handler's three gates are the policy: a dropped enable check or
-        # a dropped order comparison changes the blast radius of NORETRY from
-        # "THP-class under pressure" to every allocation, silently.
         ("mm/page_alloc.c", "abk_gfp_fastfail_hook",
          ["if (!READ_ONCE(abk_gfp_fastfail))",
           "if (order < READ_ONCE(abk_gfp_fastfail_order))",
           "if (!abk_gfp_under_pressure())",
           "*gfp |= __GFP_NORETRY | __GFP_NOWARN;"],
          ["return true"]),
-        # The gate is the once-per-second watermark probe, not a per-call
-        # walk of every zone (that would put for_each_zone on the allocator's
-        # hot path), and its two globals move through READ_ONCE/WRITE_ONCE:
-        # the hook runs from the allocator, unsynchronised against itself.
         ("mm/page_alloc.c", "abk_gfp_under_pressure",
          ["time_is_after_jiffies(READ_ONCE(abk_gfp_wm_stamp) + HZ)",
           "WRITE_ONCE(abk_gfp_high_wm, sum);",
@@ -1899,10 +1195,6 @@ REQUIRED_IN_FUNCTION = {
          ["abk_gfp_high_wm += "]),
     ],
     "core:zram_recompress_max_pages": [
-        # Both nodes need all three parts, in this relative order.  Slicing by
-        # function is the only way to see which node got which hunk: the two
-        # grammars are otherwise textually identical, so a cap that landed only
-        # on the synchronous side passes whole-file matching perfectly.
         ("drivers/block/zram/zram_drv.c", "recompress_store",
          ["u64 num_recomp_pages = ULLONG_MAX;",
           'if (!strcmp(param, "max_pages")) {',
@@ -1917,8 +1209,6 @@ REQUIRED_IN_FUNCTION = {
          ["zram_recompress(zram, index, page"]),
     ],
     "core:zram_recomp_best_prio_skip": [
-        # Presence is not enough: pin the ORDER -- the filter must precede the
-        # max_pages decrement (sync) and candidate = true (async).
         ("drivers/block/zram/zram_drv.c", "recompress_store",
          ["zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))",
           "if (abk_zram_recompress_pointless(zram, index, prio, prio_max))",
@@ -1931,25 +1221,12 @@ REQUIRED_IN_FUNCTION = {
          ["candidate = true;\n\n\t\t/* ABK stable_515_backport: Batch 47."]),
     ],
     "core:readahead_mmap_miss_race": [
-        # The guard belongs in do_async_mmap_readahead(), the function whose
-        # counter it protects.  Whole-file matching cannot say which function
-        # got it: 5.15's FAULT_FLAG_SPECULATIVE branch in filemap_fault() holds
-        # the same decrement, and this graft deliberately leaves that one alone
-        # (upstream deleted the branch, so nothing upstream fixes it).  A hunk
-        # that landed in the wrong function, or on the wrong side of the
-        # RAND_READ return, is invisible to every other audit here.
         ("mm/filemap.c", "do_async_mmap_readahead",
          ["if (likely(!PageLocked(page))) {",
           "mmap_miss = READ_ONCE(ra->mmap_miss);",
           "if (PageReadahead(page)) {"],
          ["return fpin;\n\tmmap_miss = READ_ONCE(ra->mmap_miss);\n"]),
     ],    "core:zram_wb_slot_preserve": [
-        # The completion helper is where the accounting happens, and the fix is
-        # one *removal* plus one open-coded release -- neither side is visible to
-        # whole-file matching, because zram_free_page() is called from many other
-        # places in this file and pages_stored is legitimately incremented
-        # elsewhere.  Slicing by function is what makes "the release no longer
-        # goes through zram_free_page() here" an assertion instead of a comment.
         ("drivers/block/zram/zram_drv.c", "zram_writeback_complete",
          ["if (zram_test_flag(zram, index, ZRAM_HUGE))\n"
           "\t\tatomic64_dec(&zram->stats.huge_pages);",
@@ -1962,11 +1239,6 @@ REQUIRED_IN_FUNCTION = {
           "\t\tif (huge)"]),
     ],
     "core:zsmalloc_free_zspage_out_of_lock": [
-        # zs_free(): the zspage is parked in zspage_to_free under class->lock
-        # and handed to the lockless helper *after* the unlock.  That ordering
-        # is the whole change, and it is invisible to whole-file matching.
-        # must_not_have is the old tail -- surviving it means the pages are
-        # still returned with class->lock held.
         ("mm/zsmalloc.c", "zs_free",
          ["\tstruct zspage *zspage_to_free = NULL;",
           "if (trylock_zspage(zspage)) {",
@@ -1977,45 +1249,24 @@ REQUIRED_IN_FUNCTION = {
           "\t\t__free_zspage_lockless(pool, zspage_to_free);",
           "atomic_long_sub(class->pages_per_zspage,"],
          ["\t\tfree_zspage(pool, class, zspage);"]),
-        # The locked wrapper keeps the assert and the per-class stat -- which
-        # cannot move out with the pages, because class->stats.objs[] is a plain
-        # unsigned long that zs_stat_dec() updates with -= and zs_can_compact()
-        # reads via zs_stat_get() under class->lock.
         ("mm/zsmalloc.c", "__free_zspage",
          ["assert_spin_locked(&class->lock);",
           "__free_zspage_lockless(pool, zspage);",
           "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"],
          ["put_page(page);"]),
     ],
-    # --- Batch 37: the memory-reclaim chain, function-scoped ---------------
-    # The three groups below all rewrite memory_reclaim(), so which group got
-    # which hunk is only visible by slicing the handler: whole-file matching
-    # would pass just as happily on a tree where the cap never arrived but the
-    # parser did.  Each must_not_have is the *superseded* form, which is this
-    # batch's own failure mode -- a group whose payload a later group removed
-    # reads as "applied" from the outside.
     "core:proactive_reclaim_batch_fidelity": [
-        # 0388536ac291's cap, inside the handler it belongs to.  The old
-        # argument is asserted gone: it is the overreclaim.
         ("mm/memcontrol.c", "memory_reclaim",
          ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),"],
          ["\t\t\t\t\t\tnr_to_reclaim - nr_reclaimed,\n"]),
     ],
     "core:proactive_reclaim_decaying_batches": [
-        # 287d5fedb377.  The decaying batch has to *replace* the fixed cap,
-        # not sit next to it, and it has to be the argument the call uses.
         ("mm/memcontrol.c", "memory_reclaim",
          ["unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;",
           "batch_size, GFP_KERNEL, reclaim_options);"],
          ["min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX)"]),
     ],
     "core:proactive_reclaim_swappiness_arg": [
-        # 68cd9050d871.  The parser has to be where the bytes are read: the
-        # size still comes from the buffer, the swappiness key is matched, and
-        # the value is validated against the constants before the loop starts.
-        # must_not_have is the old single-key parse and the old -EINTR -- the
-        # latter is the *next* group's target, so it also proves this group
-        # left the failure path alone rather than half-rewriting it.
         ("mm/memcontrol.c", "memory_reclaim",
          ["int swappiness = -1;",
           "substring_t args[MAX_OPT_ARGS];",
@@ -2026,14 +1277,9 @@ REQUIRED_IN_FUNCTION = {
           "swappiness == -1 ? NULL : &swappiness);"],
          ["page_counter_memparse(buf, \"\", &nr_to_reclaim);",
           "return -ERESTARTSYS;"]),
-        # The accessor is only worth anything if the scan balance asks it, and
-        # the field only if the definition fills it.
         ("mm/vmscan.c", "get_scan_count",
          ["int swappiness = sc_swappiness(sc, memcg);"],
          ["int swappiness = mem_cgroup_swappiness(memcg);"]),
-        # get_swappiness() too -- both shapes (167/178 return the accessor,
-        # 194/lts assign it into the local the ACK hook then tunes), and both
-        # have to stop reading the memcg's own setting.
         ("mm/vmscan.c", "get_swappiness",
          ["sc_swappiness(sc, memcg);"],
          ["mem_cgroup_swappiness(memcg)"]),
@@ -2043,9 +1289,6 @@ REQUIRED_IN_FUNCTION = {
          []),
     ],
     "core:proactive_reclaim_suspend_abort": [
-        # dc37771a43d4.  Both halves, each in the function that has to carry
-        # it: the MGLRU inner loop checks, and the handler stops converting
-        # that check into an -EINTR the freezer cannot resume from.
         ("mm/vmscan.c", "should_abort_scan",
          ["if (unlikely(sc->proactive && signal_pending(current)))",
           "return true;"],
@@ -2056,11 +1299,6 @@ REQUIRED_IN_FUNCTION = {
          ["return -EINTR;"]),
     ],
     "core:lru_add_drain_dead_folios": [
-        # 9669b87065a6 in 5.15's pagevec form.  The filter has to run *before*
-        # the lruvec is taken (that is the point: it saves the lock), the two
-        # flags have to be cleared (the page skips __pagevec_lru_add_fn()), and
-        # the filtered page has to be freed from this function -- a filter that
-        # nulls the slot without freeing leaks the page.
         ("mm/swap.c", "__pagevec_lru_add",
          ["if (page_ref_freeze(page, 1)) {",
           "__ClearPageActive(page);",
@@ -2069,18 +1307,10 @@ REQUIRED_IN_FUNCTION = {
           "free_unref_page_list(&pages_to_free);",
           "release_pages(pvec->pages, pvec->nr);"],
          []),
-        # ...and the consumer has to tolerate the vacated slot, or the drain
-        # dereferences a NULL entry on the very next pagevec.
         ("mm/swap.c", "release_pages",
          ["if (!page)\n\t\t\tcontinue;"],
          []),
     ],
-    # Batch 35.  The MADV_DONTNEED page-table pair (madvise_pt_reclaim +
-    # madvise_batch_tlb_flush) was REMOVED; see the note in the payload table
-    # above and CHANGELOG.md (Batch 35).
-    # The pair has to reach both invalidate paths, and the loop bound has to be
-    # the batch size the call site indexes with -- a port that changed only the
-    # helper would pass a whole-file substring check on either half.
     "core:truncate_shadow_batch_sweep": [
         ("mm/truncate.c", "__invalidate_mapping_pages",
          ["int nr = pagevec_count(&pvec);",
@@ -2093,15 +1323,6 @@ REQUIRED_IN_FUNCTION = {
          []),
     ],
 "core:fuse_prefault_out_of_write_path": [
-        # faa794dd2e17.  The group's whole claim is that the prefault *moved*,
-        # and a whole-file substring check cannot express that: the new call
-        # site alone is satisfied by a tree that kept the loop-head one too
-        # (which faults twice), and the absence of the old one alone is
-        # satisfied by a tree that deleted the prefault outright (which loses
-        # forward progress).  Both halves are pinned inside the one function, so
-        # neither a deletion nor a duplicate passes -- and the must_not_have
-        # needle carries the ` again:` label so it cannot match the retry path's
-        # own `err = -EFAULT;`.
         ("fs/fuse/file.c", "fuse_fill_write_pages",
          ["\t\tif (!tmp) {\n"
           "\t\t\tunlock_page(page);\n"
@@ -2123,12 +1344,6 @@ REQUIRED_IN_FUNCTION = {
           "\t\terr = -EFAULT;\n"]),
     ],
     "core:erofs_readahead_relaxed_gfp": [
-        # d9281660ff3f.  The claim is per call site, and a whole-file check
-        # cannot express it: `GFP_NOWAIT | __GFP_NORETRY` in the request
-        # initialiser is satisfied by a tree that also left a NOFAIL somewhere
-        # in the same function, and `rq->gfp` in the decompressor is satisfied
-        # by one that never wired the mode up.  Both sides live in the same
-        # function body, so pin them there.
         ("fs/erofs/decompressor.c", "z_erofs_lz4_prepare_dstpages",
          ["erofs_allocpage(pagepool, rq->gfp);",
           "if (!victim)",
@@ -2139,10 +1354,6 @@ REQUIRED_IN_FUNCTION = {
           "goto failed;",
           "\nfailed:\n"],
          ["GFP_KERNEL | __GFP_NOFAIL"]),
-        # The mode has to be set where the pcluster is collected, read where it
-        # is decompressed, and cleared so a recycled pcluster starts pristine --
-        # all three in this one function pair, and the polarity in the set line
-        # is the part a name-trusting port would invert.
         ("fs/erofs/zdata.c", "z_erofs_do_read_page",
          ["clt->pcl->besteffort |= !fe->readahead;"],
          ["bool ra"]),
@@ -2154,12 +1365,6 @@ REQUIRED_IN_FUNCTION = {
          []),
     ],
     "core:erofs_readmore_past_eof": [
-        # 936aa701d82d.  `cur < i_size_read(inode)` anywhere in zdata.c is
-        # satisfied by a tree that left the un-guarded `while (cur >= end) {`
-        # standing in this same function, so the conjunction has to be pinned
-        # inside z_erofs_pcluster_readmore().  `||` is forbidden too: it is a
-        # superset of `cur >= end`, so the pathological loop would survive the
-        # fix while the guard still read as present.
         ("fs/erofs/zdata.c", "z_erofs_pcluster_readmore",
          ["\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n",
           "cur = map->m_la + map->m_llen - 1;"],
@@ -2167,9 +1372,6 @@ REQUIRED_IN_FUNCTION = {
           "\twhile ((cur >= end) || (cur < i_size_read(inode))) {\n"]),
     ],
     "core:mglru_rework_refault_detection": [
-        # The windowed recency test must land in lru_gen_refault() itself;
-        # lru_gen_eviction() legitimately keeps its own min_seq local (it packs
-        # the shadow token), so the absence claim cannot be file-wide.
         ("mm/workingset.c", "lru_gen_refault",
          ["unsigned long seq;",
           "unsigned long diff;",
@@ -2230,9 +1432,6 @@ REQUIRED_IN_FUNCTION = {
           "abk_vmstats_percpu_of(memcg)->targets[target]"],
          ["vmstats_percpu->nr_page_events",
           "vmstats_percpu->targets[target]"]),
-        # uncharge_batch() adds to nr_page_events outside the charge/ratelimit
-        # pair; missing it compiles cleanly and corrupts the v1 page-event
-        # counters on every uncharge (the first enumeration pass missed it).
         ("mm/memcontrol.c", "uncharge_batch",
          ["abk_vmstats_percpu_of(ug->memcg)->nr_page_events"],
          ["vmstats_percpu->nr_page_events"]),
@@ -2245,15 +1444,6 @@ REQUIRED_IN_FUNCTION = {
           "__alignof__(struct abk_vmstats_percpu)"],
          ["alloc_percpu_gfp(struct memcg_vmstats_percpu"]),
     ],
-    # --- Batch 38 -------------------------------------------------------
-    # e923bd21058e, carried as the 5.15.y backport f87c08060818.  Both halves
-    # have to be pinned inside their own function: the signature alone is
-    # satisfied by a call site that still passes three arguments (which
-    # compiles only because the 5.15 prototype is visible), and the
-    # `mapping = NULL` alone is satisfied by a tree that nulled it without
-    # ever unlocking early.  The must_not_have on the callee catches the
-    # unpatched signature, and the one on the caller catches a half-applied
-    # group that added the parameter but left the old three-arg call.
     "core:huge_memory_imap_split_uaf": [
         ("mm/huge_memory.c", "__split_huge_page",
          ["pgoff_t end, struct address_space *mapping)",
@@ -2264,34 +1454,20 @@ REQUIRED_IN_FUNCTION = {
           "\t\tmapping = NULL;"],
          ["__split_huge_page(page, list, end);"]),
     ],
-    # a4519e5b648a.  Both call sites must lose the drain; a third one in
-    # free_pages_and_swap_cache() must keep it, so the claim is per-function
-    # and cannot be a file-wide absence.
     "core:swap_readahead_lru_add_drain": [
         ("mm/swap_state.c", "swap_cluster_readahead", [], ["lru_add_drain"]),
         ("mm/swap_state.c", "swap_vma_readahead", [], ["lru_add_drain"]),
     ],
-    # 25f52e812168, carried as the 5.15.y backport 4cdc1bdf4094.  The
-    # must_not_have pins the replacement: leaving the bare cond_resched()
-    # behind compiles identically and silently drops the fix.
     "core:vmscan_tasks_rcu_qs": [
         ("mm/vmscan.c", "shrink_lruvec",
          ["cond_resched_tasks_rcu_qs();"],
          ["\t\tcond_resched();"]),
     ],
-    # 9b0fcac3cfe7.  Pinned to filemap_map_pages() because 5.15 carries a
-    # second mmap_miss decrement in filemap_fault() with a similar-looking
-    # guard, and the filemap_fault() one is *not* the site this commit
-    # patches (upstream's analogue of it lives in do_async_mmap_readahead()).
-    # A file-wide needle would be satisfied by the wrong one.
     "core:filemap_mmap_miss_tried": [
         ("mm/filemap.c", "filemap_map_pages",
          ["if (mmap_miss > 0 && !(vmf->flags & FAULT_FLAG_TRIED))"],
          ["if (mmap_miss > 0)\n\t\t\tmmap_miss--;"]),
     ],
-    # 0beeaf14e7b9 + e13f634f50d5 + 757dd8193f6c + 10228e0a5123.  All five
-    # loops, each in its own function: a helper that is defined but called
-    # from nowhere, or called from only four of the five, still compiles.
     "core:memcg_dying_bailout": [
         ("mm/memcontrol.c", "memory_high_write",
          ["if (memcg_is_dying(memcg))"], []),
@@ -2304,20 +1480,11 @@ REQUIRED_IN_FUNCTION = {
         ("mm/memcontrol.c", "memory_reclaim",
          ["if (memcg && memcg_is_dying(memcg))"], []),
     ],
-    # aaa98b100ea8.  Only frag_show() may flip; pagetypeinfo_showfree() in the
-    # same file legitimately keeps false (it reads more than nr_free), so the
-    # forbidden needle is what stops a well-meaning "flip them all".
     "core:buddyinfo_nolock": [
         ("mm/vmstat.c", "frag_show",
          ["walk_zones_in_node(m, pgdat, true, true, frag_show_print);"],
          ["walk_zones_in_node(m, pgdat, true, false, frag_show_print);"]),
     ],
-    # b001cf7d16dd.  The kasan_disable_current()/kasan_enable_current() pair is
-    # pinned as a must-have, not decoration: the memset is what makes the
-    # s390 comment ("memset() could override KASAN redzones") load-bearing, so a
-    # later "cleanup" that drops the pair would silently reintroduce that
-    # hazard.  The per-page loop stays in the HIGHMEM branch, so the pristine
-    # loop is deliberately NOT a forbidden needle here.
     "core:pagealloc_batch_clear": [
         ("mm/page_alloc.c", "kernel_init_free_pages",
          ["kasan_disable_current();",
@@ -2328,40 +1495,6 @@ REQUIRED_IN_FUNCTION = {
           "kasan_enable_current();"],
          []),
     ],
-    # Kcompressd-Unofficial 0.5.  This is the group in the registry most able
-    # to compile and do nothing, so the behaviour-visible surface is pinned
-    # piece by piece rather than by name:
-    #   - the thread name is the only way to see from dmesg that the
-    #     per-node thread exists at all;
-    #   - the six admission gates, because a gate deleted "as unnecessary"
-    #     silently changes which pages are offloaded, and the two that are
-    #     *not* upstream (memcg_is_dying() in place of
-    #     mem_cgroup_zswap_writeback_enabled(), which 5.15 does not have, and
-    #     frontswap_enabled() in place of zswap_is_enabled(), also absent) are
-    #     the ones a future reader will be tempted to "fix" back;
-    #   - `page_ref_freeze`-adjacent `get_page(page)` -- upstream's comment
-    #     calls it "avoid it being freed", but here it is load-bearing (see
-    #     the do_swapout() banner): without it the swap slot is returned while
-    #     the write is still pending;
-    #   - the head-drain, which is the whole difference between Unofficial and
-    #     MediaTek's original and the reason this version was ported;
-    #   - the three-argument __swap_writepage() with `&wbc` (the pristine
-    #     swap_writepage() call is `__swap_writepage(page, wbc, ...)` without
-    #     the `&`), so a copy of the upstream two-argument form is caught;
-    #   - the AOSP vendor hook, present only where the tree has it -- so this
-    #     needle is asserted only for a baseline where the group applies and
-    #     the hook exists, via REQUIRED_CONTENT_OPTIONAL below.  A 4.15-style
-    #     "add the hook everywhere" would fail to compile on three of the four
-    #     baselines, and a "drop it everywhere" would break the lts contract.
-    #
-    # Batch 49 (MGLRU v7.2 reclaim-loop rework): function-scoped pins so a
-    # hunk landing in the neighbouring helper cannot satisfy them.  The loop
-    # half pins the restructured control flow where it lives; the dirty half
-    # pins the per-batch wake in evict_pages() and the absence of the divert
-    # in sort_page(); the placement half pins lru_cache_add()'s two-way
-    # dispatch INCLUDING the vendor hook it wraps (a rewrite that dropped
-    # trace_android_vh_lru_cache_add_page_activate() would break the hook
-    # contract silently).
     "core:mglru_reclaim_loop_rework": [
         ("mm/vmscan.c", "lru_gen_shrink_lruvec",
          ["bool should_age = false;",
@@ -2434,16 +1567,6 @@ REQUIRED_IN_FUNCTION = {
           "SetPageWorkingset(page);"],
          ["\tmod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);\n\n"]),
     ],
-    # --- Batch 71 -------------------------------------------------------
-    # kcompressd_writeback_pin.  The deferred swap-out must keep the page
-    # under PG_writeback across the FIFO.  enqueue side (swap_writepage): the
-    # offload branch sets writeback immediately before unlock + return 0.  drain
-    # side (abk_kcompressd_do_swapout): it locks the page then ends writeback
-    # before the write body, AND ends writeback on the !PageSwapCache drop path
-    # (which returns above the drain's own end).  Pinned per owning function and
-    # by load-bearing sequence (bare set_page_writeback/end_page_writeback
-    # pre-exist in a pristine tree) so a hunk elsewhere cannot satisfy the pins;
-    # the old trylock-skip must be gone.
     "core:kcompressd_writeback_pin": [
         ("mm/page_io.c", "swap_writepage",
          ["sailboat_kcompressd_wb_pin",
@@ -2459,18 +1582,7 @@ REQUIRED_IN_FUNCTION = {
          ["if (!trylock_page(page)) {",
           "kcompressd: skipping a locked page"]),
     ],
-    # --- Batch 70 -------------------------------------------------------
-    # smaps_migration_guard.  The helper is pinned in its own definition
-    # (PageLocked + re-validation + marker); each guarded caller is pinned
-    # in the function that owns it, so a hunk landing in a neighbour cannot
-    # satisfy the pin.  The unguarded direct calls that remain are the
-    # device-private / device-exclusive cases, whose contract is not
-    # PageLocked -- they must stay direct, so they are not forbidden.
     "core:smaps_migration_guard": [
-        # The marker is pinned by REQUIRED_CONTENT above, not here: it
-        # rides in the comment *above* the helper, and function_body() only
-        # returns the body.  What has to live inside the body is the contract
-        # itself.
         ("fs/proc/task_mmu.c", "abk_smaps_migration_page",
          ["if (!PageLocked(p))",
           "if (!is_migration_entry(entry))",
@@ -2485,9 +1597,6 @@ REQUIRED_IN_FUNCTION = {
         ("fs/proc/task_mmu.c", "smaps_hugetlb_range",
          ["page = abk_smaps_migration_page(swpent);"],
          []),
-        # The pagemap PTE path is pte_to_pagemap_entry(), this file's
-        # per-entry helper -- there is no pagemap_pte_range() in task_mmu.c,
-        # and function_body() would report the pin as an unfound function.
         ("fs/proc/task_mmu.c", "pte_to_pagemap_entry",
          ["page = abk_smaps_migration_page(entry);"],
          []),
@@ -2497,25 +1606,11 @@ REQUIRED_IN_FUNCTION = {
     ],
 }
 
-# Needles that only exist on some baselines, so they can only be asserted on a
-# tree that carries the prerequisite -- which is the same text the group's own
-# shape probe discriminates on.  This audit runs one tree at a time against a
-# fixed sublevel (167), where the prerequisite is absent, so a locally green run
-# proves nothing about the variant; tests/stable_5_15_test.py carries the
-# fixture that does.  Needed because "add it everywhere" does not compile on
-# three of the four baselines and "drop it everywhere" breaks the lts contract.
 REQUIRED_CONTENT_IF_PRESENT = {
-    # child:group -> (rel, note, needles asserted when the pristine file
-    # already carries AOSP's hook)
     "core:vm_kcompressd_swapout": (
         "mm/page_io.c",
         "trace_android_vh_shrink_page_lock_owner_clear(page);",
         [
-            # The replica inside abk_kcompressd_do_swapout()'s frontswap
-            # branch, matching the call in swap_writepage() (mm/page_io.c:204
-            # on that baseline).  The __swap_writepage() half needs no
-            # replica: the hooks that path carries (mm/page_io.c:266/:308 and
-            # block/bdev.c:380) are inside the callee and travel with it.
             "trace_android_vh_shrink_page_lock_owner_clear(page);",
         ],
     ),
@@ -2523,13 +1618,6 @@ REQUIRED_CONTENT_IF_PRESENT = {
 
 
 def function_body(text, name):
-    """Return the text of `name`'s definition, or None.
-
-    Matches a line whose last token before '(' is `name` at column 0 (kernel
-    style puts the return type on the same line), then runs to the first
-    line-initial '}'.  Returns every matching definition joined, so a symbol
-    with an #ifdef/#else pair of definitions is checked as a whole.
-    """
     bodies = []
     lines = text.split("\n")
     for index, line in enumerate(lines):
@@ -2538,17 +1626,15 @@ def function_body(text, name):
         head = line.split(f"{name}(")[0]
         if head and not head.endswith(("*", " ")):
             continue
-        # Look ahead to find the opening brace (may be several lines after signature)
         brace_start = None
         for scan in range(index, min(index + 20, len(lines))):
             if lines[scan].rstrip().endswith(";"):
-                break  # forward declaration
+                break
             if lines[scan].lstrip().startswith("{"):
                 brace_start = scan
                 break
         if brace_start is None:
             continue
-        # Now find the closing brace
         for end in range(brace_start + 1, len(lines)):
             if lines[end].startswith(("}", "};")):
                 bodies.append("\n".join(lines[index:end + 1]))
@@ -2602,10 +1688,6 @@ def run_tree(source):
                 if key in REQUIRED_CONTENT and status in ("applied", "partial"):
                     blob = "".join(ctx.read(f) for f in group.files
                                    if ctx.path(f).exists())
-                    # A bare needle checks the whole-file blob; a
-                    # (rel, needle) pair checks one file only, for claims a
-                    # neighbouring group's content in the same blob would
-                    # otherwise satisfy.
                     missing = []
                     for needle in REQUIRED_CONTENT[key]:
                         if isinstance(needle, (list, tuple)):
@@ -2619,9 +1701,6 @@ def run_tree(source):
                         problems.append(f"{child}/{group.key}: missing "
                                         f"feature content {missing}")
                 key = f"{child}:{group.key}"
-                # Variants gated on the pristine tree's own shape: checked only
-                # where the baseline carries the prerequisite, because the
-                # other shape cannot hold the text without failing to compile.
                 if key in REQUIRED_CONTENT_IF_PRESENT and \
                         status in ("applied", "partial"):
                     rel, prerequisite, needles = REQUIRED_CONTENT_IF_PRESENT[key]
@@ -2650,7 +1729,6 @@ def run_tree(source):
                         problems.append(f"{child}/{group.key}: removed "
                                         f"content survived {present}")
 
-                # Function-scoped assertions
                 if key in REQUIRED_IN_FUNCTION and status in ("applied", "partial"):
                     for rel, fn_name, must_have, must_not_have in REQUIRED_IN_FUNCTION[key]:
                         if not ctx.path(rel).exists():
@@ -2670,7 +1748,6 @@ def run_tree(source):
                                 problems.append(f"{child}/{group.key}: {fn_name} "
                                                 f"has forbidden text: {needle!r}")
 
-                # Cross-file pairing invariants
                 if key in REQUIRED_PAIRING and status in ("applied", "partial"):
                     for crel, cneedle, drel, dneedle, why in REQUIRED_PAIRING[key]:
                         if not (ctx.path(crel).exists() and ctx.path(drel).exists()):

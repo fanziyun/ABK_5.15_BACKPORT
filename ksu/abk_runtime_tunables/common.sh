@@ -1,65 +1,24 @@
 #!/system/bin/sh
-# common.sh - shared helpers for the ABK 5.15 runtime-tunables module.
-# Sourced by post-fs-data.sh / service.sh / action.sh.  Keep it POSIX sh:
-# /system/bin/sh is Android's mksh and there is no bash on the device.
 
 ABK_TAG="ABK-Tunables"
-# Computed from module.prop at source time so the banner cannot drift from the manager's version.
 ABK_VERSION="$(sed -n 's/^version=//p' "${MODDIR:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}/module.prop" 2>/dev/null)"
 
-# --- hardcoded zram policy -------------------------------------------------
-# Constants on purpose, not configuration.  Measured on the target device
-# (vermeer, android13-5.15-lts 5.15.215) by compressing an exact 64 MiB ELF
-# corpus on a single core, on a throwaway zram device:
-#   algo      compressed   ratio   compress           decompress
-#   lz4       31.19 MB     2.15x   0.60 s (107 MB/s)   865 MB/s
-#   lz4kd     31.06 MB     2.16x   0.57 s (112 MB/s)   955 MB/s
-#   lz4hc     29.31 MB     2.29x   1.13 s  (57 MB/s)   901 MB/s
-#   zstd      24.21 MB     2.77x   0.73 s  (88 MB/s)   330 MB/s
-#   deflate   23.51 MB     2.85x   2.29 s  (28 MB/s)   208 MB/s
-# lz4kd is the best fast primary (fastest both ways, best ratio of the fast
-# family, and the vendor's own CONFIG_ZRAM_DEF_COMP); zstd is the best
-# secondary (22% smaller than lz4kd; the async worker pays the compression and
-# 330 MB/s of fault-time decompression is still far above UFS).  lz4hc is
-# dominated in both slots.  The ROM's own memory daemon leaves the primary on
-# lz4hc before disksize, and the node is -EBUSY afterwards, so the module takes
-# the whole bring-up over rather than asking userspace nicely.  See README.md
-# for why there is no knob for any of this.
 ABK_ZRAM_DEV="0"
 ABK_ZRAM_PRIMARY="lz4kd"
 ABK_ZRAM_SECONDARY="zstd"
-ABK_ZRAM_MEM_LIMIT_PCT=25   # cap on compressed zram memory, percent of RAM
-# A whole multiple of every buildable page size (4K/16K/64K), so the kernel's PAGE_ALIGN() is an identity.
+ABK_ZRAM_MEM_LIMIT_PCT=25
+# 4K/16K/64K page builds' common multiple: the kernel's own PAGE_ALIGN() is a no-op.
 ABK_ZRAM_MEM_LIMIT_ALIGN=65536
-# `swapoff` reads every swapped page back into RAM (no data is lost), so this
-# gate is not about data loss: it bounds the transient RAM spike.  At boot the
-# ROM's own zram owner initialises the device a few seconds before this module
-# gets to it, and a busy boot can have a little swapped out by then; later in
-# the boot the same gate protects a device that is already under pressure.
 ABK_ZRAM_MIN_FREE_MB=256
-ABK_ZRAM_WAIT_SECS=45       # wait for the ROM's own zram bring-up before ours
-ABK_ZRAM_REASSERT_SECS=60   # how often the policy is re-checked once running
+ABK_ZRAM_WAIT_SECS=45
+ABK_ZRAM_REASSERT_SECS=60
 ABK_ZRAM_SWAP_RETRIES=3
-# Writeback auto-attach backoff.  A backing device can only be attached in the
-# pre-`disksize` window, so establishing one means a full device rewrite
-# (swapoff -> reset -> ... -> swapon).  When that attach keeps failing -- no free
-# loop device, /data not writable, an AVC on the store -- "writeback wanted but
-# unowned" would otherwise re-arm that rewrite on every reassert tick, tearing
-# the swap area down and back up once a minute forever.  A failed auto-attach
-# therefore stands the auto path down for this long before it may drive another
-# rewrite; a successful attach clears it at once.
 ABK_ZRAM_WB_RETRY_SECS=3600
 
-# --- test / diagnostic seams ----------------------------------------------
-# Every device path and helper command can be redirected, so the policy can be
-# exercised against a fixture tree.  These are not user-facing knobs.
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_PROC_SWAPS="${ABK_PROC_SWAPS:-/proc/swaps}"
 ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
 ABK_KCD_VM_DIR="${ABK_KCD_VM_DIR:-/proc/sys/vm}"
-# The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
-# *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
-# not a missing feature.
 ABK_CGROOT="${ABK_CGROOT:-$ABK_SYS_ROOT/fs/cgroup}"
 ABK_SWAPOFF="${ABK_SWAPOFF:-swapoff}"
 ABK_SWAPON="${ABK_SWAPON:-swapon}"
@@ -68,18 +27,6 @@ ABK_LOSETUP="${ABK_LOSETUP:-losetup}"
 ABK_DD="${ABK_DD:-dd}"
 ABK_GETPROP="${ABK_GETPROP:-getprop}"
 ABK_ZRAM_NODE="${ABK_ZRAM_NODE:-/dev/block/zram0}"
-# Where a zram.writeback=auto backing file goes.  /data/per_boot is the only
-# pre-unlock, DE-encrypted place for it, and /data/per_boot/zram is the path the
-# ROM's policy labels zram_data_file -- but it is a PER-BOOT directory, not a
-# persistent one: AOSP's init.rc runs
-#   on property:sys.boot_completed=1
-#     exec - system system -- /bin/rm -rf /data/per_boot
-#     mkdir /data/per_boot 0700 system system encryption=Require key=per_boot_ref
-# so its contents (and the key that encrypts them) do not survive a reboot.
-# AOSP's own mmd uses /data/per_boot/zram_swap (system/memory/mmd/src/main.rs)
-# and is started off a property its own rc sets at sys.boot_completed, i.e.
-# deliberately after that wipe; the module's auto-attach is gated on the same
-# property (abk_boot_completed) for the same reason.
 ABK_ZRAM_WB_DIR="${ABK_ZRAM_WB_DIR:-/data/per_boot/zram}"
 ABK_ZRAM_WB_FILE="${ABK_ZRAM_WB_FILE:-$ABK_ZRAM_WB_DIR/zram_swap}"
 ABK_STDOUT="${ABK_STDOUT:-0}"
@@ -96,10 +43,6 @@ abk_report_stdout() {
   return 0
 }
 
-# The module's own progress log lives in the module directory as well as in
-# logcat: logcat is best-effort (some ROMs restrict it, and a kernel-domain or
-# su-domain writer can be denied silently), while a boot that fails invisibly is
-# the one thing this module cannot afford.  `action.sh status` prints the tail.
 ABK_LOG_MAX_BYTES=65536
 
 abk_log_file() {
@@ -112,9 +55,6 @@ abk_log_append() {
   _la_file="$(abk_log_file)"
   mkdir -p "$ABK_STATE_DIR" 2>/dev/null || true
 
-  # Size probe guarded by -f: `< file` on a missing file makes the shell print
-  # its own error (the redirect fails before the command's 2>/dev/null applies),
-  # which would put a scary line in the middle of every first boot.
   if [ -f "$_la_file" ]; then
     _la_size="$(wc -c < "$_la_file" 2>/dev/null | tr -d ' ')"
   else
@@ -133,7 +73,6 @@ abk_log_append() {
   return 0
 }
 
-# report.logcat=0 silences the logcat mirror (the module log and action.sh stay).
 abk_logcat_on() {
   if [ -z "${ABK_LOGCAT_ON:-}" ]; then
     ABK_LOGCAT_ON="$(abk_cfg report.logcat 1)"
@@ -163,8 +102,6 @@ abk_read() {
   cat "$1" 2>/dev/null || true
 }
 
-# Wall-clock seconds, or empty when the device has no usable clock.  Used only
-# by the writeback backoff, which treats "no clock" as "never suppress".
 abk_now_secs() {
   date +%s 2>/dev/null
 }
@@ -176,7 +113,6 @@ abk_is_uint() {
   esac
 }
 
-# abk_clamp_uint <value> <min> <max> -> clamped value, or non-zero if not a uint
 abk_clamp_uint() {
   _cu_v="$1"
   abk_is_uint "$_cu_v" || return 1
@@ -191,12 +127,6 @@ abk_mul_div() {
     'BEGIN { printf "%.0f\n", a * b / c }' 2>/dev/null
 }
 
-# abk_gt <a> <b> / abk_le <a> <b> -> numeric comparison, 64-bit.
-# Same trap as abk_mul_div: on this ROM's mksh even `[ 17179869184 -gt 0 ]` is
-# false (it parses the operands through the same 32-bit arithmetic, where that
-# literal is 0), so a swap size above 2 GiB looked like "no size" and the module
-# silently fell back to MemTotal/2 -- halving a 16 GiB device.  Comparing in awk
-# keeps every decision independent of which shell runs the script.
 abk_gt() {
   awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }' 2>/dev/null
 }
@@ -205,15 +135,14 @@ abk_le() {
   awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }' 2>/dev/null
 }
 
-# abk_align_down <value> <alignment>; awk for the same 64-bit reason as abk_mul_div.
 abk_align_down() {
   awk -v v="$1" -v a="$2" 'BEGIN { printf "%.0f\n", int(v / a) * a }' 2>/dev/null
 }
 
-# abk_write <path> <value>: write a whole line, report but never abort
 abk_write() {
   _w_path="$1"
   _w_val="$2"
+  # A missing node is a warning, never a hard failure: the kernel may not carry the graft.
   if [ ! -e "$_w_path" ]; then
     abk_warn "node missing: $_w_path"
     return 1
@@ -225,9 +154,6 @@ abk_write() {
   return 0
 }
 
-# --- tunables.conf --------------------------------------------------------
-# The keys the module understands.  Unknown keys are reported once and ignored
-# so a typo cannot change behaviour silently.
 abk_known_keys() {
   cat <<'EOF'
 zram.recomp.enable
@@ -292,9 +218,6 @@ report.logcat
 EOF
 }
 
-# abk_cfg <key> <default>: value from tunables.conf, else the default.
-# An empty value in the file means "use the default"; for the vm/thp/sched keys
-# the default is empty, which the appliers read as "leave the kernel alone".
 abk_cfg() {
   _c_key="$1"
   _c_default="$2"
@@ -326,7 +249,6 @@ abk_cfg() {
   return 0
 }
 
-# abk_cfg_lint: warn about lines/keys the module will not honour
 abk_cfg_lint() {
   if [ ! -f "$ABK_CONF" ]; then
     abk_warn "no tunables.conf; using built-in defaults"
@@ -358,7 +280,6 @@ abk_cfg_lint() {
   return 0
 }
 
-# --- state ---------------------------------------------------------------
 abk_state_path() {
   printf '%s/%s\n' "$ABK_STATE_DIR" "$1"
 }
@@ -372,7 +293,6 @@ abk_state_set() {
   printf '%s\n' "$2" > "$(abk_state_path "$1")" 2>/dev/null || true
 }
 
-# --- pid files and supervision -------------------------------------------
 abk_pid_alive() {
   [ -n "$1" ] || return 1
   [ -r "/proc/$1" ] || return 1
@@ -388,7 +308,6 @@ abk_pid_write() {
   abk_state_set "$1.pid" "$2"
 }
 
-# --- small probes --------------------------------------------------------
 abk_getprop() {
   "$ABK_GETPROP" "$1" 2>/dev/null | tr -d '\r'
 }
@@ -404,7 +323,6 @@ abk_mem_total_bytes() {
   return 0
 }
 
-# abk_mem_pct_bytes <percent>: that share of RAM, in bytes (64-bit safe).
 abk_mem_pct_bytes() {
   _mp_bytes="$(abk_mem_total_bytes)" || return 1
   abk_mul_div "$_mp_bytes" "$1" 100
@@ -474,9 +392,6 @@ abk_kcompressd_state_line() {
   return 0
 }
 
-# --- non-zram runtime knobs ----------------------------------------------
-# Every knob is applied only when the matching key is non-empty, so an
-# unconfigured module changes nothing outside its own zram policy.
 
 abk_apply_vm_knobs() {
   _vk_val="$(abk_cfg vm.swappiness '')"
@@ -543,8 +458,6 @@ abk_apply_lru_gen() {
   return 0
 }
 
-# This ROM's init writes this node back to 0 after post-fs-data (SmartCacheEnable
-# trigger), so re-assert it on a timer, writing y only when bit 0 of the mask is clear.
 abk_reassert_lru_gen() {
   _rl_node="$ABK_SYS_ROOT/kernel/mm/lru_gen/enabled"
   [ -e "$_rl_node" ] || return 0
@@ -602,32 +515,6 @@ abk_apply_readahead_knob() {
   return 0
 }
 
-# --- per-cgroup PSI accounting ----------------------------------------------
-# The kernel derives and times pressure for *every* cgroup by default, on each
-# task state change, all the way up the hierarchy.  Android's v2 layout creates a
-# group per uid and per pid, so that is hundreds of groups whose numbers nobody
-# reads.
-# Measured on the target (vermeer / 5.15.216, Batch 24): 452 cgroups carried a
-# cgroup.pressure node; lmkd, system_server and mimd were the only pressure
-# readers and all three had the global /proc/pressure/memory open.  No process
-# held a per-cgroup PSI file open.  The cost was real and the consumer was not.
-# The node is this module's own graft, not the baseline's: Batch 21's
-# psi_cgroup_pressure_switch, ported from the android14-6.1 ACK implementation.
-# android13-5.15 has no such file, so a kernel built without that batch simply
-# has nothing to switch and the pass reports nodes=0.  From how that group was
-# written come the two properties this policy leans on: the switch is not
-# hierarchical (a disabled parent leaves its children accounting), and a
-# disabled group answers -EOPNOTSUPP on its pressure files and refuses poll
-# triggers instead of reporting frozen numbers.  A reader therefore fails loudly
-# rather than tuning on a lie.
-# The tool writes only 0.  Batch 21 frees nothing and can restart accounting, so
-# a round trip works on this kernel; upstream's version of the switch frees the
-# group's per-cpu windows and calls re-enabling not restore safe.  The companion
-# cannot tell the two apart from userspace, so the disabled state is a decision
-# made at boot (psi.cgroup) and the A/B is two boots, not one live flip.
-# keep is the built-in default: a missing key never changes behaviour, and the
-# disabled state stays something that was measured on the device first
-# (docs/psi_field_protocol.md).
 abk_psi_mode() {
   _pm_val="$(abk_cfg psi.cgroup keep)"
   case "$_pm_val" in
@@ -641,12 +528,6 @@ abk_psi_mode() {
   return 0
 }
 
-# Path prefixes that keep their accounting, matched as a literal prefix of the
-# group path (so protect_memcg covers protect_memcg_001 and friends).  The
-# built-in default is one entry; the shipped tunables.conf widens it for this
-# ROM's own groups.  Deliberately narrow either way: the per-app groups
-# (apps/pid_*, uid_*/pid_*) are the bulk of the count and have no readers, while
-# the system subtree is where a vendor monitor could be hiding.
 abk_psi_protect() {
   _pp_val="$(abk_cfg psi.cgroup.protect system)"
   [ -n "$_pp_val" ] || _pp_val=system
@@ -657,15 +538,11 @@ abk_psi_protect() {
 abk_psi_interval() {
   _pi_val="$(abk_cfg psi.cgroup.interval_sec 300)"
   abk_is_uint "$_pi_val" || _pi_val=300
-  # A pass is a full tree walk; below a minute it costs more than it saves.
   [ "$_pi_val" -ge 60 ] || _pi_val=60
   printf '%s\n' "$_pi_val"
   return 0
 }
 
-# One pass.  The tool owns every decision (which groups, which mode, what counts
-# as refused); this feeds it the configuration and puts its summary line into the
-# module log.
 abk_psi_pass() {
   _pa_tool="${ABK_PSI_TOOL:-$MODDIR/bin/abk_psi_policy.sh}"
   if [ ! -f "$_pa_tool" ]; then
@@ -676,18 +553,12 @@ abk_psi_pass() {
   _pa_protect="$(abk_psi_protect)"
   _pa_out="$(sh "$_pa_tool" --apply --mode "$_pa_mode" --protect "$_pa_protect" --cgroot "$ABK_CGROOT" 2>&1)"
   _pa_rc=$?
-  # Reset each pass: the give-up rule reads the tool's summary line out of this
-  # variable, so a pass that writes none must not leave a previous one standing.
   ABK_PSI_LAST_LINE=""
   while IFS= read -r _pa_line; do
     [ -n "$_pa_line" ] || continue
     case "$_pa_line" in
       "psi: mode="*) ABK_PSI_LAST_LINE="$_pa_line" ;;
     esac
-    # Steady state is a pass that disabled nothing: almost every group is
-    # already off, so the line is bookkeeping.  Keep it in the module log but
-    # out of logcat, which the supervisor would otherwise hit every interval.
-    # Anything else -- a real write, a refusal, no nodes -- is worth seeing.
     case "$_pa_line" in
       *"disabled=0 "*) abk_log_append INFO "$_pa_line" ;;
       *) abk_log "$_pa_line" ;;
@@ -698,11 +569,6 @@ EOF
   return $_pa_rc
 }
 
-# The tool's own summary line from the pass just run (captured verbatim in
-# abk_psi_pass), so the give-up rule judges what the tool actually reported.
-# Held in a variable rather than re-grepped from the persistent log: that log
-# survives reboots, so a pass that produced no line of its own would otherwise
-# hand the rule a verdict left over from a previous boot.
 abk_psi_state_line() {
   printf '%s\n' "${ABK_PSI_LAST_LINE:-}"
 }
@@ -720,10 +586,6 @@ abk_psi_supervisor_main() {
   abk_pid_write psi "$$"
   _ps_interval="$(abk_psi_interval)"
   abk_log "per-cgroup PSI supervisor up: mode=$(abk_psi_mode) protect=$(abk_psi_protect) interval=${_ps_interval}s"
-  # auto only reaches groups holding no tasks, and a task-empty group never runs
-  # the per-state-change accounting that disabling it would save -- measured on
-  # the target as a no-op with extra steps (docs/psi_field_protocol.md).  Say so
-  # once at startup; aggressive is the mode that touches real work.
   if [ "$(abk_psi_mode)" = auto ]; then
     abk_warn "psi.cgroup=auto reaches only task-empty groups, which cost nothing to begin with (measured no-op); use aggressive to affect accounted groups"
   fi
@@ -732,11 +594,6 @@ abk_psi_supervisor_main() {
     abk_psi_pass
     if [ "$_ps_first" = 1 ]; then
       _ps_first=0
-      # Stop rather than walk the tree forever when this module cannot touch the
-      # switch.  Three conditions together say that: nothing was already off (no
-      # earlier pass worked), nothing got disabled, and something was refused --
-      # which here means SELinux or a read-only mount.  A kernel without the
-      # switch reports no pass line at all and does not match.
       _ps_line="$(abk_psi_state_line)"
       case "$_ps_line" in
         *"already_off=0"*)
@@ -753,19 +610,6 @@ abk_psi_supervisor_main() {
     sleep "$_ps_interval"
   done
 }
-# --- the SELinux rules this module needs ----------------------------------
-# The zram writeback data path is kernel-side: the loop worker, a kernel thread
-# in u:r:kernel:s0, is what reads and writes the backing file.  Android's policy
-# has no rule for that direction, so every page returns -EIO and writeback moves
-# nothing -- measured on vermeer / 5.15.216, where even the ROM's own backing
-# store had written 0 pages since boot (bd_stat 0 0 0) while SELinux was
-# Enforcing.  KernelSU can add the rule from a module, which is the only route
-# that does not need a ROM rebuild or a relaxed boot policy; sepolicy.rule ships
-# one deliberately narrow allow (kernel -> zram_data_file, read + write).
-# Nothing here is fatal, and nothing here weakens the policy: where the manager
-# loads module rules itself this call is a redundant no-op, and where the rule
-# cannot be added the device keeps the writeback it had -- which is the silent
-# 0-page one, so the log line matters.
 abk_selinux_apply_rules() {
   _sa_rule="$MODDIR/sepolicy.rule"
   if [ ! -f "$_sa_rule" ]; then
@@ -774,9 +618,6 @@ abk_selinux_apply_rules() {
   fi
   for _sa_ks in /data/adb/ksud /data/adb/ksu/bin/ksud; do
     [ -x "$_sa_ks" ] || continue
-    # This ksud reports 0 for a duplicate and even for an unresolvable symbol,
-    # so the status means "statement submitted", never "rule took effect"; the
-    # device-side proof is bd_stat moving off zero (action.sh prints it).
     if "$_sa_ks" sepolicy apply "$_sa_rule" >/dev/null 2>&1; then
       abk_log "selinux: submitted $_sa_rule via $_sa_ks"
     else

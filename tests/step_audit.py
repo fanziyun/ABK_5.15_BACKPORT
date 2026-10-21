@@ -1,47 +1,4 @@
 #!/usr/bin/env python3
-"""Per-step audit of every PatchGroup against a pristine reference tree.
-
-Group-level statuses hide three anchor bugs that only show up at compile time:
-
-1. A step whose replacement block already exists somewhere in the pristine
-   file.  ``replace_once`` checks the replacement first (idempotency), so the
-   step is silently reported ``already_present`` and the real edit never
-   happens, while the group still reports "applied".  Every step of a group
-   that is supposed to apply on the target baseline must therefore be
-   ``applied`` -- never ``already_present``.  Groups whose upstream commit the
-   baseline already carries are exempt (see ``tests/sublevel_matrix.py``): for
-   those, ``already_present`` is the correct answer, not a trap.
-2. The same short-circuit created *inside* the group: an earlier step whose
-   replacement text contains a later step's replacement text.  Checking the
-   pristine file cannot catch it, so the audit consumes the per-step statuses
-   ``apply_steps`` returns and fails on any ``already_present`` step of a
-   must-apply group.
-3. A replacement that unbalances the ``/* ... */`` comment structure (e.g. a
-   new block that starts with the comment terminator), which turns every
-   following line into code and breaks the whole translation unit.
-
-The audit copies the files the groups touch into a disposable tree, records
-each step by wrapping ``apply_steps`` in both child modules, and asserts:
-
-- every group and every individual step reports ``applied`` on the pristine
-  tree, except for groups whose upstream commit the target baseline already
-  carries (``tests/sublevel_matrix.py``), which must report
-  ``already_present``;
-- every step's replacement block is absent from the pristine file (both LF
-  and CRLF forms) -- checked only for groups that must really apply;
-- no step of a must-apply group reports ``already_present`` at run time;
-- the open/close comment, brace and ``#if``/``#endif`` delta of each touched
-  file is unchanged;
-- a second pass over the patched tree is fully ``already_present`` and leaves
-  every file byte-identical.
-
-Usage:
-  python tests/step_audit.py /path/to/android13-5.15-common-kernel-tree
-(or set AUDIT_SOURCE_TREE; a tree at ../linux-common-android13-5.15 is picked
-up automatically).  The sublevel is read from the tree's Makefile; override
-with ABK_TEST_SUB_LEVEL.  Fetch a non-default baseline with
-``bash tests/fetch_sublevel_tree.sh <branch> <outdir>``.
-"""
 
 from __future__ import annotations
 
@@ -67,7 +24,6 @@ SUB_LEVEL = sublevel_matrix.DEFAULT_SUB_LEVEL
 AUDIT_FILES = [
     "fs/file.c",
     "Documentation/admin-guide/kernel-parameters.txt",
-    # Batch 21: cgroup.pressure documents itself in the cgroup v2 manual.
     "Documentation/admin-guide/cgroup-v2.rst",
     "kernel/rcu/Kconfig",
     "kernel/rcu/tree_nocb.h",
@@ -77,18 +33,13 @@ AUDIT_FILES = [
     "mm/vmscan.c",
     "mm/vmstat.c",
     "mm/memcontrol.c",
-    # Batch 37 (MGLRU v4 series): the workingset and deactivation groups
-    # anchor in these.
     "mm/workingset.c",
     "mm/swap.c",
-    # Batch 49 (MGLRU v7.2 loop rework): the prefault placement group
-    # rewrites lru_gen_add_page()'s generation formula here.
     "include/linux/mm_inline.h",
     "include/linux/swap.h",
     "include/linux/cgroup-defs.h",
     "include/linux/cpuset.h",
     "include/linux/mmzone.h",
-    # Batch 36: lruvec_page_state_local() moves out of this header.
     "include/linux/memcontrol.h",
     "include/linux/randomize_kstack.h",
     "include/linux/sched.h",
@@ -106,7 +57,6 @@ AUDIT_FILES = [
     "kernel/sched/features.h",
     "kernel/sched/stats.h",
     "kernel/sched/psi.c",
-    # Batch 10-2: the schedutil smart-freq policy layer appends to this file.
     "kernel/sched/cpufreq_schedutil.c",
     "kernel/fork.c",
     "kernel/locking/semaphore.c",
@@ -120,31 +70,17 @@ AUDIT_FILES = [
     "drivers/block/zram/zram_drv.c",
     "mm/zsmalloc.c",
     "include/linux/zsmalloc.h",
-    # Batch 8: fallback claimability cleanup updates compaction callers.
     "mm/compaction.c",
-    # Batch 6: the defconfig lane plus the zsmalloc and MADV_COLLAPSE grafts.
     "arch/arm64/configs/gki_defconfig",
     "mm/Kconfig",
     "mm/khugepaged.c",
     "mm/madvise.c",
     "include/linux/huge_mm.h",
     "include/uapi/asm-generic/mman-common.h",
-    # Batch 7: the 5.15.185 drm valid-clones revert.
     "drivers/gpu/drm/drm_atomic_helper.c",
-    # Batch 9-1: dynamic readahead registers its callbacks in mm/readahead.c.
     "mm/readahead.c",
-    # Batch 13: the customize_alloc_gfp hook declares in mm.h, calls in
-    # mm/page_alloc.c and exports in drivers/android/vendor_hooks.c.
     "include/trace/hooks/mm.h",
     "drivers/android/vendor_hooks.c",
-    # Batch 15: ABK_ABI_PATCH_SUITE absorption.  The suite's optimization
-    # inventory is this module's own from Batch 15 (see
-    # docs/survey_suite_absorption.md), so its target files join the fixture.
-    # Deliberately absent from this list and from FETCH_FILES:
-    #   mm/swap.h            -- 5.15 has no such file; swap internals live in
-    #                           include/linux/swap.h and mm/swap_state.c
-    #   io_uring/<many>.c    -- the post-5.18 split layout; 5.15 ships an
-    #                           11,116-line io_uring/io_uring.c monolith
     "kernel/pid.c",
     "mm/slub.c",
     "mm/huge_memory.c",
@@ -154,8 +90,6 @@ AUDIT_FILES = [
     "block/blk-core.c",
     "block/blk-mq-sched.c",
     "block/blk-sysfs.c",
-    # Batch 20: blk_mq_quiesced_elevator_switch moves the elevator_switch_mq()
-    # declaration here (block/blk.h) and renames its definition in elevator.c.
     "block/blk.h",
     "block/elevator.c",
     "block/mq-deadline.c",
@@ -166,38 +100,18 @@ AUDIT_FILES = [
     "kernel/time/tick-sched.c",
     "kernel/sched/idle.c",
     "kernel/bpf/helpers.c",
-    # Batch 30: readahead_mmap_miss_race guards the mmap_miss decrement in
-    # mm/filemap.c's do_async_mmap_readahead().  The file was already in
-    # FETCH_FILES for reference reads (the module touched no group there until
-    # now), so only the fixture list needed the entry.
     "mm/filemap.c",
-    # Batch 31: the arm64 pte_mkwrite() dirty guard (5.15.196).
     "arch/arm64/include/asm/pgtable.h",
-    # Batch 35: the page-cache shadow-entry sweeps in mm/truncate.c, and the
-    # struct zap_details (include/linux/mm.h) the MADV_DONTNEED page-table
-    # reclaim marks before the zap path can hand an empty PTE page back.
     "mm/truncate.c",
     "include/linux/mm.h",
-    # Batch 34: the non-return per-CPU atomics become load LSE atomics
-    # (mainline 535fdfc5a228) -- the whole group is this header.
     "arch/arm64/include/asm/percpu.h",
-    # Batch 35: the FUSE write-path prefault (faa794dd2e17), the module's first
-    # group in fs/fuse/.
     "fs/fuse/file.c",
-    # Batch 40: the erofs readahead temporary-buffer relaxation (d9281660ff3f),
-    # the module's first group in fs/erofs/.
     "fs/erofs/compress.h",
     "fs/erofs/decompressor.c",
     "fs/erofs/decompressor_lzma.c",
     "fs/erofs/zdata.c",
     "fs/erofs/zdata.h",
-    # Batch 41: vm_kcompressd_swapout -- the whole payload is appended to this
-    # file, so its comment/brace/#ifdef balance has to be auditable and its
-    # anchors have to be checkable for the already_present traps.
     "mm/page_io.c",
-    # Batch 70: smaps_migration_guard -- the module's first fs/proc group.
-    # The helper plus five caller guards all live here; without the file the
-    # group degrades to blocked_by_shape in audit only.
     "fs/proc/task_mmu.c",
 ]
 
@@ -225,12 +139,6 @@ def make_tree(source, work):
 
 
 def check_fixture_coverage():
-    """Every file a group declares must be part of the audit fixture.
-
-    Otherwise the group runs against a missing file, degrades to a shape error
-    and the failure reads like an anchor problem instead of the fixture gap it
-    actually is.
-    """
     for name, module in CHILD_MODULES:
         for group in module.PATCH_GROUPS:
             for rel in group.files:
@@ -246,11 +154,6 @@ def new_ctx(root):
 
 
 def record_steps(module, sink, status_sink=None):
-    """Wrap module.apply_steps so every step tuple is captured per group.
-
-    ``status_sink`` additionally collects the per-step ``(rel, status)`` pairs
-    ``apply_steps`` returned, which is what trap 1b is asserted against.
-    """
     original = module.apply_steps
 
     def wrapper(ctx, steps):
@@ -298,7 +201,6 @@ def contains_block(text, block):
 
 
 def run_child_groups(module, ctx, child_id, pass_name):
-    """Run every group, asserting each landed the status the baseline implies."""
     pre_applied = sublevel_matrix.pre_applied(SUB_LEVEL, child_id)
     debts = sublevel_matrix.debt(SUB_LEVEL, child_id)
     statuses = {}
@@ -309,8 +211,6 @@ def run_child_groups(module, ctx, child_id, pass_name):
             expected = debts.get(group.key) or (
                 "already_present" if group.key in pre_applied else "applied")
         else:
-            # An "applied"-valued debt (a partial-apply drift) becomes
-            # already_present on the second pass.  True degradations stay.
             want = debts.get(group.key)
             expected = "already_present" if want in (None, "applied") else want
         if result["status"] != expected:
@@ -326,20 +226,9 @@ def audit_child(name, module, pristine_root, work):
     current_group = [None]
     original = module.apply_steps
 
-    # Batch modules (scripts/batchNN_*.py) do `from abk_backport_engine import
-    # apply_steps`, which binds the *original* function into their own module
-    # globals at import time.  Patching only this child's attribute would let
-    # every group defined in such a module bypass this instrumentation: its steps
-    # would never reach `group_steps`, so the per-step already_present trap (1b),
-    # the comment/brace/#ifdef balance check and the byte-identity idempotency
-    # check would all silently skip every file those groups touch -- while the
-    # group-status assertions still passed, hiding it.  Rebinding the name in
-    # every loaded module that still points at the original closes that hole.
     def wrapper(ctx, steps, _o=original):
         status, results, detail = _o(ctx, steps)
         group_steps.setdefault(current_group[0], []).extend(steps)
-        # apply_steps returns one (rel, status) per evaluated step, in order,
-        # and stops early on a required miss -- zip truncates to what ran.
         group_statuses.setdefault(current_group[0], []).extend(
             (rel, step_status)
             for (rel, _old, _new, _required), (_rel, step_status)
@@ -376,10 +265,6 @@ def audit_child(name, module, pristine_root, work):
 
     steps = [s for key in group_steps for s in group_steps[key]]
 
-    # Trap 1: a replacement block that pre-exists in the pristine file would
-    # make replace_once short-circuit to already_present forever.  Groups the
-    # baseline already carries are legitimately already_present, so only audit
-    # the ones that are supposed to really apply.
     pristine_texts = {rel: common.read_text(pristine_root / rel) for rel in AUDIT_FILES}
     for key, key_steps in group_steps.items():
         if key in pre_applied or key in debts:
@@ -390,13 +275,6 @@ def audit_child(name, module, pristine_root, work):
                      f"{rel}; anchor must be unique enough that replace_once really "
                      f"applies:\n{new[:120]!r}")
 
-    # Trap 1b: the same short-circuit, but created *during* the group by an
-    # earlier step whose replacement contains a later step's replacement text.
-    # Trap 1 cannot see it -- it only inspects the pristine file -- so this
-    # consumes the per-step statuses apply_steps actually returned.  A step of
-    # a must-apply group that reports already_present means the real edit never
-    # landed while the group still reported "applied" (the MADV_COLLAPSE
-    # khugepaged_scan_file() signature reached CI that way).
     for key, key_statuses in group_statuses.items():
         if key in pre_applied or key in debts:
             continue
@@ -409,11 +287,6 @@ def audit_child(name, module, pristine_root, work):
                  "check whether an earlier step's replacement text contains this "
                  "step's replacement text")
 
-    # Trap 2: comment, brace and #ifdef structure must stay balanced per file.
-    # Only C sources are balanced this way: the module also edits plain-text
-    # documentation (Documentation/admin-guide/*.rst, *.txt), where /* and */
-    # are ordinary characters and a "/proc/pressure/*" glob legitimately adds
-    # an unbalanced "/*".
     for rel in sorted({rel for rel, _o, _n, _r in steps
                        if rel.endswith(C_SUFFIXES)}):
         after_text = common.read_text(tree / rel)
@@ -424,7 +297,6 @@ def audit_child(name, module, pristine_root, work):
                 fail(f"{name}: {label} balance changed in {rel} "
                      f"({before} -> {after}); {why}")
 
-    # Idempotency: second pass over the patched tree, byte-identical result.
     patched_files = sorted({rel for rel, _o, _n, _r in steps})
     patched_bytes = {rel: (tree / rel).read_bytes() for rel in patched_files}
     ctx2 = new_ctx(tree)
@@ -445,20 +317,6 @@ def audit_child(name, module, pristine_root, work):
 
 
 def audit_fdtable_on_suite_shape(module, source, work):
-    """Audit the fdtable group's composed variant over the suite-first shape.
-
-    Builds ABK_ABI_PATCH_SUITE's fallback alloc_fdtable() on top of the real
-    reference fs/file.c (same deltas as the unit-test fixture), then runs the
-    group: every step must be ``applied``, the replacement blocks must not
-    pre-exist, comment balance must hold, and a second pass must be a
-    byte-identical no-op.
-
-    The suite builds its fallback out of the pre-5.15.191 ``alloc_fdtable()``
-    body, so this audit only applies to a baseline that still carries that
-    shape (167, 178).  From 5.15.191 the tree is already in the upstream form
-    and the suite takes its adapt branch instead, so there is nothing to
-    compose and the audit is skipped.
-    """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from stable_5_15_test import SUITE_HELPER_TAIL, suite_fallback_deltas
 
@@ -489,8 +347,6 @@ def audit_fdtable_on_suite_shape(module, source, work):
         if result["status"] != "applied":
             fail(f"fdtable composed variant degraded on the suite shape: "
                  f"{result['status']} ({result['detail']})")
-        # The 5.15.195 replace_fd() fix is its own group and must still land on
-        # top of the composed shape.
         errno_group = next(g for g in module.PATCH_GROUPS
                            if g.key == "fdtable_replace_fd_errno")
         errno_result = errno_group.run(ctx)
@@ -532,16 +388,6 @@ def audit_fdtable_on_suite_shape(module, source, work):
 
 
 def detect_sub_level(source):
-    """Read SUBLEVEL from the reference tree's Makefile; ABK_TEST_SUB_LEVEL wins.
-
-    Raises rather than falling back.  The old behaviour returned
-    ``sublevel_matrix.DEFAULT_SUB_LEVEL`` when the Makefile was missing or
-    carried no SUBLEVEL line, which -- once the membership check below is
-    satisfied by that same default -- let an unrecognised tree be audited
-    against the lts expectations while the log claimed otherwise.  With Batch 44
-    leaving one baseline, that silent downgrade is the only way this audit could
-    ever look at the wrong tree, so it has to be an error instead.
-    """
     import os
 
     override = os.environ.get("ABK_TEST_SUB_LEVEL", "").strip()

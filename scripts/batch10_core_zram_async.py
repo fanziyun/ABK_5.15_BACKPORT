@@ -1,39 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Batch 10-1: zram async recompress (plan A, kcompressd-style soft
-decoupling).
-
-The QPACE write-path machinery in the popsicle-w-oss diff (bio submit ->
-ring -> completion handlers -> zram_write_finish) is bound to the 6.12 zram
-shape and the QTI hardware engine.  Plan A keeps the generic idea -- a
-dedicated worker thread drains an explicit job queue -- but applies it to
-the *recompress* path the module already grafted onto 5.15 (android15-6.6
-zram_recompression): a new per-device sysfs node ("recompress_async", same
-type/threshold/algo grammar as the sync "recompress") scans cheaply in the
-sysfs writer and hands every candidate page's decompress/recompress work to
-a per-device "zram_recompd" kthread_worker.  The synchronous node keeps its
-exact semantics.  No crypto_acomp is introduced: with software scomp
-backends crypto_acomp compresses synchronously anyway, so the real async
-comes from the dedicated kthread reusing the existing zcomp streams.
-
-Graft-boundary contract (why this shape): replace_once idempotency requires
-every earlier group's replacement text to survive as a contiguous block, so
-nothing here edits inside the zram_recompression group's blocks and no field
-is added to struct zram.  All edits land on pristine, never-replaced text:
-
-  * the kthread.h include goes after the pristine part_stat.h include;
-  * forward declarations + the DEVICE_ATTR go right after the pristine
-    `#include "zram_drv.h"` / DEFINE_IDR block;
-  * the sysfs-list entry is wrapped in its own CONFIG_ZRAM_MULTI_COMP guard
-    and prepended before the pristine dev_attr_comp_algorithm entry;
-  * the whole engine is appended just before the pristine module_init line,
-    after every function it uses;
-  * the worker lifetime is tracked in a small global {zram, worker} map
-    (no struct zram change), and the reset-side drain in the recompression
-    group's zram_reset_device() text calls abk_zram_recomp_drain() before
-    comps/table teardown.
-
-No exported-struct fields, no KABI slots, no new Kconfig.
-"""
 
 import re
 
@@ -41,7 +6,6 @@ __all__ = ["build_steps", "T"]
 
 
 def _tabs(text):
-    """Convert leading 4-space indentation (readable source) to kernel tabs."""
     text = re.sub(r"(?m)^    +",
                   lambda m: "\t" * (len(m.group(0)) // 4), text)
     return text.rstrip("\n") + "\n"
@@ -49,9 +13,6 @@ def _tabs(text):
 
 T = True
 
-# ---------------------------------------------------------------------------
-# 1) zram_drv.c: kthread.h include on pristine include text.
-# ---------------------------------------------------------------------------
 
 _C_INC_OLD = (
     "#include <linux/part_stat.h>\n"
@@ -66,10 +27,6 @@ _C_INC_NEW = (
     "#include \"zram_drv.h\"\n"
 )
 
-# ---------------------------------------------------------------------------
-# 2) zram_drv.c: forward declarations (drain helper always; the async store
-#    and its DEVICE_ATTR under CONFIG_ZRAM_MULTI_COMP).  Pristine anchor.
-# ---------------------------------------------------------------------------
 
 _DECL_OLD = (
     "#include \"zram_drv.h\"\n"
@@ -92,10 +49,6 @@ _DECL_NEW = (
     "static DEFINE_IDR(zram_index_idr);\n"
 )
 
-# ---------------------------------------------------------------------------
-# 3) zram_drv.c sysfs attribute list: guarded prefix before the pristine
-#    comp_algorithm entry (never inside the recompression list block).
-# ---------------------------------------------------------------------------
 
 _ATTR_OLD = "\t&dev_attr_comp_algorithm.attr,\n"
 _ATTR_NEW = (
@@ -105,12 +58,6 @@ _ATTR_NEW = (
     "\t&dev_attr_comp_algorithm.attr,\n"
 )
 
-# ---------------------------------------------------------------------------
-# 4) zram_drv.c: the engine, appended before the pristine module_init line.
-#    The drain + {zram, worker} map are unconditional; the job queue, the
-#    worker and recompress_async_store (which call the CONFIG_ZRAM_MULTI_COMP
-#    zram_recompress()) are guarded.
-# ---------------------------------------------------------------------------
 
 _ENGINE = _tabs(r"""
 /* ABK stable_515_backport: Batch 10-1 async recompress engine (plan A).

@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Unit tests for the abk_5_15_backport graft engine and compatibility shapes.
-
-Runs fully self-contained on synthetic fixtures; no kernel tree required.
-    python3 tests/stable_5_15_test.py
-"""
 
 from __future__ import annotations
 
@@ -118,11 +113,6 @@ FD_PRISTINE = (
     "\treturn do_dup2(files, file, fd, flags);\n"
     "}\n"
 )
-# Faithful reproduction of ABK_ABI_PATCH_SUITE's fallback alloc_fdtable()
-# (scripts/abk_feature_porting.py patch_fd_alloc_hotpath): helper local in the
-# body, ALIGN capacity line with its comment, round-up clamp plus an
-# INT_MAX -> return NULL guard.  Shared with tests/step_audit.py so the audit
-# can build the suite-first shape over the real reference tree as well.
 def suite_fallback_deltas(text):
     return (
         text
@@ -229,7 +219,7 @@ def test_apply_steps_transactional():
         ctx = make_ctx(tmp, {"mm/x.c": "alpha\nbeta\n"})
         steps = [
             ("mm/x.c", "alpha", "ALPHA", True),
-            ("mm/x.c", "gamma", "GAMMA", True),  # missing -> aborts everything
+            ("mm/x.c", "gamma", "GAMMA", True),
         ]
         status, _res, _detail = apply_steps(ctx, steps)
         wrote = ctx.pending_writes()
@@ -295,7 +285,6 @@ def test_fdtable_shapes():
         status2, _ = core._fdtable_apply(ctx)
         check("composed tree idempotent", status2 == "already_present", status2)
 
-    # Hard-group semantics: an unknown shape must abort the build.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"fs/file.c": "int weird;\n"})
         try:
@@ -306,16 +295,9 @@ def test_fdtable_shapes():
 
 
 def test_replace_fd_errno_group():
-    """The 5.15.195 replace_fd() fix must reach a .191-.194 baseline.
-
-    It used to be an optional step inside the fd-table conventions group, which
-    short-circuits to already_present the moment the tree is in the upstream
-    5.15.191 shape -- so on a 5.15.194 target the hunk was silently skipped.
-    """
     print("replace_fd errno group (5.15.195)")
     import abk_stable_core as core
 
-    # Upstream .191-.194 shape: conventions already in, replace_fd not yet.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"fs/file.c": FD_UPSTREAM}, sub_level="216")
         status, _ = core._fdtable_apply(ctx)
@@ -330,7 +312,6 @@ def test_replace_fd_errno_group():
         status2, _ = core._replace_fd_errno_apply(ctx)
         check("replace_fd group idempotent", status2 == "already_present", status2)
 
-    # Pristine monthly shape: the conventions group runs, the fix still lands.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"fs/file.c": FD_PRISTINE})
         core._fdtable_apply(ctx)
@@ -338,7 +319,6 @@ def test_replace_fd_errno_group():
         check("replace_fd applies after conventions", status == "applied",
               f"{status}: {detail}")
 
-    # A tree without the anchor degrades softly instead of aborting.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"fs/file.c": "int unrelated;\n"})
         status, _ = core._replace_fd_errno_apply(ctx)
@@ -349,9 +329,6 @@ def test_replace_fd_errno_group():
 
 
 def test_display_valid_clones_revert():
-    """The 5.15.185 valid-clones revert must apply on check-carrying trees,
-    report already_present on pre-185 trees, and never half-patch a shape it
-    does not recognize."""
     print("display valid-clones revert")
     import abk_stable_display as display
 
@@ -359,7 +336,6 @@ def test_display_valid_clones_revert():
     rel = "drivers/gpu/drm/drm_atomic_helper.c"
 
     with tempfile.TemporaryDirectory() as tmp:
-        # 5.15.185+ shape: function and call site both present.
         ctx = make_ctx(tmp, {rel: display._VC_FN_OLD + "\n" + display._VC_CALL_OLD})
         status, detail = group.apply_fn(ctx)
         check("185+ shape reverts", status == "applied", (status, detail))
@@ -370,7 +346,6 @@ def test_display_valid_clones_revert():
         check("second pass is already_present", status2 == "already_present", status2)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Pre-185 shape: the fixed form already exists (167/178 baselines).
         pre185 = display._VC_FN_NEW + "\n" + display._VC_CALL_NEW
         ctx = make_ctx(tmp, {rel: pre185})
         before = ctx.read(rel)
@@ -380,7 +355,6 @@ def test_display_valid_clones_revert():
         check("pre-185 tree untouched", ctx.read(rel) == before)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Unrecognized shape: both steps must degrade without writing.
         ctx = make_ctx(tmp, {rel: "static int unrelated(void) { return 0; }\n"})
         before = ctx.read(rel)
         status, detail = group.apply_fn(ctx)
@@ -434,10 +408,6 @@ _BATCH21_PSI_H = (
     "#endif\n"
 )
 
-# The psi.c shape this group lands on: the 5.15 psi_group_change() before the
-# state-mask loop, the IRQ walk psi_irq_tracking adds ahead of it (the switch
-# patches that text), psi_show/psi_trigger_create, and the end of the
-# CONFIG_CGROUPS block.
 _BATCH21_PSI_C = (
     "static void psi_group_change(struct psi_group *group, int cpu,\n"
     "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
@@ -557,9 +527,6 @@ _BATCH21_PSI_C = (
     "}\n"
 )
 
-# cgroup.c after psi_trigger_kernfs_polling: the trigger writer (which this
-# group renames), its three wrappers, the poll hook the switch is inserted
-# before, and the base-file table the knob joins.
 _BATCH21_GROUP_C = (
     "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,\n"
     "\t\t\t\t\t  size_t nbytes, enum psi_res res)\n"
@@ -649,9 +616,6 @@ def test_batch21_psi_cgroup_pressure_switch():
                   if g.key == "psi_cgroup_pressure_switch"), None)
     check("psi_cgroup_pressure_switch group registered", group is not None)
 
-    # The whole point of this port is not growing a KMI-visible struct: the ACK
-    # 6.1 shape lives in psi_types.h, so touching that file at all would be the
-    # regression.  Pin the file list, not just the resulting text.
     check("the group does not touch include/linux/psi_types.h",
           group is not None and "include/linux/psi_types.h" not in group.files,
           group is not None and group.files)
@@ -682,9 +646,6 @@ def test_batch21_psi_cgroup_pressure_switch():
                             "states */"))
         check("the IRQ walk honours the switch",
               "\t\tif (!psi_group_enabled(group))\n\t\t\tcontinue;\n" in psi_c)
-        # Four queries on purpose: the state-mask branch, the IRQ walk, the
-        # restart guard and the report path (the trigger path adds a fifth on
-        # the ERR_PTR form below).
         check("reporting and trigger creation refuse a disabled group",
               psi_c.count("if (!psi_group_enabled(group))") == 4
               and "\tif (!psi_group_enabled(group))\n\t\treturn -EOPNOTSUPP;"
@@ -739,17 +700,12 @@ def test_batch21_psi_cgroup_pressure_switch():
         check("second pass is byte-identical",
               all(ctx.read(rel) == snapshot[rel] for rel in files))
 
-    # It patches text psi_irq_tracking adds (the IRQ walk), so it has to be
-    # registered after it.
     check("registered after psi_irq_tracking",
           [g.key for g in perf.PATCH_GROUPS].index(
               "psi_cgroup_pressure_switch")
           > [g.key for g in perf.PATCH_GROUPS].index("psi_irq_tracking"))
 
 
-# The psi_types.h shape the ONCPU group lands on: the 5.15 counter-based task
-# states (psi_irq_tracking has already turned NR_PSI_STATES into an auto-sized
-# enum by then, which is what the PSI_ONCPU anchor expects).
 _BATCH22_PSI_TYPES = (
     "#ifdef CONFIG_PSI\n"
     "\n"
@@ -799,8 +755,6 @@ _BATCH22_PSI_TYPES = (
     "};\n"
 )
 
-# psi.c pieces the Batch 21 fixture does not carry: test_state() and
-# psi_task_switch() in their pristine 5.15 (counter-based) form.
 _BATCH22_PSI_EXTRA = (
     "static bool test_state(unsigned int *tasks, enum psi_states state)\n"
     "{\n"
@@ -937,9 +891,6 @@ def test_batch22_psi_oncpu_state_mask():
               and "#define PSI_ONCPU\t(1 << NR_PSI_STATES)" in types
               and "NR_ONCPU" not in types,
               [ln for ln in types.split("\n") if "ONCPU" in ln])
-        # The bit has to sit above the state enum, not take a state bit: the
-        # trigger path indexes states by PSI_IO_SOME + res * 2 and would read
-        # someone else's counter otherwise.
         check("the flag sits above the state enum",
               "NR_PSI_STATES,\n};\n\n/* ABK stable_515_backport: use one bit "
               "in the state mask to track" in types
@@ -976,9 +927,7 @@ def test_batch22_psi_oncpu_state_mask():
               all(ctx.read(rel) == snapshot[rel] for rel in files))
 
 
-
 def test_batch23_zram_writeback_guard():
-    """Batch 23: the compressed-writeback block must survive the config being off."""
     print("Batch 23: zram compressed writeback inside CONFIG_ZRAM_WRITEBACK")
     import batch17_core_zram_writeback as b17
 
@@ -990,10 +939,6 @@ def test_batch23_zram_writeback_guard():
           < read_new.index("static int zram_bvec_read(struct zram *zram"))
     check("the gate closes right before the pristine function head",
           read_new.endswith(read_old))
-    # The helpers touch zram->bdev / zram->wb_compressed / stats.bd_reads, all of
-    # which struct zram only declares under CONFIG_ZRAM_WRITEBACK -- and ABK's
-    # dispatch does not have to enable it (that is how the CI build of this
-    # batch failed: "no member named 'bdev' in 'struct zram'").
     for needle in ("zram->bdev", "zram->wb_compressed", "zram->stats.bd_reads"):
         check(f"the gated field {needle} is only reached inside the gate",
               needle in read_new)
@@ -1008,8 +953,6 @@ def test_batch23_zram_writeback_guard():
               and end_at > else_at and fallback.strip() == pristine.strip(),
               (name, block))
 
-    # And the audit that catches a regression of this kind is registered: the
-    # four text audits run against a tree and would never see a preprocessor.
     import implementation_audit as ia
     check("the config-gated reference audit covers zram_drv.c",
           "drivers/block/zram/zram_drv.c" in ia.CONFIG_GATED_REFERENCES
@@ -1019,7 +962,6 @@ def test_batch23_zram_writeback_guard():
 
 
 def test_batch24_zram_max_pages():
-    """Batch 24: max_pages bounds a recompression pass on both sysfs nodes."""
     print("Batch 24: zram_recompress_max_pages (max_pages cap + type guard)")
     import inspect
 
@@ -1037,9 +979,6 @@ def test_batch24_zram_max_pages():
     check("registered after zram_async_recompress (it generates the async node)",
           keys.index("zram_recompress_max_pages") > keys.index("zram_async_recompress"))
 
-    # Trap 5: this is the one group in the module that rewrites text two other
-    # groups append.  Both of those must therefore recognise their own payload --
-    # without the probe a second pass appends a second recompress_store().
     for fn, sym in (("_zram_recompression_apply", "RECOMPRESS_HELPER"),
                     ("_zram_async_recompress_apply", "RECOMPRESS_ASYNC_STORE")):
         src = inspect.getsource(getattr(core, fn))
@@ -1051,7 +990,6 @@ def test_batch24_zram_max_pages():
     check("six required steps, three per node",
           len(steps) == 6 and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j in range(i + 1, len(steps)):
             check("step %d new does not contain step %d new" % (i, j),
@@ -1113,8 +1051,6 @@ def test_batch24_zram_max_pages():
         check("the decrement counts attempts on both nodes",
               text.count("num_recomp_pages--;\n\t\terr = zram_recompress(") == 1
               and text.count("num_recomp_pages--;\n\t\terr = abk_zram_recomp_enqueue(") == 1)
-        # Upstream counts an attempt even when the recompression then fails, so
-        # the decrement must sit after every candidate filter, at the call.
         check("the attempt is counted after the filters, not at the scan top",
               text.index("goto next;\n\n\t\tnum_recomp_pages--;") >
               text.index("\t\tif (!num_recomp_pages)"))
@@ -1125,15 +1061,12 @@ def test_batch24_zram_max_pages():
               (status2, detail2))
         check("second pass is byte-identical", ctx.read(b24.ZRAM_C) == snapshot)
 
-        # A tree that never gained the recompression surface degrades; it must
-        # not half-graft the parameter onto one of the two nodes.
         ctx_bare = make_ctx(tmp + "/bare", {b24.ZRAM_C: "static int x;\n"})
         status3, detail3 = group.apply_fn(ctx_bare)
         check("degrades without zram_recompression",
               status3 == "blocked_by_shape" and "zram_recompression" in detail3,
               (status3, detail3))
 
-        # Only the sync node present (the async group missing) degrades too.
         ctx_half = make_ctx(tmp + "/half", {b24.ZRAM_C: sync_body})
         status4, detail4 = group.apply_fn(ctx_half)
         check("degrades without the async node",
@@ -1141,7 +1074,6 @@ def test_batch24_zram_max_pages():
               and "recompress_async_store" in detail4, (status4, detail4))
 
 def test_sublevel_matrix():
-    """The expectation matrix must stay in sync with the registries."""
     print("sublevel expectation matrix")
     import abk_stable_core as core
     import abk_stable_perf as perf
@@ -1172,9 +1104,6 @@ def test_sublevel_matrix():
             check(f"{child}@{sub_level} summary totals all groups",
                   sum(summary.values()) == len(groups), summary)
 
-    # Every supported baseline must cover every child.  With Batch 44 there is
-    # exactly one, so the loop is a single iteration -- and the surviving check
-    # below is what replaced the old cross-baseline invariant.
     for sub_level in sublevel_matrix.SUPPORTED:
         check(f"{sub_level} covers every child",
               set(sublevel_matrix.PRE_APPLIED[sub_level]) == set(registries),
@@ -1183,12 +1112,6 @@ def test_sublevel_matrix():
           sublevel_matrix.DEFAULT_SUB_LEVEL in sublevel_matrix.SUPPORTED,
           sublevel_matrix.DEFAULT_SUB_LEVEL)
 
-    # Batch 44 dropped 5.15.167/.178/.194, so the old "167 is the all-applied
-    # baseline for forward grafts" check has nothing left to compare against.
-    # The concern it guarded survives in a sharper form: with one baseline, a
-    # PRE_APPLIED row that quietly absorbs groups the module still needs makes
-    # every tree-level audit vacuous while all of them stay green.  Assert each
-    # forward-graft child still has groups that really rewrite the baseline.
     only = sublevel_matrix.SUPPORTED[0]
     for child, groups in registries.items():
         if child == "stable_display_fix":
@@ -1197,8 +1120,6 @@ def test_sublevel_matrix():
         leftover = keys - sublevel_matrix.pre_applied(only, child)
         check(f"{child} still really grafts on {only}",
               leftover, f"all {len(keys)} groups recorded pre-applied")
-    # The display child is a revert, so the invariant inverts: the rolling
-    # branch carries 5.15.185, and its group must really apply there.
     check("display revert really applies on the rolling baseline",
           not sublevel_matrix.pre_applied(only, "stable_display_fix"),
           sublevel_matrix.pre_applied(only, "stable_display_fix"))
@@ -1223,16 +1144,9 @@ def test_kabi_slot_policy():
                              "DECLARE_PER_CPU(u32, kstack_offset);\n", "init/main.c": "x\n",
                              "kernel/fork.c": "stackleak_task_init(p);\n"})
         import abk_stable_perf as perf
-        # Only assert the KABI slot rewrite step works standalone; the other
-        # kstack hunks need the full upstream shape and may abort this group.
         text = ctx.read("include/linux/sched.h")
         check("slot 8 present", "ANDROID_KABI_RESERVE(8);" in text)
         perf_ctx_texts = perf  # noqa: F841 - import proves the module loads
-        # Batch 15 retired the ABK_ABI_PATCH_SUITE red line: this module now
-        # claims sched_entity slots 1-3 itself (Batch 16 released slot 4, which
-        # nothing read).  task_struct slot 1 was never this group's to take and
-        # still is not -- the kstack rewrite lands on slot 8 (or slot 5 on a
-        # SysVIPC-patched tree, see the test below).
         check("kstack group claims no task_struct slot 1",
               "ANDROID_KABI_USE(1" not in text)
 
@@ -1252,9 +1166,6 @@ def test_kstack_slot_shape_selection():
     step2 = perf._sched_h_kstack_step(sysv)
     check("sysv-patched -> slot 5", "RESERVE(5);" in step2[1] and "USE(5" in step2[2])
     check("slot-5 anchor hits patched tail", step2[1] in sysv)
-    # android13-5.15-lts from 5.15.211 on: AOSP claims slot 1 for the
-    # user_dumpable bitfield, so the 1..8 run no longer exists -- the group has
-    # to find the 2..8 run (that shape reported blocked_by_shape until it did).
     lts = (
         "\tANDROID_KABI_USE(1, struct {\n"
         "\t\t/* Save user-dumpable when mm goes away */\n"
@@ -1354,8 +1265,6 @@ def test_batch6_registration():
     perf_keys = {g.key for g in perf.PATCH_GROUPS}
     need = {"config_enablement", "zsmalloc_chain_size", "madvise_collapse"}
     check("batch6 groups registered", need <= keys, need - keys)
-    # The no-op path must not regress: a graft that cannot find any anchor on
-    # an empty tree degrades instead of silently succeeding.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "mm/Kconfig": "config ZSMALLOC\n\ttristate\n",
@@ -1389,8 +1298,6 @@ def test_batch8_pagealloc_fallback_reuse():
           set(group.files) == {"mm/page_alloc.c", "mm/compaction.c",
                                "mm/internal.h"}, group.files)
 
-    # Keep this fixture self-contained while still exercising the complete
-    # nine-step transaction and its second-pass shape detection.
     internal_old = (
         "int find_suitable_fallback(struct free_area *area, unsigned int order,\n"
         "\t\t\tint migratetype, bool only_stealable, bool *can_steal);"
@@ -1567,8 +1474,6 @@ def test_batch10_sched_smart_policy():
 
     rel = "kernel/sched/cpufreq_schedutil.c"
     pristine = s10._INC_OLD + "void governor(void);\n" + s10._TAIL_OLD
-    # What Batch 10-4c leaves in a tree it already grafted: its include block
-    # plus its payload appended after the governor init.
     v1_tree = (s10._INC_V1 + "void governor(void);\n" + s10._TAIL_OLD
                + s10._POLICY_V1)
 
@@ -1611,9 +1516,6 @@ def test_batch10_sched_smart_policy():
         check("the payload lands exactly once",
               text.count("static bool abk_sf_enable") == 1,
               text.count("static bool abk_sf_enable"))
-        # module_param(NAME, ...) compiles the identifier NAME as the variable,
-        # so every one-name form must really declare it (ABK CI caught the
-        # counterexample once already; text audits cannot see this class).
         declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", text))
         for name in re.findall(r"(?m)^module_param\((\w+),", text):
             check(f"one-name module_param {name!r} really declares that variable",
@@ -1644,19 +1546,12 @@ def test_batch10_sched_smart_policy():
               status2 == "already_present", status2)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # Why the upgrade branch exists: the plain insert anchors on the line
-        # the payload was appended to, which still matches -- so it would
-        # define the policy a second time and fail the compile.
         ctx = make_ctx(tmp, {rel: v1_tree})
         perf.apply_steps(ctx, s10.build_steps())
         copies = ctx.read(rel).count("static bool abk_sf_enable")
         check("the upgrade branch is load-bearing (plain insert duplicates)",
               copies == 2, copies)
 
-        # Batch 10-2 grafted this group once with a payload that matches neither
-        # migration anchor, and its `_TAIL_OLD` anchor survives there too.  The
-        # same duplication would happen silently, so an unnamed shape must be
-        # refused rather than "applied".
         b10_2 = (s10._INC_V1 + "void governor(void);\n" + s10._TAIL_OLD
                  + "\n/*\n * ABK stable_515_backport: Batch 10-2 sched"
                  " smart-freq policy (PELT).\n */\n"
@@ -1768,9 +1663,6 @@ def test_batch11_zram_algo_lock():
         check(f"step {old.splitlines()[0][:34]!r} is required",
               req is True and old and old != new, (req, old == new))
 
-    # The fixture is the shape the earlier groups leave behind: Batch 10-4's
-    # parameter block, the multi-comp store both nodes share, the primary
-    # assignment in zram_add(), and Batch 10-1's engine before module_init().
     zram = (
         "static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;\n"
         "\n"
@@ -1817,11 +1709,6 @@ def test_batch11_zram_algo_lock():
               and "module_param_string(abk_comp_algo, abk_zram_comp_algo" in text
               and "module_param_named(abk_lock_algo, abk_zram_lock_algo, bool, 0444);"
               in text)
-        # module_param(NAME, ...) compiles the *identifier* NAME as the
-        # variable, so a knob whose sysfs name differs from its variable has to
-        # use module_param_named()/module_param_string().  ABK CI caught exactly
-        # this ("use of undeclared identifier 'abk_lock_algo'") because the
-        # text-level audits cannot see it; check every one-argument form here.
         declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", text))
         for name in re.findall(r"(?m)^module_param\((\w+),", text):
             check(f"one-name module_param {name!r} really declares that variable",
@@ -1835,15 +1722,11 @@ def test_batch11_zram_algo_lock():
               "dev_attr_comp_algorithm.store = abk_zram_locked_algo_store;" in text
               and "dev_attr_recomp_algorithm.store = abk_zram_locked_algo_store;" in text
               and "late_initcall(abk_zram_algo_lock_init)" in text)
-        # The whole point of accepting the write: a refused algorithm write
-        # aborts Android's mmd_setup, writeback backing device included.
         check("a locked-out write is reported as success, not refused",
               "-EPERM" not in text and "-EACCES" not in text,
               [line for line in text.splitlines() if "-EP" in line])
         check("the lock is reported through the kernel log",
               "pr_info_ratelimited(" in text)
-        # And the texts the earlier groups own must survive byte-identical, or
-        # their second pass stops being idempotent (the audit checks this).
         check("earlier groups' blocks stay untouched",
               "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
               "static char abk_zram_recomp_algo[CRYPTO_MAX_ALG_NAME] = \"zstd\";\n"
@@ -1921,12 +1804,6 @@ def test_batch13_customize_alloc_gfp_vh():
     check("hook group files match its steps",
           set(group.files) == {s[0] for s in g13.build_hook_steps()},
           group.files)
-    # The 5.15.167 slowpath-entry block is byte-identical to 6.6's; the graft
-    # is the upstream text and must stay that way -- an ABK marker comment on
-    # a line upstream also has would break already_present on a future
-    # baseline that carries the commit itself.  This is the whole-tree rule's
-    # fixture-level pin: the implementation audit cannot check it per-group
-    # because page_alloc.c legitimately carries markers from other groups.
     for blob in (g13.HOOK_MM_NEW, g13.HOOK_PA_NEW, g13.HOOK_VH_NEW):
         check("hook graft text carries no ABK marker (upstream-shape)",
               "ABK stable_515_backport" not in blob, blob[:60])
@@ -1964,9 +1841,6 @@ def test_batch13_customize_alloc_gfp_vh():
         check("hook fixture is idempotent",
               status2 == "already_present", status2)
 
-    # A tree whose baseline already carries the commit (android15-6.6 form)
-    # must short-circuit to already_present with zero writes -- that is what
-    # the marker-free upstream-shape form buys.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "include/trace/hooks/mm.h": g13.HOOK_MM_NEW,
@@ -1980,8 +1854,6 @@ def test_batch13_customize_alloc_gfp_vh():
         check("already_present writes nothing",
               ctx.pending_writes() == [], ctx.pending_writes())
 
-    # AGENTS.md trap 5: a grafted call in a TU that lost the hook-header
-    # include cannot compile -- the group must block, writing nothing.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "include/trace/hooks/mm.h": _BATCH13_MM_H,
@@ -2009,9 +1881,6 @@ def test_batch13_gfp_pressure_fastfail():
           [g.key for g in core.PATCH_GROUPS].index("gfp_pressure_fastfail")
           > [g.key for g in core.PATCH_GROUPS].index("customize_alloc_gfp_vh"))
 
-    # The payload must not land on a tree without the hook: the
-    # register_trace_ symbol would not exist at compile time (AGENTS.md trap
-    # 5 family -- text gates stay green, the build dies).
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "include/trace/hooks/mm.h": _BATCH13_MM_H,
@@ -2022,8 +1891,6 @@ def test_batch13_gfp_pressure_fastfail():
               status == "blocked_by_shape" and ctx.pending_writes() == [],
               (status, detail))
 
-    # A merely-declared hook is still inert: the callback would register but
-    # never fire, so the probe also demands the call site in the same TU.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "include/trace/hooks/mm.h": g13.HOOK_MM_NEW,
@@ -2066,8 +1933,6 @@ def test_batch13_gfp_pressure_fastfail():
                 "fast-fail." in text,
         }.items():
             check(name, cond)
-        # One-name module_param() compiles the identifier as the variable;
-        # pin that every knob declared here really declares that name.
         for knob in re.findall(r"(?m)^module_param\((\w+),", text):
             check(f"one-name module_param {knob!r} really declares it",
                   re.search(rf"(?m)^static [^;]*\b{knob}\b", text) is not None)
@@ -2084,14 +1949,6 @@ def test_batch13_gfp_pressure_fastfail():
 
 
 def test_batch13_wake_up_new_task_excluded():
-    """Pin the survey's negative result.
-
-    research/hooks_gfp_vs_wake_up_new_task.md verified
-    ``android_rvh_wake_up_new_task`` verbatim on .167/.178/.194/lts: already
-    carried, so it gets **no group** (plan.md: 已排除，不再重议).  This is
-    the guard that keeps that decision from silently regressing into a
-    duplicate graft on a future baseline that still carries the hook.
-    """
     print("Batch 13 wake_up_new_task exclusion pin")
     import abk_stable_core as core
     import abk_stable_perf as perf
@@ -2151,10 +2008,6 @@ def test_config_tiers():
           dict(plain).get("ZRAM_MULTI_COMP") == "y"
           and "LRU_GEN_ENABLED" not in dict(plain)
           and "ZRAM_WRITEBACK" not in dict(plain), sorted(dict(plain)))
-    # LRU_GEN_ENABLED is in the opt-in align tier (not the module tier): this
-    # module's MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained
-    # thrash and SIGSEGVs a third-party app on launch, so MGLRU is off by
-    # default (trap 8).  TCP_CONG_BBR and LRU_GEN_ENABLED are both align markers.
     check("align tier adds the 6.6 GKI config deltas (incl. opt-in MGLRU)",
           dict(align).get("TCP_CONG_BBR") == "y"
           and dict(align).get("LRU_GEN_ENABLED") == "y"
@@ -2164,11 +2017,6 @@ def test_config_tiers():
           and "TCP_CONG_BBR" not in dict(rom), sorted(dict(rom)))
     check("ROM tier is reported in the detail string",
           status == "applied" and "ROM integration" in detail, (status, detail))
-    # The PSI tier is the only one that touches the kernel command line, and it
-    # exists because the AOSP lts gki_defconfig hides every pressure file (and
-    # switches per-cgroup accounting off) with one token:
-    # cgroup_disable=pressure.  Without dropping it, Batch 21's cgroup.pressure
-    # is never created and the companion's PSI policy has nothing to walk.
     check("only the PSI tier edits CONFIG_CMDLINE",
           plain_cmd is None and align_cmd is None and rom_cmd is None
           and psi_cmd == core._PSI_CMDLINE_TOKEN,
@@ -2199,17 +2047,6 @@ def test_config_tiers():
 
 
 def test_psi_cmdline_tier():
-    """The PSI tier's one edit, on a real defconfig file.
-
-    Batch 21's cgroup.pressure and the companion's per-cgroup PSI policy are
-    both unreachable on any build from a tree whose gki_defconfig ships
-    cgroup_disable=pressure -- which android13-5.15-lts does.  The token makes
-    cgroup_psi_enabled() false, so psi_init() disables the psi_cgroups_enabled
-    static branch and cgroup_addrm_files() never creates a CFTYPE_PRESSURE
-    file: no accounting to switch off, and no switch.  This test pins the edit
-    that removes it, the fact that it survives a second pass byte-identically,
-    and that it refuses to touch a tree it was not written against.
-    """
     print("PSI tier: CONFIG_CMDLINE token drop (Batch 26)")
     import abk_stable_core as core
     from pathlib import Path
@@ -2284,15 +2121,6 @@ def test_psi_cmdline_tier():
 
 
 def test_introduced_kconfig_tiers():
-    """Every Kconfig symbol this module introduces must have a way to compile.
-
-    The failure this guards against is not hypothetical: Batch 8 added
-    ``config RCU_NOCB_CPU_DEFAULT_ALL`` (bool, ``default n``) plus the
-    ``offload_all`` machinery in ``kernel/rcu/tree_nocb.h``, but no tier ever
-    enabled the symbol -- so both assignments that could set ``offload_all``
-    compiled out, ``if (offload_all)`` was provably always false, and the group
-    still reported "applied".  A graft that compiles to nothing is not a graft.
-    """
     print("introduced Kconfig symbols: each one has a way to compile")
     import abk_stable_core as core
 
@@ -2304,18 +2132,12 @@ def test_introduced_kconfig_tiers():
 
     for symbol, tier in sorted(core._INTRODUCED_KCONFIG.items()):
         if tier is None:
-            # Kconfig itself supplies a workable default (a non-bool, or a bool
-            # defaulting to y), so no tier has to name it.
             continue
         check(f"{symbol} is named by the {tier} tier",
               symbol in tiers[tier], f"{tier} has {sorted(tiers[tier])}")
         check(f"{symbol} is enabled (=y) in the {tier} tier",
               tiers[tier].get(symbol) == "y", tiers[tier].get(symbol))
 
-    # Reverse direction, module tier only: a symbol this module turns on without
-    # documenting it in the table is a symbol nobody checked has a Kconfig
-    # declaration at all.  (The align tier is deliberately exempt -- those
-    # symbols come from the 6.6 GKI defconfig, not from this module's Kconfig.)
     for symbol in tiers["module"]:
         check(f"module-tier symbol {symbol} is recorded in _INTRODUCED_KCONFIG",
               symbol in core._INTRODUCED_KCONFIG,
@@ -2323,21 +2145,6 @@ def test_introduced_kconfig_tiers():
 
 
 def test_mglru_is_enabled_by_the_default_tier():
-    """MGLRU must be OFF by default on this baseline (device-wedge evidence).
-
-    MGLRU was briefly in the module (default) tier so Batch 37/49's groups
-    would run.  Device evidence reversed that: on SM8550 vermeer (5.15.220)
-    this module's MGLRU reclaim-loop rewrite does not converge under sustained
-    memory thrash -- two kworker/*:*H pin at 100% kernel CPU in
-    ``lru_gen_shrink_lruvec``/``evict_pages``, lmkd starves, the QCOM watchdog
-    cold-resets the device, and a third-party app (bilibili) SIGSEGVs on launch
-    in the dex-preload mmap path.  The identical load with MGLRU off rode out
-    (zram took 8.6 GB, PSI self-recovered).  So ``LRU_GEN_ENABLED`` is in the
-    opt-in align tier, not the default tier: the MGLRU grafts stay compiled-in
-    but runtime-inert until the shrink loop is made to converge (a dedicated
-    follow-up PR).  This is trap 8 (AGENTS.md): an upstream mechanism must not
-    be turned on by default without the self-defence the stock kernel relied on.
-    """
     print("MGLRU is OFF by default (device-wedge evidence); opt-in only")
     import abk_stable_core as core
 
@@ -2351,26 +2158,16 @@ def test_mglru_is_enabled_by_the_default_tier():
           core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED") == "align",
           core._INTRODUCED_KCONFIG.get("LRU_GEN_ENABLED"))
 
-    # The MGLRU grafts stay registered -- they are compiled in, just
-    # runtime-off by default.  Turning the opt-in align tier on makes them live.
     mglru = sorted(g.key for g in core.PATCH_GROUPS if g.key.startswith("mglru_"))
     check("the MGLRU groups stay registered (compiled-in, runtime-off)",
           len(mglru) >= 6, mglru)
 
-    # The companion and the kernel tier must agree: MGLRU is off by default.
-    # The kernel keeps LRU_GEN_ENABLED in the opt-in align tier, and the
-    # companion must not re-assert MGLRU on.  abk_apply_lru_gen() only ever
-    # *writes* on ==1, so lru_gen.enable=0 stops the companion forcing MGLRU on
-    # and leaves an opt-in tester (ABK_515_DEFCONFIG_ALIGN=1) free to run it.
     ksu = (Path(__file__).resolve().parent.parent / "ksu"
            / "abk_runtime_tunables")
     tunables = (ksu / "tunables.conf").read_text(encoding="utf-8")
     check("the companion does not re-assert MGLRU on (lru_gen.enable=0)",
           re.search(r"(?m)^lru_gen\.enable=0$", tunables) is not None,
           [l for l in tunables.splitlines() if l.startswith("lru_gen.enable")])
-    # The knob must stay a write-only assertion: if abk_apply_lru_gen() ever
-    # grows an else-branch that writes n, a future 0 would silently disable
-    # MGLRU again and the two layers would fight.
     common_sh = (ksu / "common.sh").read_text(encoding="utf-8")
     lines = common_sh.split("\n")
     start = next((i for i, l in enumerate(lines)
@@ -2388,8 +2185,6 @@ def test_mglru_is_enabled_by_the_default_tier():
             check("abk_apply_lru_gen() writes y, never a bare 1",
                   'abk_write "$_lg_node" y' in body, "the write target changed")
 
-    # The ROM's init writes lru_gen/enabled 0 after post-fs-data
-    # (SmartCacheEnable trigger), so the companion re-asserts it on a timer.
     check("common.sh ships the lru_gen reassert",
           "abk_reassert_lru_gen()" in common_sh
           and 'abk_write "$_rl_node" y' in common_sh,
@@ -2482,9 +2277,6 @@ def test_batch10_cached_freeze_reclaim():
         check(f"step {old.splitlines()[0][:34]!r} is required",
               req is True and old and old != new, (req, old == new))
 
-    # vmscan/memcontrol fixtures: pristine anchors only (the accounting must
-    # not touch the text the memcg_memory_reclaim group installs, or that
-    # group stops being idempotent on the second pass).
     vmscan = (
         c10._CFR_DECL_OLD + "\n"
         "unsigned long try_to_free_mem_cgroup_pages(void)\n"
@@ -2525,15 +2317,6 @@ def test_batch10_cached_freeze_reclaim():
 
 
 def test_batch10_daemon_script():
-    """The cached-freeze-reclaim daemon is a userspace script, not a graft.
-
-    The script is exercised against throwaway cgroup directories in *both*
-    layouts: v2 (memory.current / memory.reclaim / cgroup.freeze) and v1
-    (memory.usage_in_bytes / memory.reclaim / freezer.state), because this
-    module's own target device mounts the memory controller on v1.  The whole
-    driver is fed to the shell on stdin so Windows/WSL path and quoting
-    differences never touch the assertions.
-    """
     print("Batch 10-3 cached_freeze_reclaim daemon script")
     tool = Path(__file__).resolve().parent.parent / "tools" / "cached_freeze_reclaim.sh"
     check("cfr daemon script exists", tool.is_file(), tool)
@@ -2550,8 +2333,6 @@ def test_batch10_daemon_script():
         tool_sh = "/mnt/" + tool_sh[0].lower() + tool_sh[2:]
 
     def run_shell(script):
-        # Feed the driver as bytes: text mode would rewrite LF to CRLF on
-        # Windows and bash would choke on the stray carriage returns.
         r = subprocess.run(shell, input=script.encode("utf-8"),
                            capture_output=True, timeout=120)
         return subprocess.CompletedProcess(
@@ -2828,13 +2609,6 @@ rm -rf "$T" "$T1" "$T1E" "$T2" "$T3" "$T3F" "$T4" "$T4P" "$T4F"
 
 
 def test_batch10_zram_trigger_script():
-    """The recompression trigger is a userspace script, not a graft.
-
-    Its most important behaviour is refusing to report success on a device
-    whose secondary compressor was never registered -- that silent no-op is
-    exactly what the on-device check found, and it is what Batch 10-4's
-    kernel half fixes.
-    """
     print("Batch 10-4 zram_recompress_trigger script")
     tool = (Path(__file__).resolve().parent.parent / "tools"
             / "zram_recompress_trigger.sh")
@@ -2987,10 +2761,6 @@ rm -rf "$T"
           r.stdout)
     check("--idle-age passes the age to the kernel, not 'all'",
           got.get("idle_age") == "3600", r.stdout)
-    # A capped sweep can only advance if the mark is not repeated: the kernel
-    # re-sets ZRAM_IDLE on everything older than the cutoff at every mark, and a
-    # recompressed page keeps its old age, so a mark per sweep would re-drain the
-    # same first max_pages entries forever.
     check("--no-mark skips the mark and still runs the pass",
           got.get("nomark_idle") == "sentinel-not-marked"
           and got.get("nomark_async") == "type=idle threshold=0", r.stdout)
@@ -3011,7 +2781,6 @@ rm -rf "$T"
 
 
 def test_batch47_zram_recomp_best_prio_skip():
-    """Batch 47: a sweep skips entries no higher priority can improve."""
     print("Batch 47: zram_recomp_best_prio_skip (skip pointless recompressions)")
 
     import abk_stable_core as core
@@ -3024,8 +2793,6 @@ def test_batch47_zram_recomp_best_prio_skip():
     if group is None:
         return
     keys = [g.key for g in core.PATCH_GROUPS]
-    # Trap 5, third instance: this group rewrites generated text, so it must be
-    # ordered behind everything that produces it.
     for dep in ("zram_recompression", "zram_async_recompress",
                 "zram_recompress_max_pages"):
         check(f"registered after {dep} (it generates an anchor)",
@@ -3035,14 +2802,11 @@ def test_batch47_zram_recomp_best_prio_skip():
     check("three required steps: the predicate and one filter per node",
           len(steps) == 3 and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j in range(i + 1, len(steps)):
             check("step %d new does not contain step %d new" % (i, j),
                   steps[j][2] not in new_i)
 
-    # Trap 7: the predicate reads comps[], real only under
-    # CONFIG_ZRAM_MULTI_COMP; unguarded it would also be an unused static.
     check("the predicate is wrapped in CONFIG_ZRAM_MULTI_COMP",
           b47._HELP_NEW.count("#ifdef CONFIG_ZRAM_MULTI_COMP") == 1
           and b47._HELP_NEW.count("#endif") == 1)
@@ -3054,14 +2818,11 @@ def test_batch47_zram_recomp_best_prio_skip():
           "zram_get_priority(zram, index)" in b47._HELP_NEW
           and "prio > abk_cur && zram->comps[prio]" in b47._HELP_NEW)
 
-    # Trap 1: old must not be a prefix of new, or idempotency fires early.
     for name, old, new in (("sync", b47._SYNC_OLD, b47._SYNC_NEW),
                            ("async", b47._ASYNC_OLD, b47._ASYNC_NEW)):
         check(f"the {name} step's old is not a prefix of its new",
               not new.startswith(old))
 
-    # The shape both scans have after zram_recompression, zram_async_recompress
-    # and zram_recompress_max_pages have all applied.
     sync_body = (
         "static void zram_bio_discard(struct zram *zram, u32 index,\n"
         "\t\t\t\t    struct bio *bio)\n"
@@ -3112,8 +2873,6 @@ def test_batch47_zram_recomp_best_prio_skip():
         check("both nodes carry the filter",
               text.count("if (abk_zram_recompress_pointless(zram, index, "
                          "prio, prio_max))") == 2)
-        # The async filter must precede `candidate = true`; scoped to the async
-        # function so the sync filter (first match in the file) is not compared.
         async_part = text[text.index("recompress_async_store"):]
         check("the async filter precedes candidate = true",
               async_part.index("if (abk_zram_recompress_pointless") <
@@ -3133,8 +2892,6 @@ def test_batch47_zram_recomp_best_prio_skip():
               status2 == "already_present" and ctx.read(b47.ZRAM_C) == snapshot,
               (status2, detail2))
 
-    # Dependency order: without max_pages the sync anchor does not exist, and
-    # such a tree must be refused with nothing written.
     with tempfile.TemporaryDirectory() as tmp:
         bare = files[b47.ZRAM_C].replace(
             "\t\tnum_recomp_pages--;\n"
@@ -3155,20 +2912,6 @@ def test_batch47_zram_recomp_best_prio_skip():
 
 
 def test_runtime_tunables_module():
-    """The KernelSU companion module, its fixed zram policy and its packagers.
-
-    Three separate things are pinned here:
-
-      * the module packages deterministically and the AK3 ride-along is
-        idempotent, because that is how the policy reaches the device,
-      * the algorithm policy is a *constant* with a fixed order of operations,
-        so the ROM's own zram owner cannot win the race again, and
-      * the device scripts behave: they rewrite the algorithms, they refuse to
-        touch swap that is in use, they preserve (or establish) the writeback
-        backing device instead of trading it away, they do nothing at all on a
-        kernel that already locks the compressors, and the supervisor keeps
-        sweeping when a pass fails.
-    """
     print("Batch 11 runtime tunables companion module")
     repo = Path(__file__).resolve().parent.parent
     module_dir = repo / "ksu" / "abk_runtime_tunables"
@@ -3182,30 +2925,11 @@ def test_runtime_tunables_module():
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
-    # The shipped files must be LF, not CRLF, and this is a load-bearing pin
-    # rather than tidiness.  A Windows text-mode write (python's
-    # Path.write_text()) turns every LF into CRLF; nothing complains at
-    # `bash -n`, and the failure shows up as an inert supervisor instead of a
-    # syntax error: bash dies on `$'\r': command not found`, so
-    # abk_zram_supervisor_main never runs and the harness reports
-    # supervisor_runs="" (which then crashes int('')).  The packer zips the
-    # working tree, so a CRLF source is a CRLF device -- and Android's mksh
-    # chokes exactly like bash.  For tunables.conf specifically it is worse
-    # than a broken script: abk_cfg's awk strips trailing spaces and tabs but
-    # not \r, so `sched.abk_sf_floor_pct=85` yields "85\r", abk_clamp_uint
-    # rejects it as "not a number", and the knob writes nothing.
     for name in required:
         blob = (module_dir / name).read_bytes()
         check(f"{name} is LF, not CRLF", b"\r\n" not in blob,
               blob.count(b"\r\n"))
 
-    # `required` is what the module must ship; a file that is *not* in it is not
-    # covered by the loop above, which is how a CRLF file would ship silently.
-    # The pin below flips that: the directory as it stands must contain exactly
-    # the known set, so adding a file means adding it to `required` here, where
-    # the CRLF and read-only-partition sweeps then reach it too.  state/ and run/
-    # are runtime directories (the module's log, its pid files) and are excluded
-    # by name so a device-side tree is not mistaken for a stray source file.
     shipped = sorted(path for path in module_dir.rglob("*")
                      if path.is_file() and path.suffix != ".log"
                      and "state" not in path.parts and "run" not in path.parts)
@@ -3230,14 +2954,6 @@ def test_runtime_tunables_module():
     check("module versionCode is a positive integer",
           props.get("versionCode", "").isdigit() and int(props["versionCode"]) > 0)
 
-    # module.conf carries the companion through the module-set contract
-    # (ABK's app reads parts[10] = name and parts[11] = download url).  On this
-    # repo the companion is *bundled into the AnyKernel3 zip* (after_patch ->
-    # ak3_bundle_ksu_module.py, abk-ksu-modules/), so flashing the kernel also
-    # installs it and there is nothing for the app to download: both fields are
-    # deliberately empty placeholders.  The 12-field shape still holds; if a
-    # future layout stops bundling the module, the fields get filled and this
-    # check flips to the old non-empty assertions.
     conf = (repo / "module.conf").read_text(encoding="utf-8")
     items = re.search(r"ABK_MODULE_SET_ITEMS='(.*?)'", conf, re.S)
     check("module.conf declares ABK_MODULE_SET_ITEMS", items is not None)
@@ -3250,42 +2966,12 @@ def test_runtime_tunables_module():
     check("companion ships inside the kernel zip, not via an app download",
           len(core_row) >= 12 and core_row[10] == "" and core_row[11] == "",
           core_row[10:12])
-    # The companion rides the kernel module's version: it is bundled into the
-    # same zip, so a release that bumps one and not the other would ship a
-    # module.prop that disagrees with module.conf.  Releasing means updating
-    # the expected version below -- that is deliberate, it is the touch point
-    # that makes an unreleased version drift visible instead of silent.
     _versions = re.findall(r'^ABK_MODULE_(?:SET_)?VERSION="([^"]+)"', conf, re.M)
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
           _versions == ["0.75.0", "0.75.0"], _versions)
 
-    # The zram writeback data path is kernel-side: the loop worker -- a kernel
-    # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
-    # and writes the backing file, and Android's policy has no rule for that
-    # direction.  Under Enforcing the first page therefore returns -EIO, the
-    # reserved block is freed again, and writeback reports success while moving
-    # nothing: measured on the reference device, where even the ROM's own
-    # loop49 backing store had written 0 pages since boot (bd_stat 0 0 0) until
-    # this rule was submitted.  KernelSU can add the rule from a module, which
-    # is the only route that needs neither a ROM rebuild nor a relaxed boot
-    # policy.  What is pinned here is *narrowness* as much as presence: a
-    # widened rule is a policy change shipped by a kernel flash, so every
-    # statement below is a least-privilege allow, and no module code gets to
-    # relax SELinux to reach the same end.
-    #
-    # There are two, and the second is not optional: the rule has to name the
-    # file TYPE of the backing store actually in use, and the type differs with
-    # who attached the device.  The module's own backing file lives under
-    # /data/per_boot/zram/ (zram_data_file); the ROM's memory extension backs
-    # its own loop device with /data/extm/extm_file (extm_data_file), which is
-    # the case the module prefers, because it preserves a ROM attachment rather
-    # than trading it away.  Measured on vermeer / 5.15.216 2026-09-15:
-    # /data/extm/extm_file is u:object_r:extm_data_file:s0 while
-    # /data/per_boot/zram is u:object_r:zram_data_file:s0 -- so with only the
-    # first rule the file matches nothing on that device and every page still
-    # returns -EIO.  A third type must fail this check and be argued for.
     rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
     rule_statements = [line.strip() for line in rule.splitlines()
                        if line.strip() and not line.lstrip().startswith("#")]
@@ -3333,7 +3019,6 @@ def test_runtime_tunables_module():
 
     policy = (module_dir / "zram-policy.sh").read_text(encoding="utf-8")
     common_sh = (module_dir / "common.sh").read_text(encoding="utf-8")
-    # ABK_VERSION is computed from module.prop at source time, so pin the computation itself (the two had drifted: v0.11.0 vs v0.12.0).
     check("common.sh ABK_VERSION is computed from module.prop",
           "ABK_VERSION=\"$(sed -n 's/^version=//p'" in common_sh
           and "module.prop" in common_sh,
@@ -3356,11 +3041,6 @@ def test_runtime_tunables_module():
                    ("disksize", "abk_zram_set_mem_limit", "ABK_MKSWAP", "ABK_SWAPON")]
     check("remount order is disksize -> mem_limit -> mkswap -> swapon",
           mount_order == sorted(mount_order), mount_order)
-    # A dry-run has to describe the command it is deliberately NOT running, so
-    # the names in it must be the real ones.  `$_ABK_MKSWAP` and friends are one
-    # leading underscore away from the truth: they expand to nothing, and under
-    # the `set -u` both entry points carry they abort the run rather than
-    # printing it -- which is the opposite of what a dry-run is for.
     mount_code = "\n".join(l for l in mount.splitlines()
                            if not l.lstrip().startswith("#"))
     check("the dry-run branch names the real swap commands, not $_ABK_ typos",
@@ -3370,10 +3050,6 @@ def test_runtime_tunables_module():
     check("the safety gate precedes the swapoff",
           "abk_zram_swap_idle_enough" in takeover
           and takeover.index("abk_zram_swap_idle_enough") < takeover.index("ABK_SWAPOFF"))
-    # Writeback and the algorithm policy used to exclude each other: the
-    # backing device lives in the same pre-disksize window and `reset` drops it
-    # (reset_bdev()).  The rewrite now remembers it before the reset and puts it
-    # back in that window instead of trading it away.
     check("the writeback attachment is remembered before the rewrite",
           "abk_zram_backing_dev" in takeover
           and takeover.index("abk_zram_backing_dev") < takeover.index("ABK_SWAPOFF"))
@@ -3384,9 +3060,6 @@ def test_runtime_tunables_module():
     check("a device that already owns writeback is never rewritten blindly",
           "keeping the live writeback device" in takeover)
 
-    # The locked-kernel path: `abk_zram_ensure` rewrites only when something is
-    # actually missing, which is what keeps writeback and the ROM's own
-    # bring-up out of the module's way.
     ensure = policy[policy.index("abk_zram_ensure() {"):policy.index("abk_zram_reassert() {")]
     check("the service entry point rewrites only when the policy is not in force",
           "abk_zram_need_rewrite" in ensure
@@ -3409,7 +3082,7 @@ def test_runtime_tunables_module():
           and ensure.index("abk_zram_need_swap_area") < ensure.index("abk_zram_takeover")
           and "abk_zram_mount_swap_area" in ensure)
     repair = policy[policy.index("abk_zram_mount_swap_area() {"):
-                    policy.index("# --- takeover / rewrite")]
+                    policy.index("abk_zram_takeover() {")]
     check("the swap-area repair never resets or rewrites the device",
           "reset\" 1" not in repair
           and 'abk_write "$ABK_ZRAM_DIR/disksize"' not in repair
@@ -3422,7 +3095,7 @@ def test_runtime_tunables_module():
           and repair.index("abk_zram_set_mem_limit")
           < repair.index('while [ "$_ma_n" -lt "$ABK_ZRAM_SWAP_RETRIES" ]'))
     takeover_fn = policy[policy.index("abk_zram_takeover() {"):
-                         policy.index("# Does the device still need the rewrite above?")]
+                         policy.index("abk_zram_need_rewrite() {")]
     retry = takeover_fn[takeover_fn.index("if ! abk_zram_mount_swap"):
                         takeover_fn.index('_to_state="$(abk_zram_initstate)"')]
     check("the takeover retry never re-writes disksize after init_done",
@@ -3432,7 +3105,7 @@ def test_runtime_tunables_module():
           and retry.index('[ "$(abk_zram_initstate)" = "1" ]')
           < retry.index("abk_zram_mount_swap_area \"$_to_prio\""))
     algo_recovery = takeover_fn[takeover_fn.index("if ! abk_zram_set_algorithms"):
-                                takeover_fn.index("# Writeback is attached before disksize")]
+                                takeover_fn.index("_to_wb_ok=0")]
     check("the algorithm-failure recovery also splits on initstate",
           "abk_zram_mount_swap_area \"$_to_prio\"" in algo_recovery
           and '[ "$(abk_zram_initstate)" = "1" ]' in algo_recovery)
@@ -3449,9 +3122,6 @@ def test_runtime_tunables_module():
           and re.search(r"(?m)^\s*zram\.writeback=", tunables) is not None
           and re.search(r"(?m)^\s*zram\.reassert_interval_sec=", tunables) is not None)
 
-    # The compaction gate ships ON with measured defaults; a silent default
-    # drift would take the gate out the back door (healthy devices would
-    # start paying compaction passes, or fragmented ones would stop).
     for line in ("zram.compact.enable=1", "zram.compact.min_waste_mb=50",
                  "zram.compact.waste_pct=15"):
         check(f"tunables.conf ships the compaction default {line}",
@@ -3461,8 +3131,6 @@ def test_runtime_tunables_module():
                                            "zram.compact.min_waste_mb",
                                            "zram.compact.waste_pct")))
 
-    # The recompression defaults live in four places (tunables.conf, abk_cfg
-    # fallback, the clamp, the README table); retune all four together.
     _zs_clamp = {
         "zram.recomp.idle_age_sec": "_zs_age",
         "zram.recomp.interval_sec": "_zs_interval",
@@ -3488,11 +3156,6 @@ def test_runtime_tunables_module():
               f"{_key}` | `{_value}`" in _zs_readme)
 
 
-    # Byte-count arithmetic has to leave the shell: /system/bin/sh is Android's
-    # mksh and wraps at 2^31 on the target ROM (measured on device:
-    # `15561024 * 1024` -> -1245380608), while KernelSU's busybox ash does not.
-    # A wrapped value turns the compressed-memory cap negative, the kernel
-    # refuses the write, and the cap silently stays off.
     check("RAM byte math goes through awk, not shell arithmetic",
           "abk_mul_div() {" in common_sh and "a * b / c" in common_sh
           and "_mt_kb * 1024" not in common_sh
@@ -3528,7 +3191,6 @@ def test_runtime_tunables_module():
     check("cfr.group is a known tunables.conf key",
           "cfr.group" in common_sh
           and re.search(r"(?m)^\s*cfr\.group=", tunables) is not None)
-    # mem_limit has no read node, so the target must be floored to a page multiple before the write or every reassert reports the kernel's own rounding as a mismatch (v0.22.0).
     setter = policy[policy.index("abk_zram_set_mem_limit() {"):
                     policy.index("abk_zram_mount_swap() {")]
     check("the mem_limit target is floored to the alignment constant",
@@ -3541,10 +3203,6 @@ def test_runtime_tunables_module():
           'if [ "$_ml_seen" = "$_ml_val" ]; then' in setter
           and setter.index('"$_ml_seen" = "$_ml_val"')
           < setter.index('abk_write "$ABK_ZRAM_DIR/mem_limit"'))
-    # A per-UID tree on this ROM is one level below the root the tool searches
-    # (/dev/memcg/mimd), and it holds the app on screen as well as the cached
-    # ones -- so reaching it and restricting it are one change, not two: an
-    # extra root without the frozen filter would reclaim the foreground app.
     check("the cfr supervisor can reach a deeper per-UID tree",
           "abk_cfg cfr.cgroup_root" in policy
           and '--cgroup-root $_cf_r' in policy
@@ -3556,10 +3214,6 @@ def test_runtime_tunables_module():
           and '--freezer-root $_cf_freezer' in policy)
     check("a freezer root without the frozen filter is dropped, not passed inert",
           '[ "$_cf_frozen" = 1 ] || _cf_freezer=""' in policy)
-    # The frozen filter needs a platform that freezes.  This one does not (the
-    # freezing had been an installed extension), so the rank-based filter is
-    # the one that decides anything here -- and it must be a separate knob, not
-    # a reinterpretation of the frozen one.
     check("the cfr supervisor can restrict a sweep to the platform's cached rank",
           "abk_cfg cfr.cached_only" in policy and '--cached-only' in policy
           and "cached_only=$_cf_cached" in policy)
@@ -3570,11 +3224,6 @@ def test_runtime_tunables_module():
     check("the cached rank is AOSP's CACHED_APP_MIN_ADJ, not an invented one",
           "ABK_CACHED_APP_MIN_ADJ=900" in cfr_tool
           and 'if [ "$_gc_adj" -lt "$ABK_CACHED_APP_MIN_ADJ" ]' in cfr_tool)
-    # A process that exited between the listing and the rank read must not take
-    # the whole sweep down.  There are two ways that race lands, and `set -e`
-    # turns either into an abort unless it is absorbed: the per-read redirection
-    # fails when that process is gone, and the loop's own redirection fails when
-    # the group's last process leaves between the -r guard and the open.
     check("a process that exits mid-walk cannot take the sweep down with it",
           '2>/dev/null || continue' in cfr_tool
           and 'done < "$1/cgroup.procs" || true' in cfr_tool)
@@ -3584,16 +3233,7 @@ def test_runtime_tunables_module():
               key in common_sh
               and re.search(r"(?m)^\s*" + re.escape(key) + r"=", tunables) is not None)
 
-    # "Never touches a read-only partition" is about the Android partitions
-    # (/system, /vendor, /odm, /product).  /sys/devices/system/... is sysfs, which
-    # this module reads and writes by design, so it must not match -- an earlier
-    # form of this regex did, and module code was contorted into globs to dodge
-    # it.  With the rule precise, the sweep can and must cover the tools this
-    # module ships in bin/ as well: once installed they are module code too.
     ro_path = re.compile(r"/(?:vendor|odm|product)\b|(?<!/devices)/system\b")
-    # sepolicy.rule belongs in this sweep: it is policy shipped by a kernel
-    # flash, so "never relaxes SELinux" has to hold for it as literally as it
-    # does for the scripts.
     for script in sorted(module_dir.glob("*.sh")) + [module_dir / "sepolicy.rule"]:
         body = script.read_text(encoding="utf-8")
         code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
@@ -3603,11 +3243,6 @@ def test_runtime_tunables_module():
         check(f"{script.name} never relaxes SELinux",
               "setenforce" not in code and "permissive" not in code.lower())
 
-    # --- per-cgroup PSI accounting policy (companion v0.9.0) ---------------
-    # The node comes from this module's own Batch 21 graft, so nothing here is
-    # kernel work.  What can go wrong is the policy: protect so much that the
-    # pass buys nothing, protect so little that a future reader is refused, or
-    # re-enable a group whose per-cpu windows some other kernel already freed.
     service_source = (module_dir / "service.sh").read_text(encoding="utf-8")
     readme_source = (module_dir / "README.md").read_text(encoding="utf-8")
     for key in ("psi.cgroup", "psi.cgroup.protect", "psi.cgroup.interval_sec"):
@@ -3638,13 +3273,6 @@ def test_runtime_tunables_module():
     check("the companion README records the two-boot rule and every supervisor",
           "two boots" in readme_source
           and "five supervisors" in readme_source)
-    # Measured on the target device (2026-09-15): the psi supervisor wrote a
-    # literal "$" into its pid file -- `abk_pid_write psi "$"` is a quoted dollar
-    # sign, not the pid -- so abk_spawn polled for ten seconds and logged "psi
-    # supervisor did not start" while the supervisor was in fact running, and
-    # every pid-file-based check of it was blind.  zram and cfr already passed
-    # "$$"; the psi one was a typo.  Pin the whole class, not the one line.
-    # The other half of the class is a call that is *absent*: a shipped iorap-watch.sh missing its abk_pid_write line left both checks above green, so pair the sets.
     _pid_writes = []
     for _sh in sorted(module_dir.glob("*.sh")):
         _pid_writes += re.findall(r'abk_pid_write\s+(\S+)\s+"([^"]*)"',
@@ -3661,13 +3289,11 @@ def test_runtime_tunables_module():
     check("every spawned supervisor has a pid write, so none goes unreported",
           bool(_spawns) and set(_spawns) <= _write_names,
           (sorted(_spawns), sorted(_write_names)))
-    # The report must name them too, or "running" means grepping /proc by hand.
     check("status reports every supervisor it spawns",
           all(f'abk_supervisor_state {_n} ' in action_source for _n in _spawns),
           [_n for _n in _spawns
            if f'abk_supervisor_state {_n} ' not in action_source])
 
-    # --- packaging: the module zip and the AK3 ride-along ---
     sys.path.insert(0, str(repo / "scripts"))
     import ak3_bundle_ksu_module as ak3  # noqa: E402
     import build_ksu_module as bkm  # noqa: E402
@@ -3721,12 +3347,6 @@ def test_runtime_tunables_module():
             check("the shipped PSI tool carries the fixture self test the device lacks",
                   "abk_psi_selftest" in _psi_tool
                   and "psi selftest PASS" in _psi_tool)
-            # The one-way rule.  The upstream version of this switch frees the
-            # group per-cpu windows and calls re-enabling not restore safe; the
-            # Batch 21 graft can restart accounting, but the companion cannot
-            # tell the two kernels apart from userspace, so the walk body must
-            # hold no write of 1.  Sliced, because the self test re-arms its own
-            # fixture files on purpose.
             _psi_walk = _psi_tool.split("abk_psi_walk() {", 1)[1]
             _psi_walk = _psi_walk.split(chr(10) + "}", 1)[0]
             check("the PSI walk only ever writes 0",
@@ -3737,12 +3357,6 @@ def test_runtime_tunables_module():
             check("the PSI tool names Batch 21 as the node origin, not upstream",
                   "Batch 21" in _psi_tool
                   and "inherited upstream" not in _psi_tool)
-            # A live phone deletes cgroups underneath the walk.  Booking that as
-            # "refused" made the supervisor's first-pass rule (nothing off,
-            # nothing disabled, something refused => this kernel will not let me
-            # write) fire on a single exited app and stop the policy for the rest
-            # of the boot.  The two counters are separate on purpose and the
-            # fixture has a node that disappears to prove it.
             check("the PSI walk books a group that went away mid-walk as vanished",
                   "ABK_n_vanished" in _psi_tool
                   and "vanished=$ABK_n_vanished" in _psi_tool
@@ -3751,21 +3365,8 @@ def test_runtime_tunables_module():
             check("the PSI selftest asserts the vanished counter",
                   "vanished=1" in _psi_tool)
             _psi_bench = archive.read("bin/abk_psi_bench.sh").decode("utf-8")
-            # Whether a string is absent depends on comment vs code here: two of
-            # the strings below are named in the tool header precisely because
-            # they are the old bugs, so the absence checks run against a
-            # comment-stripped view (the same split the DVFS pins use above).
             _psi_bench_code = "\n".join(l for l in _psi_bench.splitlines()
                                          if not l.lstrip().startswith("#"))
-            # The first version of this tool billed itself out of /proc/stat and was
-            # rewritten after the first device run, because two things about it were wrong
-            # in ways every local gate had passed: machine-wide busy jiffies are about 45%
-            # background load on this phone, so the saving this switch can produce is a
-            # rounding error on that number; and its wake storm was a second fork storm
-            # wearing a wake storm label, because toybox sleep forks.  The pins below are
-            # about the second version, and they pin the same three shapes the first one
-            # ate: a reading that came back silently empty, a label the tree does not
-            # support, and a run that generated no work exiting 0.
             check("the bench reads cpu.stat by key, not by summing /proc/stat",
               "awk -v k=" in _psi_bench_code and "$1 == k" in _psi_bench_code
                   and "/^cpu  /" not in _psi_bench_code
@@ -3781,11 +3382,6 @@ def test_runtime_tunables_module():
             check("a missing storm binary fails the bench instead of passing it",
               "cannot generate a storm" in _psi_bench
                   and "exit 1" in _psi_bench.split("cannot generate a storm", 1)[1][:40])
-            # The loop must create no process at all.  "sleep 0" was the first
-            # shape of that bug; the second was "printf", which on the target
-            # ROM is a tracked alias to /system/bin/printf -- 500 calls measured
-            # 6.3 s on device, i.e. two fork+execs per round trip.  echo is a
-            # builtin there (500 calls: 0.01 s).
             check("the wake storm is a blocking wake, not a fork storm in disguise",
               "mkfifo" in _psi_bench_code and "sleep 0" not in _psi_bench_code
                   and "printf" not in _psi_bench_code
@@ -3793,20 +3389,13 @@ def test_runtime_tunables_module():
                   and "echo y; done <" in _psi_bench_code)
             check("the bench reports the groups it left behind",
               "groups left =" in _psi_bench)
-            # The companion's own periodic pass disables every unprotected group,
-            # the bench's arms included, so a run crossing a tick would compare
-            # two disabled arms and call the difference a saving.
             check("the bench re-checks both arms every round and aborts if one moved",
                   "arm state changed mid-run" in _psi_bench
                   and "want=$_want_v" in _psi_bench)
             check("the bench has a help path", "-h|--help) abk_usage" in _psi_bench)
-            # Measured on the target device: _diff * 10000 overflows mksh's 32-bit
-            # arithmetic and printed 49 permille for a negative saving.  Divide first.
             check("the bench cannot overflow its 32-bit arithmetic",
                   "_diff / (_on_tot / 1000)" in _psi_bench_code
                   and "* 10000 / _on_tot" not in _psi_bench_code)
-            # Installed under bin/, these are module code as much as service.sh
-            # is, so the same two invariants apply to them.
             for _bin in sorted(n for n in names if n.startswith("bin/")):
                 _bin_code = "\n".join(
                     line.split("#", 1)[0]
@@ -3861,9 +3450,6 @@ def test_runtime_tunables_module():
         saved_env = {key: os.environ.pop(key, None)
                      for key in ("ANYKERNEL3", "GITHUB_WORKSPACE")}
         try:
-            # Outside the directory that now holds a real AK3 tree, the
-            # discovery must report "nothing" rather than pick a stranger's
-            # anykernel.sh.
             with tempfile.TemporaryDirectory() as empty_tmp:
                 check("injector discovers nothing instead of guessing",
                       ak3.discover_ak3_dir(None, start=Path(empty_tmp)) is None)
@@ -3872,7 +3458,6 @@ def test_runtime_tunables_module():
                 if value is not None:
                     os.environ[key] = value
 
-    # --- device behaviour, against a fixture sysfs tree ---
     bash = shutil.which("bash")
     if bash is None:
         print("  (no bash on this host: policy behaviour checks skipped)")
@@ -4390,7 +3975,6 @@ rm -rf "$T"
           got.get("disksize1") == "17179869184", r.stdout)
     check("takeover caps zram at 25% of RAM, floored to the mem_limit alignment",
           got.get("memlimit1") == "3983605760", r.stdout)
-    # The device run behind this: an unaligned target read one page high every tick; flooring to 64 KiB makes the kernel's round an identity.
     check("the regression fixture reproduces the device's unaligned target",
           got.get("ml0_raw") == "2933763072" and got.get("ml0_mod") != "0",
           (got.get("ml0_raw"), got.get("ml0_mod")))
@@ -4439,8 +4023,6 @@ rm -rf "$T"
     check("the refused run leaves the ROM's algorithm alone",
           got.get("primary2") == "lz4hc", r.stdout)
 
-    # 3: writeback-capable, unowned -> the module establishes it rather than
-    # losing it (this is the half that used to be traded away).
     check("an unowned writeback device is set up during the rewrite",
           got.get("RC3") == "0" and got.get("primary3") == "lz4kd", r.stdout)
     check("the backing device is a loop device over the backing file",
@@ -4453,7 +4035,6 @@ rm -rf "$T"
           and "bs=1048576" in got.get("calls3", "")
           and "seek=1023" in got.get("calls3", ""), got.get("calls3"))
 
-    # 4: a live writeback device survives the rewrite.
     check("a live writeback device is re-attached, not dropped",
           got.get("backing4") == "/dev/block/loop7" and got.get("RC4") == "0", r.stdout)
     check("... and the same device is reused instead of a new loop",
@@ -4462,14 +4043,12 @@ rm -rf "$T"
     check("... with the ROM's own writeback limit kept",
           got.get("limit4") == "512", got.get("limit4"))
 
-    # 5: never trade a live writeback device for the algorithm.
     check("a live writeback device plus swap in use refuses the rewrite",
           got.get("RC5") != "0" and "swapoff" not in got.get("calls5", ""),
           (got.get("RC5"), got.get("calls5")))
     check("... leaving the ROM's algorithm alone", got.get("primary5") == "lz4hc",
           r.stdout)
 
-    # 6: locked kernel -> nothing to rewrite.
     check("the kernel-side lock is detected", got.get("locked6") == "yes", r.stdout)
     check("a locked kernel is left completely alone",
           got.get("RC6") == "0" and "swapoff" not in got.get("calls6", "")
@@ -4487,10 +4066,6 @@ rm -rf "$T"
           got.get("supervisor_compact") == "100", r.stdout)
     check("the supervisor up line carries the gate config, so the defaults are pinned",
           got.get("supervisor_gate_line") == "compact=1>50MB+15%", r.stdout)
-    # The mark runs once and the sweeps in between must not repeat it: a mark
-    # re-sets ZRAM_IDLE on every page older than the cutoff, and a recompressed
-    # page never has its age refreshed, so marking each sweep would pin the
-    # capped pass to the same first max_pages entries forever.
     check("the first sweep marks and the ones after it pass --no-mark",
           "--no-mark" not in got.get("supervisor_args", "")
           and "--no-mark" in got.get("supervisor_args2", ""),
@@ -4500,8 +4075,6 @@ rm -rf "$T"
     check("the supervisor records its own pid", got.get("supervisor_pid") == "set",
           r.stdout)
 
-    # 7b assertions.  One mark per mark_interval / interval_sec sweeps: here
-    # every second sweep, so mark, drain, mark, drain.
     check("the mark cadence survives long enough to reach a second mark",
           (got.get("mark_runs") or "0").isdigit()
           and int(got["mark_runs"]) >= 4, r.stdout)
@@ -4515,10 +4088,6 @@ rm -rf "$T"
     check("the sweep after the second mark passes --no-mark",
           "--no-mark" in got.get("mark_run4", ""), got.get("mark_run4"))
 
-    # 11: the writeback sweep.  The kernel only moves a page when userspace
-    # asks, so this is the whole trigger -- and it is the one place the module
-    # writes the writeback node, which is why `off` is checked as hard as the
-    # two live modes.
     check("the writeback sweep leaves the node alone while trigger=off",
           got.get("wb_off_lines") == "0" and got.get("wb_off_limit") == "0",
           (got.get("wb_off_lines"), got.get("wb_off_limit")))
@@ -4549,18 +4118,13 @@ rm -rf "$T"
     check("the shipped tunables.conf carries that off default",
           any(line.strip() == "zram.writeback=off" for line in tunables.splitlines()),
           tunables)
-    # 12: the boot gate.  Nothing may attach before sys.boot_completed, because
-    # init empties /data/per_boot at that property (init.rc).
     check("writeback is not wanted before the boot completes",
           got.get("want12") == "no", r.stdout)
-    # abk_zram_backing_dev() reports the kernel's "none" as an empty string.
     check("... and no backing file is created either",
           got.get("RC12") == "0" and not got.get("backing12")
           and "dd if=/dev/zero" not in got.get("calls12", "")
           and "losetup" not in got.get("calls12", ""),
           (got.get("RC12"), got.get("backing12"), got.get("calls12")))
-    # 13: after the boot it attaches, and with the policy off it releases its own
-    # file instead of preserving a device nothing can use.
     check("after boot_completed the same policy attaches a backing file",
           got.get("RC13") == "0" and got.get("backing13") == "/dev/block/loop42"
           and "dd if=/dev/zero" in got.get("calls13", ""), got.get("calls13"))
@@ -4573,21 +4137,15 @@ rm -rf "$T"
     check("a backing device the ROM owns is never released",
           got.get("RC14") == "0" and got.get("backing14") == "/dev/block/loop7"
           and "losetup -d" not in got.get("calls14", ""), got.get("calls14"))
-    # 15/16: what an older build left behind has to go at the first pass, without
-    # waiting for a rewrite that may never come -- but never while it is in use.
     check("a stale backing file is removed at the first pass",
           got.get("RC15") == "0" and got.get("file15") == "removed", r.stdout)
     check("... but not while a backing device is attached",
           got.get("file16") == "present", r.stdout)
-    # 15561024 KiB is past 2^31 bytes; a 32-bit shell would wrap it negative.
     check("byte counts survive the 32-bit shell arithmetic limit",
           got.get("ram_bytes") == "15934488576"
           and got.get("ram_25pct") == "3983622144"
           and got.get("ram_half") == "7967244288",
           (got.get("ram_bytes"), got.get("ram_25pct"), got.get("ram_half")))
-    # A 16 GiB swap is the case that broke on device: `[ 17179869184 -gt 0 ]` is
-    # false under this ROM's mksh, so the module treated a healthy device as
-    # sizeless and halved it on the next rewrite.
     check("a 16 GiB swap size is preserved, not treated as sizeless",
           got.get("saved_live") == "17179869184"
           and got.get("saved_fallback") == "7967244288",
@@ -4606,7 +4164,6 @@ rm -rf "$T"
     check("the log records the supervisor start",
           (got.get("log_supervisor") or "0") != "0", r.stdout)
 
-    # 10: the compaction gate, directly.
     check("a fragmented device gets one full compaction pass",
           got.get("compact_go") == "100"
           and (got.get("compact_go_log") or "0") != "0",
@@ -4621,23 +4178,10 @@ rm -rf "$T"
 
 
 def test_batch8_autofdo_tool():
-    """The AutoFDO tool is a build-engineering script, not a graft.
-
-    It never edits a kernel tree and never registers a PatchGroup; its only job
-    is to collect a device-specific 5.15 AutoFDO profile and to refuse any
-    profile that does not identify a 5.15 kernel or whose vmlinux hash does not
-    match the recorded build.  These checks exercise only the offline gates
-    (init / validate / build-env); record and convert need a real device, adb
-    and simpleperf/create_llvm_prof, so they are not invoked here.
-    """
     print("Batch 8 AutoFDO profile tool")
     tool = Path(__file__).resolve().parent.parent / "tools" / "autofdo_515_profile.sh"
     check("autofdo tool exists", tool.is_file(), tool)
 
-    # The tool is a host script; on Windows the only bash is WSL's, which cannot
-    # open a C:\... path (backslashes and the drive letter are mangled before
-    # bash ever sees them).  Every path argument therefore has to be handed over
-    # in /mnt/<drive>/... form, exactly as the other shell-driven tests do.
     bash = shutil.which("bash")
     if bash is None:
         print("  (no bash on this host: autofdo checks skipped)")
@@ -4718,17 +4262,6 @@ def test_batch8_autofdo_tool():
 
 
 def test_madvise_collapse_step_independence():
-    """No step of a group may pre-create a later step's replacement text.
-
-    ``replace_once`` checks the replacement before the anchor (idempotency), so
-    a step whose ``new`` text is contained in an earlier step's ``new`` text is
-    silently reported ``already_present`` while the group still says "applied".
-    That is how the MADV_COLLAPSE ``khugepaged_scan_file()`` signature reached
-    CI: the CONFIG_SHMEM-off stub was built by string-concatenating the very
-    signature the following step was supposed to install, so the real
-    CONFIG_SHMEM=y definition stayed at four parameters while its body and all
-    of its callers moved to five.
-    """
     print("madvise_collapse step independence (silent-skip trap)")
     import abk_stable_core as core
 
@@ -4739,7 +4272,6 @@ def test_madvise_collapse_step_independence():
           "int *res)" in core._MC_FILE_STUB_NEW
           and "BUILD_BUG();" in core._MC_FILE_STUB_NEW)
 
-    # Same invariant, generically, over every _MC_*_NEW pair.
     new_blocks = {n: getattr(core, n) for n in dir(core)
                   if n.startswith("_MC_") and n.endswith("_NEW")
                   and isinstance(getattr(core, n), str)}
@@ -4748,7 +4280,6 @@ def test_madvise_collapse_step_independence():
               in new_blocks[a].replace("\r\n", "\n")]
     check("no _MC_ replacement contains another", not nested, nested)
 
-    # End-to-end on a two-definition fixture: both signatures must move.
     fixture = (
         "#ifdef CONFIG_SHMEM\n"
         + core._MC_FILE_SIG_OLD + "\n{\n\tint result = SCAN_SUCCEED;\n}\n"
@@ -4767,14 +4298,6 @@ def test_madvise_collapse_step_independence():
 
 
 def test_madvise_collapse_revalidate_convention():
-    """The graft must use the 5.15 hugepage_vma_revalidate() return convention.
-
-    5.15 returns 0 on success and a scan code otherwise; 6.1 returns
-    SCAN_SUCCEED, which is 1 in this enum.  Copying the 6.1
-    ``!= SCAN_SUCCEED`` test makes every successful revalidation look like a
-    failure, so any multi-PMD MADV_COLLAPSE that dropped mmap_lock returns
-    -EINVAL.  It compiles either way, so only this assertion catches it.
-    """
     print("madvise_collapse revalidate return convention")
     import abk_stable_core as core
 
@@ -4788,7 +4311,6 @@ def test_madvise_collapse_revalidate_convention():
 
 
 def test_batch17_zram_writeback():
-    """Batch 17 registry, anchor hygiene and the C-level shape of the graft."""
     print("Batch 17: zram writeback batching + compressed writeback")
     import batch14_core_zram_writeback as b14
     import batch17_core_zram_writeback as b17
@@ -4816,19 +4338,10 @@ def test_batch17_zram_writeback():
         for _rel, old, new, _req in group_steps:
             steps.append((key, old, new))
 
-    # A later anchor that occurs inside an earlier replacement is how
-    # replace_once edits the wrong occurrence or leaves a duplicated copy
-    # behind: no group status and no brace/comment balance check can see it.
-    # This is the exact shape that shipped a stray page = alloc_page() into the
-    # sweep while this batch was being written (the batching group then
-    # replaced the *pristine* copy and left the one Batch 14 had just inserted,
-    # because _B_POSTLOCK_NEW still carried that line while _B_POSTLOCK no
-    # longer did).
     collisions = []
     for i, (k1, _o1, n1) in enumerate(steps):
         for k2, o2, _n2 in steps[i + 1:]:
             if k1 == k2:
-                # within one group the per-step audit (trap 2) covers it
                 continue
             if o2 in n1:
                 collisions.append((k1, k2, o2.strip()[:60]))
@@ -4842,57 +4355,40 @@ def test_batch17_zram_writeback():
     g2 = joined("b17:batch_size")
     g3 = joined("b17:compressed")
 
-    # bf62f69574b1: the UAF fix is the only form that may ship.
     check("wb_ctl is freed through RCU", "kfree_rcu(wb_ctl, rcu)" in g1)
     check("the buggy kfree(wb_ctl) form is not shipped",
           "kfree(wb_ctl);" not in g1)
     check("the completion callback runs inside an RCU read section",
           "rcu_read_lock();" in g1 and "rcu_read_unlock();" in g1)
-    # 3e8d8eb8d7f5: release the reservation *before* draining.
     tail = b17._A_TAIL_NEW
     check("the reserved blk_idx is released before the drain",
           tail.index("free_block_bdev(zram, blk_idx);")
           < tail.index("while (atomic_read(&wb_ctl->num_inflight) > 0)"))
     check("a recycled request drops its block index",
           "req->blk_idx = 0;" in g1)
-    # 5.15 slot metadata: the block index lives in .element, not in a handle.
     check("the block index is stored through zram_set_element()",
           "zram_set_element(zram, index, req->blk_idx)" in g1
           and "zram_set_handle(zram, index, req->blk_idx)" not in g1)
-    # The sweep must not wait synchronously and must still yield.
     loop = b17._A_LOOP_NEW
     check("the sweep no longer submits synchronously",
           "submit_bio_wait" not in loop)
     check("the sweep yields once per iteration",
           loop.count("cond_resched();") == 1)
-    # The gate only *reads* the budget; charging moved into the submission
-    # helper (before submit_bio), or a batch of in-flight bios would overshoot
-    # the configured limit by up to wb_batch_size pages.
     check("the sweep only reads the writeback budget",
           loop.count("spin_lock(&zram->wb_limit_lock);") == 1
           and "zram->bd_wb_limit -=" not in loop)
     check("the in-flight window is marked with ZRAM_UNDER_WB",
           "zram_set_flag(zram, index, ZRAM_UNDER_WB)" in loop
           and "zram_clear_flag(zram, index, ZRAM_UNDER_WB)" in loop)
-    # d38fab605c66 (+ 3bf1c285dc40) write half.
-    # The needle carries its call shape on purpose: the helper block documents
-    # the upstream API by name in a comment, and a bare needle would match the
-    # comment and fail the assertion it is supposed to protect.
     check("the raw object read uses the 5.15 mapping API",
           "zs_map_object(zram->mem_pool, handle, ZS_MM_RO)" in g1
           and "zs_obj_read_begin(zram->mem_pool" not in g1)
     check("trailing bytes are zeroed before writeback",
           "memzero_page(page, size, PAGE_SIZE - size)" in g1)
-    # This is the batching group's *generated* payload.  Batch 32
-    # (zram_wb_slot_preserve) later removes the save/restore dance from it --
-    # the pairs asserted there are what keeps the metadata without going through
-    # zram_free_page(), and the assertions below stay true of this group's own
-    # replacement block.
     check("compressed writeback preserves the slot metadata",
           "zram_set_obj_size(zram, index, size)" in g1
           and "zram_set_priority(zram, index, prio)" in g1)
     check("the write half is gated on the flag", "zram->wb_compressed" in g1)
-    # d38fab605c66 read half, 5.15 zcomp convention included.
     check("decompression uses the 5.15 stream API",
           "zcomp_stream_put(zram->comps[prio])" in g3
           and "zcomp_stream_put(zstrm)" not in g3
@@ -4903,7 +4399,6 @@ def test_batch17_zram_writeback():
     check("a stale read-back zeroes through zero_user()",
           "zero_user(page, 0, PAGE_SIZE)" in g3
           and "memset_page(" not in g3)
-    # Defaults, the attribute surface and the bounded pool.
     check("the batch size defaults to upstream 32 and compressed is off",
           "zram->wb_batch_size = 32;" in g1
           and "zram->wb_compressed = false;" in g1)
@@ -4914,15 +4409,11 @@ def test_batch17_zram_writeback():
           and "dev_attr_compressed_writeback.attr" in g3)
     check("compressed writeback refuses a live device",
           "return -EBUSY;" in g3 and "zram->wb_compressed = val;" in g3)
-    # step_audit trap 4: the third group shape probe must accept both the
-    # pristine and the already-redirected call site, or it reports
-    # blocked_by_shape on every second pass.
     src = (Path(__file__).resolve().parent.parent / "scripts"
            / "batch17_core_zram_writeback.py").read_text()
     check("the compressed-writeback probe accepts both call shapes",
           "ret = __zram_bvec_read(zram, page, index, bio, true);" in src
           and "ret = abk_zram_bvec_read(zram, page, index, bio, true);" in src)
-    # Degradation on a foreign tree: no half-patched writes.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
             "drivers/block/zram/zram_drv.c": "static int zram_bvec_read(void);\n",
@@ -4941,16 +4432,6 @@ def test_batch17_zram_writeback():
 
 
 def test_batch32_zram_wb_slot_preserve():
-    """Batch 32: a written-back slot keeps its metadata and is counted once.
-
-    The fixture's completion helper is *batch17's own generated text*
-    (``_A_HELPERS_NEW``), not a copy of this batch's anchors, so the steps are
-    checked against the shape the earlier group really produces.  The
-    zram_free_page() half is composed from this batch's pristine anchor, but
-    that block is byte-identical in pristine 5.15 and in the shape
-    zram_recompression rewrites it into -- which step_audit.py verifies for real
-    on all four baselines.
-    """
     print("Batch 32: zram_wb_slot_preserve (no zram_free_page() on a WB slot)")
     import inspect
 
@@ -4970,11 +4451,6 @@ def test_batch32_zram_wb_slot_preserve():
         check(f"registered after {earlier}",
               keys.index("zram_wb_slot_preserve") > keys.index(earlier))
 
-    # Trap 5: this group rewrites zram_writeback_complete(), which
-    # zram_writeback_batching generates.  That group must therefore recognise
-    # its own payload -- without the probe a second pass drops to
-    # blocked_by_shape (its replacement block no longer matches the file) and
-    # step_audit.py fails on the patched tree.
     src = inspect.getsource(b17._batching_apply)
     check("_batching_apply short-circuits on its own payload",
           b32.BATCHING_PAYLOAD in src and "already_present" in src,
@@ -4984,7 +4460,6 @@ def test_batch32_zram_wb_slot_preserve():
     check("three required steps",
           len(steps) == 3 and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j in range(i + 1, len(steps)):
             check("step %d new does not contain step %d new" % (i, j),
@@ -5020,9 +4495,6 @@ def test_batch32_zram_wb_slot_preserve():
         "\tzram_set_obj_size(zram, index, 0);\n"
         "}\n"
     )
-    # The real generated shape: the batching group's helper suite (it carries
-    # zram_writeback_complete() plus the pool/endio/drain helpers) followed by
-    # the free path it is counted against.
     fixture = b17._A_HELPERS_NEW + "\n" + free_page
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -5041,17 +4513,9 @@ def test_batch32_zram_wb_slot_preserve():
               and "atomic64_sub(zram_get_obj_size(zram, index)," in body
               and "if (zram_test_flag(zram, index, ZRAM_HUGE))\n"
                   "\t\tatomic64_dec(&zram->stats.huge_pages);" in body)
-        # pages_stored moved in both directions before (zram_free_page's out:
-        # label decremented, the path incremented); dropping only one side
-        # would make a written-back page start counting twice.
         mentions = [ln for ln in body.split(chr(10)) if "pages_stored" in ln]
         check("pages_stored is left untouched by completion",
               all(ln.lstrip().startswith("*") for ln in mentions), mentions)
-        # The metadata readers this keeps: obj_size/priority for the compressed
-        # read, ZRAM_HUGE for the raw one.  The values must survive on the slot,
-        # i.e. nothing may write them back from a saved copy -- asserted on the
-        # function slice, because the recompression path legitimately writes
-        # obj_size and priority after its own zram_free_page().
         check("the saved-copy restore dance is gone",
               "\t\tsize = zram_get_obj_size(zram, index);" not in text
               and "\tu32 size = 0, prio = 0;" not in text)
@@ -5062,8 +4526,6 @@ def test_batch32_zram_wb_slot_preserve():
               and "\t\tif (huge)" not in body,
               [ln for ln in body.split(chr(10))
                if "huge" in ln or "prio" in ln])
-        # The other half of the accounting: the final release of a written-back
-        # huge slot must not decrement the counter a second time.
         check("zram_free_page() guards the huge-page decrement",
               b32.HUGE_GUARD in text)
         check("the huge-page decrement is written once per side",
@@ -5079,16 +4541,12 @@ def test_batch32_zram_wb_slot_preserve():
               (status2, detail2))
         check("second pass is byte-identical", ctx.read(b32.ZRAM_C) == snapshot)
 
-        # A tree that never gained the batching graft degrades; it must not
-        # rewrite the free path for a writeback path that does not exist.
         ctx_bare = make_ctx(tmp + "/bare", {b32.ZRAM_C: free_page})
         status3, detail3 = group.apply_fn(ctx_bare)
         check("degrades without zram_writeback_batching",
               status3 == "blocked_by_shape" and "zram_writeback_batching" in detail3,
               (status3, detail3))
 
-        # Half a tree: the completion helper is there, the huge block is not.
-        # Transactional apply, so nothing at all may be written.
         half = b17._A_HELPERS_NEW + "\nstatic void zram_free_page(void) {}\n"
         ctx_half = make_ctx(tmp + "/half", {b32.ZRAM_C: half})
         status4, detail4 = group.apply_fn(ctx_half)
@@ -5099,76 +4557,38 @@ def test_batch32_zram_wb_slot_preserve():
 
 
 def test_batch27_launch_bench():
-    """The cold-launch instrument refuses to answer a question it did not ask.
-
-    Batch 27's premise is that a launch has three candidate owners and only
-    measurement taken *during* the launch window separates them, so the tool's
-    value is entirely in what it refuses: a median it did not take, a placement
-    ratio out of too few samples, a run against a dozing phone.  Those refusals
-    are what these checks pin -- the device run itself is in
-    research/launch/vermeer_launch_20260915/.
-    """
     print("Batch 27 cold-launch instrument")
     repo = Path(__file__).resolve().parent.parent
     tool = repo / "tools" / "abk_launch_bench.sh"
     check("launch bench exists", tool.is_file(), tool)
     text = tool.read_text(encoding="utf-8")
-    # The header's own promise, and the trap that produced the first wrong answer.
     check("the tool documents the screen guard",
           "dozing" in text and "top-app (cpus 0-7)" in text)
     check("the tool names its batch of origin",
           "Batch 27" in text)
-    # The user-side stack is not a kernel feature and the tool must not imply it
-    # is.  Naming it is allowed -- the storage verdict names it precisely to say
-    # it is not running -- but only in a sentence that calls it userspace, and no
-    # invented CONFIG_ name may appear at all.
     check("the tool does not claim launch_boost is a kernel feature",
           "CONFIG_LAUNCH_BOOST" not in text
           and ("xiaomi.launch_boost" not in text
                or ("userspace" in text and "is not running" in text)))
-    # 32-bit shell arithmetic: 855 * 2803200 wraps on this ROM, so the product has
-    # to reach awk.  Same rule abk_fas_check.sh landed with.
     check("cap_view goes through awk, not shell arithmetic",
           "a * f / m" in text and "int(carch[p] * clr[k] / cinfo[p])" in text)
     check("the refusal to report a zero it did not measure is present",
           "0 ms would be a lie" in text)
-    # "The launch did not run on the super core" has two different owners and the
-    # tool must not name one when it only measured the other: a measured ceiling
-    # inversion is the ceiling holder's problem, while an available-but-unused
-    # super core is an outcome with no cause measured in that run.
     check("the two placement verdicts are distinct",
           "VERDICT: ceiling bound." in text
           and "VERDICT: placement bound, cause not measured." in text)
-    # The storage verdict may only be printed when the other arm is available.
-    # Measured on device: dropping the page cache made every launch read 5 to 340
-    # times more pages for 11% to 29% more wall clock, so "this arm read N pages"
-    # is traffic and not a cause -- a single arm must not be allowed to call it.
     check("the storage verdict needs the other arm",
           "abk_storage_share" in text and "--compare" in text
           and "one arm cannot say" in text)
-    # The device state is re-read before every launch, not only at startup: four
-    # runs produced complete, plausible tables from a phone that was asleep or
-    # sitting on its lock screen, and the visible symptoms were "the launches that
-    # failed are the ones that were warm" and "the super core is not in the app's
-    # cpuset".  Both are the same precondition, so both are checked.
     check("the device guard is re-checked per launch, not only at startup",
           "abk_device_block" in text and "after $_done_launches launch(es)" in text)
     check("the lock screen is part of the guard, not just the screen",
           "mDreamingLockscreen" in text and "lock screen is up" in text
           and "mShowingLockscreen" in text and "stayed false" in text)
-    # A launch that never reports a LaunchState did not happen; a median over the
-    # survivors is not a sample of anything.
     check("a run that stops producing LaunchStates aborts",
           "produced no LaunchState" in text)
     check("the cpuset range form is expanded, not compared as one token",
           "abk_expand_cpus" in text)
-    # The processor-field strip.  The first version matched up to the first '(',
-    # which never matches on a line whose comm is itself parenthesised; the
-    # substitution then did nothing and $37 read cnswap, so forty launches
-    # reported a perfectly shaped "0/714 samples on the super core".  A fixture
-    # case in the tool's own selftest now covers it; this pins the form.  The
-    # absence half runs against a comment-stripped view, because the header names
-    # the old expression on purpose (the same split the PSI bench pins use).
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
     check("the processor strip goes to the last paren, not the first",
           "sub(/^.*\\) /" in code and "sub(/^[^(]*\\) /" not in code)
@@ -5199,8 +4619,6 @@ def test_batch27_launch_bench():
     r = run_tool(["--selftest"])
     check("launch bench selftest passes", r.returncode == 0, r.stdout + r.stderr)
     check("selftest reports every case it ran", "selftest PASS" in r.stdout)
-    # The fixture cases that back the verdict, by name, so a case silently
-    # dropped from the selftest is a failure here too.
     for case in ("a capped super core counts as an inversion",
                  "a ceiling that moves is reported as ceilings=3",
                  "a pid that never appeared yields 0 polls",
@@ -5209,34 +4627,26 @@ def test_batch27_launch_bench():
                  "the two-arm storage share is 33% here"):
         check(f"selftest covers: {case}", case in r.stdout)
 
-    # A malformed --apps entry is refused before anything is launched.
     r = run_tool(["--apps", "not-a-component", "--selftest"])
     check("a malformed --apps entry is refused with usage", r.returncode == 2,
           r.stdout + r.stderr)
     check("the refusal names the offending entry",
           "not-a-component" in (r.stdout + r.stderr))
-    # ... and a well-formed one is accepted, including the pkg/component form
-    # that repeats the package name (a slash count of one is not the rule).
     r = run_tool(["--apps", "com.example.app/com.example.app/.MainActivity",
                   "--selftest"])
     check("a pkg/pkg.Activity entry is accepted", r.returncode == 0,
           r.stdout + r.stderr)
 
-    # --help must not truncate as options are added (the abk_fas_check.sh lesson).
     r = run_tool(["--help"])
     check("--help prints the usage block", "Usage:" in r.stdout)
     for opt in ("--mode", "--apps", "--iters", "--invert-pct", "--allow-screen-off",
                 "--selftest", "--sys-root", "--save", "--compare"):
         check(f"--help documents {opt}", opt in r.stdout)
-    # The help body is a sed range that ends at a marker in the header.  A code
-    # symbol leaking into it means the range ran past its end -- the failure
-    # abk_fas_check.sh fixed by adding the marker in the first place.
     check("--help stops at its own end marker",
           "end of help" in r.stdout and "abk_launch_selftest" not in r.stdout)
 
 
 def test_batch30_readahead_mmap_miss_race():
-    """Batch 30: the mmap_miss decrement sits behind a page-lock test."""
     print("Batch 30: readahead_mmap_miss_race (concurrent-fault mmap_miss guard)")
     import abk_stable_core as core
     import batch30_core_mmap_miss_races as b30
@@ -5256,9 +4666,6 @@ def test_batch30_readahead_mmap_miss_race():
     rel, old, new, _req = steps[0]
     check("step targets mm/filemap.c", rel == "mm/filemap.c", rel)
 
-    # Trap 1/2: replace_once tests `new` first, so `old` must not survive inside
-    # `new` (that would make a patched tree re-apply) and the block must not be
-    # present in the pristine file.
     check("old is not a substring of new (the guard re-indents the decrement)",
           old not in new)
     check("new is not a prefix of old", not new.startswith(old))
@@ -5313,19 +4720,12 @@ def test_batch30_readahead_mmap_miss_race():
               status2 == "already_present", status2)
         check("the second pass writes nothing",
               ctx2.read("mm/filemap.c") == patched)
-        # A tree without the anchor degrades instead of half-patching.
-        # apply_steps returns None for a missing *required* anchor and the child
-        # maps that to blocked_by_shape (house convention: the shape preflight
-        # is what reports the missing-anchor status).
         ctx3 = make_ctx(tmp, {"mm/filemap.c": "static int other(void) { return 0; }\n"})
         status3, _d3 = b30._mmap_miss_race_apply(ctx3)
         check("a missing anchor degrades to blocked_by_shape",
               status3 == "blocked_by_shape", status3)
         check("a degraded group writes nothing",
               ctx3.pending_writes() == [], ctx3.pending_writes())
-# Minimal arm64/include/asm/pgtable.h shapes -- only what the Batch 31 group
-# anchors on.  The `pte_sw_dirty()` macro is the 5.15 spelling the fix relies
-# on (and it is why this is portable at all: the macro predates the commit).
 _BATCH31_PGTABLE_PRECOMMIT = (
     "#define pte_sw_dirty(pte)\t(!!(pte_val(pte) & PTE_DIRTY))\n"
     "\n"
@@ -5351,16 +4751,6 @@ _BATCH31_PGTABLE_216 = (
 
 
 def test_batch31_arm64_pte_mkwrite_clean():
-    """The port source is 5.15.y's shape, and the target form is the probe.
-
-    Two things this group gets wrong silently if they drift, so both are pinned
-    here rather than only on a real tree: the *name* (mainline's
-    `pte_mkwrite_novma()` arrives with the v6.6 rename 2f0584f3f4bd -- pasting
-    that hunk anchors nowhere on all four baselines, and shows up only as
-    `blocked_by_shape` on a real one), and the *absence* of an ABK marker (an
-    upstream-shape rewrite must leave a baseline that already carries 5.15.196
-    byte-identical, which is what makes 216 report already_present).
-    """
     print("Batch 31 arm64 pte_mkwrite() dirty guard (upstream-shape rewrite)")
     import abk_stable_core as core
 
@@ -5409,7 +4799,6 @@ def test_batch31_arm64_pte_mkwrite_clean():
 
 
 def test_batch33_zsmalloc_free_out_of_lock():
-    """Batch 33: zs_free() returns a dead zspage's pages outside class->lock."""
     print("Batch 33: zsmalloc_free_zspage_out_of_lock (free after the unlock)")
     import abk_stable_core as core
     import batch33_core_zsmalloc_free as b33
@@ -5426,15 +4815,11 @@ def test_batch33_zsmalloc_free_out_of_lock():
     check("three required steps", len(steps) == 3
           and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j in range(i + 1, len(steps)):
             check("step %d new does not contain step %d new" % (i, j),
                   steps[j][2] not in new_i)
 
-    # The region this group owns: the two helpers, then zs_free()'s declaration
-    # head and its tail.  Kept synthetic -- the real anchors are proven against
-    # a fetched tree by step_audit.py.
     fixture = (
         "static void free_zspage(struct zs_pool *pool, struct size_class *class,\n"
         "\t\t\t\tstruct zspage *zspage)\n{\n"
@@ -5460,14 +4845,9 @@ def test_batch33_zsmalloc_free_out_of_lock():
         check("the old locked tail is gone", b33.LOCKED_TAIL not in text)
         check("zs_free() frees after dropping class->lock",
               b33.FREE_OUTSIDE_LOCK in text)
-        # The pages move with the helper: put_page() must now sit above the
-        # wrapper's assert, not inside it.
         check("the locked wrapper no longer touches the pages",
               text.index("put_page(page);")
               < text.index("assert_spin_locked(&class->lock);"))
-        # The wrapper's only remaining job is the locked class stat: class->stats
-        # .objs[] is a plain unsigned long (zs_stat_dec() does -=), so it cannot
-        # move out with the pages.
         check("the class stat stays inside the locked wrapper",
               "zs_stat_dec(class, OBJ_ALLOCATED, class->objs_per_zspage);"
               in text.split("assert_spin_locked(&class->lock);")[1])
@@ -5480,8 +4860,6 @@ def test_batch33_zsmalloc_free_out_of_lock():
               (status2, detail2))
         check("second pass is byte-identical", ctx.read(b33.ZSMALLOC_C) == snapshot)
 
-        # A tree that lacks the anchors degrades instead of half-patching: a
-        # renamed helper nothing calls would change no behaviour at all.
         ctx_bare = make_ctx(tmp + "/bare", {b33.ZSMALLOC_C: "static int x;\n"})
         status3, detail3 = group.apply_fn(ctx_bare)
         check("degrades on an unknown shape", status3 == "blocked_by_shape",
@@ -5491,12 +4869,6 @@ def test_batch33_zsmalloc_free_out_of_lock():
 
 
 def _batch37_memory_reclaim_fixture(b37):
-    """A synthetic ``memory_reclaim()`` in the shape memcg_memory_reclaim makes.
-
-    Assembled out of the batch module's own pre-image constants, so the fixture
-    cannot drift from the anchors the steps are written against (the module's
-    `_*_OLD` blocks are exactly what the group before each one leaves behind).
-    """
     return (
         b37._TOKENS_OLD
         + "\t\t\t      size_t nbytes, loff_t off)\n"
@@ -5525,7 +4897,6 @@ def _batch37_memory_reclaim_fixture(b37):
 
 
 def test_batch37_reclaim_paths():
-    """Batch 37: the memory.reclaim chain plus the lru_add drain filter."""
     print("Batch 37: proactive reclaim's batch, swappiness= and suspend abort")
     import abk_stable_core as core
     import batch37_core_reclaim_paths as b37
@@ -5541,9 +4912,6 @@ def test_batch37_reclaim_paths():
           sorted(groups))
     if set(groups) != set(keys):
         return
-    # Registration order is load-bearing (trap 5): each superseded group must
-    # run before the group that rewrites its output, and the defines must
-    # precede the parser that validates against them.
     order = [g.key for g in core.PATCH_GROUPS if g.key in keys]
     check("the chain is registered in dependency order", order == keys, order)
     for group in groups.values():
@@ -5551,8 +4919,6 @@ def test_batch37_reclaim_paths():
               group.files and all(isinstance(f, str) for f in group.files),
               group.files)
 
-    # Trap 2 across the whole chain: no step may build its replacement out of a
-    # later step's replacement, which replace_once would short-circuit.
     chain_steps = [dict(zip(["rel", "old", "new", "req"], s))
                    for s in b37.build_steps_batch_fidelity()]
     chain_steps += [dict(zip(["rel", "old", "new", "req"], s))
@@ -5567,7 +4933,6 @@ def test_batch37_reclaim_paths():
                   not (a["new"] in b["new"] and i < j)
                   and not (b["new"] in a["new"] and j < i))
 
-    # Trap 5, first link: the memcg group must stop on its own handler.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"mm/memcontrol.c":
                              b37.MEMORY_RECLAIM_MARKER + "\n"
@@ -5578,7 +4943,6 @@ def test_batch37_reclaim_paths():
               status == "already_present" and ctx.pending_writes() == [],
               (status, ctx.pending_writes()))
 
-    # ...and the two superseded groups in the middle of the chain.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"mm/memcontrol.c": b37.DECAYING_BATCH_DECL})
         status, _d = groups["proactive_reclaim_batch_fidelity"].apply_fn(ctx)
@@ -5588,7 +4952,6 @@ def test_batch37_reclaim_paths():
         check("the decaying batch is recognised on a second pass",
               status2 == "already_present" and ctx.pending_writes() == [], status2)
 
-    # End to end over a synthetic handler: the four groups in chain order.
     fixture = _batch37_memory_reclaim_fixture(b37)
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
@@ -5635,7 +4998,6 @@ def test_batch37_reclaim_paths():
         for rel, text in snap.items():
             check(f"second pass is byte-identical for {rel}", ctx.read(rel) == text)
 
-    # The lru_add filter, in 5.15's pagevec shape.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"mm/swap.c": b37._LRU_ADD_OLD + b37._RELEASE_OLD})
         status, detail = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
@@ -5644,14 +5006,9 @@ def test_batch37_reclaim_paths():
         check("a page on its last reference is taken out of the add batch",
               b37.DEAD_PAGE_FILTER in swap
               and "free_unref_page_list(&pages_to_free);" in swap)
-        # The two flags the page no longer clears through __pagevec_lru_add_fn().
         check("the flags the LRU add would have cleared are cleared here",
               "__ClearPageActive(page);" in swap
               and "__ClearPageUnevictable(page);" in swap)
-        # Deliberate 5.15 omission: upstream's deferred-split unqueue touches
-        # page[2], which for the order-0 pages that really linger in the batch
-        # is a neighbouring allocation -- not a list head.  The added comment
-        # names the helper, so the assertion is on the *call*, not the name.
         check("the deferred-split unqueue is not carried onto the page API",
               "folio_unqueue_deferred_split(folio);" not in swap
               and "list_del(page_deferred_list(page));" not in swap)
@@ -5663,7 +5020,6 @@ def test_batch37_reclaim_paths():
         check("the lru_add group's second pass is byte-identical",
               ctx.read("mm/swap.c") == snapshot)
 
-    # Degradation, not half-patching: an unknown shape must not be written.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {"mm/swap.c": "static int x;\n"})
         status, _d = groups["lru_add_drain_dead_folios"].apply_fn(ctx)
@@ -5674,7 +5030,6 @@ def test_batch37_reclaim_paths():
 
 
 def test_batch35_pagecache_pt():
-    """Batch 35: shadow-entry sweeps (the MADV_DONTNEED page-table pair removed)."""
     print("Batch 35: shadow-entry sweeps")
     import abk_stable_core as core
     import batch35_core_pagecache_pt as b34
@@ -5684,23 +5039,13 @@ def test_batch35_pagecache_pt():
     for key in ("truncate_shadow_batch", "truncate_shadow_batch_sweep"):
         check(f"{key} group registered", key in groups)
 
-    # The MADV_DONTNEED page-table pair (madvise_pt_reclaim +
-    # madvise_batch_tlb_flush) was removed: it freed empty PTE pages under
-    # mmap_read_lock and raced the smaps/reclaim page-table walkers on 5.15,
-    # which panicked in smaps_pte_range.  They must NOT be registered.
     for key in ("madvise_pt_reclaim", "madvise_batch_tlb_flush"):
         check(f"{key} group removed", key not in groups)
 
-    # The pair has to be registered in dependency order: the second group
-    # rewrites text the first one wrote, and the first group probes its own
-    # payload so the second pass stops there (trap 5).
     check("the sweep group follows the batch group",
           keys.index("truncate_shadow_batch")
           < keys.index("truncate_shadow_batch_sweep"))
 
-    # Trap 2 inside each group: no step may build its replacement out of a
-    # later step's (the batch clear and the call-site rewrites are four
-    # near-identical blocks, so this is exactly where it would happen).
     for key, builder in (
             ("truncate_shadow_batch", b34.build_shadow_batch_steps),
             ("truncate_shadow_batch_sweep", b34.build_shadow_sweep_steps)):
@@ -5713,22 +5058,12 @@ def test_batch35_pagecache_pt():
                 check("%s: step %d new does not contain step %d new"
                       % (key, i, j), steps[j][2] not in new_i)
 
-    # Trap 1: the two group-4 call-site rewrites share one replacement text
-    # (`clear_shadow_entries(mapping, indices[0], indices[nr-1]);`), which
-    # replace_once would short-circuit on after the first one landed.  They are
-    # distinguished by carrying the surrounding lines, so the two blocks must
-    # differ textually.
     check("the two sweep call-site steps are textually distinct",
           b34._SWEEP_BIP_CALL_NEW != b34._SWEEP_IIP_CALL_NEW)
     check("the two sweep loop steps are textually distinct",
           b34._SWEEP_BIP_LOOP_NEW != b34._SWEEP_IIP_LOOP_NEW)
-    # ... and the same for the two clear steps of the first group.
     check("the two batch clear steps are textually distinct",
           b34._BIP_CLEAR_NEW != b34._IIP_CLEAR_NEW)
-    # The trap-5 probes, asserted by behaviour rather than by source: a deleted
-    # probe is invisible on the first pass (the pair still applies) and only the
-    # second pass fails -- for the truncate pair with a blocked_by_shape, for the
-    # others with a duplicated definition reaching the compiler.
     class _ProbeCtx:
         def __init__(self, texts):
             self._texts = texts
@@ -5747,17 +5082,12 @@ def test_batch35_pagecache_pt():
               probe(_ProbeCtx({rel: before})) is False)
         check(f"{probe.__name__}: true once its payload is in the tree",
               probe(_ProbeCtx({rel: after})) is True)
-    # Both groups of a pair have to probe *their own* payload: a shared probe
-    # would make the first group skip on text the second one writes.
     check("the truncate pair uses two different probes",
           b34._shadow_batch_probe.__name__ != b34._shadow_sweep_probe.__name__)
     check("the batch probe stops on the pagevec form, not the sweep form",
           b34._shadow_batch_probe(_ProbeCtx({b34.TRUNCATE: b34._SWEEP_FN_NEW}))
           is True)
 
-    # End-to-end on a synthetic tree: the first group's pagevec helper is
-    # entirely replaced by the second group's sweep, so the *end state* of the
-    # pair is what both groups are asserted against.
     truncate_fixture = (
         "static inline void __clear_shadow_entry(struct address_space *mapping,\n"
         "\t\t\t\tpgoff_t index, void *entry)\n{\n"
@@ -5811,8 +5141,6 @@ def test_batch35_pagecache_pt():
         "\t\tpagevec_release(&pvec);\n"
         "\t}\n"
         "\treturn ret;\n}\n"
-        # The truncate path keeps its own __clear_shadow_entry() caller, which
-        # is why 5.15 must not delete the helper the sweep group stops using.
         "static void truncate_exceptional_pvec_entries(struct address_space *mapping,\n"
         "\t\t\t\tstruct pagevec *pvec, pgoff_t *indices)\n{\n"
         "\t__clear_shadow_entry(mapping, index, page);\n}\n"
@@ -5829,9 +5157,6 @@ def test_batch35_pagecache_pt():
               "\t\t\t\t struct pagevec *pvec, pgoff_t *indices)" in text)
         check("the per-entry wrapper definitions are gone",
               "static int invalidate_exceptional_entry" not in text)
-        # The needle carries the call shape: the replacement blocks *document*
-        # __clear_shadow_entry() by name in a comment, so a bare symbol count
-        # would match the comment (the same trap smoke.sh records).
         check("the truncate path's own caller survives",
               "truncate_exceptional_pvec_entries" in text
               and text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
@@ -5853,14 +5178,11 @@ def test_batch35_pagecache_pt():
         check("__clear_shadow_entry() keeps its truncate caller",
               text.count("\t__clear_shadow_entry(mapping, index, page);") == 1)
 
-        # Second pass: the earlier group has to stop on its own payload rather
-        # than re-derive anchors the sweep group consumed (trap 5).
         for name, fn in (("batch", group), ("sweep", sweep)):
             status3, detail3 = fn.apply_fn(ctx)
             check(f"second pass: the {name} group is already_present",
                   status3 == "already_present", (status3, detail3))
 
-        # A tree that lacks the anchors degrades instead of half-patching.
         bare = make_ctx(tmp + "/bare35", {b34.TRUNCATE: "static int x;\n"})
         status4, _detail4 = group.apply_fn(bare)
         check("degrades on an unknown shape", status4 == "blocked_by_shape")
@@ -5869,7 +5191,6 @@ def test_batch35_pagecache_pt():
 
 
 def test_batch41_kcompressd_offload():
-    """Batch 41: kcompressd moves kswapd's swap-out compression off kswapd."""
     print("Batch 41: vm_kcompressd_swapout (per-node kcompressd offload)")
     import abk_stable_core as core
     import batch41_core_vm_kcompressd as b41
@@ -5883,10 +5204,6 @@ def test_batch41_kcompressd_offload():
           group.files == [b41.PAGE_IO], group.files)
 
     steps = b41.build_steps()
-    # Four, not three: the CI compile gate failed the first push because
-    # swap_writepage() calls abk_kcompressd_store() while the engine is appended
-    # *after* it, so a prototype is required (upstream's patch inserts the engine
-    # above swap_writepage() and never hits this).
     check("four required steps, all in mm/page_io.c",
           [rel for rel, _o, _n, req in steps] == [b41.PAGE_IO] * 4
           and all(req for _r, _o, _n, req in steps),
@@ -5900,10 +5217,6 @@ def test_batch41_kcompressd_offload():
           b41._C_DECL_NEW)
     check("the prototype's anchor is the doc comment plus the signature",
           b41._C_DECL_OLD == b41.DECL_ANCHOR, b41._C_DECL_OLD)
-    # Trap 1: a replacement block that already exists in the pristine file is
-    # short-circuited by replace_once's idempotency pre-check and the real edit
-    # never lands, while the group still reports applied.  Asserted against the
-    # synthetic pristine fixture for both shapes.
     def pristine_text(frontswap):
         return (
             "#include <linux/sched/task.h>\n"
@@ -5931,7 +5244,6 @@ def test_batch41_kcompressd_offload():
         for index, (_rel, _old, new, _req) in enumerate(steps):
             check(f"{label} shape: step {index}'s replacement is not already "
                   "in the pristine file", new not in base)
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
             if i == j or new_i in old_j:
@@ -5943,10 +5255,6 @@ def test_batch41_kcompressd_offload():
     check("the engine step keeps the file's last function verbatim",
           steps[3][2].startswith(b41._ENGINE_ANCHOR_OLD))
 
-    # Two fixture shapes: the 167/178/194 form and the android13-5.15-lts form
-    # carrying AOSP's android_vh_shrink_page_lock_owner_clear().  The probe is
-    # what discriminates them, because a hook call cannot be emitted on a tree
-    # whose DECLARE_HOOK does not exist.
     prefixes = {
         "plain": b41.PLAIN_PROBE,
         "hook": b41.HOOK_PROBE,
@@ -5964,25 +5272,9 @@ def test_batch41_kcompressd_offload():
                   status == "applied", (status, detail))
             text = ctx.read(b41.PAGE_IO)
 
-            # The engine, the thread and the knob really landed.
             check(f"{label} shape: the store path is hooked in",
                   "\tif (abk_kcompressd_store(page)) {\n" in text
                   and "\t\treturn 0;\n" in text)
-            # The page lock must be released inside that block, before the
-            # return.  Without it the early return skips __swap_writepage(),
-            # which is where the unlock normally happens, so pageout() reads
-            # our 0 as PAGE_SUCCESS, its trylock_page() fails because
-            # shrink_page_list() still holds the lock, `keep:` (which sits
-            # after keep_locked:'s unlock_page()) does no unlocking itself,
-            # move_pages_to_lru() does not unlock either, and
-            # do_swapout()'s own lock_page() sleeps forever.  Measured on
-            # vermeer: 26 pages queued, swapped pinned at 0, thread in D.
-            #
-            # The block is cut out first and then searched, never searched in
-            # place: page_io.c calls unlock_page() in do_swapout() as well,
-            # and an unbounded regex walking forward from the `if` would find
-            # that one and pass with the fix deleted.  Verified by deleting
-            # the line and watching this go red.
             offload_block = re.search(r"\tif \(abk_kcompressd_store\(page\)\)"
                                       r" \{\n(.*?)\n\t\}\n", text, re.S)
             check(f"{label} shape: the offload releases the page lock",
@@ -5994,10 +5286,6 @@ def test_batch41_kcompressd_offload():
             check(f"{label} shape: per-node state is private",
                   "static struct abk_kcompressd_node "
                   "abk_kcompressd_nodes[MAX_NUMNODES];" in text,
-                  # the array is plural because the singular name was
-                  # already taken by the thread function below -- a
-                  # redefinition as different kinds of symbol that no
-                  # text audit could see (the CI compile gate found it).
                   [ln.strip() for ln in text.splitlines()
                    if "abk_kcompressd_nodes[" in ln])
             check(f"{label} shape: the knob and its counters are registered",
@@ -6018,12 +5306,6 @@ def test_batch41_kcompressd_offload():
                   and "if (!frontswap_enabled() &&" in text
                   and "SWP_SYNCHRONOUS_IO" in text)
 
-            # The vendor hook is the shape's defining difference: replicating
-            # it where the tree has no DECLARE_HOOK would not compile, and
-            # dropping it where the tree has it would break the AOSP
-            # shrink_page_lock_owner_clear contract.  Count over the whole
-            # file: once in the fixture's own swap_writepage() on the hook
-            # shape (zero on the plain one) plus one in the engine's replica.
             hook_call = "\t\ttrace_android_vh_shrink_page_lock_owner_clear(page);\n"
             hooked = ("\t\tset_page_writeback(page);\n" + hook_call) in text
             check(f"{label} shape: the frontswap hook follows the tree's shape",
@@ -6032,9 +5314,6 @@ def test_batch41_kcompressd_offload():
                   text.count(hook_call) == (2 if label == "hook" else 0),
                   text.count(hook_call))
 
-            # One lock taken, and the counter/put_page shared by both branches.
-            # "unlock_page(page);" contains "lock_page(page);", so the lock is
-            # counted per line rather than by substring.
             engine = text.split(
                 "ABK stable_515_backport: Batch 41 -- kcompressd swap-out"
                 " offload.", 1)[1]
@@ -6054,16 +5333,10 @@ def test_batch41_kcompressd_offload():
             check("the engine opens no preprocessor gate",
                   "#if" not in engine and "#endif" not in engine)
 
-            # Safety guards.  These are the three that turn an unreachable or
-            # future condition into a fallback instead of a crash or a stall, so
-            # they are pinned like any behaviour-visible symbol.
             guard = ('\tif (unlikely(!PageSwapCache(page))) {\n'
                      '\t\tpr_warn_once("kcompressd: dropping a queued page')
             check("the swap-slot guard skips the write instead of warning",
                   guard in text, text.count("pr_warn_once"))
-            # Comment lines are excluded: the payload *names* WARN_ON_ONCE in
-            # the comment explaining why it is not used, which is the whole
-            # point of the assertion.
             code_lines = [ln for ln in engine.split("\n")
                           if not ln.lstrip().startswith(("*", "/*", "//"))]
             warns = [ln.strip() for ln in code_lines
@@ -6083,12 +5356,6 @@ def test_batch41_kcompressd_offload():
                   and 'pr_err("kcompressd: cannot register '
                       '/proc/sys/vm/kcompressd, offload disabled' in text)
 
-            # Node lifecycle.  Without the teardown, every hotplug removal
-            # leaks a kthread + ring + task_struct; without the stop-aware
-            # predicate, kthread_stop() blocks forever on a thread nothing
-            # wakes, holding mem_hotplug_lock in write mode; without the
-            # in-lock task re-check, a reclaim page that passed the unlocked
-            # task read can touch a just-freed ring.
             check("the node bring-up and teardown both exist",
                   "static void abk_kcompressd_add_node(int nid)" in text
                   and "static void abk_kcompressd_del_node(int nid)" in text)
@@ -6111,9 +5378,6 @@ def test_batch41_kcompressd_offload():
             check("MEM_OFFLINE is gated on the node becoming memoryless",
                   "if (arg->status_change_nid < 0)" in text
                   and "case MEM_OFFLINE:" in text)
-            # The memcg gate is the only helper with a page-shape precondition
-            # (page_memcg's CONFIG_DEBUG_VM_PGFLAGS tail assert), so it has to run
-            # after every shape-agnostic gate.
             order = [text.index("if (!current_is_kswapd())"),
                      text.index("if (!PageAnon(page))"),
                      text.index("if (!frontswap_enabled() &&"),
@@ -6128,9 +5392,6 @@ def test_batch41_kcompressd_offload():
             check(f"{label} shape: second pass is byte-identical",
                   ctx2.read(b41.PAGE_IO) == text)
 
-    # An unknown shape must stop the group, not make it guess: a tree whose
-    # frontswap branch is neither of the two is exactly the tree where the
-    # hook variant might be wrong.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {b41.PAGE_IO:
                              "#include <linux/sched/task.h>\n"
@@ -6151,7 +5412,6 @@ def test_batch41_kcompressd_offload():
 
 
 def test_batch40_erofs_readahead():
-    """Batch 40: the erofs readahead temporary-buffer relaxation."""
     print("Batch 40: erofs_readahead_relaxed_gfp (readahead allocs may fail)")
     import abk_stable_core as core
     import batch40_core_erofs_readahead as b40
@@ -6169,8 +5429,6 @@ def test_batch40_erofs_readahead():
           b40.ZDATA_H == "fs/erofs/zdata.h", b40.ZDATA_H)
 
     steps = b40.build_steps()
-    # The declaration is in the header (5.15 keeps the struct in zdata.h);
-    # the three zdata.c steps only read or clear the field.
     check("the besteffort declaration lands in zdata.h, not zdata.c",
           [rel for rel, _o, new, _r in steps
            if b40.PCLUSTER_BESTEFFORT in new] == [b40.ZDATA_H],
@@ -6178,26 +5436,18 @@ def test_batch40_erofs_readahead():
     check("eight required steps",
           len(steps) == 8 and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j in range(i + 1, len(steps)):
             check("step %d new does not contain step %d new" % (i, j),
                   steps[j][2] not in new_i)
-    # Trap 1: every `new` must be absent from the pristine shape it anchors on.
     for rel, old, new, _req in steps:
         check(f"the {rel} new block is not already in its old block",
               new not in old)
 
-    # The anchor policy: d9281660ff3f is reproduced as an upstream-shape
-    # rewrite, so a baseline that carries the commit must stay byte-identical
-    # and report already_present -- no marker on any of these lines.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         check("step %d adds no ABK marker" % i,
               "ABK stable_515_backport" not in new_i)
 
-    # The polarity trap.  Upstream's field is named `besteffort` but comments
-    # and reads inverted: TRUE means the allocation must succeed.  Assert both
-    # sides by their flags, so a later edit cannot quietly swap the ternary.
     init = steps[6][2]
     check("the mode is read as pcl->besteffort ? NOFAIL : NOWAIT",
           b40.REQ_GFP_INIT in init
@@ -6206,23 +5456,16 @@ def test_batch40_erofs_readahead():
           and init.index("GFP_KERNEL | __GFP_NOFAIL")
           < init.index("GFP_NOWAIT | __GFP_NORETRY"),
           init)
-    # ... and the set side must be `|= !readahead`: a synchronous read
-    # (fe->readahead == false) marks the pcluster must-succeed.
     check("the set side is `besteffort |= !fe->readahead`",
           b40.SET_MODE_LINE == "\tclt->pcl->besteffort |= !fe->readahead;",
           b40.SET_MODE_LINE)
     check("both decompressors take the flags from rq->gfp",
           "erofs_allocpage(pagepool, rq->gfp);" in steps[1][2]
           and "erofs_allocpage(pagepool, rq->gfp);" in steps[2][2])
-    # Upstream threads a new `bool ra` parameter because v6.9 moved the fact;
-    # 5.15 already carries it on the frontend, so copying the signature is the
-    # one form that would be wrong here.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         check("step %d does not copy upstream's `bool ra` parameter" % i,
               "bool ra" not in new_i and "!ra" not in new_i)
 
-    # Synthetic 5.15-shaped tree: only the anchors, which are what the group
-    # owns.  The real text is proven against a fetched tree by step_audit.py.
     fixture = {
         b40.COMPRESS_H: (
             "struct z_erofs_decompress_req {\n"
@@ -6304,14 +5547,12 @@ def test_batch40_erofs_readahead():
         check("the pcluster is put back to pristine",
               b40.RESET_LINE in zd)
 
-        # Two-pass idempotency: the group probes its own payload.
         status2, detail2 = group.apply_fn(ctx)
         check("second pass: already_present",
               status2 == "already_present", (status2, detail2))
         check("second pass: the tree is byte-identical",
               ctx.read(b40.ZDATA_C) == zd)
 
-        # A post-v6.9 erofs (upstream's own layout) is not this group's shape.
         post = make_ctx(tmp + "/post", {
             b40.COMPRESS_H: ("\tunsigned int alg;\n"
                              "\tbool inplace_io, partial_decoding, fillgaps;\n"
@@ -6322,7 +5563,6 @@ def test_batch40_erofs_readahead():
         check("the degraded tree is not written",
               "gfp_t gfp;" not in post.read(b40.COMPRESS_H))
 
-        # A tree that never gained the anchors degrades too.
         bare = make_ctx(tmp + "/bare40", {b40.COMPRESS_H: "static int x;\n"})
         status4, _d4 = group.apply_fn(bare)
         check("degrades on an unknown shape", status4 == "blocked_by_shape")
@@ -6331,7 +5571,6 @@ def test_batch40_erofs_readahead():
 
 
 def test_batch46_erofs_readmore_eof():
-    """Batch 46: the erofs readmore loop stops at the inode size."""
     print("Batch 46: erofs_readmore_past_eof (readmore bounded by i_size)")
     import abk_stable_core as core
     import batch46_core_erofs_readmore_eof as b46
@@ -6353,13 +5592,9 @@ def test_batch46_erofs_readmore_eof():
     for rel, old, new, _req in steps:
         check(f"the {rel} new block is not already in its old block",
               new not in old)
-    # The anchor policy: an upstream-shape rewrite, so a baseline carrying the
-    # commit must stay byte-identical and report already_present.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         check("step %d adds no ABK marker" % i,
               "ABK stable_515_backport" not in new_i)
-    # v6.5 rewrote the `backmost` branch above these lines, so an anchor that
-    # reached into it could match neither the 5.15 nor the upstream shape.
     check("the anchor does not reach the backmost branch",
           "backmost" not in steps[0][1] and "backmost" not in steps[0][2])
     check("the anchor starts at the mapped-extent line",
@@ -6377,10 +5612,6 @@ def test_batch46_erofs_readmore_eof():
           and new_lines[1] == "\twhile ((cur >= end) && (cur < i_size_read(inode))) {",
           (old_lines[1], new_lines[1]))
 
-    # The guard is the second conjunct, so `cur >= end` still terminates the
-    # loop on its own and the new condition can only narrow it.  A port that
-    # put the EOF test first, or replaced the extent test with it, would make
-    # the loop over-read.
     check("the EOF test is the second conjunct",
           b46.LOOP_CONDITION_NEW
           == "\twhile ((cur >= end) && (cur < i_size_read(inode))) {\n",
@@ -6390,8 +5621,6 @@ def test_batch46_erofs_readmore_eof():
     check("the EOF test names i_size_read(inode)",
           b46.EOF_GUARD == "cur < i_size_read(inode)", b46.EOF_GUARD)
 
-    # Only the anchor, which is all the group owns; the real text is proven
-    # against a fetched tree by step_audit.py.
     fixture = {
         b46.ZDATA_C: (
             "static void z_erofs_pcluster_readmore(void)\n{\n"
@@ -6426,16 +5655,12 @@ def test_batch46_erofs_readmore_eof():
         check("the anchor line itself is unchanged",
               "\tcur = map->m_la + map->m_llen - 1;\n" in zd)
 
-        # replace_once checks the new block first, so a tree that carries the
-        # commit short-circuits with no probe of its own.
         status2, detail2 = group.apply_fn(ctx)
         check("second pass: already_present",
               status2 == "already_present", (status2, detail2))
         check("second pass: the tree is byte-identical",
               ctx.read(b46.ZDATA_C) == zd)
 
-        # Upstream's own shape -- the signature lost `end` and `pagepool`, which
-        # this group never owned -- must report already_present, not degrade.
         upstream = make_ctx(tmp + "/upstream", {
             b46.ZDATA_C: (
                 "static void z_erofs_pcluster_readmore("
@@ -6462,16 +5687,6 @@ def test_batch46_erofs_readmore_eof():
 
 
 def test_sched_tunables_module():
-    """sailboat addon 2: the cpufreq/scheduler half, split out of addon 1.
-
-    Every pin below moved here from test_runtime_tunables_module() when the
-    scheduling keys did, so the constants they hold are the ones that were
-    measured on the device.  What is *new* is the split itself: the failure mode
-    of a bad split is silent and expensive -- a key that lands in both modules is
-    written twice by two authors, and a key that lands in neither is a node
-    nobody drives -- so the two key sets are pinned against each other rather
-    than each against a literal.
-    """
     print("sailboat addon 2 (schedutil governor + smart-freq band)")
     repo = Path(__file__).resolve().parent.parent
     module_dir = repo / "ksu" / "sailboat_addon_2"
@@ -6484,12 +5699,6 @@ def test_sched_tunables_module():
     for name in required:
         check(f"module ships {name}", (module_dir / name).is_file())
 
-    # Same CRLF pin as addon 1, and for the same measured reason: a Windows
-    # text-mode write turns every LF into CRLF, `bash -n` says nothing, and the
-    # failure shows up as an inert supervisor.  For tunables.conf it is worse
-    # than a broken script: abk_cfg's awk strips trailing spaces and tabs but not
-    # \r, so sched.abk_sf_floor_pct=85 yields "85\r", abk_clamp_uint rejects it,
-    # and the knob writes nothing at all.
     for name in required:
         blob = (module_dir / name).read_bytes()
         check(f"{name} is LF, not CRLF", b"\r\n" not in blob,
@@ -6509,9 +5718,6 @@ def test_sched_tunables_module():
     check("module id matches the directory KernelSU installs into",
           props.get("id") == module_dir.name == "sailboat_addon_2",
           props.get("id"))
-    # The name is the user-facing contract: addon 1 was renamed to (一) and this
-    # is (二), and the id must NOT follow the display name, because changing an
-    # installed module's id orphans it instead of upgrading it.
     check("the display name is sailboat addon 2",
           props.get("name") == "sailboat 附加模块（二）", props.get("name"))
     check("the id is not the display name",
@@ -6526,9 +5732,6 @@ def test_sched_tunables_module():
     post_fs_data = (module_dir / "post-fs-data.sh").read_text(encoding="utf-8")
     readme_source = (module_dir / "README.md").read_text(encoding="utf-8")
 
-    # --- the split itself ---------------------------------------------------
-    # Addon 1 must no longer own any of this.  A key left behind there is a key
-    # two modules write.
     one = repo / "ksu" / "abk_runtime_tunables"
     one_common = (one / "common.sh").read_text(encoding="utf-8")
     one_tunables = (one / "tunables.conf").read_text(encoding="utf-8")
@@ -6559,15 +5762,11 @@ def test_sched_tunables_module():
     check("addon 1's action.sh points here instead of reading those nodes",
           "ksu/sailboat_addon_2" in one_action
           and "abk_sc_cap_pct" not in one_action)
-    # The packer installs every zip in the bundle directory, which is what makes
-    # two modules ride one AnyKernel3 zip; if that loop ever narrows to a single
-    # id, addon 2 stops shipping silently.
     bundler = (repo / "scripts" / "ak3_bundle_ksu_module.py").read_text(encoding="utf-8")
     check("the AK3 installer installs every bundled module, not just one",
           '*' in bundler and '*.zip' in bundler,
           [l.strip() for l in bundler.splitlines() if ".zip" in l][:3])
 
-    # --- the knobs ---------------------------------------------------------
     dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):]
     sched_knobs = common_sh[common_sh.index("abk_apply_sched_knobs() {"):
                            common_sh.index("abk_gov_wanted() {")]
@@ -6583,13 +5782,6 @@ def test_sched_tunables_module():
     check("the DVFS capacity math goes through abk_mul_div, not shell arithmetic",
           'abk_mul_div "$_rs_arch" "$_rs_max" "$_rs_imax"' in dvfs)
 
-    # action.sh reports the payload nodes from one `for node in ...` loop, so the
-    # pin is the loop's membership rather than ten separate lines.  The gap that
-    # actually shipped was action.sh listing the floor's nodes and nothing of the
-    # cap's, which made "who owns this range" unanswerable on device.
-    # A backslash line-continuation joins the loop's three lines into one, so
-    # the membership is the whole `for ... in ...; do` clause with the
-    # continuations collapsed.
     _loop = re.search(r"(?ms)^  for node in (.*?); do", action_source)
     check("action.sh reports the payload nodes from one loop",
           _loop is not None)
@@ -6601,7 +5793,6 @@ def test_sched_tunables_module():
                  "abk_sc_hold_ms", "abk_sc_release_pct", "abk_sc_release_ms"):
         check(f"action.sh status reports the node {node}",
               node in _node_names, _node_names)
-    # ... and the two read-only nodes are reported beside them, by name.
     for node in ("abk_sf_boosting", "abk_sc_capped", "abk_sc_boosting"):
         check(f"action.sh status reports the read-only node {node}",
               f'abk_show_or_absent "{node}"' in action_source)
@@ -6634,9 +5825,9 @@ def test_sched_tunables_module():
     check("the cap stays above the floor (a crossed band is a frequency lock)",
           sc_cap - sf_floor >= 5 and sc_cap <= 100,
           (sf_floor, sc_cap))
-    check("... and the band's inequality is stated where the next editor reads it",
+    check("... and the band's inequality is stated in the README",
           "floor_pct=85" in tunables_conf and "cap_pct=90" in tunables_conf
-          and "Batch 10-4c ratchet" in tunables_conf,
+          and "Batch 10-4c ratchet" in readme_source,
           [l for l in tunables_conf.splitlines()
            if "floor_pct" in l or "cap_pct" in l])
     dvfs_code = "\n".join(l for l in dvfs.splitlines()
@@ -6645,14 +5836,6 @@ def test_sched_tunables_module():
           "/devices/system/cpu/cpufreq/policy" in dvfs_code
           and "/devices/system/cpu/cpu" in dvfs_code)
 
-    # --- the governor ------------------------------------------------------
-    # The band is inert unless the policy's governor is schedutil, and this ROM
-    # leaves it on walt outside games.  This is the one capability here that has
-    # to fight for the node it writes, and the fight has four load-bearing steps,
-    # each pinned below: the write is refused on the node the policy ships (0444
-    # root:root, EACCES even for root -- measured), the chmod that opens it is
-    # what makes the write succeed, the readback is the only way to tell "armed"
-    # from "actually running", and the supervisor is what keeps it that way.
     gov_block = common_sh[common_sh.index("abk_gov_wanted() {"):
                           common_sh.index("abk_read_flat() {")]
     gov_code = "\n".join(l for l in gov_block.splitlines()
@@ -6700,9 +5883,6 @@ def test_sched_tunables_module():
           [l for l in tunables_code.splitlines() if l.startswith("sched.")])
     check("the DVFS report reads the governor but never writes it",
           "abk_gov_state_line" in dvfs and "abk_gov_enforce" not in dvfs)
-    # The boot order is the whole point of the governor being here at all: the
-    # band and the payloads' ownership gates both need schedutil, so writing the
-    # band first would arm it against a governor that ignores it.
     _pfd_code = "\n".join(l for l in post_fs_data.splitlines()
                           if not l.lstrip().startswith("#"))
     early_order = [_pfd_code.index(t) for t in
@@ -6726,18 +5906,15 @@ def test_sched_tunables_module():
           and "event-driven" in readme_source,
           "README must carry the chmod route, how to revert, and that the"
           " vendor's revert has no identified trigger")
-    # The measured reason cap_pct is 90 and not 95: the vendor pins
-    # scaling_max_freq to 92-94% of cpuinfo.max_freq, and abk_sc_owns() refuses
-    # any cap at or above the pin -- so 95 was armed and never once ran.
     check("the README records why cap_pct is 90 and not 95",
           "92-94%" in readme_source and "never once run" in readme_source)
-    check("tunables.conf says the same thing where the next editor reads it",
-          "92-94%" in tunables_conf)
-
+    check("the tunables ship the band and the README explains the measurement",
+          re.search(r"(?m)^sched\.abk_sf_floor_pct=\d+$", tunables_conf) is not None
+          and re.search(r"(?m)^sched\.abk_sc_cap_pct=\d+$", tunables_conf) is not None
+          and "92-94%" in readme_source)
 
 
 def test_batch72_kcompressd_swapcache_drop():
-    
     print("Batch 72: kcompressd_swapcache_drop (same-pass swap cache drop)")
     import abk_stable_core as core
     import batch72_core_kcompressd_swapcache_drop as b72
@@ -6770,7 +5947,6 @@ def test_batch72_kcompressd_swapcache_drop():
                   "wait_on_page_writeback" not in new)
 
     def synthetic_vmscan():
-        """The three pristine anchors, in file order, in a minimal caller."""
         return (
             "static unsigned int shrink_page_list(struct list_head *page_list)\n"
             "{\n"
@@ -6972,7 +6148,6 @@ B73_INTERNAL_FIXTURE = (
 
 
 def test_batch73_swapin_readahead_window():
-    
     print("Batch 73: swapin_readahead_window (boost/shrink/vma_ra)")
     import abk_stable_core as core
     import batch73_core_swapin_window as b73
@@ -7214,7 +6389,6 @@ def test_batch74_fault_around_app_policy():
 
 
 def test_port_review_regressions():
-    
     print("port review regressions (I-G1 boost clamp order, I-P4 depth formula)")
     import batch73_core_swapin_window as b73
 
@@ -7306,26 +6480,10 @@ def main():
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} of {len(CHECKS_RUN)} check(s): {FAILURES}")
         sys.exit(1)
-    # The count is part of the result.  CHANGELOG.md quotes "N checks" per batch
-    # and plan.md quotes it as the suite total, so the number has to come out of
-    # the runner rather than out of someone's arithmetic over the check sites --
-    # a check inside a loop runs once per iteration and a static count of `check(`
-    # is not the same number.
     print(f"all checks passed ({len(CHECKS_RUN)} checks)")
 
 
 def test_batch42_schedutil_smart_cap():
-    """Batch 42: the freq_cap[] clamp, and its ordering against the floor.
-
-    Two things here are structural rather than cosmetic and are what the test
-    is really for.  First, the cap's payload has to end up *textually ahead* of
-    schedutil_smart_policy's, because android_vh probes run in registration
-    order and the clamp must be the first thing the floor sees -- so the test
-    runs the two groups in both orders and demands the same file.  Second, the
-    release decision must be the request direction, not the util time window
-    whose 70-90% dead band latched the floor's reason on a real device, so the
-    payload is pinned to not contain any of that idiom.
-    """
     print("Batch 42 schedutil_smart_cap (freq_cap[] -> min(freq, cap))")
     import abk_stable_perf as perf
     import batch10_perf_sched_policy as b10
@@ -7343,8 +6501,6 @@ def test_batch42_schedutil_smart_cap():
 
     rel = "kernel/sched/cpufreq_schedutil.c"
     pristine = b42._INC_OLD + "void governor(void);\n" + b42._TAIL_OLD
-    # A tree the floor group has already helped: the include block and the
-    # payload are in, so the cap must not re-add the header.
     floor_only = (b10._INC_NEW + "void governor(void);\n" + b10._TAIL_OLD
                   + b10._POLICY_V2)
 
@@ -7365,7 +6521,6 @@ def test_batch42_schedutil_smart_cap():
         ]:
             check(name, text.count(found) == want, text.count(found))
 
-    # Registry order: floor first, then cap.  This is the order the child ships.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {rel: pristine})
         st_p, d_p = perf._sched_smart_policy_apply(ctx)
@@ -7375,10 +6530,6 @@ def test_batch42_schedutil_smart_cap():
         text = ctx.read(rel)
         cap_init = text.index("late_initcall(abk_sc_init);")
         floor_init = text.index("late_initcall(abk_sf_init);")
-        # Registration order is execution order for android_vh probes.  Both
-        # probes clamp-or-raise are level 7, so within this one translation
-        # unit source order decides: the cap's has to come first, which is what
-        # grafting the payload in front of the anchor buys.
         check("cap's late_initcall is textually before the floor's, so the "
               "clamp is the first thing the floor sees",
               cap_init < floor_init, (cap_init, floor_init))
@@ -7403,8 +6554,6 @@ def test_batch42_schedutil_smart_cap():
                 check(f"{g.key} is idempotent", st2 == "already_present",
                       (g.key, st2))
 
-    # The placement has to make the two orders converge: graft the cap first,
-    # then the floor, and the file must be byte-identical.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {rel: pristine})
         perf._sched_smart_cap_apply(ctx)
@@ -7420,16 +6569,12 @@ def test_batch42_schedutil_smart_cap():
               < reversed_text.index("late_initcall(abk_sf_init);"))
 
     payload = b42._CAP
-    # module_param(NAME, ...) compiles the identifier NAME as the variable, so
-    # every one-name form must really declare it (ABK CI caught the
-    # counterexample in Batch 12; no text audit can see this class).
     declared = set(re.findall(r"(?m)^static\s+[\w \t\*]+?(\w+)\s*=", payload))
     for name in re.findall(r"(?m)^module_param\((\w+),", payload):
         check(f"one-name module_param {name!r} really declares that variable",
               name in declared, (name, sorted(declared)))
 
     for name, cond in {
-        # --- knobs and defaults (upstream constants in parentheses) ---
         "cap ships disabled": "static bool abk_sc_enable = false;" in payload,
         "cap_pct defaults to no clamp": "static uint abk_sc_cap_pct = 100;" in payload,
         "hold_ms is upstream UNCAP_THRES":
@@ -7446,7 +6591,6 @@ def test_batch42_schedutil_smart_cap():
         "all six knobs are 0644":
             len(re.findall(r"(?m)^module_param\(abk_sc_\w+, \w+, 0644\);",
                            payload)) == 6,
-        # --- gates: every one of them, or the ratchet is back ---
         "ownership gate: a non-schedutil governor is refused":
             'strcmp(policy->governor->name, "schedutil") != 0' in payload,
         "ownership gate: the helper is this payload's own, not the floor's":
@@ -7458,7 +6602,6 @@ def test_batch42_schedutil_smart_cap():
             "if (c <= policy->min || c >= policy->max)" in payload,
         "the clamp itself is upstream's form":
             "*target_freq = cap;" in payload,
-        # --- the lesson: release is request-direction, not a util window ---
         "the dead-band lesson is cited in the payload":
             "ABK_SC_RELEASE IS NOT A UTIL WINDOW" in payload
             and "70-90% dead band" in payload,
@@ -7476,10 +6619,7 @@ def test_batch42_schedutil_smart_cap():
             in payload,
         "none of smart_policy's util-window idiom is reused":
             not re.search(r"\b(ABK_SF_\w+|boost_release)\b", payload)
-            # the single abk_sf_ token left is the comment that explains why
-            # the ownership gate is duplicated here rather than shared
             and len(re.findall(r"\babk_sf_\w+", payload)) == 1,
-        # --- per-policy state under a raw spinlock ---
         "state is per-policy, not per-CPU":
             "struct abk_sc_policy {" in payload
             and "abk_sc_policies[policy->cpu]" in payload,
@@ -7493,13 +6633,11 @@ def test_batch42_schedutil_smart_cap():
             "kcalloc(num_possible_cpus(), sizeof(*abk_sc_cpus)," in payload
             and "kcalloc(num_possible_cpus(), sizeof(*abk_sc_policies)," in payload
             and "kfree(abk_sc_cpus);" in payload,
-        # --- the floor yields: the re-assert probe ---
         "the re-assert probe re-applies this pass's clamp only":
             "if (p->capped && *target_freq > cap)" in payload
             and "late_initcall_sync(abk_sc_reassert_init);" in payload,
         "the re-assert cannot touch a target the cap did not clamp":
             "if (!target_freq || !abk_sc_owns(policy, &cap))" in payload,
-        # --- observability ---
         "both read-only nodes are 0444":
             "module_param_cb(abk_sc_boosting, &abk_sc_boosting_ops, "
             "NULL, 0444);" in payload
@@ -7515,7 +6653,6 @@ def test_batch42_schedutil_smart_cap():
         "the only abk_sf_ mention is the comment naming the duplicate":
             payload.count("abk_sf_") == 1
             and "abk_sf_dvfs_owned" in payload,
-        # --- quality red lines ---
         "no debug residue": "pr_err(" not in payload and "pr_debug(" not in payload
             and payload.count("pr_info(") == 1
             and payload.count("pr_warn(") == 3,
@@ -7526,7 +6663,6 @@ def test_batch42_schedutil_smart_cap():
         "every new line carries the marker":
             "/*\n * ABK stable_515_backport: Batch 42 schedutil smart_freq cap"
             in payload
-            # the header plus the three pr_warn lines plus the one pr_info.
             and payload.count("ABK stable_515_backport:") == 5,
     }.items():
         check(name, cond)
@@ -7562,8 +6698,6 @@ def test_batch42_schedutil_smart_cap():
         check("the cap degrades on an empty tree",
               st_m.startswith("blocked") and ctx2.pending_writes() == [],
               (st_m, d_m))
-        # A tree whose include block has a shape this module cannot recognise:
-        # the required anchor misses, so nothing at all is written.
         odd = ("#include <linux/sched/cpufreq.h>\n" + "void governor(void);\n"
                + b42._TAIL_OLD)
         ctx3 = make_ctx(tmp, {rel: odd})
@@ -7573,14 +6707,6 @@ def test_batch42_schedutil_smart_cap():
               (st_o, d_o, ctx3.pending_writes()))
 
 
-# ---------------------------------------------------------------------------
-# Batch 70 / Batch 71: the two minidump fragments.
-# ---------------------------------------------------------------------------
-
-# The fs/proc/task_mmu.c regions Batch 70 rewrites, copied from the 5.15.220
-# tree (android13-5.15-lts).  Only the statements the anchors need are kept,
-# but every anchor must be byte-identical to the tree's text or the fixture
-# would prove nothing.
 TASK_MMU_FIXTURE = (
     "static void smaps_pte_entry(pte_t *pte, unsigned long addr,\n"
     "\t\tstruct mm_walk *walk)\n"
@@ -7654,8 +6780,6 @@ TASK_MMU_FIXTURE = (
     "\treturn 0;\n"
     "}\n"
     "\n"
-    # The pagemap PTE path is pte_to_pagemap_entry(), this file's
-    # per-entry helper; there is no pagemap_pte_range() in task_mmu.c.
     "static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,\n"
     "\t\tstruct vm_area_struct *vma, unsigned long addr, pte_t pte)\n"
     "{\n"
@@ -7742,20 +6866,6 @@ TASK_MMU_FIXTURE = (
 
 
 def test_batch70_smaps_migration_guard():
-    """Batch 70: the smaps/pagemap walkers stop tripping swapops.h:267.
-
-    Field panic MD_RST_STAT.BIN.txt:777:
-    smaps_rollup -> smaps_pte_range -> smaps_pte_entry ->
-    pfn_swap_entry_to_page -> BUG at include/linux/swapops.h:267.  The walkers
-    never hold the target page lock, so a migration that completes between the
-    PTE snapshot and the PageLocked() check is a panic.
-
-    What the test pins is the whole guard, not just its presence: a helper that
-    exists while one caller keeps the direct call still panics on that path,
-    so each of the five call sites is counted, and the direct calls that must
-    stay direct (device-private / device-exclusive entries, whose contract is
-    not PageLocked) are pinned as still-direct.
-    """
     print("Batch 70: smaps_migration_guard (migration-entry PageLocked race)")
     import abk_stable_core as core
     import batch70_core_smaps_migration_guard as b70
@@ -7770,8 +6880,6 @@ def test_batch70_smaps_migration_guard():
     check("fs/proc/task_mmu.c is the module's first fs/proc target",
           b70.TASK_MMU == "fs/proc/task_mmu.c", b70.TASK_MMU)
 
-    # fs/proc/task_mmu.c carries no other group: the guard is a single-writer
-    # file, which is also why its own helper doubles as the idempotency probe.
     owners = [g.key for g in core.PATCH_GROUPS if b70.TASK_MMU in g.files]
     check("no other group writes fs/proc/task_mmu.c",
           owners == ["smaps_migration_guard"], owners)
@@ -7784,15 +6892,11 @@ def test_batch70_smaps_migration_guard():
           [(rel, req) for rel, _o, _n, req in steps])
 
     fixture = TASK_MMU_FIXTURE
-    # Trap 1: a replacement block that already exists in the pristine file is
-    # short-circuited by replace_once's idempotency pre-check while the group
-    # still reports applied -- the graft never lands.
     for index, (_rel, _old, new, _req) in enumerate(steps):
         check(f"step {index}'s replacement is not already in the pristine file",
               new not in fixture)
         check(f"step {index}'s replacement does not start with its own anchor",
               not new.startswith(_old))
-    # Trap 2: no step may build its replacement out of a later step's.
     for i, (_rel, _o, new_i, _req) in enumerate(steps):
         for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
             if i == j or new_i in old_j:
@@ -7800,8 +6904,6 @@ def test_batch70_smaps_migration_guard():
             check(f"step {i} does not pre-create step {j}'s replacement",
                   new_j not in new_i)
 
-    # Every anchor is byte-identical pristine text: the fixture is taken from
-    # the 5.15.220 tree, so these are real upstream anchors.
     for index, (_rel, old, _n, _req) in enumerate(steps):
         check(f"step {index}'s anchor occurs exactly once in the fixture",
               fixture.count(old) == 1, fixture.count(old))
@@ -7813,14 +6915,10 @@ def test_batch70_smaps_migration_guard():
               status == "applied", (status, detail))
         text = ctx.read(b70.TASK_MMU)
 
-        # The helper: the whole point is that it does NOT carry the BUG_ON
-        # contract, so it may never call pfn_swap_entry_to_page() itself.
         helper = text[text.index("/*\n * sailboat_smaps_migration_guard:"):
                       text.index(b70._HELPER_OLD)]
         check("the helper resolves the page itself",
               "p = pfn_to_page(swp_offset(entry));" in helper, helper)
-        # The comment names the form it replaces, so the assertion is over
-        # the helper's code lines only -- "no call", not "no mention".
         helper_code = [ln for ln in helper.split("\n")
                        if not ln.lstrip().startswith(("*", "/*", "//"))]
         check("the helper never calls the BUG_ON form",
@@ -7836,15 +6934,11 @@ def test_batch70_smaps_migration_guard():
         check("the helper returns NULL rather than panicking",
               helper.count("return NULL;") == 2, helper)
 
-        # All five callers route through it: a helper nobody calls changes
-        # nothing, and a caller left on the direct call still panics.
         check("the smaps PTE and hugetlb callers are guarded",
               text.count(b70.PTE_GUARD) == 2, text.count(b70.PTE_GUARD))
         check("the smaps PMD and both pagemap callers are guarded",
               text.count(b70.PMD_GUARD) == 3, text.count(b70.PMD_GUARD))
 
-        # ...and the device-private / device-exclusive entries keep the direct
-        # call, whose contract really is not PageLocked.
         check("the smaps PTE non-migration path keeps the direct call",
               "\t\t\tif (is_migration_entry(swpent)) {\n"
               "\t\t\t\tmigration = true;\n"
@@ -7862,15 +6956,10 @@ def test_batch70_smaps_migration_guard():
               "\t\t\tpage = abk_smaps_migration_page(entry);\n"
               "\t\telse if (is_pfn_swap_entry(entry))\n"
               "\t\t\tpage = pfn_swap_entry_to_page(entry);\n" in text)
-        # pagemap_pmd_range's guard sits behind the tree's own VM_BUG_ON: the
-        # migration-entry precondition still has to be asserted there, or a
-        # batch that dropped it would swap the panic for a silent wrong path.
         check("the pagemap PMD guard keeps the tree's own VM_BUG_ON",
               "\t\t\tVM_BUG_ON(!is_pmd_migration_entry(pmd));\n"
               "\t\t\tmigration = is_migration_entry(entry);\n"
               "\t\t\tpage = abk_smaps_migration_page(entry);\n" in text)
-        # Indexed from the gate, not from the top of the file: the smaps PMD
-        # guard carries the same three-tab text and would otherwise answer.
         gate = text.index("#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION")
         check("the pagemap PMD guard stays inside its CONFIG gate",
               "\t\telse if (is_swap_pmd(pmd)) {" in text
@@ -7878,13 +6967,10 @@ def test_batch70_smaps_migration_guard():
                                    gate)
               < text.index("#endif", gate))
 
-        # Ordering: a file-static helper must exist before its first caller.
         first_guard = min(text.index(b70.PTE_GUARD), text.index(b70.PMD_GUARD))
         check("the helper is defined before its first caller",
               text.index(b70.HELPER_DEF) < first_guard)
 
-        # The migration flag is still raised on the guarded paths: the guard
-        # replaces the page resolution, not the smaps accounting contract.
         check("the smaps PMD caller still raises the migration flag",
               "\t\tif (is_migration_entry(entry)) {\n"
               "\t\t\tmigration = true;\n"
@@ -7893,28 +6979,17 @@ def test_batch70_smaps_migration_guard():
               "\t\t\tif (is_migration_entry(swpent)) {\n"
               "\t\t\t\tmigration = true;\n"
               "\t\t\t\tpage = abk_smaps_migration_page(swpent);\n" in text)
-        # Every caller of the helper already tolerates a NULL page, which is
-        # what makes "skip the entry" the safe outcome instead of a new NULL
-        # dereference.
         check("the NULL contract is satisfied by the callers' own code",
               "\tif (!page)\n\t\treturn;\n" in text
               and "\tif (IS_ERR_OR_NULL(page))\n\t\treturn;\n" in text
               and "\tif (page && !PageAnon(page))\n" in text)
 
-        # No new translation-unit dependency: pfn_to_page() and smp_rmb() are
-        # already visible in this file, so the group must add no include and
-        # open no CONFIG gate.
         check("the guard adds no include",
               text.count("#include") == fixture.count("#include"),
               text.count("#include"))
         check("the guard opens no preprocessor gate",
               text.count("#if") == fixture.count("#if"))
 
-        # The marker is part of the idempotency match, not decoration: a tree
-        # that kept the helper but lost the comment must NOT be skipped as
-        # already_present -- it has to fall through and report blocked_by_shape,
-        # so that a grep for the marker is never the only thing that can find
-        # this graft.
         markerless = text.replace(b70.HELPER_MARKER, "no marker here")
         check("the probe requires the marker, not just the helper",
               b70.HELPER_MARKER in text and b70.HELPER_MARKER not in markerless,
@@ -7926,24 +7001,15 @@ def test_batch70_smaps_migration_guard():
                   status_m == "blocked_by_shape", (status_m, detail_m))
             check("the refusal names the missing marker",
                   b70.HELPER_MARKER in detail_m, detail_m)
-            # The teeth of the refusal: falling through to apply_steps instead
-            # would insert a second copy of a static function, because the helper
-            # step's `old` anchor still matches below the grafted helper while
-            # its `new` block no longer does.  That is a redefinition -- a
-            # compile error on a tree that used to build.
             check("the marker-less tree is not written",
                   ctx_m.pending_writes() == [],
                   ctx_m.pending_writes())
         check("a second pass cannot duplicate the helper",
               text.count(b70.HELPER_DEF) == 1, text.count(b70.HELPER_DEF))
-        # No WARN-family: a WARN is an oops, and panic_on_oops turns it into
-        # the very panic this batch exists to remove.
         code_lines = [ln for ln in text.split("\n")
                       if not ln.lstrip().startswith(("*", "/*", "//"))]
         warns = [ln.strip() for ln in code_lines
                  if "WARN_ON" in ln or "WARN(" in ln]
-        # VM_BUG_ON is not WARN-family (it is a BUG, and its precondition is
-        # the tree's own), so the only expectation here is "no WARN at all".
         check("no WARN in the guarded code", warns == [], warns)
 
         with tempfile.TemporaryDirectory() as tmp2:
@@ -7954,7 +7020,6 @@ def test_batch70_smaps_migration_guard():
             check("second pass is byte-identical",
                   ctx2.read(b70.TASK_MMU) == text)
 
-    # An unknown shape must stop the group rather than half-patch the file.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {b70.TASK_MMU: "static void other(void)\n"})
         status, detail = b70._smaps_migration_guard_apply(ctx)
@@ -7973,21 +7038,6 @@ def test_batch70_smaps_migration_guard():
 
 
 def test_fetch_decode_roundtrip():
-    """The tree fetcher's decode() must refuse a body that is not clean base64.
-
-    A gitiles body carrying a byte outside the base64 alphabet has to fail
-    loudly.  The failure it guards is silent by construction: the shifted text
-    still looks like source, so it passes all three of acceptable()'s checks
-    (size, NUL-free, not-HTML) and lands in the tree as a file nobody
-    questions -- which is how one broken fetch read as anchor drift for a whole
-    batch (fs/erofs/compress.h landing as "DD..X-License-Identifier").
-
-    The two backends fail differently, which is why both are driven here:
-    python3's b64decode() without validate=True silently DISCARDS the stray
-    byte and exits 0 (measured: correct 40 bytes, rc=0), while GNU coreutils
-    >= 9 refuses the same body.  Asserting only through whichever backend the
-    host happens to have is what let that divergence hide in the first place.
-    """
     print("fetch_sublevel_tree.sh: decode() refuses a non-canonical body")
     tool = Path(__file__).resolve().parent / "fetch_sublevel_tree.sh"
     check("the fetcher is present", tool.is_file(), tool)
@@ -7999,10 +7049,6 @@ def test_fetch_decode_roundtrip():
     quoted = str(tool).replace("\\", "/")
 
     def run_decode(body_b64, backend=None):
-        # The body goes through a file, never through argv.  A 76-column
-        # wrapped body is full of newlines, and argv does not reliably carry
-        # them on this platform -- passing one inline made bash treat a chunk
-        # of base64 as a script name (exit 127, "No such file or directory").
         env = dict(os.environ)
         if backend:
             env["ABK_FETCH_DECODER"] = backend
@@ -8028,30 +7074,19 @@ def test_fetch_decode_roundtrip():
             check(f"the {backend} backend is available", False, "missing")
             continue
 
-        # Positive half: the good body must still decode to its exact source,
-        # so the check cannot be "fixed" by refusing everything.
         good = run_decode(clean_b64, backend)
         check(f"{backend}: a clean body decodes to its exact source",
               good.returncode == 0 and good.stdout == raw,
               (good.returncode, good.stdout[:60]))
 
-        # Negative half, and the one with teeth: a non-zero exit, not a look at
-        # what the self-test said about itself.
         bad = run_decode(corrupt_b64, backend)
         check(f"{backend}: a corrupted body is refused (non-zero exit)",
               bad.returncode != 0,
               (bad.returncode, bad.stdout[:60]))
         if backend == "python3":
-            # validate=True raises before writing anything.  GNU base64 -d
-            # instead emits a short prefix and then fails, so "no bytes" is
-            # not its contract -- the caller's non-zero exit is, and the
-            # caller rm -f's the partial file (the FAILED branch in
-            # fetch_sublevel_tree.sh's fetch loop).
             check("python3: a corrupted body yields no bytes at all",
                   bad.stdout == b"", bad.stdout[:60])
 
-        # And the wrapped form gitiles actually sends, which validate=True
-        # rejects outright unless the CR/LF strip has done its job.
         wrapped = base64.b64encode(raw * 40).decode()
         wrapped = "\n".join(wrapped[i:i + 76] for i in range(0, len(wrapped), 76))
         wr = run_decode(wrapped, backend)
@@ -8059,8 +7094,6 @@ def test_fetch_decode_roundtrip():
               wr.returncode == 0 and wr.stdout == raw * 40,
               (wr.returncode, wr.stdout[:40]))
 
-    # The script's own self-test must agree, and must have exercised BOTH
-    # backends rather than only the default one.
     st = subprocess.run([bash, quoted, "--self-test-decode"],
                         capture_output=True, text=True, timeout=180)
     check("the fetcher self-test passes", st.returncode == 0,
@@ -8072,20 +7105,6 @@ def test_fetch_decode_roundtrip():
 
 
 def test_batch71_kcompressd_wb_pin():
-    """Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO.
-
-    Device A/B (verify_swap) on SM8550 vermeer: kcompressd's deferred swap-out
-    corrupted 10/614400 swapped pages with the offload on, 0/614400 off.  Root
-    cause: the offload branch left the page unlocked and NOT under writeback for
-    the whole FIFO residency, so try_to_free_swap() (which bails only on
-    PageWriteback) freed and reused the swap slot mid-queue and the deferred
-    write landed in the wrong slot.  The fix restores the async-writeback
-    contract: set_page_writeback at enqueue (pins the slot), end_page_writeback
-    once the drain holds the lock.
-
-    The test runs the real two-group chain (Batch 41 then Batch 71) on both
-    engine shapes, because the anchors are text Batch 41 generates.
-    """
     print("Batch 71: kcompressd_writeback_pin (swap slot pinned under writeback)")
     import abk_stable_core as core
     import batch41_core_vm_kcompressd as b41
@@ -8100,8 +7119,6 @@ def test_batch71_kcompressd_wb_pin():
           group.files == [b71.PAGE_IO], group.files)
 
     keys = [g.key for g in core.PATCH_GROUPS]
-    # Trap 5: this group rewrites text vm_kcompressd_swapout generates, so it
-    # must be registered after it.
     check("the writeback pin is registered after vm_kcompressd_swapout",
           keys.index("kcompressd_writeback_pin")
           > keys.index("vm_kcompressd_swapout"),
@@ -8117,8 +7134,6 @@ def test_batch71_kcompressd_wb_pin():
         check(f"step {i}'s replacement does not start with its own anchor (trap 1)",
               not new.startswith(old))
 
-    # Refuses without the Batch 41 engine: an unknown tree must never be
-    # half-patched, and the refusal writes nothing.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {b71.PAGE_IO: "int swap_writepage(void)\n"})
         status, detail = b71._kcompressd_wb_pin_apply(ctx)
@@ -8165,7 +7180,6 @@ def test_batch71_kcompressd_wb_pin():
             status, detail = core._vm_kcompressd_swapout_apply(ctx)
             check(f"{label} shape: Batch 41 applies first",
                   status == "applied", (status, detail))
-            # Both anchors really are text Batch 41 generates.
             text = ctx.read(b71.PAGE_IO)
             for _rel, anchor, _new, _req in steps:
                 check(f"{label} shape: an anchor occurs exactly once in "
@@ -8177,9 +7191,6 @@ def test_batch71_kcompressd_wb_pin():
                   status == "applied", (status, detail))
             text = ctx.read(b71.PAGE_IO)
 
-            # Enqueue side (swap_writepage offload branch): set_page_writeback
-            # before unlock_page + return 0, so the slot is pinned across the
-            # queue.  Pinned by sequence to prove ordering.
             check(f"{label} shape: enqueue sets writeback before unlocking",
                   "\t\tset_page_writeback(page);\n"
                   "\t\tunlock_page(page);\n"
@@ -8187,11 +7198,6 @@ def test_batch71_kcompressd_wb_pin():
 
             do_swapout = text[text.index("static void abk_kcompressd_do_swapout("):
                               text.index("static bool abk_kcompressd_enqueue(")]
-            # Drain side: lock_page (Batch 41) then end_page_writeback (Batch 71),
-            # before the body.  The drain's end is the one followed by the blank
-            # line + body (`end_page_writeback(page);\n\n`), distinct from the
-            # drop-path end below (which is followed by put_page), so these
-            # checks cannot be satisfied by the wrong occurrence.
             check(f"{label} shape: the drain takes the page lock",
                   "\tlock_page(page);\n" in do_swapout)
             check(f"{label} shape: the drain ends the writeback it inherited",
@@ -8200,32 +7206,23 @@ def test_batch71_kcompressd_wb_pin():
             check(f"{label} shape: lock precedes the drain end precedes body",
                   do_swapout.index("\tlock_page(page);\n") < drain_end
                   < do_swapout.index("frontswap_store(page)"))
-            # Drop path (!PageSwapCache early return): it must also end the
-            # writeback the enqueue set, before put_page -- else the dropped
-            # page is stuck under PG_writeback forever.  This end sits BEFORE
-            # lock_page, since the guard returns above the drain's own end.
             check(f"{label} shape: the drop path ends writeback before put_page",
                   "end_page_writeback(page);\n\t\tput_page(page);" in do_swapout)
             check(f"{label} shape: the drop-path end precedes the drain lock",
                   do_swapout.index("end_page_writeback(page);\n\t\tput_page(page);")
                   < do_swapout.index("\tlock_page(page);\n"))
-            # The superseded trylock-skip must be gone.
             check(f"{label} shape: no trylock-skip remains",
                   "if (!trylock_page(page)) {" not in text
                   and "skipping a locked page" not in text, "trylock remnants")
-            # The marker rides in all three edits (enqueue, drain, drop path).
             check(f"{label} shape: the marker is on all three edits",
                   text.count("sailboat_kcompressd_wb_pin") == 3,
                   text.count("sailboat_kcompressd_wb_pin"))
-            # No WARN-family added by the pin.
             code_lines = [ln for ln in do_swapout.split("\n")
                           if not ln.lstrip().startswith(("*", "/*", "//"))]
             warns = [ln.strip() for ln in code_lines
                      if "WARN_ON" in ln or "WARN(" in ln]
             check(f"{label} shape: no WARN in the drain's code", not warns, warns)
 
-            # Both groups idempotent together: the successor probe on Batch 41
-            # keeps its second pass already_present over the rewritten text.
             ctx2 = make_ctx(tmp + "-b", {b71.PAGE_IO: text})
             status2, detail2 = core._vm_kcompressd_swapout_apply(ctx2)
             check(f"{label} shape: Batch 41's second pass is already_present",
@@ -8245,23 +7242,7 @@ def test_batch71_kcompressd_wb_pin():
                       st == "already_present", (key, st))
 
 
-
 def test_workflow_expressions_are_ascii():
-    """A `${{ }}` written inside a `run: |` block is live, comment or not.
-
-    GitHub interpolates expressions across the whole block *string*, so the
-    shell `#` carries no meaning to that pass: a literal interpolation written
-    in a comment as documentation is an expression like any other.  A
-    non-ASCII one makes the entire workflow unparseable, and the failure mode
-    is not "this step is wrong" but "nothing dispatches at all" -- measured
-    2026-10-13, `Line: 293 ... Unexpected symbol: '<ellipsis>'`, the line
-    number being the start of the run block rather than the comment that
-    carried it.  Expressions are ASCII by construction, so any non-ASCII byte
-    between `${{` and `}}` is a documentation-shaped bug.
-
-    The second half pins the gate's own contract probe to a **prefix** match:
-    a literal is exactly what broke it when ABK restyled its run-name line.
-    """
     print("workflow expression hygiene (a ${{ }} in a run block is live)")
     wf_dir = Path(__file__).resolve().parent.parent / ".github" / "workflows"
     files = sorted(wf_dir.glob("*.y*ml"))

@@ -1,74 +1,3 @@
-"""Batch 37: the memory-reclaim path -- proactive reclaim's batch fidelity,
-its swappiness argument, the suspend abort, and the lru_add drain.
-
-Six upstream commits, all on the ``memory.reclaim`` line.  Five are the ones
-this batch was scoped to; ``410abb20acae`` is the sixth and is carried because
-the fifth commit's hunk *references* the two constants it adds (see group
-``reclaim_swappiness_defines`` below) -- without it the port would have to
-substitute literals for upstream's own names.
-
-What the chain is, in upstream order:
-
-  * ``0388536ac291`` (v6.6) caps one ``try_to_free_mem_cgroup_pages()`` call
-    in ``memory_reclaim()`` at ``SWAP_CLUSTER_MAX``.  Before it the reclaimer
-    keeps reclaiming towards the *original* ``sc->nr_to_reclaim`` after an
-    inner loop already reclaimed part of the request, so the overreclaim is
-    anywhere in [request, 2 * request).
-  * ``287d5fedb377`` (v6.9, ``Fixes: 0388536ac291``) replaces the fixed 32-page
-    cap with a decaying batch (``(nr_to_reclaim - nr_reclaimed) / 4``): the
-    32-page cap cost more in reclaim start/stop cycles than it saved in error
-    (13742 pages/sec vs 67352 on a full root-cgroup reclaim; the numbers are
-    upstream's).  The two are inseparable -- landing either alone is a
-    regression, which is why both are in this batch, and why the pair is
-    registered in this order.
-  * ``410abb20acae`` / ``68cd9050d871`` (v6.11, one series) add the
-    ``swappiness=`` nested key to ``memory.reclaim`` and the
-    ``MIN_SWAPPINESS``/``MAX_SWAPPINESS`` defines the parser validates against.
-    The swappiness value travels to ``get_scan_count()``/``get_swappiness()``
-    through a new ``sc_swappiness()`` accessor rather than through
-    ``mem_cgroup_swappiness()`` directly.
-  * ``dc37771a43d4`` (v7.2, ``Fixes: 287d5fedb377``) lets the PM freezer
-    interrupt a proactive reclaim: the MGLRU inner loop gains the signal
-    check, and the handler returns ``-ERESTARTSYS`` instead of ``-EINTR`` so
-    the syscall restarts transparently after resume.  It sits after the
-    decaying-batch group because the decaying batch is *why* the inner loop
-    can run for seconds -- that commit is in its own Fixes: line.
-  * ``9669b87065a6`` (v7.2) is the other end of the same path: a page whose
-    last reference is the ``lru_add`` batch's own is dead before it reaches
-    the LRU, so adding it only to remove it again costs two lruvec lock
-    acquisitions.  Independent of the groups above (mm/swap.c).
-
-Every target of the five ``memory.reclaim`` commits lives in text this module
-generates itself (``memcg_memory_reclaim`` creates ``memory_reclaim()`` and
-rewrites all seven ``try_to_free_mem_cgroup_pages()`` call sites, because
-android13-5.15 has neither).  That makes this batch the third instance of the
-``docs/group_recipe.md`` trap-5 shape -- after Batch 21/24 -- and it is a
-*chain* rather than a single later edit: the same call site is rewritten four
-times (0388536ac291, then 287d5fedb377, then 68cd9050d871).  So
-``memcg_memory_reclaim`` and each superseded group probe for content that
-survives its successor (``apply_steps`` is transactional, so one probe is
-enough), and the registry keeps them in dependency order.  See
-``PROBE_*`` below and the registration note in ``abk_stable_core.py``.
-
-Nothing here is a new CONFIG gate and nothing here reads a symbol that lives
-inside one: the only added line inside an existing gate is the signal check in
-``should_abort_scan()``, which is inside ``#ifdef CONFIG_LRU_GEN`` already.
-
-One 5.15-side caveat on the swappiness group: every supported baseline calls
-``trace_android_vh_tune_swappiness()``, the ACK hook that is Android's own
-swappiness override point -- from ``get_scan_count()`` on all four, and from
-``get_swappiness()`` on 194 and the lts branch as well.  Upstream's edit moves
-the *source* of the value (``mem_cgroup_swappiness()`` -> ``sc_swappiness()``)
-and the hook then tunes whatever that holds, so on an ACK tree the vendor hook
-still has the last word over a proactive ``swappiness=`` on the scan-balance
-path.  That is the baseline's own policy and this port does not fight it; it is
-also why the ``get_swappiness()`` step has two shapes.
-
-Sources (verbatim, in ``research/upstream-5.15.y/patches/``):
-``0388536ac291``, ``287d5fedb377``, ``410abb20acae``, ``68cd9050d871``,
-``dc37771a43d4``, ``9669b87065a6``.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -81,49 +10,23 @@ SWAP_C = "mm/swap.c"
 
 T = True
 
-# ---------------------------------------------------------------------------
-# Probes.  A group whose output a later group rewrites cannot rely on
-# replace_once's new-block check (that text is gone by the second pass) nor on
-# its `old` anchor (also gone), so it stops on a probe instead.  Each probe is
-# content that outlives every later group in the chain.
-# ---------------------------------------------------------------------------
 
-# The batch_size declaration 287d5fedb377 adds, and which no later group
-# touches: it is what survives once the call site has moved on.
 DECAYING_BATCH_DECL = "unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;"
-# 0388536ac291's own target form.  It is in the tree only between that group
-# and 287d5fedb377 -- and it is the form the group must also accept if a tree
-# ever arrives carrying 0388536ac291 upstream-first without its follow-up.
 SWAP_CLUSTER_BATCH = "min(nr_to_reclaim - nr_reclaimed, SWAP_CLUSTER_MAX),"
-# 68cd9050d871's parser: the marker, the enum, and the argument it builds.
 SWAPPINESS_ARG = "swappiness == -1 ? NULL : &swappiness"
-# dc37771a43d4's two halves.
 SUSPEND_ABORT_GUARD = "if (unlikely(sc->proactive && signal_pending(current)))"
 SUSPEND_ABORT_ERRNO = "return -ERESTARTSYS;"
-# 9669b87065a6's filter.
 DEAD_PAGE_FILTER = "if (page_ref_freeze(page, 1)) {"
 
-# The call site, before any of this batch's groups rewrite it -- text the
-# memcg_memory_reclaim group generates.  Used as an anchor by the first group
-# of the chain.
 _CALL_OLD = (
     "\t\treclaimed = try_to_free_mem_cgroup_pages(memcg,\n"
     "\t\t\t\t\t\tnr_to_reclaim - nr_reclaimed,\n"
     "\t\t\t\t\t\tGFP_KERNEL, reclaim_options);\n"
 )
 
-# memcg_memory_reclaim's own marker on the handler it generates.  That group
-# stops on it (trap 5): the call site inside the handler is rewritten three
-# times by this batch, so on a second pass the handler's `new` block no longer
-# matches while its `old` anchor still does -- which would append a second copy
-# of the whole function.  The marker sits on the handler, is written by that
-# group alone, and is not touched by any later group.
 MEMORY_RECLAIM_MARKER = ("/* ABK stable_515_backport: per-memcg proactive "
                          "reclaim (android14-6.1 memory.reclaim). */")
 
-# ===========================================================================
-# 0388536ac291 -- mm:vmscan: fix inaccurate reclaim during proactive reclaim
-# ===========================================================================
 
 _C1_NEW = (
     "\t\treclaimed = try_to_free_mem_cgroup_pages(memcg,\n"
@@ -133,7 +36,6 @@ _C1_NEW = (
 
 
 def build_steps_batch_fidelity():
-    """Upstream 0388536ac291 verbatim: one hunk, the call's first argument."""
     return [(MEMCONTROL_C, _CALL_OLD, _C1_NEW, T)]
 
 
@@ -142,8 +44,6 @@ def _batch_fidelity_apply(ctx):
         text = ctx.read(MEMCONTROL_C)
     except FileNotFoundError:
         return "blocked_by_shape", MEMCONTROL_C + ": file absent"
-    # Trap 5: 287d5fedb377 replaces this group's only output, and 68cd9050d871
-    # then replaces *its* output.  Stop on either successor's payload.
     if SWAP_CLUSTER_BATCH in text or DECAYING_BATCH_DECL in text:
         return "already_present", (
             "the proactive-reclaim batch is already capped and decaying")
@@ -152,10 +52,6 @@ def _batch_fidelity_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ===========================================================================
-# 287d5fedb377 -- mm: memcg: use larger batches for proactive reclaim
-# ===========================================================================
 
 _BATCH_DECL_OLD = (
     "\treclaim_options\t= MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE;\n"
@@ -184,13 +80,6 @@ _C2_CALL_NEW = (
 
 
 def build_steps_decaying_batches():
-    """Upstream 287d5fedb377 verbatim: the batch declaration, then the call.
-
-    Both halves, and both required: a tree that learned the declaration but
-    kept ``nr_to_reclaim - nr_reclaimed`` as the argument would still
-    overreclaim, and one that learned the argument without the declaration
-    would not compile.
-    """
     return [
         (MEMCONTROL_C, _BATCH_DECL_OLD, _BATCH_DECL_NEW, T),
         (MEMCONTROL_C, _C2_CALL_OLD, _C2_CALL_NEW, T),
@@ -202,21 +91,13 @@ def _decaying_batches_apply(ctx):
         text = ctx.read(MEMCONTROL_C)
     except FileNotFoundError:
         return "blocked_by_shape", MEMCONTROL_C + ": file absent"
-    # Trap 5 again: 68cd9050d871 rewrites the call this group produces.  The
-    # declaration it adds is untouched by that group and survives to the end.
     if DECAYING_BATCH_DECL in text:
         return "already_present", ("the proactive-reclaim batch is already decaying")
-    # A tree that carries 0388536ac291's cap but not this follow-up is the
-    # regression this pair exists to avoid: refuse rather than apply half of it.
     status, _results, detail = apply_steps(ctx, build_steps_decaying_batches())
     if status is None:
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ===========================================================================
-# 410abb20acae -- mm: add defines for min/max swappiness
-# ===========================================================================
 
 _DEFINES_OLD = (
     "#define MEMCG_RECLAIM_MAY_SWAP (1 << 1)\n"
@@ -247,20 +128,6 @@ _SWAPPINESS_WRITE_NEW = (
 
 
 def build_steps_swappiness_defines():
-    """Upstream 410abb20acae verbatim, adapted to the 5.15 call sites.
-
-    The patch is the whole of that commit's reachable payload: the two
-    defines, the ``get_scan_count()`` fraction, and the cgroup-v1
-    ``memory.swappiness`` bound.  (The MGLRU reach of the same commit --
-    ``get_type_to_scan()``, ``isolate_folios()``, ``lru_gen_run_cmd()`` --
-    also has no first ``200`` literal here: it is inside ``CONFIG_LRU_GEN``
-    and is left byte-identical, the same treatment this module gives every
-    other MGLRU-only hunk.)
-
-    The defines are anchored on the pair ``memcg_memory_reclaim`` installs,
-    which is exactly where upstream put them (between ``MEMCG_RECLAIM_*`` and
-    the ``try_to_free_mem_cgroup_pages()`` prototype).
-    """
     return [
         (SWAP_H, _DEFINES_OLD, _DEFINES_NEW, T),
         (VMSCAN_C, _SWAPPINESS_LITERAL_FP_OLD, _SWAPPINESS_LITERAL_FP_NEW, T),
@@ -274,10 +141,6 @@ def _swappiness_defines_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ===========================================================================
-# 68cd9050d871 -- mm: add swappiness= arg to memory.reclaim
-# ===========================================================================
 
 _PROTO_OLD = (
     "extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
@@ -313,9 +176,6 @@ _SC_FIELD_NEW = (
     "\t/* Can active pages be deactivated as part of reclaim? */\n"
 )
 
-# The two sc_swappiness() definitions, one per side of the file's CONFIG_MEMCG
-# split.  Anchored on the branch tails so each lands in the branch whose
-# mem_cgroup_swappiness() it may call.
 _SC_HELPER_OLD = (
     "static bool writeback_throttling_sane(struct scan_control *sc)\n"
     "{\n"
@@ -402,12 +262,6 @@ _GET_SWAPPINESS_NEW = (
     "}\n"
 )
 
-# 194 and the lts branch carry an ACK vendor hook inside get_swappiness() as
-# well: there the value is computed into a local, offered to the hook, then
-# returned.  Same edit, one line up -- and the hook keeps tuning a *proactive*
-# request's swappiness, which is what it is for.  (All four baselines call the
-# hook from get_scan_count(), so the call alone does not identify the shape;
-# that is why the selector below matches the block, not the hook.)
 _VENDOR_SWAPPINESS_HOOK = "trace_android_vh_tune_swappiness(&swappiness);"
 
 _GET_SWAPPINESS_HOOK_OLD = (
@@ -467,10 +321,6 @@ _INCLUDE_NEW = (
     "#include <linux/vmpressure.h>\n"
 )
 
-# The six call sites that pass NULL: every other try_to_free_mem_cgroup_pages()
-# caller in the tree.  Without them the extra parameter would silently mean
-# "no swappiness override" only by accident -- the prototypes would not match
-# and the build would fail, which is the point of the pairing.
 _CALL_RECLAIM_HIGH_OLD = (
     "\t\tnr_reclaimed += try_to_free_mem_cgroup_pages(memcg, nr_pages,\n"
     "\t\t\t\t\t\t\t     gfp_mask,\n"
@@ -538,10 +388,6 @@ _CALL_MAX_WRITE_NEW = (
     "\t\t\t\t\tGFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP, NULL))\n"
 )
 
-# The parser: upstream's enum + match_table, inserted immediately before the
-# handler they belong to.  The anchor is this module's own marker line, which
-# no other group writes (the Batch 10-4 forward declaration carries no marker
-# and is not this text).
 _TOKENS_OLD = (
     MEMORY_RECLAIM_MARKER + "\n"
     "static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,\n"
@@ -620,13 +466,6 @@ _C3_CALL_NEW = (
     "\t\t\t\t\tswappiness == -1 ? NULL : &swappiness);\n"
 )
 
-# The manual.  5.15's cgroup-v2.rst has no memory.reclaim section at all --
-# the interface is this module's own graft (94968384dde1, v5.16, which is what
-# memcg_memory_reclaim carries), so that group now documents it and this group
-# applies upstream's amendment to that section: the two "no nested keys"
-# paragraphs go, the nested-key table arrives.  Copied verbatim, including
-# upstream's own column-0 placement of the table (it is outside the definition
-# list upstream too).
 _DOC_OLD = (
     "\tThis file accepts a single key, the number of bytes to reclaim.\n"
     "\tNo nested keys are currently supported.\n"
@@ -667,24 +506,6 @@ _DOC_NEW = (
 
 
 def _get_swappiness_step(ctx):
-    """Pick the ``get_swappiness()`` shape this tree carries.
-
-    ``trace_android_vh_tune_swappiness()`` is an ACK hook, and 194 and the lts
-    branch call it from ``get_swappiness()`` too: there the value is computed
-    into a local and offered to the hook before being returned, where 167/178
-    return ``mem_cgroup_swappiness()`` directly.  The edit is the same line
-    either way and only its context differs, so the variant is chosen by
-    matching the block itself -- not by sublevel (the engine never gates on the
-    version) and not by the bare hook call (all four baselines call it from
-    ``get_scan_count()``).
-
-    Counting on the hook is also why the choice has to accept its own *output*:
-    the second pass has to pick the same variant to report already_present.
-
-    A tree with neither shape keeps the 167/178 variant, whose required step
-    then reports the miss -- the right answer for a shape this port does not
-    know.
-    """
     try:
         text = ctx.read(VMSCAN_C)
     except FileNotFoundError:
@@ -697,19 +518,9 @@ def _get_swappiness_step(ctx):
 
 
 def build_steps_swappiness_arg(swap_step=None):
-    """Upstream 68cd9050d871, in the patch's own file order.
-
-    Eighteen steps in mm/memcontrol.c/mm/vmscan.c/include/linux/swap.h plus
-    the manual.  All required: the parameter is threaded through the prototype,
-    the definition, the accessor pair, and every call site, and a half-threaded
-    parameter is a compile error rather than a degraded graft -- so it must not
-    be possible to land half of it.
-    """
     if swap_step is None:
         swap_step = (VMSCAN_C, _GET_SWAPPINESS_OLD, _GET_SWAPPINESS_NEW, T)
     return [
-        # include/linux/swap.h is 5.15's home for the prototype; upstream's
-        # hunk targets the same declaration.
         (SWAP_H, _PROTO_OLD, _PROTO_NEW, T),
         (VMSCAN_C, _SC_FIELD_OLD, _SC_FIELD_NEW, T),
         (VMSCAN_C, _SC_HELPER_OLD, _SC_HELPER_NEW, T),
@@ -720,9 +531,6 @@ def build_steps_swappiness_arg(swap_step=None):
         (MEMCONTROL_C, _INCLUDE_OLD, _INCLUDE_NEW, T),
         (MEMCONTROL_C, _CALL_RECLAIM_HIGH_OLD, _CALL_RECLAIM_HIGH_NEW, T),
         (MEMCONTROL_C, _CALL_TRY_CHARGE_OLD, _CALL_TRY_CHARGE_NEW, T),
-        # Upstream's patch also carries mem_cgroup_resize_max() and
-        # mem_cgroup_force_empty() from mm/memcontrol-v1.c, the post-5.18
-        # split; on 5.15 both live in mm/memcontrol.c and are reached here.
         (MEMCONTROL_C, _CALL_RESIZE_MAX_OLD, _CALL_RESIZE_MAX_NEW, T),
         (MEMCONTROL_C, _CALL_FORCE_EMPTY_OLD, _CALL_FORCE_EMPTY_NEW, T),
         (MEMCONTROL_C, _CALL_HIGH_WRITE_OLD, _CALL_HIGH_WRITE_NEW, T),
@@ -741,11 +549,6 @@ def _swappiness_arg_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ===========================================================================
-# dc37771a43d4 -- mm: vmscan: abort proactive reclaim early when freezing
-#                 for suspend
-# ===========================================================================
 
 _SHOULD_ABORT_OLD = (
     "static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,\n"
@@ -804,19 +607,6 @@ _SIGNAL_NEW = (
 
 
 def build_steps_suspend_abort():
-    """Upstream dc37771a43d4, both hunks.
-
-    The MGLRU hunk is re-anchored, not copied: 5.15's ``should_abort_scan()``
-    still takes the old ``(lruvec, seq, sc, need_swapping)`` signature (the
-    parameters were dropped later), but the guard's job is the same -- it is
-    the check the MGLRU scan and eviction loops call between batches -- so the
-    signal test goes right after the function's locals, where upstream put it.
-
-    The second hunk is the other end: upstream 7.2 keeps the proactive-reclaim
-    loop in ``user_proactive_reclaim()`` in mm/vmscan.c, which 5.15 does not
-    have.  On 5.15 that loop is this module's ``memory_reclaim()`` in
-    mm/memcontrol.c, so the -ERESTARTSYS change lands there.
-    """
     return [
         (VMSCAN_C, _SHOULD_ABORT_OLD, _SHOULD_ABORT_NEW, T),
         (MEMCONTROL_C, _SIGNAL_OLD, _SIGNAL_NEW, T),
@@ -829,11 +619,6 @@ def _suspend_abort_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ===========================================================================
-# 9669b87065a6 -- mm/lruvec: preemptively free dead folios during lru_add
-#                 drain
-# ===========================================================================
 
 _LRU_ADD_OLD = (
     "void __pagevec_lru_add(struct pagevec *pvec)\n"
@@ -911,9 +696,6 @@ _LRU_ADD_NEW = (
     "}\n"
 )
 
-# The batch consumer.  Upstream's third hunk is in folios_put_refs(); on 5.15
-# the consumer of an add batch is release_pages(), which release_pages() is
-# also the one __pagevec_lru_add() calls.
 _RELEASE_OLD = (
     "\tfor (i = 0; i < nr; i++) {\n"
     "\t\tstruct page *page = pages[i];\n"
@@ -942,20 +724,6 @@ _RELEASE_NEW = (
 
 
 def build_steps_lru_add_drain():
-    """Upstream 9669b87065a6, both halves, on 5.15's pagevec shape.
-
-    mm/swap.c here is pre-folio-batch (v5.17 converted it): the add batch is
-    ``struct pagevec``/``__pagevec_lru_add()`` rather than
-    ``folio_batch``/``folio_batch_move_lru()``, and the batch consumer is
-    ``release_pages()`` rather than ``folios_put_refs()``.  The filter is
-    written against the page API for that reason -- ``page_ref_freeze()`` is
-    the 5.15 spelling of ``folio_ref_freeze()`` and is already what vmscan.c
-    uses for the same "only the batch's reference is left" test.
-
-    Only the add path is touched, exactly as upstream does: the other pagevec
-    consumers move pages between LRUs, they do not inherit them, so a dead
-    page there is not the same case.
-    """
     return [
         (SWAP_C, _LRU_ADD_OLD, _LRU_ADD_NEW, T),
         (SWAP_C, _RELEASE_OLD, _RELEASE_NEW, T),
@@ -970,16 +738,6 @@ def _lru_add_drain_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return this batch's six PatchGroup records, in dependency order.
-
-    The first three all rewrite the ``memory_reclaim()`` call site the
-    ``memcg_memory_reclaim`` group generates, and each is superseded by the
-    next; ``docs/group_recipe.md`` trap 5 is why they carry probes and why the
-    order is fixed.  ``reclaim_swappiness_defines`` must precede
-    ``proactive_reclaim_swappiness_arg`` (that group's parser validates against
-    the constants it adds), and ``proactive_reclaim_suspend_abort`` is last of
-    the five because ``287d5fedb377`` is in its Fixes: line.
-    """
     return [
         PatchGroup(
             "proactive_reclaim_batch_fidelity",

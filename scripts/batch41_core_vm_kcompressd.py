@@ -1,90 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Batch 41: kcompressd -- kswapd's swap-out compression moved off its thread.
-
-Kcompressd-Unofficial 0.5 (Masahito Suzuki <firelzrd@gmail.com>, forked from
-MediaTek's Kcompressd by Qun-Wei Lin) is distributed as patches for three
-kernels only: 6.12.44, 6.18 and 7.1-rc1.  There is no 5.15 patch and there
-cannot be one in that shape, because the carrier the upstream chose is a
-struct pglist_data field run and android13-5.15's GKI ABI pins that struct
-completely.  So this batch is a re-carriage rather than a backport, and it
-lands as one new PatchGroup, ``vm_kcompressd_swapout``, with the whole payload
-in mm/page_io.c.
-
-The feature.  kswapd spends its reclaim scan inside swap_writepage() waiting
-for zram to compress every anonymous page it writes out.  The patch moves that
-wait onto a per-node kcompressd%d kthread: swap_writepage() queues the page
-and returns, kcompressd does the compression and the writeback.  This is *not*
-what Batch 10-1 does.  That one offloads the second compression of an already
-resident page (``zram_async_recompress`` -- an already-used-memory saving);
-this offloads the first compression of a page being reclaimed (a
-reclaim-latency / allocation-stall saving).  Neither covers the other's case,
-and plan.md records "kcompressd was superseded by Batch 10-1" as the wrong call
-it was.
-
-Graft-boundary contract.  Everything lands on pristine text in a file no other
-group writes -- mm/page_io.c appears in zero groups' file lists -- so no later
-group can edit this group's blocks and no trap-5 ordering is involved:
-
-  * the include block, right after the pristine ``sched/task.h`` include;
-  * the offload call inside swap_writepage(), anchored on the
-    ``ret = __swap_writepage(...)`` / ``out:`` / ``return ret;`` tail, which is
-    byte-identical on all four baselines -- unlike the frontswap_store() block
-    above it, which android13-5.15-lts grew a vendor hook in;
-  * the engine, appended after the file's last function, so everything it
-    calls is already declared and no forward declaration has to be invented.
-
-Only mm/page_io.c is touched: no struct pglist_data field, no mm/vmscan.c, no
-include/linux/swap.h extern, no Kconfig edit and no new Kconfig symbol, so
-nothing lands in _MODULE_CONFIGS or _INTRODUCED_KCONFIG either.
-
-The four deviations from upstream, each forced rather than chosen, are spelled
-out in the C banner this module emits: private per-node state instead of
-pglist_data members; boot-time node set-up from an initcall instead of
-kswapd_run() (with the hotplug half picked up by a memory notifier, see below);
-a file-static knob registered with register_sysctl() instead of an entry in
-kernel/sysctl.c's vm_table[]; and the page ABI plus the three-argument
-__swap_writepage().  Three further corrections are the ones worth knowing:
-
-  * abk_kcompressd_do_swapout() takes the page lock.  Upstream does not, and
-    the reason is a fact about 5.15 that also holds on 6.12: an offloaded page
-    waits on the FIFO with no owner, so anyone may lock it meanwhile, while
-    __swap_writepage() is a ->writepage implementation and every one of its
-    exits unlocks.  Upstream 0.5 carries that latent double-unlock; it
-    survives only because unlock_page()'s VM_BUG_ON_PAGE(!PageLocked(page))
-    needs CONFIG_DEBUG_VM to be visible.
-  * swap_writepage() releases the page lock before returning from the
-    offload, and upstream does not.  That early return skips
-    __swap_writepage(), which is where the unlock normally happens, so the
-    page would reach ret_pages still locked: pageout() reads our 0 as
-    PAGE_SUCCESS, its `if (!trylock_page(page)) goto keep;` fails because
-    shrink_page_list() holds the lock it took before calling, and `keep:`
-    comes after keep_locked:'s unlock_page() so it unlocks nothing itself.
-    move_pages_to_lru() does not unlock either, so the kcompressd thread's
-    own lock_page() -- the line above -- would sleep forever.  Found on
-    vermeer with 26 pages queued and swapped pinned at 0.
-  * mem_cgroup_zswap_writeback_enabled() does not exist here, so that gate is
-    replaced by this module's own Batch-38 policy, memcg_is_dying()
-    (include/linux/memcontrol.h, already reachable through the swap.h include
-    mm/page_io.c has), which is both a stricter and a better-motivated refusal
-    than the upstream one.
-  * zswap_is_enabled() does not exist here either -- 5.15 predates the
-    zswap_enabled() rename -- so the "synchronously efficient swap device"
-    gate tests frontswap_enabled(), the 5.15 spelling of the same question.
-    On a zram-only Android with no zswap, SWP_SYNCHRONOUS_IO is what opens the
-    gate, and it is set: mm/swapfile.c:3252 tests p->bdev->bd_disk->fops->
-    rw_page and zram implements .rw_page.  Without that the patch would be
-    inert on every device this module targets.
-
-The one per-baseline text variant is AOSP's
-android_vh_shrink_page_lock_owner_clear() vendor hook, which the lts branch
-grew at the swap_writepage() unlock points together with its DECLARE_HOOK in
-include/trace/hooks/vmscan.h.  It is absent from 167/178/194 entirely, so
-there is nothing to compile against and no CONFIG gate can express it: the
-shape is probed in abk_stable_core._vm_kcompressd_swapout_apply and the engine
-text follows.  A baseline that matches neither shape reports
-blocked_by_shape and writes nothing, because an offload that dropped a
-vendor-hook contract the tree does honour is worse than no offload.
-"""
 
 import re
 
@@ -97,32 +11,10 @@ PAGE_IO = "mm/page_io.c"
 
 
 def _tabs(text):
-    """Convert leading 4-space indentation (readable source) to kernel tabs."""
     text = re.sub(r"(?m)^    +",
                   lambda m: "\t" * (len(m.group(0)) // 4), text)
     return text.rstrip("\n") + "\n"
 
-
-# ---------------------------------------------------------------------------
-# 1) mm/page_io.c: the includes the engine needs, on pristine include text.
-#
-# The pristine list is mm.h, kernel_stat.h, gfp.h, pagemap.h, swap.h, bio.h,
-# swapops.h, buffer_head.h, writeback.h, frontswap.h, blkdev.h, psi.h, uio.h
-# and sched/task.h.  `#include <linux/sched/task.h>` is its own line and
-# occurs once, so replace_once cannot take the anchor twice.  Five of these
-# arrive transitively today (mm.h pulls mmzone.h, which pulls nodemask.h and
-# numa.h for MAX_NUMNODES; sysctl.h pulls wait.h); they are named anyway,
-# because what the engine uses should not be an accident of the include
-# closure.
-#
-# <linux/memory.h> is the one that is genuinely new: it carries
-# register_memory_notifier() (the stubbed version when
-# !CONFIG_MEMORY_HOTPLUG_SPARSE, in either case safe to call), struct
-# memory_notify, the MEM_ONLINE/MEM_OFFLINE actions, NOTIFY_OK and struct
-# notifier_block.  Nothing heavier is needed: the node-lifecycle code touches
-# no part of <linux/memory_hotplug.h> that is gated behind
-# CONFIG_MEMORY_HOTPLUG.
-# ---------------------------------------------------------------------------
 
 _C_INC_OLD = (
     "#include <linux/sched/task.h>\n"
@@ -140,25 +32,6 @@ _C_INC_NEW = (
     "\n"
 )
 
-# ---------------------------------------------------------------------------
-# 2) mm/page_io.c: the offload call, inside swap_writepage().
-#
-# Placement is upstream's: after frontswap_store() has failed -- so zswap has
-# already declined the page and cannot be bypassed -- and before
-# __swap_writepage().  try_to_free_swap() and arch_prepare_to_swap() stay
-# above it, so the swap-slot bookkeeping and the AOP_WRITEPAGE_ACTIVATE return
-# are unchanged, and the writeback accounting stays inside __swap_writepage().
-#
-# The anchor is the function's tail rather than the frontswap_store() block,
-# because that block is the one place in this function the four baselines
-# disagree: android13-5.15-lts grew a shrink_page_lock_owner_clear() vendor hook
-# into it (and a `#undef CREATE_TRACE_POINTS` +
-# `#include <trace/hooks/vmscan.h>` pair after the include list).  The tail is
-# byte-identical on all four, so one step covers every baseline.  The
-# `ret = __swap_writepage(...)` line is unique in the file too -- the only
-# other occurrence of __swap_writepage is its definition, which is not
-# preceded by `ret =` -- so replace_once cannot match it twice.
-# ---------------------------------------------------------------------------
 
 _C_OFFLOAD_OLD = (
     "\tret = __swap_writepage(page, wbc, end_swap_bio_write);\n"
@@ -200,28 +73,7 @@ _C_OFFLOAD_NEW = (
     "\n"
 ) + _C_OFFLOAD_OLD
 
-# ---------------------------------------------------------------------------
-# 2b) mm/page_io.c: the forward declaration swap_writepage() needs.
-#
-# The engine is appended at the end of the file, i.e. *after* swap_writepage(),
-# so the call above precedes the definition by roughly 500 lines.  Upstream never
-# hits this -- its patch inserts do_swapout()/kcompressd_store() in a hunk
-# *above* the swap_writepage() hunk -- but appending means C requires a
-# prototype.  Without it: "implicit declaration of function
-# 'abk_kcompressd_store'" and then "static declaration follows non-static
-# declaration", both -Werror.  That is what the ABK CI compile gate found on the
-# first run of this batch, and no text audit can see it: step_audit checks
-# comment/brace/#ifdef balance and idempotency, implementation_audit checks
-# content -- neither runs a compiler (AGENTS.md trap 6).
-#
-# Anchored on the function's signature, which is unique in the file.  `struct
-# page` is only forward-declared this early, which is fine for a prototype, and
-# bool comes from <linux/types.h> via mm.h.
-# ---------------------------------------------------------------------------
 
-# The same anchor spelled out on its own so the unit test can compare against it:
-# an edit to _C_DECL_OLD that stops being "the doc comment + the signature"
-# would otherwise silently produce the comment-splitting shape.
 DECL_ANCHOR = (
     "/*\n"
     " * We may have stale swap cache pages in memory: notice\n"
@@ -252,33 +104,7 @@ _C_DECL_NEW = (
     "{\n"
 )
 
-# ---------------------------------------------------------------------------
-# 3) mm/page_io.c: the engine, appended after the file's last function.
-#
-# swap_set_page_dirty() is the tail of mm/page_io.c on every baseline and is
-# byte-identical there, so the anchor needs no shape handling at all.  It
-# carries the whole function so the appended text is guaranteed fresh (trap 1)
-# and so the second pass finds the replacement already present.
-#
-# The text below is the 167/178/194 variant, with no vendor hook.  216 calls
-# android_vh_shrink_page_lock_owner_clear() here, and that call inside the
-# replicated frontswap branch is the only per-baseline variance in the whole
-# payload -- a text variant, not a CONFIG gate, because the hook is absent from
-# 167/178/194 outright (its DECLARE_HOOK is not in include/trace/hooks/vmscan.h
-# there), so there is nothing to compile against and nothing to gate on.
-# ---------------------------------------------------------------------------
 
-# The two shapes of swap_writepage()'s frontswap branch, exactly as they appear in
-# the tree -- the shape probe, and the only place in this group's payload where
-# the baselines differ.  Each is unique in the file (it only occurs in
-# swap_writepage()).
-#
-# android13-5.15-lts (216): AOSP's android_vh_shrink_page_lock_owner_clear()
-# call.  It is there because the DECLARE_HOOK in include/trace/hooks/vmscan.h
-# arrived in the same change, which is also why the hook variant needs no extra
-# include step -- that branch's page_io.c already carries `#undef
-# CREATE_TRACE_POINTS` + `#include <trace/hooks/vmscan.h>` after the pristine
-# include list, and the engine sits in that same translation unit.
 HOOK_PROBE = (
     '\tif (frontswap_store(page) == 0) {\n'
     '\t\tset_page_writeback(page);\n'
@@ -289,8 +115,6 @@ HOOK_PROBE = (
     '\t}\n'
 )
 
-# 167 / 178 / 194: no vendor hook in the tree at all, so the replicated branch
-# carries none -- a call with no DECLARE_HOOK behind it would not compile there.
 PLAIN_PROBE = (
     '\tif (frontswap_store(page) == 0) {\n'
     '\t\tset_page_writeback(page);\n'
@@ -300,10 +124,6 @@ PLAIN_PROBE = (
     '\t}\n'
 )
 
-# The emitted do_swapout() body.  Upstream writes it as an if/else, so this does
-# too -- and unlike the probe it drops the pristine `goto out;`, because the
-# __swap_writepage() half and the frontswap half then share the counter and the
-# put_page() rather than each exiting on its own.
 HOOK_BODY = (
     '\n'
     '\tif (frontswap_store(page) == 0) {\n'
@@ -322,7 +142,6 @@ HOOK_BODY = (
     '\n'
 )
 
-# 167/178/194: the same text minus the hook line.
 PLAIN_BODY = (
     '\n'
     '\tif (frontswap_store(page) == 0) {\n'
@@ -1044,14 +863,6 @@ _ENGINE_ANCHOR_OLD = (
 
 
 def probe_swapout_shape(ctx):
-    """Return ``"hook"``/``"plain"`` for the tree, or None on an unknown shape.
-
-    Discriminates the two shapes of swap_writepage()'s frontswap branch, which
-    is the only place in this group's payload where the baselines differ: the
-    216 lts branch grew AOSP's android_vh_shrink_page_lock_owner_clear() call
-    into it, and neither the call nor its DECLARE_HOOK exists on 167/178/194.
-    A tree matching neither shape stops the group instead of letting it guess.
-    """
     try:
         text = ctx.read(PAGE_IO)
     except OSError:
@@ -1064,7 +875,6 @@ def probe_swapout_shape(ctx):
 
 
 def swapout_body(ctx):
-    """The engine's per-baseline do_swapout() body, or None on an unknown shape."""
     shape = probe_swapout_shape(ctx)
     if shape is None:
         return None
@@ -1072,11 +882,6 @@ def swapout_body(ctx):
 
 
 def build_steps(swapout_body=None):
-    """The three mm/page_io.c steps, in order.
-
-    ``swapout_body`` defaults to the no-vendor-hook variant so the step list can
-    be inspected without a tree; abk_stable_core passes the probed one.
-    """
     if swapout_body is None:
         swapout_body = PLAIN_BODY
     engine = _ENGINE.replace(_SWAPOUT_BODY_MARKER,

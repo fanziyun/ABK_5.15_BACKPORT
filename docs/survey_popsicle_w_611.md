@@ -44,7 +44,7 @@ diff 工件在同目录。要点:来源分支是 bazel 增量树(全树 2370 文
 
 - 来源 = 分支当前形态,非单一 commit(小米整包 squash,无法按 commit 引用)。
 - 本调研本身零代码改动;dynamic_readahead 的落地单独发生在 Batch 9-1
-  (组 `dynamic_readahead_lowmem`,见 plan.md),不在本调研范围内。
+  (组 `dynamic_readahead_lowmem`,见 `CHANGELOG.md` 附录),不在本调研范围内。
 ## 复核实测（2026-09-26）
 
 **目标**:从小米 17 Pro 内核分支找可移植的 f2fs 优化以改善 `/data` 读取。
@@ -81,4 +81,4 @@ MiCode 侧不存在 f2fs 定制可搬: `fs/`、`block/`、`crypto/` 归 AOSP GKI
 5.15.y stable, 清单见 `docs/batch8_long_term.md` C 节
 （`f2fs_lookup_mode_perf` 投入最小）。红线撤销后新增的硬约束见
 `docs/porting_policy.md` "Footprint overlap", 与本仓库 Batch 43 的记录
-（`CHANGELOG.md#batch-43`、`plan.md` 的 Batch 43 索引行）。
+（`CHANGELOG.md#batch-43`、`CHANGELOG.md` 附录的 Batch 43 索引行）。

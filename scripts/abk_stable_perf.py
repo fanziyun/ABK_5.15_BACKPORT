@@ -1,37 +1,3 @@
-"""Child ``stable_perf_backport``: upstream 5.15.y optimization grafts.
-
-Carries the NOHZ idle-balance optimization series (5.15.174), the PSI
-migration flags micro-optimization (5.15.179), the RT scan optimizations
-(5.15.202/.212), per-task kstack randomization (5.15.210), the
-__release_sock() cond_resched reduction (5.15.197), the semaphore wake_q
-offload (5.15.180), the blk-mq suspend wakeup abort (5.15.198), and the
-android14-6.1 line (lazy preemption + mutex/rwsem wakeup vendor hooks,
-PSI IRQ pressure tracking, PSI trigger kernfs polling, the per-cgroup PSI
-accounting switch `cgroup.pressure`, and the PSI ONCPU state-mask sync).
-
-KMI notes: the per-task kstack offset reuses task_struct's
-ANDROID_KABI_RESERVE(8) slot instead of growing the struct, and the PSI group
-only removes a bitfield member whose word is force-aligned by ``unsigned :0``
-(upstream-verified no-op for struct layout).  The android14-6.1 groups only
-add vendor tracepoints and heap-internal struct members, so the stable KMI is
-preserved; the ACK 6.1 psi_group pointer/parent rework is deliberately NOT
-ported (it changes struct cgroup layout).  The Batch 21 `cgroup.pressure` switch
-keeps its state in the cgroup's own `flags` word (CGRP_PSI_DISABLED) for the same
-reason -- `struct psi_group` is embedded in `struct cgroup`, so the ACK
-`psi_group::enabled` member cannot be added without moving `bpf`/`congestion_count`/
-`freezer`/`ancestor_ids[]`.
-
-Every group degrades to a reported status when its anchor shape is absent.
-From Batch 15 this child is the owner of the sched_entity 1-4 slots (the
-absorbed EEVDF family) and of request_queue slot 1 (blk_mq_async_depth), so
-these are now claimed here rather than avoided -- see the Batch 15 modules and
-"Suite absorption" in docs/porting_policy.md.
-
-Coexistence: standalone by default; if storage-rollback or other feature-
-graft modules are injected in the same build, keep this child between them
-(injection order in docs/porting_policy.md).
-"""
-
 from __future__ import annotations
 
 import sys
@@ -48,17 +14,12 @@ from abk_backport_engine import (  # noqa: E402
     run_child,
 )
 
-T = True  # required step
-F = False  # optional step
+T = True
+F = False
 
-
-# ---------------------------------------------------------------------------
-# NOHZ idle balance optimization series (5.15.174)
-# ---------------------------------------------------------------------------
 
 def _nohz_apply(ctx):
     steps = [
-        # kernel/sched/sched.h: NOHZ_NEXT_KICK flag
         ("kernel/sched/sched.h",
          "#define NOHZ_BALANCE_KICK_BIT\t0\n"
          "#define NOHZ_STATS_KICK_BIT\t1\n"
@@ -85,7 +46,6 @@ def _nohz_apply(ctx):
          "\n"
          "#define NOHZ_KICK_MASK\t(NOHZ_BALANCE_KICK | NOHZ_STATS_KICK | NOHZ_NEXT_KICK)\n",
          T),
-        # fair.c: nohz_balancer_kick() five kick sites become scoped kicks
         ("kernel/sched/fair.c",
          "\tif (rq->nr_running >= 2) {\n\t\tflags = NOHZ_KICK_MASK;\n\t\tgoto out;\n\t}",
          "\tif (rq->nr_running >= 2) {\n\t\tflags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;\n\t\tgoto out;\n\t}",
@@ -106,7 +66,6 @@ def _nohz_apply(ctx):
          "\t\tif (nr_busy > 1) {\n\t\t\tflags = NOHZ_KICK_MASK;\n\t\t\tgoto unlock;\n\t\t}",
          "\t\tif (nr_busy > 1) {\n\t\t\tflags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;\n\t\t\tgoto unlock;\n\t\t}",
          T),
-        # fair.c: _nohz_idle_balance() only maintain blocked stats for STATS kicks
         ("kernel/sched/fair.c",
          "\tWRITE_ONCE(nohz.has_blocked, 0);\n",
          "\tif (flags & NOHZ_STATS_KICK)\n\t\tWRITE_ONCE(nohz.has_blocked, 0);\n",
@@ -121,7 +80,6 @@ def _nohz_apply(ctx):
          "\tWRITE_ONCE(nohz.next_blocked,\n\t\tnow + msecs_to_jiffies(LOAD_AVG_PERIOD));\n",
          "\tif (flags & NOHZ_STATS_KICK)\n\t\tWRITE_ONCE(nohz.next_blocked,\n\t\t\t   now + msecs_to_jiffies(LOAD_AVG_PERIOD));\n",
          T),
-        # core.c: nohz_csd_func() stops waking ksoftirqd and uses the raw raise
         ("kernel/sched/core.c",
          "\trq->idle_balance = idle_cpu(cpu);\n"
          "\tif (rq->idle_balance && !need_resched()) {\n"
@@ -140,10 +98,6 @@ def _nohz_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# PSI: use task->psi_flags deltas on CPU migration (5.15.179)
-# ---------------------------------------------------------------------------
 
 def _psi_flags_apply(ctx):
     steps = [
@@ -222,10 +176,6 @@ def _psi_flags_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# RT scan optimizations (5.15.202 rto skip-self + 5.15.212 RT_PUSH_IPI default)
-# ---------------------------------------------------------------------------
-
 def _rt_optimizations_apply(ctx):
     steps = [
         ("kernel/sched/rt.c",
@@ -251,10 +201,6 @@ def _rt_optimizations_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# update_sg_wakeup_stats(): only count CPUs the waking task may use (5.15.212)
-# ---------------------------------------------------------------------------
-
 def _dst_group_allowed_stats_apply(ctx):
     status, _results, detail = apply_steps(ctx, [
         ("kernel/sched/fair.c",
@@ -269,22 +215,6 @@ def _dst_group_allowed_stats_apply(ctx):
     if status is None:
         return "blocked_by_shape", detail
     return status, detail
-
-
-# ---------------------------------------------------------------------------
-# sched: drop excess steal time instead of carrying it forward (5.15.179)
-# ---------------------------------------------------------------------------
-
-# Upstream-shape rewrite (no marker): the 194/216 baselines already carry it and
-# a tree that does ends up byte-identical to this group's output.  Value
-# boundary, stated up front: the whole block sits under
-# CONFIG_PARAVIRT_TIME_ACCOUNTING (present in the GKI defconfig because the same
-# image runs as a KVM/AVF guest) *and* inside
-# static_key_false(paravirt_steal_rq_enabled), which only a hypervisor that
-# advertises steal time ever turns on.  On bare metal the graft is therefore
-# inert by construction; inside a guest it stops the catch-up from freezing
-# clock_task for the whole time the host is suspended (and from charging that
-# steal to whichever task happens to be running next).
 
 
 def _sched_steal_time_drop_apply(ctx):
@@ -331,28 +261,7 @@ def _sched_steal_time_drop_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# Per-task kstack randomization offset (5.15.210) - KMI-safe via KABI slot 8
-# ---------------------------------------------------------------------------
-
 def _sched_h_kstack_step(text):
-    """Pick the KABI slot for kstack_offset based on the tree shape.
-
-    Three shapes are known, and every one of them keeps the member inside
-    struct task_struct (see _verify_kstack_member, which re-checks that):
-
-    - the anchored 1..8 RESERVE run (every deprecated/ release baseline) --
-      claim slot 8;
-    - ABK's kernel-specific patch step rewrites task_struct's slots 6/7/8 into
-      the CONFIG_SYSVIPC sysvsem/sysvshm restoration (an #ifdef/#else block).
-      In that shape slots 7/8 only exist inside the dead #else branch, so a
-      first-occurrence RESERVE(8) replacement lands in dead code and the struct
-      silently loses the member -- use the still-free slot 5 there;
-    - the android13-5.15-lts branch from 5.15.211 on: AOSP already claims slot 1
-      for the user_dumpable:1 bitfield, so the free RESERVE run starts at 2 and
-      the 1..8 anchor is gone.  Claim slot 8 there as well, so the smoke grep
-      for ANDROID_KABI_USE(8 holds on every baseline.
-    """
     marker = "/* ABK stable_515_backport: per-task kstack randomization offset (5.15.210) mapped onto the KABI reserve slot. */"
     if "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" in text:
         return (
@@ -363,9 +272,6 @@ def _sched_h_kstack_step(text):
             T,
         )
     if "ANDROID_KABI_USE(1, struct {" in text and "user_dumpable:1;" in text:
-        # 5.15.211+ lts shape: slot 1 is AOSP, so the anchored run is 2..8.
-        # (The probe cannot fire on the 1..8 baselines: they carry neither the
-        # KABI_USE(1) bitfield nor user_dumpable.)
         run_old = "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(2, 9))
         run_new = (
             "".join("\tANDROID_KABI_RESERVE(%d);\n" % n for n in range(2, 8))
@@ -383,7 +289,6 @@ def _sched_h_kstack_step(text):
 
 
 def _verify_kstack_member(ctx):
-    """Fail loudly when the kstack_offset member is not inside task_struct."""
     text = ctx.read("include/linux/sched.h")
     if "kstack_offset" not in text:
         raise ValueError("kstack_offset member missing from include/linux/sched.h")
@@ -513,10 +418,6 @@ def _kstack_pertask_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# net core: __release_sock() cond_resched reduction (5.15.197)
-# ---------------------------------------------------------------------------
-
 def _release_sock_apply(ctx):
     old = """	struct sk_buff *skb, *next;
 
@@ -572,10 +473,6 @@ def _release_sock_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# locking: semaphore wake_q offload (5.15.180)
-# ---------------------------------------------------------------------------
-
 def _semaphore_wake_q_apply(ctx):
     steps = [
         ("kernel/locking/semaphore.c",
@@ -609,17 +506,6 @@ def _semaphore_wake_q_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# block: abort suspend when wakeup events are pending (5.15.198)
-# ---------------------------------------------------------------------------
-
-# The lts branch (5.15.211+) carries 8fe7de5d1c7f upstream-first, but with the
-# <linux/suspend.h> include wrapped in an AOSP `#ifndef __GENKSYMS__` guard
-# (AOSP keeps the CRCs stable that way), so the plain include-pair anchor never
-# matches there and the group reported blocked_by_shape on a tree that already
-# has the payload.  Probe the payload itself instead -- it is the same four
-# lines either way, and this module's own graft uses the identical text, so the
-# second pass short-circuits here too.
 _BLK_MQ_SUSPEND_PAYLOAD = (
     "\t\t\tif (pm_wakeup_pending()) {\n"
     "\t\t\t\tclear_bit(BLK_MQ_S_INACTIVE, &hctx->state);\n"
@@ -674,17 +560,7 @@ def _blk_mq_suspend_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# android14-6.1 line: lazy preemption via vendor hooks (ACK 969cb3d family)
-# ---------------------------------------------------------------------------
-
 def _blk_mq_quiesced_elevator_apply(ctx):
-    """Reinit-time elevator switch goes through the quiesced entry point.
-
-    Upstream-shape rewrite (no marker): the baseline that already carries
-    8237c01f1696 looks byte-identical to this group's output, which is what
-    the already_present probe below detects.
-    """
     try:
         text = ctx.read("block/blk-mq.c")
     except FileNotFoundError:
@@ -694,8 +570,6 @@ def _blk_mq_quiesced_elevator_apply(ctx):
             "the 5.15.209 quiesced elevator switch is already in "
             "blk_mq_elv_switch_none()/blk_mq_elv_switch_back()")
     steps = [
-        # rename -> users, all required: a tree holding one half of the pair
-        # (a static definition plus a non-static declaration) does not link.
         ("block/elevator.c",
          "int elevator_switch_mq(struct request_queue *q,\n"
          "\t\t\t      struct elevator_type *new_e)\n"
@@ -704,9 +578,6 @@ def _blk_mq_quiesced_elevator_apply(ctx):
          "\t\t\t      struct elevator_type *new_e)\n"
          "{\n",
          T),
-        # The one-line form of this replacement is a substring of the
-        # pristine static definition, so replace_once would short-circuit to
-        # already_present (trap 1) -- the comment tail anchors it instead.
         ("block/elevator.c",
          " */\n"
          "static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)\n"
@@ -743,10 +614,6 @@ def _blk_mq_quiesced_elevator_apply(ctx):
 
 def _lazy_preempt_hooks_apply(ctx):
     steps = []
-    # dtask.h: the set_tsk_need_resched_lazy hook exists only on the newer
-    # 5.15 ACK lineage; the 2024-11 baseline needs the whole block added.
-    # The marker doubles as the idempotency probe: once grafted, no dtask
-    # step runs and the remaining steps all report already_present.
     dtext = ctx.read("include/trace/hooks/dtask.h")
     if "ABK stable_515_backport: lazy preemption scheduling hooks" not in dtext:
         if "android_vh_set_tsk_need_resched_lazy" not in dtext:
@@ -806,7 +673,6 @@ def _lazy_preempt_hooks_apply(ctx):
                 "#endif /* _TRACE_HOOK_DTASK_H */",
                 T,
             ))
-    # core.c: resched_curr() gains the lazy gate on the 2024-11 baseline
     ctext = ctx.read("kernel/sched/core.c")
     if "trace_android_vh_set_tsk_need_resched_lazy" not in ctext:
         steps.append((
@@ -841,14 +707,11 @@ def _lazy_preempt_hooks_apply(ctx):
             T,
         ))
     steps.extend([
-        # fair.c: the lazy hooks live in dtask.h; mirror the 6.1 include pair
-        # so the tracepoint macros are visible in this translation unit.
         ("kernel/sched/fair.c",
          "#include <trace/hooks/sched.h>",
          "#include <trace/hooks/sched.h>\n"
          "#include <trace/hooks/dtask.h>",
          T),
-        # core.c: __schedule() may skip this schedule() call entirely
         ("kernel/sched/core.c",
          "\tstruct task_struct *prev, *next;\n"
          "\tunsigned long *switch_count;\n"
@@ -882,7 +745,6 @@ def _lazy_preempt_hooks_apply(ctx):
          "\n"
          "\tif (sched_feat(HRTICK) || sched_feat(HRTICK_DL))",
          T),
-        # core.c: lazy state is cleared once the next task is picked
         ("kernel/sched/core.c",
          "\tnext = pick_next_task(rq, prev, &rf);\n"
          "\tclear_tsk_need_resched(prev);\n"
@@ -892,7 +754,6 @@ def _lazy_preempt_hooks_apply(ctx):
          "\tclear_preempt_need_resched();\n"
          "\ttrace_android_vh_clear_curr_lazy(prev);",
          T),
-        # fair.c: check_preempt_tick() can defer the resched
         ("kernel/sched/fair.c",
          "\tif (delta_exec > ideal_runtime) {\n"
          "\t\tresched_curr(rq_of(cfs_rq));\n"
@@ -908,7 +769,6 @@ def _lazy_preempt_hooks_apply(ctx):
          "\t\t/*\n"
          "\t\t * The current task ran long enough, ensure it doesn't get",
          T),
-        # fair.c: entity_tick() HRTICK branch can defer the resched
         ("kernel/sched/fair.c",
          "\tif (queued) {\n"
          "\t\tresched_curr(rq_of(cfs_rq));\n"
@@ -926,7 +786,6 @@ def _lazy_preempt_hooks_apply(ctx):
          "\t\treturn;\n"
          "\t}",
          T),
-        # fair.c: wakeup preemption can defer the resched
         ("kernel/sched/fair.c",
          "preempt:\n"
          "\tresched_curr(rq);\n"
@@ -948,10 +807,6 @@ def _lazy_preempt_hooks_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# android14-6.1 line: mutex/rwsem wakeup patch vendor hooks (ACK dfdcb1d)
-# ---------------------------------------------------------------------------
 
 def _locking_wakeup_patch_apply(ctx):
     steps = [
@@ -1024,19 +879,7 @@ def _locking_wakeup_patch_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# android14-6.1 line: PSI IRQ pressure accounting (mainline 6.1 52b1364,
-# adapted to the 5.15 iterate_groups walk and embedded psi_group)
-# ---------------------------------------------------------------------------
-
 def _psi_irq_tracking_apply(ctx):
-    # Shape probe.  psi_cgroup_pressure_switch (registered below) adds the
-    # per-cgroup accounting switch to the walk this group appends, so its
-    # psi.c replacement block no longer appears verbatim on the second pass:
-    # without this probe the group would re-append the whole function and the
-    # tree would end up with two psi_account_irqtime() definitions (the module's
-    # trap 2, one group removed).  The function's presence in psi.c is the
-    # group's own all-or-nothing marker -- apply_steps is transactional.
     try:
         text = ctx.read("kernel/sched/psi.c")
     except FileNotFoundError:
@@ -1045,7 +888,6 @@ def _psi_irq_tracking_apply(ctx):
         return "already_present", (
             "PSI IRQ accounting is already in the tree")
     steps = [
-        # psi_types.h: PSI_IRQ resource and state, gated like the ACK tree
         ("include/linux/psi_types.h",
          "enum psi_res {\n"
          "\tPSI_IO,\n"
@@ -1081,7 +923,6 @@ def _psi_irq_tracking_apply(ctx):
          "\tNR_PSI_STATES,\n"
          "};",
          T),
-        # stats.h: declaration and compile-out stubs
         ("kernel/sched/stats.h",
          "#ifdef CONFIG_PSI\n"
          "/*\n"
@@ -1113,7 +954,6 @@ def _psi_irq_tracking_apply(ctx):
          "#endif /* CONFIG_IRQ_TIME_ACCOUNTING */\n"
          "#endif /* CONFIG_PSI */",
          T),
-        # psi.c: the accounting function, walking the 5.15 iterate_groups chain
         ("kernel/sched/psi.c",
          "/**\n"
          " * psi_memstall_enter - mark the beginning of a memory stall section\n"
@@ -1175,7 +1015,6 @@ def _psi_irq_tracking_apply(ctx):
          " * psi_memstall_enter - mark the beginning of a memory stall section\n"
          " * @flags: flags to handle nested sections",
          T),
-        # psi.c: psi_show() renders the irq resource as a single full line
         ("kernel/sched/psi.c",
          "int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)\n"
          "{\n"
@@ -1203,7 +1042,6 @@ def _psi_irq_tracking_apply(ctx):
          "\t\t\t   full ? \"full\" : \"some\",",
          "\t\t\t   full || only_full ? \"full\" : \"some\",",
          T),
-        # psi.c: psi_trigger_create() must reject some/ only for the irq resource
         ("kernel/sched/psi.c",
          "\telse\n"
          "\t\treturn ERR_PTR(-EINVAL);\n"
@@ -1222,7 +1060,6 @@ def _psi_irq_tracking_apply(ctx):
          "\tif (state >= PSI_NONIDLE)\n"
          "\t\treturn ERR_PTR(-EINVAL);",
          T),
-        # psi.c: /proc/pressure/irq surface
         ("kernel/sched/psi.c",
          "\nstatic int __init psi_proc_init(void)\n",
          "\n"
@@ -1265,7 +1102,6 @@ def _psi_irq_tracking_apply(ctx):
          "#endif\n"
          "\t}",
          T),
-        # core.c: account irq time at tick and before the context switch
         ("kernel/sched/core.c",
          "\trq_lock(rq, &rf);\n"
          "\n"
@@ -1293,14 +1129,8 @@ def _psi_irq_tracking_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# android14-6.1 line: PSI trigger kernfs polling (ACK 6.1 backport of the
-# kernfs polling rework; psi_trigger is heap-only so the KMI is untouched)
-# ---------------------------------------------------------------------------
-
 def _psi_kernfs_polling_apply(ctx):
     steps = [
-        # psi_types.h: deferred-event flag and the kernfs wrapper struct
         ("include/linux/psi_types.h",
          "\t/*\n"
          "\t * Time last event was generated. Used for rate-limiting\n"
@@ -1336,7 +1166,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\tstruct kernfs_open_file *of;\n"
          "};",
          T),
-        # psi.h: trigger creation carries the file/kernfs identity
         ("include/linux/psi.h",
          "struct psi_trigger *psi_trigger_create(struct psi_group *group,\n"
          "\t\t\tchar *buf, size_t nbytes, enum psi_res res);",
@@ -1345,7 +1174,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\t\t\t\t       enum psi_res res, struct file *file,\n"
          "\t\t\t\t       struct kernfs_open_file *of);",
          T),
-        # psi.c: short windows are no longer floored at 500ms
         ("kernel/sched/psi.c",
          "/* PSI trigger definitions */\n"
          "#define WINDOW_MIN_US 500000\t/* Min window size is 500ms */\n"
@@ -1361,7 +1189,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\tif (window_us == 0 || window_us > WINDOW_MAX_US)\n"
          "\t\treturn ERR_PTR(-EINVAL);",
          T),
-        # psi.c: trigger_create() allocates the ext wrapper and seeds the window
         ("kernel/sched/psi.c",
          "struct psi_trigger *psi_trigger_create(struct psi_group *group,\n"
          "\t\t\tchar *buf, size_t nbytes, enum psi_res res)\n"
@@ -1409,8 +1236,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\t\t\tkfree(t_ext);\n"
          "\t\t\tmutex_unlock(&group->trigger_lock);",
          T),
-        # psi.c: update_triggers() ratelimits without dropping events and
-        # signals cgroup triggers through kernfs
         ("kernel/sched/psi.c",
          "static u64 update_triggers(struct psi_group *group, u64 now)\n"
          "{\n"
@@ -1513,7 +1338,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\t\tmemcpy(group->polling_total, total,\n"
          "\t\t\t\tsizeof(group->polling_total));",
          T),
-        # psi.c: trigger destruction and poll wake cgroup waiters via kernfs
         ("kernel/sched/psi.c",
          "void psi_trigger_destroy(struct psi_trigger *t)\n"
          "{\n"
@@ -1568,7 +1392,6 @@ def _psi_kernfs_polling_apply(ctx):
          "\telse\n"
          "\t\tpoll_wait(file, &t->event_wait, wait);",
          T),
-        # psi.c + cgroup.c: callers pass the open file identity through
         ("kernel/sched/psi.c",
          "\tnew = psi_trigger_create(&psi_system, buf, nbytes, res);",
          "\tnew = psi_trigger_create(&psi_system, buf, res, file, NULL);",
@@ -1584,35 +1407,6 @@ def _psi_kernfs_polling_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# android14-6.1 line: the per-cgroup PSI accounting switch (cgroup.pressure)
-# ---------------------------------------------------------------------------
-
-# Upstream keeps the switch in struct psi_group::enabled and reaches the
-# ancestor chain through a newly added struct psi_group::parent.  Neither is
-# available on 5.15: struct psi_group is embedded in struct cgroup
-# (cgroup-defs.h), so a new member -- at the front as much as at the back --
-# moves bpf/congestion_count/freezer/ancestor_ids[] and breaks the cgroup KMI.
-# The 5.15 walk (iterate_groups()) already reaches every ancestor level through
-# the cgroup tree, so no parent pointer is needed either.  What the port keeps is
-# the semantics:
-#
-#   * the switch is per cgroup and NOT hierarchical (cgroup-v2.rst: disabling
-#     accounting in a cgroup does not affect its descendants),
-#   * a disabled group keeps counting tasks -- the levels above and below consult
-#     those counts -- but stops deriving state masks and timing them,
-#   * re-enabling rebuilds each CPU's state mask from those counts
-#     (psi_cgroup_restart()), and
-#   * a disabled group has no pressure data to report.
-#
-# The state is therefore the CGRP_PSI_DISABLED bit of the cgroup's own
-# (unsigned long) flags word, and the root cgroup's switch -- whose pressure
-# files are backed by psi_system rather than by an embedded group -- drives a
-# flag in psi.c.  One deviation is deliberate: 5.15 has no kernfs_show() and no
-# KERNFS_HIDDEN (that mechanism arrived with this very series), so the pressure
-# files are not hidden; reading one reports -EOPNOTSUPP instead of frozen
-# numbers, which is the same signal to a consumer.
-
 def _psi_cgroup_pressure_apply(ctx):
     try:
         text = ctx.read("kernel/cgroup/cgroup.c")
@@ -1622,7 +1416,6 @@ def _psi_cgroup_pressure_apply(ctx):
         return "already_present", (
             "cgroup.pressure is already in the cgroup base files")
     steps = [
-        # cgroup-defs.h: a flag bit, so no struct offset moves
         ("include/linux/cgroup-defs.h",
          "\t/* Control group has to be killed. */\n"
          "\tCGRP_KILL,\n"
@@ -1639,7 +1432,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\tCGRP_PSI_DISABLED,\n"
          "};",
          T),
-        # psi.h: what the cgroup file needs from psi.c
         ("include/linux/psi.h",
          "#ifdef CONFIG_CGROUPS\n"
          "int psi_cgroup_alloc(struct cgroup *cgrp);\n"
@@ -1659,8 +1451,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "void psi_cgroup_restart(struct psi_group *group);\n"
          "#endif",
          T),
-        # psi.c: the helper every accounting path asks, plus the system group's
-        # own switch (psi_system has no cgroup to carry a flag)
         ("kernel/sched/psi.c",
          "static void psi_group_change(struct psi_group *group, int cpu,\n"
          "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
@@ -1688,7 +1478,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\t\t\t     unsigned int clear, unsigned int set, u64 now,\n"
          "\t\t\t     bool wake_clock)\n",
          T),
-        # psi.c: accounting off -- counts stay live, states stop
         ("kernel/sched/psi.c",
          "\tfor (t = 0; set; set &= ~(1 << t), t++)\n"
          "\t\tif (set & (1 << t))\n"
@@ -1716,7 +1505,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\n"
          "\t/* Calculate state mask representing active states */\n",
          T),
-        # psi.c: the IRQ accounting walk (added by psi_irq_tracking) honours it
         ("kernel/sched/psi.c",
          "\twhile ((group = iterate_groups(curr, &iter))) {\n"
          "\t\tu64 now;\n"
@@ -1730,7 +1518,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\n"
          "\t\tgroupc = per_cpu_ptr(group->pcpu, cpu);\n",
          T),
-        # psi.c: reports
         ("kernel/sched/psi.c",
          "\tif (static_branch_likely(&psi_disabled))\n"
          "\t\treturn -EOPNOTSUPP;\n"
@@ -1749,7 +1536,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\n"
          "\t/* Update averages before reporting them */\n",
          T),
-        # psi.c: no new trigger on a group that does not account
         ("kernel/sched/psi.c",
          "\tif (static_branch_likely(&psi_disabled))\n"
          "\t\treturn ERR_PTR(-EOPNOTSUPP);\n"
@@ -1766,7 +1552,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\n"
          "\tif (sscanf(buf, \"some %u %u\", &threshold_us, &window_us) == 2)\n",
          T),
-        # psi.c: the accessors and the re-enable sync
         ("kernel/sched/psi.c",
          "\ttask_rq_unlock(rq, task, &rf);\n"
          "}\n"
@@ -1824,8 +1609,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "}\n"
          "#endif /* CONFIG_CGROUPS */",
          T),
-        # cgroup.c: the trigger writer yields its name to the switch, as it does
-        # in the ACK tree (where it became pressure_write())
         ("kernel/cgroup/cgroup.c",
          "static ssize_t cgroup_pressure_write(struct kernfs_open_file *of, char *buf,\n"
          "\t\t\t\t\t  size_t nbytes, enum psi_res res)\n",
@@ -1847,7 +1630,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\treturn cgroup_pressure_write(of, buf, nbytes, PSI_CPU);\n",
          "\treturn pressure_write(of, buf, nbytes, PSI_CPU);\n",
          T),
-        # cgroup.c: the knob itself
         ("kernel/cgroup/cgroup.c",
          "static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,\n"
          "\t\t\t\t\t  poll_table *pt)\n",
@@ -1901,7 +1683,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "static __poll_t cgroup_pressure_poll(struct kernfs_open_file *of,\n"
          "\t\t\t\t\t  poll_table *pt)\n",
          T),
-        # cgroup.c: the file, next to the pressure files it controls
         ("kernel/cgroup/cgroup.c",
          "\t{\n"
          "\t\t.name = \"cpu.pressure\",\n"
@@ -1930,7 +1711,6 @@ def _psi_cgroup_pressure_apply(ctx):
          "\t\t.write = cgroup_pressure_write,\n"
          "\t},\n",
          T),
-        # Documentation: the knob is user-visible, so it is documented
         ("Documentation/admin-guide/cgroup-v2.rst",
          "\tIn a threaded cgroup, writing this file fails with EOPNOTSUPP as\n"
          "\tkilling cgroups is a process directed operation, i.e. it affects\n"
@@ -1975,26 +1755,6 @@ def _psi_cgroup_pressure_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# android14-6.1 line: TSK_ONCPU becomes a bit of the state mask
-# ---------------------------------------------------------------------------
-
-# The last PSI item on the 6.1 backlog (plan.md: "PSI 内部全量同步").  Upstream
-# counts ONCPU like any other task state, which is one counter more than the
-# hardware can justify -- only one task is ever scheduled on a CPU -- and makes
-# the scheduler/psi hand-off racy: psi_task_switch() has to guess when to stop
-# setting ONCPU on @next's ancestors (the old code needed an "identical state"
-# comparison to decide), and a mismatch shows up as the "psi: task underflow!"
-# splat.  The ACK 6.1 shape drops the counter: TSK_ONCPU is a flag carried in
-# the same state mask that holds the derived states, so setting it where it is
-# already set is idempotent and the switch can stop at the first ancestor that
-# already has it.
-#
-# The ancestor walk stays the 5.15 iterate_groups() cgroup-tree walk (the ACK
-# tree's psi_group::parent pointer is still not needed and must not be added --
-# struct psi_group is embedded in struct cgroup).  psi_group_cpu is
-# percpu-internal, so dropping tasks[NR_ONCPU] changes no KMI-visible layout.
-
 def _psi_oncpu_state_mask_apply(ctx):
     try:
         text = ctx.read("include/linux/psi_types.h")
@@ -2004,7 +1764,6 @@ def _psi_oncpu_state_mask_apply(ctx):
         return "already_present", (
             "TSK_ONCPU is already a state-mask bit")
     steps = [
-        # psi_types.h: NR_ONCPU is not a task count any more
         ("include/linux/psi_types.h",
          "\tNR_RUNNING,\n"
          "\t/*\n"
@@ -2053,7 +1812,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          " */\n"
          "#define PSI_ONCPU\t(1 << NR_PSI_STATES)\n",
          T),
-        # psi.c: test_state asks the mask instead of counting
         ("kernel/sched/psi.c",
          "static bool test_state(unsigned int *tasks, enum psi_states state)\n"
          "{\n"
@@ -2074,8 +1832,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          "\tcase PSI_CPU_FULL:\n"
          "\t\treturn unlikely(tasks[NR_RUNNING] && !oncpu);\n",
          T),
-        # psi.c: the flag is set, cleared or carried before the counts are
-        # touched, so it never reaches the count loops
         ("kernel/sched/psi.c",
          "\twrite_seqcount_begin(&groupc->seq);\n"
          "\n"
@@ -2104,7 +1860,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          "\n"
          "\tfor (t = 0, m = clear; m; m &= ~(1 << t), t++) {\n",
          T),
-        # psi.c: four counters left in the underflow splat
         ("kernel/sched/psi.c",
          "\t\t\tprintk_deferred(KERN_ERR \"psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u %u] clear=%x set=%x\\n\",\n"
          "\t\t\t\t\tcpu, t, groupc->tasks[0],\n"
@@ -2116,7 +1871,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          "\t\t\t\t\tgroupc->tasks[1], groupc->tasks[2],\n"
          "\t\t\t\t\tgroupc->tasks[3], clear, set);\n",
          T),
-        # psi.c: the cgroup.pressure switch keeps the flag, not just the counts
         ("kernel/sched/psi.c",
          "\t * ABK stable_515_backport: cgroup.pressure -- with the accounting\n"
          "\t * switched off, keep the task counts current (the levels above and\n"
@@ -2151,8 +1905,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          "\tif (unlikely(groupc->tasks[NR_ONCPU] && cpu_curr(cpu)->in_memstall))\n",
          "\tif (unlikely((state_mask & PSI_ONCPU) && cpu_curr(cpu)->in_memstall))\n",
          T),
-        # psi.c: the switch stops at the first ancestor that already carries the
-        # flag, which is the common ancestor -- no state comparison needed
         ("kernel/sched/psi.c",
          "\tif (next->pid) {\n"
          "\t\tbool identical_state;\n"
@@ -2196,7 +1948,6 @@ def _psi_oncpu_state_mask_apply(ctx):
          "\t\t}\n"
          "\t}\n",
          T),
-        # psi.c: ... so everything else has to keep propagating above it
         ("kernel/sched/psi.c",
          "\t\t/*\n"
          "\t\t * TSK_ONCPU is handled up to the common ancestor. If we're tasked\n"
@@ -2342,23 +2093,6 @@ PATCH_GROUPS = [
     ),
 ]
 
-# ============================================================================
-# Batch 10-2 / 10-4c / 10-5: schedutil smart-freq policy layer on PELT
-# (inspired by the WALT smart_freq SUSTAINED_HIGH_UTIL reason; see
-# walt_pelt_survey.md).  Steps live in scripts/batch10_perf_sched_policy.py:
-# per-cluster sustained-high util election sampled in the scheduler tick,
-# floored at cpufreq resolve time (android_vh_cpufreq_resolve_freq).
-#
-# 10-5 is the ownership fix.  A device whose only governor is the vendor walt
-# one (FAS driven by a userspace scheduler profile) showed the floor turning
-# into a ratchet: waltgov computed 766 MHz from cluster demand while the policy
-# sat at 1785600 for a whole game session, because a FAS owner requests
-# min == max == its own target and a floor clamped to policy->max simply
-# re-states the current frequency.  The policy is now disabled by default and
-# refuses to act on any policy that is not plain schedutil or has collapsed to
-# a single operating point; a tree already carrying the 10-4c payload is
-# upgraded in place (build_upgrade_steps) instead of getting a second copy.
-# ============================================================================
 import batch10_perf_sched_policy as _b10_sched  # noqa: E402
 
 
@@ -2367,15 +2101,8 @@ def _sched_smart_policy_apply(ctx):
     try:
         text = ctx.read(rel)
     except FileNotFoundError:
-        # Let apply_steps report the missing file as a degraded shape, exactly
-        # as it does for any other absent anchor.
         text = ""
     if _b10_sched.has_unknown_policy(text):
-        # Batch 10-2 grafted this group once with a different payload, and that
-        # shape matches neither migration anchor while still leaving the insert
-        # anchor in place.  Taking the plain path there would define the policy
-        # twice -- and still report `applied`.  A shape this module cannot name
-        # is refused; nothing is written.
         return "blocked_by_shape", (
             "an unrecognised smart-freq payload is already in the tree "
             "(neither the current nor the Batch 10-4c shape); inserting would "
@@ -2388,8 +2115,6 @@ def _sched_smart_policy_apply(ctx):
         return "blocked_by_shape", detail
     if upgrade:
         detail = "upgraded the Batch 10-4c payload in place; " + detail
-    # The payload cannot carry its own digest (that would move the digest), so the
-    # graft report is where "which generation did this build write" is recorded.
     return status, detail + "; payload " + _b10_sched.policy_sha256()
 
 
@@ -2406,47 +2131,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 42: the un-landed half of Batch 10-2's WALT smart_freq scope -- the
-# freq_cap[] -> min(freq, cap) clamp.  Steps live in
-# scripts/batch42_perf_schedutil_smart_cap.py.
-#
-# Batch 10-2's scope was "reason election + deactivation hysteresis +
-# frequency cap + per-cluster threshold table"; schedutil_smart_policy landed
-# the first two (per-cluster sustained-high-util reason election and the
-# frequency floor) and the cap never landed.  This group is the cap, from the
-# same upstream code (smart_freq.c:433/505, cpufreq_walt.c:264) and on the same
-# hook, off by default and gated exactly as hard.
-#
-# ORDERING -- the reason this group is registered immediately after
-# schedutil_smart_policy and not anywhere else in this child:
-#
-# Both payloads register on android_vh_cpufreq_resolve_freq in the same
-# translation unit, and android_vh probes run in registration order, so
-# registration order IS execution order.  The clause has to be "cap first,
-# floor second": a floor that runs first would raise the target above the cap
-# and the cap would be applied to a target it can no longer see.  Both groups
-# use late_initcall, so within one translation unit that is text order -- and
-# the cap's payload is therefore grafted *in front of* the
-# cpufreq_governor_init(schedutil_gov); anchor this group's predecessor is
-# appended behind.  That placement is also the only one that is idempotent for
-# both groups: inserting after that anchor would sandwich the cap between the
-# anchor and the floor payload, so on the second pass the floor group's
-# replacement would stop matching while its anchor still did and it would
-# append a second floor payload -- the Batch-21 psi_account_irqtime() trap
-# (group_recipe.md §2 trap 5).
-#
-# "Cap first" alone does not settle the conflict, because the floor runs after
-# the clamp and can only raise.  The cap therefore keeps a second probe on the
-# same hook, registered at late_initcall_sync (which orders after the floor's
-# late_initcall), that re-asserts the clamp this pass took -- so while the cap
-# owns a policy's range the floor yields, and the two never trade the range
-# back and forth.  The floor payload itself is byte-frozen (Batch 10-5's
-# migration anchor), so the yield is enforced on the cap's side rather than by
-# rewriting code that already-grafted trees would stop recognising.  Both
-# payloads expose a read-only node (abk_sc_capped, abk_sf_boosting) so which of
-# them owns a range is observable instead of inferred from frequencies.
-# ============================================================================
 import batch42_perf_schedutil_smart_cap as _b42_cap  # noqa: E402
 
 
@@ -2455,21 +2139,12 @@ def _sched_smart_cap_apply(ctx):
     try:
         text = ctx.read(rel)
     except FileNotFoundError:
-        # Let apply_steps report the missing file as a degraded shape, exactly
-        # as it does for any other absent anchor.
         text = ""
     if _b42_cap.has_unknown_cap(text):
-        # A cap payload that matches no known anchor still leaves _TAIL_OLD in
-        # place, so the plain insert would define the payload twice and the
-        # group would still report applied.  Refuse, and write nothing.
         return "blocked_by_shape", (
             "an unrecognised smart-freq cap payload is already in the tree; "
             "inserting would duplicate its definitions, so nothing was "
             "written")
-    # The shared header block is added by schedutil_smart_policy's include step
-    # when that group runs first (it does: this group is registered after it),
-    # so probing for it is what keeps this group's own include step from
-    # short-circuiting to already_present.
     steps = _b42_cap.build_steps(
         add_headers=not _b42_cap.has_header_block(text))
     status, _results, detail = apply_steps(ctx, steps)
@@ -2493,45 +2168,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 15: ABK_ABI_PATCH_SUITE absorption -- scheduler refinements + EEVDF.
-# Steps live in scripts/batch15_perf_sched_refinements.py and
-# scripts/batch15_perf_eevdf.py.
-#
-# Batch 15 retires the suite-preference rule (docs/porting_policy.md, "Suite
-# absorption"), so the suite's scheduler inventory is re-registered here:
-#
-#   batch15_perf_sched_refinements
-#       nohz_field_refinement    names the legacy tick_sched nohz state fields
-#                                and adds accessors, so the ~8 read sites stop
-#                                open-coding the bit tests.
-#       avg_idle_preemption_mode drops the wake_avg_idle prediction while
-#                                keeping the direct avg_idle newidle thresholds,
-#                                and simplifies the SIS_PROP scan budgeting.
-#
-#   batch15_perf_eevdf
-#       THIS is where this module takes ownership of the sched_entity KABI
-#       slots 1-4 (deadline / min_vruntime / vlag / slice) -- the slots the
-#       retired red line used to forbid.  Its three groups are registered in a
-#       deliberate order, pick_logic BEFORE core_fields and modern_fields, so
-#       the slot claim and the cfs_rq accumulators only happen once the fair.c
-#       logic has really landed: on anchor drift the slots stay
-#       ANDROID_KABI_RESERVE instead of being claimed for code that is not in
-#       the tree.
-#
-#       Batch 28 rebuilt that payload onto the upstream data structure and
-#       policy (docs/survey_eevdf_gap.md): the cfs_rq virtual-time accumulators
-#       make avg_vruntime() O(1), update_curr() owns the deadline refresh so the
-#       selector is O(n) and read-only, and RUN_TO_PARITY / PREEMPT_SHORT /
-#       EEVDF wakeup preemption / EEVDF yield / new-task placement are in.
-#       The modern_fields group adds the cfs_rq fields and the two switches.
-#
-# Ordering: both modules are appended after every pre-existing perf group, so
-# their fair.c / core.c anchors see the earlier groups' output.  A build that
-# injects ABK_ABI_PATCH_SUITE instead of this module keeps the suite's copies;
-# the suite must never ride the same build (AGENTS.md -- it would double-claim
-# sched_entity 1-4 and request_queue 1).
-# ============================================================================
 import batch15_perf_sched_refinements as _b15_sched  # noqa: E402
 import batch15_perf_eevdf as _b15_eevdf  # noqa: E402
 import batch15_perf_blk_mq_async_depth as _b15_blkdepth  # noqa: E402
@@ -2539,13 +2175,6 @@ import batch15_perf_blk_mq_async_depth as _b15_blkdepth  # noqa: E402
 PATCH_GROUPS = PATCH_GROUPS + _b15_sched.build_groups(PatchGroup)
 PATCH_GROUPS = PATCH_GROUPS + _b15_eevdf.build_groups(PatchGroup)
 
-# blk_mq_async_depth: the absorbed queue-depth policy.  This is the group that
-# claims request_queue KABI slot 1 (ANDROID_KABI_USE(1, unsigned int async_depth))
-# -- the other half of the retired red line.  It shares no anchor text with
-# blk_mq_suspend_wakeup_abort (that one owns the blk-mq.c #include pair and
-# blk_mq_hctx_notify_offline(); this one owns __blk_mq_alloc_request(),
-# blk_mq_init_allocated_queue() and blk_mq_update_nr_requests()), so their
-# relative order does not matter.
 PATCH_GROUPS = PATCH_GROUPS + _b15_blkdepth.build_groups(PatchGroup)
 
 

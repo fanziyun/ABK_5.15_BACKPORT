@@ -1,46 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Batch 10-4c/10-5: schedutil smart-freq policy, gated to the schedutil owner.
-
-The first form of this policy sampled its input in
-``android_vh_map_util_freq_new`` -- a hook schedutil calls from
-``get_next_freq()``.  On a device whose only governor is the vendor ``walt``
-one, that hook is never reached, so the policy was inert.  Batch 10-4c moved
-sampling to ``android_vh_scheduler_tick`` (every governor) and applied the
-floor in ``android_vh_cpufreq_resolve_freq`` (both cpufreq paths), which made
-the policy *live* -- and that turned out to be the wrong fix.
-
-Measured on a kalama (SM8550) device running that vendor governor with FAS
-driven by a userspace scheduler profile: with the policy enabled, every cpufreq
-policy froze at its current ceiling.  ``waltgov_next_freq`` showed the governor
-computing 766 MHz from a cluster at 22% demand while the policy sat at
-1785600 for a whole game session.  The reason is structural: a FAS-style owner
-requests ``min == max == its own target``, so ``floor`` -- computed from
-``cpuinfo.max_freq`` and then clamped to ``policy->max`` -- degenerates to "the
-frequency applied a moment ago".  The hook then cancels every downscale, and
-the cluster ratchets up to the ceiling and stays there.  Two further defects
-made the latch nearly permanent: ``boost_start`` only reset below the *exit*
-threshold (so the 70-90% dead band banked boost time, turning "sustained for
-300 ms" into "high once, more than 300 ms ago"), and release was evaluated only
-in the tick (an idle CPU stops ticking under NO_HZ_IDLE, freezing the flag).
-
-The current form therefore (a) defaults to disabled so a vendor FAS/WALT device
-keeps exclusive ownership of DVFS, (b) refuses to act on any policy whose
-governor is not ``schedutil`` or whose range has collapsed to a single
-operating point, (c) only applies a floor that has real headroom under
-``policy->max``, (d) slides the sustained window properly, and (e) expires the
-reason at resolve time as well as in the tick.  ``abk_sf_boosting`` exposes the
-reason state read-only so the next diagnosis does not have to infer it from
-frequencies.
-
-``_POLICY_V1`` is kept verbatim: a tree already grafted with it is upgraded in
-place (see ``build_upgrade_steps``) rather than having a second copy appended,
-which would fail the compile with duplicate definitions.  The *other* legacy
-shape -- Batch 10-2, whose payload hung off ``android_vh_map_util_freq_new`` --
-matches no anchor at all while still leaving ``_TAIL_OLD`` intact, so inserting
-there would duplicate the definitions the same way.  Nothing in this module can
-upgrade a shape it cannot name, so that shape is detected and refused
-(:func:`has_unknown_policy`) instead of being reported as a clean apply.
-"""
 
 import hashlib
 import re
@@ -61,9 +19,6 @@ def _tabs(text):
 T = True
 
 _INC_OLD = "#include <trace/hooks/sched.h>\n"
-# The include block Batch 10-4c left behind.  It is its own anchor so a v1 tree
-# gains only the missing header: re-inserting the whole block right after the
-# first include line would duplicate the three lines that are already there.
 _INC_V1 = (
     "#include <trace/hooks/sched.h>\n"
     "#include <trace/hooks/cpufreq.h>\n"
@@ -75,11 +30,6 @@ _INC_NEW = _INC_V1 + "#include <linux/string.h>\n"
 _TAIL_OLD = "cpufreq_governor_init(schedutil_gov);\n"
 _REL = "kernel/sched/cpufreq_schedutil.c"
 
-# --- payloads ---------------------------------------------------------------
-# v1: the shape shipped by Batch 10-4c.  Byte-frozen, because it is the
-# migration anchor for any tree already carrying it.  Do not edit: changing it
-# silently strands those trees (the upgrade anchor stops matching and the
-# plain insert would then define the policy twice).
 _POLICY_V1 = _tabs(r"""
 /*
  * ABK stable_515_backport: Batch 10-4 sched smart-freq policy (PELT).
@@ -506,43 +456,24 @@ def _norm(text):
 
 
 def has_current_policy(text):
-    """True when the tree already carries the current payload."""
     return _norm(_POLICY_V2) in _norm(text)
 
 
 def has_legacy_policy(text):
-    """True when the tree carries the Batch 10-4c payload."""
     return _norm(_POLICY_V1) in _norm(text)
 
 
 def has_unknown_policy(text):
-    """True when a smart-freq payload is present that matches no known anchor.
-
-    Batch 10-2 shipped this group once before the hook move, and its payload
-    declares the same variables against the same `_TAIL_OLD` anchor.  Neither
-    migration anchor matches it, so the plain insert would put a second copy of
-    the policy in front of it -- duplicate definitions, and a group still
-    reporting `applied`.  Refusing is the only transactional option.
-    """
     text = _norm(text)
     return ("static bool abk_sf_enable" in text
             and not has_current_policy(text) and not has_legacy_policy(text))
 
 
 def needs_legacy_upgrade(text):
-    """A previously grafted tree whose payload predates the DVFS-ownership fix."""
     return has_legacy_policy(text) and not has_current_policy(text)
 
 
 def policy_sha256():
-    """Short fingerprint of the live payload.
-
-    Reported in the graft detail so a build log says *which* payload generation it
-    wrote.  It cannot live in the payload itself -- embedding the digest would move
-    the digest -- and before it existed, telling a pre-10-5 kernel from a current
-    one meant reading frequencies and guessing, which is how the Batch 10-6
-    mis-attribution happened in the first place.
-    """
     return hashlib.sha256(_POLICY_V2.encode()).hexdigest()[:16]
 
 
@@ -551,7 +482,6 @@ def _inc_step(anchor):
 
 
 def build_steps():
-    """Steps for a tree without this policy (or one already at v2)."""
     return [
         _inc_step(_INC_OLD),
         (_REL, _TAIL_OLD, _TAIL_NEW, T),
@@ -559,14 +489,6 @@ def build_steps():
 
 
 def build_upgrade_steps():
-    """Steps for a tree carrying the v1 payload: rewrite it in place.
-
-    ``_TAIL_OLD`` alone still matches such a file (it is the line the payload
-    was appended to), so taking :func:`build_steps` there would insert a second
-    copy of the policy ahead of the first -- duplicate definitions, compile
-    failure.  Anchoring on ``_TAIL_OLD + _POLICY_V1`` instead makes the upgrade
-    a replacement, and every shape stays idempotent.
-    """
     return [
         _inc_step(_INC_V1),
         (_REL, _TAIL_OLD + _POLICY_V1, _TAIL_OLD + _POLICY_V2, T),

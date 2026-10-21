@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""Pack a KernelSU module from ``ksu/<id>/`` into a flashable zip.
-
-The default module source is ``ksu/abk_runtime_tunables/``; this script turns it
-into ``build/ksu/abk_runtime_tunables.zip``, which the KernelSU manager can flash
-and ``ksud module install`` can install over adb.  Pass ``--module`` for the
-second module (``ksu/sailboat_addon_2``).  The AK3 bundler renames each zip to
-the ``id=`` inside its module.prop, because the installer derives the install
-directory from that basename -- so module 1 keeps its original id (an installed
-copy must upgrade in place rather than be orphaned) and module 2, being new, is
-free to take the sailboat_addon_2 id.
-
-Three details matter:
-
-* Entries sit at the zip root, because KernelSU extracts them straight into
-  ``/data/adb/modules/<id>``.  No ``META-INF/`` is shipped: ``ksud module
-  install`` has its own unpacker (it even skips ``META-INF/*``).
-* ``embed.conf`` maps repository files -- currently
-  ``tools/zram_recompress_trigger.sh`` -- into the module, so the device-facing
-  tool stays a single implementation instead of a copy that drifts.
-* The output is deterministic (fixed timestamps, sorted entries, ``.sh`` at
-  0755), so two builds of the same tree are byte-identical and CI can compare
-  them.
-
-Run: python3 scripts/build_ksu_module.py
-"""
 
 from __future__ import annotations
 
@@ -43,11 +18,10 @@ FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
 
 class BuildError(SystemExit):
-    """A condition the caller must fix; the CLI reports it and exits non-zero."""
+    pass
 
 
 def read_module_id(source: Path = MODULE_SOURCE) -> str:
-    """The ``id=`` of module.prop, which must also be the module directory name."""
     prop = source / "module.prop"
     if not prop.is_file():
         raise BuildError(f"no module.prop in {source}")
@@ -58,11 +32,6 @@ def read_module_id(source: Path = MODULE_SOURCE) -> str:
 
 
 def read_embed_manifest(source: Path = MODULE_SOURCE) -> list[tuple[Path, str]]:
-    """Parse ``<repo-relative source>=<path inside the module>`` lines.
-
-    Paths are resolved and checked: a manifest must not reach outside the
-    repository, and must not escape the module directory either.
-    """
     manifest = source / EMBED_MANIFEST
     if not manifest.is_file():
         return []
@@ -93,7 +62,6 @@ def read_embed_manifest(source: Path = MODULE_SOURCE) -> list[tuple[Path, str]]:
 
 
 def module_entries(source: Path = MODULE_SOURCE) -> list[tuple[str, bytes, int]]:
-    """(entry name, bytes, mode) for the module tree plus everything embedded."""
     if not (source / "module.prop").is_file():
         raise BuildError(f"{source} does not look like a KernelSU module")
 
@@ -131,7 +99,7 @@ def build(source: Path = MODULE_SOURCE, output: Path = DEFAULT_OUTPUT) -> Path:
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, data, mode in entries:
             info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
-            info.create_system = 3  # unix, so external_attr carries the mode
+            info.create_system = 3
             info.external_attr = mode << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, data)
@@ -146,7 +114,7 @@ def build(source: Path = MODULE_SOURCE, output: Path = DEFAULT_OUTPUT) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description="Pack the KernelSU runtime companion")
     parser.add_argument("--module", type=Path, default=MODULE_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--list", action="store_true", help="print the entries and exit")
