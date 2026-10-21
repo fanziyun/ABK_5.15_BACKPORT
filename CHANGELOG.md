@@ -2,7 +2,7 @@
 
 本文件由 `plan.md` 拆分而来：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）逐字搬运到此，按 Batch 倒序排列；`plan.md` 只保留每个批次的一行索引，以及尚未落地的候选、延后项、排除记录与禁区清单。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。100 个移植组（core 75 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。103 个移植组（core 78 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -1149,6 +1149,112 @@ MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)�
 都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
 载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
 DARK_GATES,无本组新增)。
+<a id="batch-72-74"></a>
+
+## Batch 72-74(swap 缓存积压收敛 + 换入预读窗口 + fault-around uid 策略,v0.75.0,core 75 → 78 组)
+
+主题:**把延迟换出造成的 swap cache 积压收敛到 MB 级,并把换入预读与 fault-around 的策略面补成可调**。
+三组各自独立注册、独立回退,共用一条真机验证链;设计、参数表与复现口径详见
+[docs/swap_cache_backlog.md](docs/swap_cache_backlog.md)。
+
+### 1. 现象与归因
+
+日常使用后 `SwapCached` 稳态停在 0.6-1.1 GB,`SwapFree` 充足且 `pswpout` 不再增长;
+`kcompressd` 的 `enqueued - swapped` 长期为 0(offload 线程跟得上,积压不在队列里)。
+关掉 offload 后同样负载下 `SwapCached` 峰值≈起始值、结束回到几十 MB,唯一变量是 offload。
+
+归因:`shrink_page_list()` 的 `case PAGE_SUCCESS:` 在 `pageout()` 后检查
+`PageWriteback(page)`;Batch 41 把首次换出压缩搬进 per-node 线程,入队即返回、页仍带
+`PG_writeback`,于是走 pristine 的 `goto keep`——页放回 LRU、swap 缓存项保持分配。
+写回完成后只有下一次回收扫描才会 `__remove_mapping()`,而 kswapd 满足水位即停止扫描,
+积压留在原地。现场细分(`/proc/kpageflags`)显示平台期 97% 的 swapcache 页是
+`writeback=0` + `unmapped` + `inactive`:写完、干净、可回收,只是没人再扫。
+
+### 2. Batch 72:`kcompressd_swapcache_drop`(core,脚本 `scripts/batch72_core_kcompressd_swapcache_drop.py`)
+
+三处 `mm/vmscan.c` 编辑,标记 `sailboat_kcompressd_swapcache_drop`:声明
+`LIST_HEAD(wb_retry_pages)` + 一次性闩 `wb_retry_done`;`PAGE_SUCCESS` 分支里在
+`#ifdef CONFIG_SWAP` 内匹配 `!wb_retry_done && PageSwapCache(page) && (page_swap_info(page)->flags & SWP_SYNCHRONOUS_IO)`
+时把页挂起并 `continue`(其余保持 pristine);`/* 'page_list' is always empty here */`
+之后、demote 之前做一次重扫——仍 `PageWriteback` 的页 `wait_on_page_writeback()`,
+**在 drain 自身上下文(`PF_KSWAPD` 且无 `PF_SWAPWRITE`)跳过等待并退回旧 prefilter**,
+wait 后重读 writeback 仍置位也回退,其余 `list_splice_tail()` 回 `page_list` 并
+`goto retry`。移除仍走内核 `__remove_mapping()`,本组只改变"何时重扫";无新锁、无分配;
+等待只作用于本模块入队的页,上界是该 FIFO(≤256 页)的排空时间。异步 swap 设备保持
+pristine 的"稍后再看";`page_swap_info()` 的引用带 `CONFIG_SWAP` 门。
+
+### 3. Batch 73:`swapin_readahead_window`(core,脚本 `scripts/batch73_core_swapin_window.py`)
+
+六步,标记 `sailboat_swapin_readahead_window`:`mm/readahead.c` 加
+`#include <linux/moduleparam.h>` 与文件末尾策略块;`mm/swap_state.c` 去
+`static enable_vma_readahead`、在 `__swapin_nr_pages()` 与 `swapin_nr_pages()` 的终值处
+各插一次 clamp;`mm/internal.h` 两条 extern。整块在 `#ifdef CONFIG_SWAP` 内。参数
+(`/sys/module/readahead/parameters/`,`0644`):`swapin_window_enable=1`、
+`swapin_boost_enable=1`、`swapin_boost_pages=8`、`swapin_shrink_enable=1`、
+`swapin_shrink_pages=1`、`swapin_window_background_only=1`、`swapin_vma_ra=1`
+(内核 `enable_vma_readahead` 的第二句柄,与 `/sys/kernel/mm/swap/vma_ra_enabled` 同变量)。
+boost 是**地板不是上限**:默认 8 在 `page_cluster=3` 下把共享页换入窗口从自适应的
+1-4 页抬到 8 页;shrinking 默认 1 页且只作用于 Batch 9-1 判定为后台的任务,分类器未编入时
+门保持关闭。窗口强制 2 的幂(boost 取幂前夹到 `1 << SWAP_RA_ORDER_CEILING`(32),shrink 0
+视作 1),否则 cluster 路径的对齐掩码(`pages-1`)会在越界输入下退化成全 1。
+
+### 4. Batch 74:`fault_around_app_policy`(core,脚本 `scripts/batch74_core_fault_around_app_policy.py`)
+
+两步,标记 `sailboat_fault_around_app_policy`,只改 `mm/memory.c`:`do_read_fault()` 上方
+插策略块(90,000 位位图 `DIV_ROUND_UP(90000, BITS_PER_LONG)` ≈ 11.25 KiB `.bss`、写侧
+mutex、读侧 lockless `test_bit`、四个参数 `fault_around_enable=1`/`fault_around_sys_uid=1`/
+`fault_around_app_only=0`/`fault_around_app` 自定义 set-get:写 0 清空、uid∈[10000,99999]
+置位、读回前 64 个逗号分隔);在 vendor hook `trace_android_vh_should_fault_around(vmf,
+&should_around)` 与它喂的 `if` 之间插 `abk_fa_adjust(&should_around);`,**hook 行字节不动**,
+同点位其它 handler 的 probe 仍命中、注册顺序无约束。判定在 hook 答案之后只收紧:
+`enable` 关→不动;`uid<10000` 且 `sys_uid`→抑制;`uid>99999`→不动;否则 `app_only=0` 且
+位图置位→抑制。`from_kuid(&init_user_ns, current_uid())` 的 `(uid_t)-1` 由 `uid>99999`
+早退封住。默认只让系统 uid 失去 fault-around,app 行为不变。
+
+### 5. 伴生模块(v0.23.0)
+
+`ksu/abk_runtime_tunables`:`abk_kcompressd_state_line()` 读阈值与三计数并给出
+`depth = enqueued - swapped`(`sync` 是未入队量,不参与),supervisor 每个
+`kcompressd.monitor_interval_sec`(默认 600 s)打一行;两条不变量告警(连续两次
+`depth <= threshold && SwapCached >= swapcached_warn_mb` 为"写完未摘"形状,
+`depth >= threshold` 为队列饱和)。策略接管:`fault_around.{enable,sys_uid,app_only,app_uids}`
+与 `swapin.{window_enable,boost_enable,boost_pages,shrink_enable,shrink_pages,background_only,vma_ra}`
+及 `policy.reassert_interval_sec`(默认 300 s)在开机 apply、supervisor 周期重断言,
+**只在读回值与期望不一致时写并记一行**;bool 归一为内核读回的 `Y/N`;`app_uids` 去重、
+限 64、0 只用于清空、空串表示清空列表。12 个键成为单一事实来源,改内核默认必须同步
+`tunables.conf`。`ksu/abk_runtime_tunables/module.prop` v0.22.0 → **v0.23.0**
+(versionCode 26 → 27)。
+
+### 6. 验证
+
+- 门禁:`py_compile`、`bash -n`(`scripts/`/`tests/`/`tools/`/`ksu/`),
+  `stable_5_15_test` **1680 项**全绿;`step_audit`、`implementation_audit`
+  (三组均 `applied`)、`smoke`、`config_gate_audit` 在 5.15.220 参考树/构建 `.config`
+  上全绿;`scripts/sublevel_matrix` 的 core 计数 75 → **78**。
+- 本地内核构建(WSL,clang-r450784e,GKI):两轮 `REBUILD_EXIT=0`;产物
+  `android13-5.15.220-lts-AnyKernel3.zip`;`vmlinux` 含 11 个
+  `__param_swapin_*`/`__param_fault_around_*`、`abk_swapin_window_clamp`/
+  `abk_swapin_shrink_gate`、`abk_fa_app_bitmap` 与 `enable_vma_readahead`。
+- 产物级功能核验:按同 clang、同 `.config` 做 with/without 差分编译,
+  `mm/vmscan.c`/`readahead.c`/`swap_state.c`/`memory.c` 的 `.text` 分别 +344/+1248/+20/+1514 B,
+  `page_swap_info` 重定位 0→1、clamp 0→3、`from_kuid` 0→1;DWARF 行映射把新增源码行
+  钉到具体指令;`.data` 直接读出默认值。
+- 真机(SM8550 / 5.15.220,offload=24):8 GB fill 峰值 3.0-3.3 GB → **7 MB**、结束
+  0.28-0.40 GB → 7 MB;连续 fill 后稳定 7.6 MB;1 小时 soak(无线 adb,换出 10.1 GB)
+  峰值 **60 MB**、60/60 采样 <100 MB、`depth` 全程 0;16 GB 并发压力存活(峰值 70 MB);
+  24 GB 并发压力存活(峰值 8-82 MB,`depth` 瞬时 2.9k-7.2k 页后回 0);32 GB 超
+  RAM+swap 容量时设备重启,但 offload 开/关均复现、无 kernel panic(`init` SIGABRT、
+  `crash_dump` 无法 exec、温度 92-96 °C),属设备容量/热极限而非本组缺陷;
+  `verify_swap` 累计 655,360 页 0 corrupt(含 12 GB 持压下 131,072 页 0 corrupt);
+  fill 墙钟与关闭 offload 相同(8 GB 22.1 s / 12 GB 25.4-26.0 s),无变慢。
+
+### 7. 风险与开关
+
+等待依赖 drain 线程存活(已用上下文判别避免自等待,32 GB 过载下无 hung task);
+仅同步 IO swap 设备受益;`fault_around_sys_uid=1` 与 `swapin_boost_pages=8` 都是相对
+基线的真实行为变化,默认值按设备 A/B 定稿;若 drain 被长期饿死,`/proc/sys/vm/kcompressd=0`
+即回到同步换出,零重编。
+
 <a id="batch-71"></a>
 
 ## Batch 71(kcompressd 延迟换出用 PG_writeback 钉住 swap 槽,v0.73.0,core 72 → 73 组)
