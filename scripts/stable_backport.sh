@@ -143,11 +143,13 @@ abk_stable_backport_overlay_of_address() {
   abk_log "of/address.c: overlaid pre-rework ranges parser (reverts the 5.15.213 rework; WLAN BAR0 fix)"
 }
 
-# The runtime companion (ksu/abk_runtime_tunables) is a distribution asset, not
-# a graft: it registers no PatchGroup and never writes into the kernel tree.  It
-# rides inside the AnyKernel3 zip so that flashing a kernel also installs the
-# policy that makes the landed zram recompression actually run, and that fixes
-# the primary algorithm the ROM's own zram owner leaves on the dominated lz4hc.
+# The runtime companions (ksu/abk_runtime_tunables and ksu/sailboat_addon_2)
+# are distribution assets, not grafts: they register no PatchGroup and never
+# write into the kernel tree.  They ride inside the AnyKernel3 zip so that
+# flashing a kernel also installs the policy that makes the landed zram
+# recompression actually run, fixes the primary algorithm the ROM's own zram
+# owner leaves on the dominated lz4hc, and holds the cpufreq governor on
+# schedutil so the smart-freq floor/cap payloads have a policy to act under.
 abk_stable_backport_bundle_ksu_module() {
   local output
 
@@ -164,7 +166,7 @@ abk_stable_backport_bundle_ksu_module() {
   case "$output" in
     *"nothing to bundle"*)
       abk_warn "$output"
-      abk_warn "this build has no AnyKernel3 tree; flash ksu/abk_runtime_tunables manually"
+      abk_warn "this build has no AnyKernel3 tree; flash ksu/abk_runtime_tunables and ksu/sailboat_addon_2 manually"
       return 0
       ;;
   esac

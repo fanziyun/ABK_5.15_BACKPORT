@@ -9,7 +9,10 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 MODULE_SOURCE = REPOSITORY / "ksu/abk_runtime_tunables"
-DEFAULT_OUTPUT = REPOSITORY / "build/ksu/abk_runtime_tunables.zip"
+ADDON2_SOURCE = REPOSITORY / "ksu/sailboat_addon_2"
+MODULE_SOURCES = (MODULE_SOURCE, ADDON2_SOURCE)
+BUILD_DIR = REPOSITORY / "build/ksu"
+DEFAULT_OUTPUT = BUILD_DIR / "abk_runtime_tunables.zip"
 EMBED_MANIFEST = "embed.conf"
 
 EXECUTABLE_MODE = 0o755
@@ -29,6 +32,10 @@ def read_module_id(source: Path = MODULE_SOURCE) -> str:
         if line.startswith("id="):
             return line[3:].strip()
     raise BuildError(f"no id= in {prop}")
+
+
+def default_output(source: Path = MODULE_SOURCE) -> Path:
+    return BUILD_DIR / f"{read_module_id(source)}.zip"
 
 
 def read_embed_manifest(source: Path = MODULE_SOURCE) -> list[tuple[Path, str]]:
@@ -114,21 +121,29 @@ def build(source: Path = MODULE_SOURCE, output: Path = DEFAULT_OUTPUT) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Pack the KernelSU runtime companion")
+    parser = argparse.ArgumentParser(description="Pack the KernelSU runtime companions")
     parser.add_argument("--module", type=Path, default=MODULE_SOURCE)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--list", action="store_true", help="print the entries and exit")
+    parser.add_argument("--all", action="store_true", help="pack every shipped companion")
     args = parser.parse_args()
 
+    sources = MODULE_SOURCES if args.all else (args.module,)
     if args.list:
-        for name, data, mode in module_entries(args.module):
-            print(f"{oct(mode)}  {len(data):>8}  {name}")
+        for source in sources:
+            if args.all:
+                print(f"# {source.name}")
+            for name, data, mode in module_entries(source):
+                print(f"{oct(mode)}  {len(data):>8}  {name}")
         return 0
 
-    output = build(args.module, args.output)
-    with zipfile.ZipFile(output) as archive:
-        count = len(archive.namelist())
-    print(f"{output} ({count} entries, {output.stat().st_size} bytes)")
+    if args.output is not None and len(sources) != 1:
+        raise BuildError("--output needs a single --module, not --all")
+    for source in sources:
+        output = build(source, args.output or default_output(source))
+        with zipfile.ZipFile(output) as archive:
+            count = len(archive.namelist())
+        print(f"{output} ({count} entries, {output.stat().st_size} bytes)")
     return 0
 
 

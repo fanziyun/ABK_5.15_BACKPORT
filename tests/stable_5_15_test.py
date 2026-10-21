@@ -3447,6 +3447,72 @@ def test_runtime_tunables_module():
         check("zip injection adds the bundle and verifies",
               ak3.verify_zip(patched) == [] and entry.endswith("abk_runtime_tunables.zip"))
 
+        addon2 = bkm.build(bkm.ADDON2_SOURCE, tmp_path / "sailboat_addon_2.zip")
+        check("the second companion packs under its own id",
+              bkm.read_module_id(bkm.ADDON2_SOURCE) == "sailboat_addon_2"
+              and addon2.is_file())
+        with zipfile.ZipFile(addon2) as archive:
+            addon2_names = archive.namelist()
+            addon2_fas = archive.read("bin/abk_fas_check.sh")
+            addon2_modes = {info.filename: (info.external_attr >> 16) & 0o777
+                            for info in archive.infolist()}
+        check("addon 2's zip carries the embedded FAS check",
+              "bin/abk_fas_check.sh" in addon2_names)
+        check("addon 2's embedded FAS check is byte-identical to tools/",
+              addon2_fas == (repo / "tools" / "abk_fas_check.sh").read_bytes())
+        check("every addon 2 script is 0755",
+              all(addon2_modes[name] == 0o755
+                  for name in addon2_names if name.endswith(".sh")))
+
+        both_dir = tmp_path / "AnyKernel3-both"
+        (both_dir / "tools").mkdir(parents=True)
+        both_script = both_dir / "anykernel.sh"
+        both_script.write_text("#!/sbin/sh\n# a fresh AnyKernel3 tree\n")
+        _, targets = ak3.inject_dir_modules(both_dir, [module_zip, addon2])
+        check("AK3 injection puts both companions under abk-ksu-modules/",
+              sorted(path.name for path in targets)
+              == ["abk_runtime_tunables.zip", "sailboat_addon_2.zip"]
+              and sorted(path.name for path in
+                         (both_dir / "abk-ksu-modules").glob("*.zip"))
+              == ["abk_runtime_tunables.zip", "sailboat_addon_2.zip"])
+        check("the both-companion AK3 tree verifies", ak3.verify_dir(both_dir) == [])
+        both_body = both_script.read_text(encoding="utf-8")
+        check("the installer block installs every bundled zip by glob",
+              'for ABK_TU_ZIP in "$ABK_TU_SRC"/*.zip' in both_body
+              and "abk_runtime_tunables.zip" not in both_body
+              and "sailboat_addon_2.zip" not in both_body)
+
+        ak3.inject_dir(ak3_dir, module_zip)
+        single = ak3.verify_dir(ak3_dir, require=ak3.expected_module_ids())
+        check("the CLI verify insists on both companions",
+              len(single) == 1 and "sailboat_addon_2" in single[0], single)
+        check("the CLI verify passes once both are injected",
+              ak3.verify_dir(both_dir, require=ak3.expected_module_ids()) == [])
+
+        both_zip = tmp_path / "AnyKernel3-both.zip"
+        with zipfile.ZipFile(both_zip, "w") as archive:
+            archive.writestr("anykernel.sh", "#!/sbin/sh\n")
+            archive.writestr("tools/ak3-core.sh", "# core\n")
+        both_patched = tmp_path / "AnyKernel3-both-patched.zip"
+        _, entries = ak3.inject_zip_modules(both_zip, both_patched, [module_zip, addon2])
+        check("zip injection adds both companions at their bundle paths",
+              sorted(entries) == ["abk-ksu-modules/abk_runtime_tunables.zip",
+                                  "abk-ksu-modules/sailboat_addon_2.zip"], entries)
+        with zipfile.ZipFile(both_patched) as archive:
+            both_names = archive.namelist()
+        check("the finished zip carries both companions and verifies",
+              all(name in both_names for name in entries)
+              and ak3.verify_zip(both_patched) == []
+              and ak3.verify_zip(both_patched,
+                                 require=ak3.expected_module_ids()) == [])
+        again = tmp_path / "AnyKernel3-both-patched2.zip"
+        ak3.inject_zip_modules(both_patched, again, [module_zip, addon2])
+        with zipfile.ZipFile(again) as archive:
+            again_names = archive.namelist()
+        check("two-companion zip injection is idempotent",
+              sorted(again_names) == sorted(both_names)
+              and all(again_names.count(name) == 1 for name in entries))
+
         saved_env = {key: os.environ.pop(key, None)
                      for key in ("ANYKERNEL3", "GITHUB_WORKSPACE")}
         try:
@@ -5763,9 +5829,15 @@ def test_sched_tunables_module():
           "ksu/sailboat_addon_2" in one_action
           and "abk_sc_cap_pct" not in one_action)
     bundler = (repo / "scripts" / "ak3_bundle_ksu_module.py").read_text(encoding="utf-8")
-    check("the AK3 installer installs every bundled module, not just one",
-          '*' in bundler and '*.zip' in bundler,
-          [l.strip() for l in bundler.splitlines() if ".zip" in l][:3])
+    packer = (repo / "scripts" / "build_ksu_module.py").read_text(encoding="utf-8")
+    check("the AK3 installer installs every bundled zip, not a fixed id",
+          'for ABK_TU_ZIP in "$ABK_TU_SRC"/*.zip' in bundler,
+          [l.strip() for l in bundler.splitlines() if "ABK_TU_ZIP in" in l])
+    check("both companions are packed and injected by default",
+          "ksu/sailboat_addon_2" in packer and "MODULE_SOURCES" in packer
+          and "MODULE_SOURCES" in bundler)
+    check("the CLI verify requires both companions, not just whichever zip is present",
+          "expected_module_ids()" in bundler and "require=require" in bundler)
 
     dvfs = common_sh[common_sh.index("abk_report_dvfs_state() {"):]
     sched_knobs = common_sh[common_sh.index("abk_apply_sched_knobs() {"):
