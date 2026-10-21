@@ -467,6 +467,38 @@ abk_zram_mount_swap() {
   return 0
 }
 
+abk_zram_mount_swap_area() {
+  _ma_prio="$1"
+  abk_is_uint "$_ma_prio" || _ma_prio=0
+
+  if [ "${ABK_DRY_RUN:-0}" = "1" ]; then
+    abk_log "[dry-run] $ABK_MKSWAP $ABK_ZRAM_NODE"
+    abk_log "[dry-run] $ABK_SWAPON -p $_ma_prio $ABK_ZRAM_NODE"
+    return 0
+  fi
+
+  abk_zram_set_mem_limit
+  _ma_n=0
+  _ma_mk=0
+  while [ "$_ma_n" -lt "$ABK_ZRAM_SWAP_RETRIES" ]; do
+    if abk_zram_swap_on; then
+      return 0
+    fi
+    if [ "$_ma_mk" = 0 ] \
+        && "$ABK_MKSWAP" "$ABK_ZRAM_NODE" >/dev/null 2>&1; then
+      _ma_mk=1
+    fi
+    if [ "$_ma_mk" = 1 ] \
+        && "$ABK_SWAPON" -p "$_ma_prio" "$ABK_ZRAM_NODE" >/dev/null 2>&1; then
+      abk_state_set disksize "$(abk_zram_disksize)"
+      return 0
+    fi
+    _ma_n=$(( _ma_n + 1 ))
+    [ "$_ma_n" -ge "$ABK_ZRAM_SWAP_RETRIES" ] || sleep 1
+  done
+  abk_zram_swap_on
+}
+
 # --- takeover / rewrite --------------------------------------------------
 # The rewrite is the repair path: it rebuilds the device with the measured
 # algorithms, the compressed-memory cap, the swap area it found, and -- on a
@@ -551,8 +583,12 @@ abk_zram_takeover() {
 
   if ! abk_zram_set_algorithms; then
     abk_warn "algorithm rewrite failed; restoring the saved configuration"
-    abk_zram_mount_swap "$_to_size" "$_to_prio" \
-      || abk_warn "RECOVERY FAILED: no swap area is mounted"
+    if [ "$(abk_zram_initstate)" = "1" ]; then
+      abk_zram_mount_swap_area "$_to_prio" || true
+    else
+      abk_zram_mount_swap "$_to_size" "$_to_prio" || true
+    fi
+    abk_zram_swap_on || abk_warn "RECOVERY FAILED: no swap area is mounted"
     return 1
   fi
 
@@ -587,10 +623,17 @@ abk_zram_takeover() {
   [ "$_to_wb_ok" = 0 ] || abk_zram_wb_backoff_clear
 
   if ! abk_zram_mount_swap "$_to_size" "$_to_prio"; then
-    abk_warn "swap remount failed; retrying once"
-    abk_zram_mount_swap "$_to_size" "$_to_prio" \
-      || abk_warn "RECOVERY FAILED: no swap area is mounted"
-    return 1
+    abk_warn "swap remount failed; retrying the swap area"
+    if [ "$(abk_zram_initstate)" = "1" ]; then
+      abk_zram_mount_swap_area "$_to_prio" || true
+    else
+      abk_zram_mount_swap "$_to_size" "$_to_prio" || true
+    fi
+    if [ "$(abk_zram_initstate)" != "1" ] || ! abk_zram_swap_on; then
+      abk_warn "RECOVERY FAILED: no swap area is mounted"
+      return 1
+    fi
+    abk_log "swap area recovered on the retry"
   fi
 
   _to_state="$(abk_zram_initstate)"
@@ -609,14 +652,21 @@ abk_zram_takeover() {
 
 # Does the device still need the rewrite above?  Only three things justify it:
 # an algorithm the policy does not want (only possible on a kernel without the
-# Batch 11 lock), an uninitialised device / missing swap area, or writeback the
+# Batch 11 lock), an uninitialised device, or writeback the
 # kernel supports, our policy wants and nobody has claimed.
 abk_zram_need_rewrite() {
   abk_zram_algorithms_ok || return 0
   [ "$(abk_zram_initstate)" = "1" ] || return 0
-  abk_zram_swap_on || return 0
   abk_zram_writeback_wanted && return 0
   return 1
+}
+
+abk_zram_need_swap_area() {
+  [ "$(abk_zram_initstate)" = "1" ] || return 1
+  abk_zram_algorithms_ok || return 1
+  abk_zram_writeback_wanted && return 1
+  abk_zram_swap_on && return 1
+  return 0
 }
 
 # The one entry point the service, the supervisors and action.sh share: put the
@@ -633,6 +683,15 @@ abk_zram_ensure() {
   abk_zram_drop_stale_backing_file
 
   if ! abk_zram_need_rewrite; then
+    if abk_zram_need_swap_area; then
+      abk_log "swap area missing on an initialised device; repairing without a reset"
+      if abk_zram_mount_swap_area "$(abk_zram_swap_prio)"; then
+        abk_log "swap area repaired: prio=$(abk_zram_swap_prio)"
+        return 0
+      fi
+      abk_warn "swap area repair failed; the supervisor will retry"
+      return 1
+    fi
     abk_zram_set_mem_limit
     return 0
   fi

@@ -93,6 +93,14 @@ Posture:
   transient RAM spike rather than protecting data: at boot the ROM initialises
   zram seconds before this module reaches it, and later in the boot the same gate
   keeps a device under pressure from being pushed over the edge.
+* **A missing swap area is repaired in place, never by a reset** (unless a
+  writeback attachment needs the pre-`disksize` window, which still requires the
+  full rewrite below). At boot the ROM's own bring-up leaves the device
+  initialised with no swap area for a moment (`disksize` in, `mkswap`/`swapon`
+  still to come). Resetting the device there destroys the ROM's work and races
+  its openers into `-EBUSY`; the module therefore redoes only `mkswap`+`swapon`
+  (bounded retries, a swap area the ROM won the race for counts as success, and
+  the compressed-memory cap is restored on the same path).
 * **Writeback and the algorithm policy no longer exclude each other.** The
   backing device is written in the same pre-`disksize` window and `reset` drops
   it (`reset_bdev()`), which is why the old module traded one for the other. The

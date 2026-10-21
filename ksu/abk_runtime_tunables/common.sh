@@ -39,6 +39,7 @@ ABK_ZRAM_MEM_LIMIT_ALIGN=65536
 ABK_ZRAM_MIN_FREE_MB=256
 ABK_ZRAM_WAIT_SECS=45       # wait for the ROM's own zram bring-up before ours
 ABK_ZRAM_REASSERT_SECS=60   # how often the policy is re-checked once running
+ABK_ZRAM_SWAP_RETRIES=3
 # Writeback auto-attach backoff.  A backing device can only be attached in the
 # pre-`disksize` window, so establishing one means a full device rewrite
 # (swapoff -> reset -> ... -> swapon).  When that attach keeps failing -- no free

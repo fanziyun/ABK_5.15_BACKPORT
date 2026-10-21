@@ -3320,6 +3320,11 @@ def test_runtime_tunables_module():
     check("the status report shows the verdict node, not just the attachment",
           'abk_show "bd_stat"' in action_source
           and 'abk_show "selinux"' in action_source)
+    check("the status report distinguishes a missing swap area from a rewrite",
+          "abk_zram_need_swap_area" in action_source
+          and "the swap area is missing" in action_source
+          and action_source.index("abk_zram_need_swap_area")
+          < action_source.index('abk_show "policy" "in force"'))
 
     tunables = (module_dir / "tunables.conf").read_text(encoding="utf-8")
     for forbidden in ("algo", "disksize", "mem_limit"):
@@ -3386,11 +3391,51 @@ def test_runtime_tunables_module():
     check("the service entry point rewrites only when the policy is not in force",
           "abk_zram_need_rewrite" in ensure
           and ensure.index("abk_zram_need_rewrite") < ensure.index("abk_zram_takeover"))
-    check("the policy check covers algorithms, init, swap and writeback",
-          all(token in policy[policy.index("abk_zram_need_rewrite() {"):
-                             policy.index("abk_zram_ensure() {")]
+    need_rewrite = policy[policy.index("abk_zram_need_rewrite() {"):
+                          policy.index("abk_zram_need_swap_area() {")]
+    need_swap = policy[policy.index("abk_zram_need_swap_area() {"):
+                       policy.index("abk_zram_ensure() {")]
+    check("the rewrite triggers cover algorithms, init and writeback, not swap",
+          all(token in need_rewrite
               for token in ("abk_zram_algorithms_ok", "abk_zram_initstate",
-                            "abk_zram_swap_on", "abk_zram_writeback_wanted")))
+                            "abk_zram_writeback_wanted"))
+          and "abk_zram_swap_on" not in need_rewrite)
+    check("a swap-only gap is detected separately, on an initialised device",
+          all(token in need_swap
+              for token in ("abk_zram_initstate", "abk_zram_algorithms_ok",
+                            "abk_zram_writeback_wanted", "abk_zram_swap_on")))
+    check("the service entry point repairs a swap-only gap in place",
+          "abk_zram_need_swap_area" in ensure
+          and ensure.index("abk_zram_need_swap_area") < ensure.index("abk_zram_takeover")
+          and "abk_zram_mount_swap_area" in ensure)
+    repair = policy[policy.index("abk_zram_mount_swap_area() {"):
+                    policy.index("# --- takeover / rewrite")]
+    check("the swap-area repair never resets or rewrites the device",
+          "reset\" 1" not in repair
+          and 'abk_write "$ABK_ZRAM_DIR/disksize"' not in repair
+          and "ABK_MKSWAP" in repair and "ABK_SWAPON" in repair)
+    check("the swap-area repair treats a swap area that appeared as success",
+          repair.count("if abk_zram_swap_on; then") == 1
+          and repair.rstrip().endswith("abk_zram_swap_on\n}"))
+    check("the swap-area repair restores the compressed-memory cap",
+          repair.count("abk_zram_set_mem_limit") == 1
+          and repair.index("abk_zram_set_mem_limit")
+          < repair.index('while [ "$_ma_n" -lt "$ABK_ZRAM_SWAP_RETRIES" ]'))
+    takeover_fn = policy[policy.index("abk_zram_takeover() {"):
+                         policy.index("# Does the device still need the rewrite above?")]
+    retry = takeover_fn[takeover_fn.index("if ! abk_zram_mount_swap"):
+                        takeover_fn.index('_to_state="$(abk_zram_initstate)"')]
+    check("the takeover retry never re-writes disksize after init_done",
+          "abk_zram_mount_swap_area \"$_to_prio\"" in retry
+          and "swap area recovered on the retry" in retry
+          and '[ "$(abk_zram_initstate)" = "1" ]' in retry
+          and retry.index('[ "$(abk_zram_initstate)" = "1" ]')
+          < retry.index("abk_zram_mount_swap_area \"$_to_prio\""))
+    algo_recovery = takeover_fn[takeover_fn.index("if ! abk_zram_set_algorithms"):
+                                takeover_fn.index("# Writeback is attached before disksize")]
+    check("the algorithm-failure recovery also splits on initstate",
+          "abk_zram_mount_swap_area \"$_to_prio\"" in algo_recovery
+          and '[ "$(abk_zram_initstate)" = "1" ]' in algo_recovery)
     check("the kernel-side lock is detected and reported",
           "abk_lock_algo" in policy and 'Y|y|1' in policy
           and "the kernel locks the compressors" in policy)
@@ -3901,6 +3946,9 @@ abk_write() {
   _kw_val="$2"
   abk_write_node "$_kw_path" "$_kw_val" || return 1
   case "$_kw_path" in
+    */disksize)
+      printf 'x\n' >> "$T/disksize_writes"
+      ;;
     */mem_limit)
       if [ -e "$T/mem_limit_ignored" ]; then
         # A kernel that ignores the write: the one state the readback WARN is for.
@@ -4119,6 +4167,52 @@ echo "ml4_warn=$(grep -c 'readback is' "$T/out6b5" 2>/dev/null)"
 rm -f "$T/mem_limit_ignored"
 printf 'MemTotal:       15561024 kB\n' > "$T/meminfo"
 
+reset_fixture
+printf 'lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus [lz4kd] deflate 842 zstd\n' > "$T/sys/block/zram0/comp_algorithm"
+printf '#1: lzo lzo-rle lz4 lz4hc lz4k lz4k_oplus lz4kd deflate 842 [zstd]\n' > "$T/sys/block/zram0/recomp_algorithm"
+mkdir -p "$T/sys/module/zram/parameters"
+printf 'Y\n' > "$T/sys/module/zram/parameters/abk_lock_algo"
+printf 'lz4kd\n' > "$T/sys/module/zram/parameters/abk_comp_algo"
+: > "$T/proc_swaps"
+: > "$T/calls"
+: > "$T/sys/block/zram0/reset"
+abk_zram_ensure > "$T/out6c" 2>&1
+echo "RC6c=$?"
+echo "reset6c=$(cat "$T/sys/block/zram0/reset" 2>/dev/null)"
+echo "disksize6c=$(abk_zram_disksize)"
+echo "ml6c=$(abk_zram_mem_limit)"
+echo "calls6c=$(tr '\n' ';' < "$T/calls")"
+echo "log6c=$(tr '\n' ';' < "$T/out6c")"
+rm -f "$T/sys/block/zram0/reset"
+
+reset_fixture
+: > "$T/proc_swaps"
+: > "$T/calls"
+: > "$T/disksize_writes"
+cat > "$T/stub/swapon" <<'EOF'
+#!/bin/sh
+echo "swapon $*" >> "$HARNESS_CALLS"
+_n=$(cat "$(dirname "$HARNESS_CALLS")/swapon_calls" 2>/dev/null || echo 0)
+_n=$((_n + 1))
+echo "$_n" > "$(dirname "$HARNESS_CALLS")/swapon_calls"
+if [ "$_n" -ge 2 ]; then
+  printf '/dev/block/zram0                        partition       16777212  0       0\n' > "$(dirname "$HARNESS_CALLS")/proc_swaps"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$T/stub/swapon"
+abk_zram_takeover > "$T/out6d" 2>&1
+echo "RC6d=$?"
+echo "swapon6d=$(grep -c 'swapon ' "$T/calls")"
+echo "disksize6d=$(wc -l < "$T/disksize_writes" | tr -d ' ')"
+echo "ready6d=$(grep -c 'zram ready' "$T/out6d")"
+echo "recovered6d=$(grep -c 'swap area recovered on the retry' "$T/out6d")"
+echo "failed6d=$(grep -c 'RECOVERY FAILED' "$T/out6d")"
+printf '#!/bin/sh\necho "swapon $*" >> "$HARNESS_CALLS"\nexit 0\n' > "$T/stub/swapon"
+chmod +x "$T/stub/swapon"
+rm -f "$T/swapon_calls" "$T/disksize_writes"
+
 # 7. the supervisor keeps sweeping when a pass fails, and records its pid.  The
 #    device already carries the policy here, so each tick is a cheap re-check
 #    plus the sweep -- which is the point of the tick loop.
@@ -4310,6 +4404,27 @@ rm -rf "$T"
           got.get("ml3_log") == "1", got.get("ml3_log"))
     check("a kernel that ignores the write still trips the readback WARN",
           got.get("ml4_warn") == "1", got.get("ml4_warn"))
+    check("a swap-only gap is repaired without a reset",
+          got.get("RC6c") == "0" and got.get("reset6c") == ""
+          and got.get("disksize6c") == "17179869184", r.stdout)
+    check("... by redoing mkswap+swapon only",
+          "mkswap /dev/block/zram0" in got.get("calls6c", "")
+          and "swapon -p 0 /dev/block/zram0" in got.get("calls6c", "")
+          and "swapoff" not in got.get("calls6c", ""), got.get("calls6c"))
+    check("... and says so instead of logging a rewrite",
+          "repairing without a reset" in got.get("log6c", "")
+          and "swap area repaired" in got.get("log6c", "")
+          and "rewrite: size=" not in got.get("log6c", "")
+          and "zram ready" not in got.get("log6c", ""), got.get("log6c"))
+    check("... and restores the compressed-memory cap on the repair path",
+          got.get("ml6c") == "3983605760", got.get("ml6c"))
+    check("the takeover retry recovers through the swap area",
+          got.get("RC6d") == "0" and got.get("ready6d") == "1"
+          and got.get("recovered6d") == "1" and got.get("failed6d") == "0",
+          r.stdout)
+    check("... and calls swapon twice without a second disksize rewrite",
+          got.get("swapon6d") == "2" and got.get("disksize6d") == "1",
+          (got.get("swapon6d"), got.get("disksize6d")))
     calls1 = got.get("calls1", "")
     check("takeover unmounts and remounts the swap area itself",
           "swapoff /dev/block/zram0" in calls1

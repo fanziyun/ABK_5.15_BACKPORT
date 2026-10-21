@@ -351,6 +351,83 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 能不能用」所依赖的那条可用性链路（Batch 21 → 25 → 26）一并收进来，证据全部取自本仓库既有的
 实测记录（真机 adb 输出、CI 构建号、审计门禁名），没有新增批次，也没有改写任何历史结论。
 
+<a id="companion-v0-22-1"></a>
+
+## companion v0.22.1（开机接管与 ROM 自己的 zram bring-up 撞车：交换区缺失改为原地修复，不再 reset）
+
+真机日志（12 GB vermeer，`5.15.220-202609202-FanZiyun-pr41`，companion v0.21.0）里，每次开机的
+service 阶段都出现同一条失败链：
+
+    zram initialised after 0s
+    zram policy not in force (... initstate=1) swap=off
+    rewrite: size=12884901888 prio=0 ...
+    WARN swapon failed on /dev/block/zram0
+    WARN swap remount failed; retrying once
+    WARN write failed: /sys/block/zram0/disksize <- 12884901888
+    WARN RECOVERY FAILED: no swap area is mounted
+
+2~3 秒后 supervisor 第一次 tick 的完整 takeover 才把交换区挂上（`zram ready`）。同一份日志里
+**2/2 次开机都撞**；而另一台 16 GB vermeer（同内核串、companion v0.22.0）**2/2 次开机**都是
+`zram policy in force`，没有任何接管 —— 这是竞态，不是确定性缺陷。
+
+**根因**是模块把 ROM bring-up 的**中间态**当成了完成态，然后做了一次破坏性改写：
+
+1. `abk_zram_wait_ready()` 以 `initstate=1` 为「ROM bring-up 完成」。但这只是 ROM 序列的第一步：
+   这套 ROM 上 `mmd.enabled_aconfig=false`，AOSP fs_mgr 在这种配置下明确由 init 的 `swapon_all`
+   建 zram（`fs_mgr_swapon_all()`：写 `/sys/block/zram0/disksize` → `fork/exec mkswap` → `swapon`；
+   ROM 的触发点在 `/system_ext/etc/init/perfservice.rc` 的 `on property:ro.vendor.qti.per_boot_created=1`）。
+   `disksize` 写完、`mkswap`/`swapon` 还没跑的那一瞬，模块看到的就是 `initstate=1 + swap=off`。
+2. `abk_zram_need_rewrite()` 把 `swap=off` 判成「策略不成立、要重写设备」→ `abk_zram_takeover()`
+   先写 `reset`，把 ROM 刚写的 disksize / swap 签名抹掉。
+3. 首次 `swapon` 失败后，retry 又调 `abk_zram_mount_swap()`，第一步重新写 `disksize`；内核
+   `disksize_store()` 在 `init_done` 时返回 `-EBUSY`（`drivers/block/zram/zram_drv.c`），所以这条
+   retry **必然失败**，`RECOVERY FAILED` 是假「恢复失败」；而且旧代码即使 retry 成功也仍 `return 1`。
+4. 内核的三个契约解释了失败链的每一行：`reset_store()` 在 `bdev->bd_openers || zram->claim` 时返回
+   `-EBUSY`（所以日志里没有 `write failed: reset`，说明 reset 那一刻 ROM 没有持有设备）；`swapon`
+   的 `claim_swapfile()` 以 `FMODE_EXCL` 打开 bdev，另一个并发 `swapon`（holder）会让模块的 `swapon`
+   拿到 `-EBUSY`（普通 opener 如 `mkswap` 不阻止独占 claim）；反过来模块的 `reset` 清掉 ROM 的签名
+   时 ROM 的 `swapon` 会拿到 `EINVAL` —— 两个写者可以**双双失败**，交换区保持 off，这正是 supervisor
+   2 秒后看到的 `swap=off`。
+
+**修复**（只动 companion，内核 graft 一行未动）：
+
+- `abk_zram_need_rewrite()` 不再把「缺交换区」当重写理由；新增 `abk_zram_need_swap_area()`
+  （`initstate=1` + 算法符合策略 + 不需要 writeback 变更 + `swap=off`）。
+- 新增 `abk_zram_mount_swap_area()`：只做 `mkswap`+`swapon`，**不 reset、不写 disksize**；
+  最多 `ABK_ZRAM_SWAP_RETRIES=3` 次、每次间隔 1 s；循环开头先看交换区是否已经出现（ROM 抢先挂上
+  也算成功），最后一次尝试后再确认一次。
+- `abk_zram_ensure()` 在「不需要重写但缺交换区」时走原地修复，日志
+  `swap area missing on an initialised device; repairing without a reset` →
+  `swap area repaired`；修复失败只 WARN 并交给 supervisor 下一 tick，不升级为 reset。
+- takeover 的 retry 改为按状态分支：`initstate=1` 时只重试交换区（避免第二次 `disksize` 的
+  `-EBUSY`），否则才重跑 `mount_swap`；重试成功则继续，不再无条件 `return 1`。
+- 原地修复在重试循环**之前**补写 `mem_limit`：`mount_swap()` 不在该路径上，旧实现里 retry 若只走
+  交换区分支，cap 会漏写（`zram.recomp.enable=0` 时连 supervisor 的下一 tick 也没有）；放在循环前
+  也保证交换区最终没挂上时 cap 仍然落地，设备不会带着 `mem_limit=0` 跑。
+- 算法失败恢复也按 `initstate` 分支：`reset` 被 ROM 的 opener 拒掉时设备仍是初始化态，重写
+  `disksize` 同样 `-EBUSY`，所以只恢复交换区；原地修复里的 `mkswap` 只跑一次，ROM 抢先 `swapon`
+  后不再重写活动交换区的 header page。
+
+**测试**：单测 **1541 → 1555 项全绿**。新增两组 fixture：6c（`initstate=1`、锁定内核、swap off →
+`ensure` 不写 reset（fixture 提供 reset 节点，写入即可观测）、`disksize` 不变、只调
+`mkswap`/`swapon`、cap 补写为 3983605760、日志不出现 `rewrite:`/`zram ready`）；6d（takeover 首次
+`swapon` 失败、第二次成功 → `swap area recovered on the retry` + `zram ready`，`swapon` 恰好调用
+两次、`disksize` 只写一次、`RECOVERY FAILED` 不出现）。静态断言钉住：`need_rewrite` 不再含
+`abk_zram_swap_on`、交换区检测与修复是独立函数、修复路径不含 `reset`/disksize 写且补写 cap、
+takeover 的 mount retry（切片到函数内，避免旧断言匹配到 `need_rewrite()` 的文本）在 `init_done`
+后走交换区分支、算法失败恢复同样按 `initstate` 分支、`action.sh` 的缺失交换区分支排在
+`in force` 之前。`py_compile` / `bash -n` / `dash -n` 全绿。
+
+**未验证 / 范围外**：真机未刷入验证（需要一次重启后的模块日志）；设备侧 mksh 的
+`su -c 'sh -n <path>'` 未跑（设备不在线，本机 `dash -n` 通过）；diag/日志持久化未做。ROM 侧
+bring-up owner 的最终身份（init `swapon_all` 还是 mcd）仍待那台 12 GB 机的
+`/vendor/etc/fstab.default` / `/system_ext/etc/mcd_default.conf` 确认 —— 但不影响本修复：原地修复
+对两种写者都是竞态容忍的。
+
+`module.conf` 保持不动（companion-only 惯例），companion v0.22.0 → **v0.22.1**。
+
+---
+
 <a id="companion-v0-22-0"></a>
 
 ## companion v0.22.0（mem_limit 的假 WARN 与每 tick 一条的常驻 INFO）
