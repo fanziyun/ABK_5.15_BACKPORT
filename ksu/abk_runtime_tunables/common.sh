@@ -281,6 +281,18 @@ iorap.global_gap_sec
 kcompressd.monitor_interval_sec
 kcompressd.swapcached_warn_mb
 kcompressd.depth_warn
+fault_around.enable
+fault_around.sys_uid
+fault_around.app_only
+fault_around.app_uids
+swapin.window_enable
+swapin.boost_enable
+swapin.boost_pages
+swapin.shrink_enable
+swapin.shrink_pages
+swapin.background_only
+swapin.vma_ra
+policy.reassert_interval_sec
 report.logcat
 EOF
 }
@@ -832,8 +844,88 @@ abk_selinux_apply_rules() {
   return 0
 }
 
+abk_sync_node() {
+  _sn_path="$1"
+  _sn_want="$2"
+  _sn_tag="$3"
+  [ -e "$_sn_path" ] || return 0
+  _sn_cur="$(abk_read "$_sn_path" | tr -d ' \t\r\n')"
+  [ "$_sn_cur" = "$_sn_want" ] && return 0
+  abk_write "$_sn_path" "$_sn_want" && abk_log "$_sn_tag=$_sn_want"
+  return 0
+}
+
+abk_apply_fault_around_knobs() {
+  _fa_d="/sys/module/memory/parameters"
+  _fa_v="$(abk_cfg fault_around.enable '')"
+  if [ -n "$_fa_v" ]; then
+    abk_sync_node "$_fa_d/fault_around_enable" "$_fa_v" fault_around.enable
+  fi
+  _fa_v="$(abk_cfg fault_around.sys_uid '')"
+  if [ -n "$_fa_v" ]; then
+    abk_sync_node "$_fa_d/fault_around_sys_uid" "$_fa_v" fault_around.sys_uid
+  fi
+  _fa_v="$(abk_cfg fault_around.app_only '')"
+  if [ -n "$_fa_v" ]; then
+    abk_sync_node "$_fa_d/fault_around_app_only" "$_fa_v" fault_around.app_only
+  fi
+  _fa_list="$(abk_cfg fault_around.app_uids '')"
+  [ -n "$_fa_list" ] || return 0
+  [ -e "$_fa_d/fault_around_app" ] || return 0
+  _fa_norm="$(printf '%s' "$_fa_list" | tr ',' ' ')"
+  _fa_exp="$(for _fa_u in $_fa_norm; do
+    if abk_is_uint "$_fa_u" && [ "$_fa_u" -ge 10000 ] && [ "$_fa_u" -le 99999 ]; then
+      printf '%s\n' "$_fa_u"
+    else
+      abk_warn "fault_around.app_uids: '$_fa_u' ignored"
+    fi
+  done | sort -n | tr '\n' ',')"
+  _fa_exp="${_fa_exp%,}"
+  _fa_cur="$(abk_read "$_fa_d/fault_around_app" | tr -d ' \t\r\n')"
+  [ "$_fa_cur" = "$_fa_exp" ] && return 0
+  abk_write "$_fa_d/fault_around_app" 0 || return 0
+  for _fa_u in $(printf '%s' "$_fa_exp" | tr ',' ' '); do
+    abk_write "$_fa_d/fault_around_app" "$_fa_u" || return 0
+  done
+  abk_log "fault_around.app_uids=$_fa_exp"
+  return 0
+}
+
+abk_apply_swapin_knobs() {
+  _si_d="/sys/module/readahead/parameters"
+  for _si_pair in \
+      "swapin_window_enable|swapin.window_enable" \
+      "swapin_boost_enable|swapin.boost_enable" \
+      "swapin_boost_pages|swapin.boost_pages" \
+      "swapin_shrink_enable|swapin.shrink_enable" \
+      "swapin_shrink_pages|swapin.shrink_pages" \
+      "swapin_window_background_only|swapin.background_only"; do
+    _si_node="${_si_pair%%|*}"
+    _si_key="${_si_pair#*|}"
+    _si_v="$(abk_cfg "$_si_key" '')"
+    [ -n "$_si_v" ] || continue
+    abk_sync_node "$_si_d/$_si_node" "$_si_v" "$_si_key"
+  done
+  _si_v="$(abk_cfg swapin.vma_ra '')"
+  [ -n "$_si_v" ] || return 0
+  case "$_si_v" in
+    1|true|on) _si_w=true ;;
+    0|false|off) _si_w=false ;;
+    *) abk_warn "swapin.vma_ra: '$_si_v' ignored"; return 0 ;;
+  esac
+  abk_sync_node /sys/kernel/mm/swap/vma_ra_enabled "$_si_w" swapin.vma_ra
+  return 0
+}
+
+abk_apply_policy_knobs() {
+  abk_apply_fault_around_knobs
+  abk_apply_swapin_knobs
+  return 0
+}
+
 abk_apply_early_knobs() {
   abk_apply_vm_knobs
+  abk_apply_policy_knobs
   abk_apply_lru_gen
   abk_apply_thp
   abk_apply_readahead_knob

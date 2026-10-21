@@ -58,10 +58,8 @@ namespace then owns the knobs) as two helpers:
     device.  Returning true unconditionally when the knob is off is the
     documented escape hatch for "shrink everything".
 
-Defaults pick the performance-maximal setting that is safe with no tuning:
-boost 8 pages (a no-op while ``page_cluster`` is 3, i.e. the stock 8-page
-cluster, and a lift on smaller clusters), shrink 1 page but background-only,
-``swapin_vma_ra`` on.  Runtime knobs are all ``module_param_named`` under
+Defaults pick the performance-maximal setting: boost 8 pages, shrink 1 page
+but background-only, ``swapin_vma_ra`` on.  Runtime knobs are all ``module_param_named`` under
 ``/sys/module/readahead/parameters/`` (``0644``).
 
 ``swapin_vma_ra`` is deliberately *not* a new variable: it is a second sysfs
@@ -193,8 +191,7 @@ _RA_TAIL_NEW_HEAD = (
     " *                                   kernel's own window untouched\n"
     " *   swapin_boost_enable             raise the window to the floor below\n"
     " *   swapin_boost_pages              boost floor, rounded up to a power\n"
-    " *                                   of two (default 8: a no-op while\n"
-    " *                                   page_cluster is 3)\n"
+    " *                                   of two (default 8)\n"
     " *   swapin_shrink_enable            cap the window at the ceiling below\n"
     " *   swapin_shrink_pages             shrink ceiling, rounded down to a\n"
     " *                                   power of two (default 1)\n"
@@ -277,10 +274,6 @@ _RA_TAIL_NEW = (
         "\t/*\n"
         "\t * Boost.  The window must stay a power of two: the cluster path\n"
         "\t * derives its alignment mask as (pages - 1) and the vma path aligns on\n"
-        "\t * the same value.  With the stock page_cluster of 3 the kernel already\n"
-        "\t * caps the window at 8, so the default boost_pages of 8 is a no-op\n"
-        "\t * there and only lifts a smaller cluster setting.\n"
-        "\t *\n"
         "\t * Clamp the floor to ABK_SWAPIN_WINDOW_MAX BEFORE the round-up, for\n"
         "\t * two reasons.  roundup_pow_of_two() returns unsigned long, so a\n"
         "\t * configured floor in [2^31 + 1, 2^32 - 1] rounds to 2^32, which\n"
