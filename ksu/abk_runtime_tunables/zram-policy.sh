@@ -996,6 +996,9 @@ abk_zram_supervisor_main() {
   [ "$_zs_kcd_interval" -ge 60 ] || _zs_kcd_interval=60
   _zs_per_kcd=$(( _zs_kcd_interval / _zs_reassert ))
   [ "$_zs_per_kcd" -ge 1 ] || _zs_per_kcd=1
+  _zs_pol_interval="$(abk_cfg policy.reassert_interval_sec 300)"
+  _zs_per_pol=$(( _zs_pol_interval / _zs_reassert ))
+  [ "$_zs_per_pol" -ge 1 ] || _zs_per_pol=1
 
   if [ ! -f "$_zs_tool" ]; then
     abk_warn "$_zs_tool is missing; recompression sweeps disabled"
@@ -1019,6 +1022,7 @@ abk_zram_supervisor_main() {
   # Seeded like _zs_mark_tick below: the first tick logs the boot baseline
   # (threshold, counters, depth) instead of waiting a full monitor interval.
   _zs_kcd_tick="$_zs_per_kcd"
+  _zs_pol_tick=0
   ABK_KCD_BAD_STREAK=0
   # The first sweep marks -- the boot mark is what finds the initial cold set --
   # and the --no-mark drain begins only after it.  Seeding the counter at
@@ -1032,6 +1036,12 @@ abk_zram_supervisor_main() {
     if [ "$_zs_kcd_tick" -ge "$_zs_per_kcd" ]; then
       _zs_kcd_tick=0
       abk_kcompressd_monitor_tick || true
+    fi
+
+    _zs_pol_tick=$(( _zs_pol_tick + 1 ))
+    if [ "$_zs_pol_tick" -ge "$_zs_per_pol" ]; then
+      _zs_pol_tick=0
+      abk_apply_policy_knobs || true
     fi
 
     _zs_wb_tick=$(( _zs_wb_tick + 1 ))
