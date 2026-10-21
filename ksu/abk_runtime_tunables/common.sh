@@ -844,6 +844,15 @@ abk_selinux_apply_rules() {
   return 0
 }
 
+abk_norm_yn() {
+  case "$1" in
+    1|y|Y|yes|on|true) printf 'Y\n' ;;
+    0|n|N|no|off|false) printf 'N\n' ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
 abk_sync_node() {
   _sn_path="$1"
   _sn_want="$2"
@@ -856,18 +865,24 @@ abk_sync_node() {
 }
 
 abk_apply_fault_around_knobs() {
-  _fa_d="/sys/module/memory/parameters"
+  _fa_d="$ABK_SYS_ROOT/module/memory/parameters"
   _fa_v="$(abk_cfg fault_around.enable '')"
   if [ -n "$_fa_v" ]; then
-    abk_sync_node "$_fa_d/fault_around_enable" "$_fa_v" fault_around.enable
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_enable" "$_fa_v" fault_around.enable
   fi
   _fa_v="$(abk_cfg fault_around.sys_uid '')"
   if [ -n "$_fa_v" ]; then
-    abk_sync_node "$_fa_d/fault_around_sys_uid" "$_fa_v" fault_around.sys_uid
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_sys_uid" "$_fa_v" fault_around.sys_uid
   fi
   _fa_v="$(abk_cfg fault_around.app_only '')"
   if [ -n "$_fa_v" ]; then
-    abk_sync_node "$_fa_d/fault_around_app_only" "$_fa_v" fault_around.app_only
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_app_only" "$_fa_v" fault_around.app_only
   fi
   _fa_list="$(abk_cfg fault_around.app_uids '')"
   [ -n "$_fa_list" ] || return 0
@@ -892,7 +907,7 @@ abk_apply_fault_around_knobs() {
 }
 
 abk_apply_swapin_knobs() {
-  _si_d="/sys/module/readahead/parameters"
+  _si_d="$ABK_SYS_ROOT/module/readahead/parameters"
   for _si_pair in \
       "swapin_window_enable|swapin.window_enable" \
       "swapin_boost_enable|swapin.boost_enable" \
@@ -904,6 +919,10 @@ abk_apply_swapin_knobs() {
     _si_key="${_si_pair#*|}"
     _si_v="$(abk_cfg "$_si_key" '')"
     [ -n "$_si_v" ] || continue
+    case "$_si_key" in
+      swapin.boost_pages|swapin.shrink_pages) ;;
+      *) _si_v="$(abk_norm_yn "$_si_v")" || { abk_warn "$_si_key: '$_si_v' ignored"; continue; } ;;
+    esac
     abk_sync_node "$_si_d/$_si_node" "$_si_v" "$_si_key"
   done
   _si_v="$(abk_cfg swapin.vma_ra '')"
@@ -913,7 +932,8 @@ abk_apply_swapin_knobs() {
     0|false|off) _si_w=false ;;
     *) abk_warn "swapin.vma_ra: '$_si_v' ignored"; return 0 ;;
   esac
-  abk_sync_node /sys/kernel/mm/swap/vma_ra_enabled "$_si_w" swapin.vma_ra
+  abk_sync_node "$ABK_SYS_ROOT/kernel/mm/swap/vma_ra_enabled" \
+    "$_si_w" swapin.vma_ra
   return 0
 }
 

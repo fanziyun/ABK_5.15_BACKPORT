@@ -997,6 +997,9 @@ abk_zram_supervisor_main() {
   _zs_per_kcd=$(( _zs_kcd_interval / _zs_reassert ))
   [ "$_zs_per_kcd" -ge 1 ] || _zs_per_kcd=1
   _zs_pol_interval="$(abk_cfg policy.reassert_interval_sec 300)"
+  abk_is_uint "$_zs_pol_interval" || _zs_pol_interval=300
+  [ "$_zs_pol_interval" -ge 60 ] || _zs_pol_interval=60
+  [ "$_zs_pol_interval" -le 86400 ] || _zs_pol_interval=86400
   _zs_per_pol=$(( _zs_pol_interval / _zs_reassert ))
   [ "$_zs_per_pol" -ge 1 ] || _zs_per_pol=1
 
