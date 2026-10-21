@@ -891,10 +891,10 @@ abk_apply_fault_around_knobs() {
   _fa_exp="$(for _fa_u in $_fa_norm; do
     if abk_is_uint "$_fa_u" && [ "$_fa_u" -ge 10000 ] && [ "$_fa_u" -le 99999 ]; then
       printf '%s\n' "$_fa_u"
-    else
+    elif [ "$_fa_u" != "0" ]; then
       abk_warn "fault_around.app_uids: '$_fa_u' ignored"
     fi
-  done | sort -n | tr '\n' ',')"
+  done | sort -n -u | head -n 64 | tr '\n' ',')"
   _fa_exp="${_fa_exp%,}"
   _fa_cur="$(abk_read "$_fa_d/fault_around_app" | tr -d ' \t\r\n')"
   [ "$_fa_cur" = "$_fa_exp" ] && return 0
