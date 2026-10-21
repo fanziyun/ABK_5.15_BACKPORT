@@ -885,7 +885,6 @@ abk_apply_fault_around_knobs() {
       "$_fa_d/fault_around_app_only" "$_fa_v" fault_around.app_only
   fi
   _fa_list="$(abk_cfg fault_around.app_uids '')"
-  [ -n "$_fa_list" ] || return 0
   [ -e "$_fa_d/fault_around_app" ] || return 0
   _fa_norm="$(printf '%s' "$_fa_list" | tr ',' ' ')"
   _fa_exp="$(for _fa_u in $_fa_norm; do
@@ -909,14 +908,14 @@ abk_apply_fault_around_knobs() {
 abk_apply_swapin_knobs() {
   _si_d="$ABK_SYS_ROOT/module/readahead/parameters"
   for _si_pair in \
-      "swapin_window_enable|swapin.window_enable" \
-      "swapin_boost_enable|swapin.boost_enable" \
-      "swapin_boost_pages|swapin.boost_pages" \
-      "swapin_shrink_enable|swapin.shrink_enable" \
-      "swapin_shrink_pages|swapin.shrink_pages" \
-      "swapin_window_background_only|swapin.background_only"; do
-    _si_node="${_si_pair%%|*}"
-    _si_key="${_si_pair#*|}"
+      "swapin_window_enable:swapin.window_enable" \
+      "swapin_boost_enable:swapin.boost_enable" \
+      "swapin_boost_pages:swapin.boost_pages" \
+      "swapin_shrink_enable:swapin.shrink_enable" \
+      "swapin_shrink_pages:swapin.shrink_pages" \
+      "swapin_window_background_only:swapin.background_only"; do
+    _si_node="${_si_pair%%:*}"
+    _si_key="${_si_pair#*:}"
     _si_v="$(abk_cfg "$_si_key" '')"
     [ -n "$_si_v" ] || continue
     case "$_si_key" in
