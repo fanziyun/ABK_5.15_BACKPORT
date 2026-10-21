@@ -6713,7 +6713,7 @@ PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)
 # later scan.  This group parks it and re-scans once inside the same call so
 # __remove_mapping() frees the entry now.  One-shot retry, no lock, no sleep.
 # ============================================================================
-import batch72_core_kcompressd_swapcache_drop as _b72_scd  # noqa: E402
+import batch72_core_kcompressd_swapcache_drop as _b72_scd
 
 PATCH_GROUPS = PATCH_GROUPS + _b72_scd.build_groups(PatchGroup)
 
@@ -6724,7 +6724,7 @@ PATCH_GROUPS = PATCH_GROUPS + _b72_scd.build_groups(PatchGroup)
 # window computed by __swapin_nr_pages()/swapin_nr_pages(), plus a sysfs handle
 # onto the kernel's VMA readahead switch.  Pure arithmetic, no lock, no sleep.
 # ============================================================================
-import batch73_core_swapin_window as _b73_swapin  # noqa: E402
+import batch73_core_swapin_window as _b73_swapin
 
 PATCH_GROUPS = PATCH_GROUPS + _b73_swapin.build_groups(PatchGroup)
 
@@ -6734,7 +6734,7 @@ PATCH_GROUPS = PATCH_GROUPS + _b73_swapin.build_groups(PatchGroup)
 # and the decision point after the hook: suppress for system uids (default) and
 # for an explicit app-uid exclusion list, readable/writable at runtime.
 # ============================================================================
-import batch74_core_fault_around_app_policy as _b74_fa  # noqa: E402
+import batch74_core_fault_around_app_policy as _b74_fa
 
 PATCH_GROUPS = PATCH_GROUPS + _b74_fa.build_groups(PatchGroup)
 
