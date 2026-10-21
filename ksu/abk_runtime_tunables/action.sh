@@ -109,6 +109,8 @@ abk_status_report() {
     fi
     if abk_zram_need_rewrite; then
       abk_show "policy" "not in force -- a rewrite is pending"
+    elif abk_zram_need_swap_area; then
+      abk_show "policy" "not in force -- the swap area is missing"
     else
       abk_show "policy" "in force"
     fi
