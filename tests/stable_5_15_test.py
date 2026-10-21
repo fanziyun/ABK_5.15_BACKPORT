@@ -6669,10 +6669,10 @@ def test_batch72_kcompressd_swapcache_drop():
         # fine: the pristine sweep above proves `new` does not pre-exist.)
         check(f"step {i}'s replacement is not a prefix of its own anchor "
               "(trap 1)", not old.startswith(new))
-        # The pass must never wait: a page still in flight goes back to the
-        # LRU exactly as in the pristine kernel.
-        check(f"step {i} adds no wait_on_page_writeback",
-              "wait_on_page_writeback" not in new)
+        # Only the re-scan step waits, and only on pages this module queued.
+        if i != 2:
+            check(f"step {i} adds no wait_on_page_writeback",
+                  "wait_on_page_writeback" not in new)
 
     def synthetic_vmscan():
         """The three pristine anchors, in file order, in a minimal caller."""
@@ -6795,30 +6795,30 @@ def test_batch72_kcompressd_swapcache_drop():
               < tail.index("wb_retry_done = true;"))
         check("the latch is set before the re-scan",
               tail.index(b72.RETRY_LATCH) < tail.index(b72.SPLICE))
-        check("still-writeback pages are pre-filtered back to ret_pages",
-              b72.PRE_FILTER in tail
+        check("still-writeback pages wait for the deferred write",
+              b72.WAIT_PIN in tail
               and tail.index("list_for_each_entry_safe(page, next, "
                              "&wb_retry_pages, lru)")
-              < tail.index(b72.PRE_FILTER))
-        check("the pre-filter is guarded by PageWriteback",
-              "if (PageWriteback(page))\n\t\t\t\tlist_move(" in tail)
+              < tail.index(b72.WAIT_PIN))
+        check("the wait is guarded by PageWriteback",
+              "if (PageWriteback(page))\n\t\t\t\twait_on_page_writeback(page);" in tail)
         check("the remaining pages are spliced onto page_list",
               b72.SPLICE in tail)
         check("do_demote_pass is cleared before the retry",
               tail.index(b72.SPLICE)
-              < tail.index("\t\t\tdo_demote_pass = false;")
-              < tail.index("\t\t\tgoto retry;"))
+              < tail.index("\t\tdo_demote_pass = false;")
+              < tail.index("\t\tgoto retry;"))
         check("the retry precedes the demotion retry",
-              tail.index("\t\t\tgoto retry;")
+              tail.index("\t\tgoto retry;")
               < tail.index("list_splice_init(&demote_pages, page_list);"))
         check("both halves are bounded by the one-shot latch",
               tail.count("!wb_retry_done && !list_empty(&wb_retry_pages)") == 1
               and tail.count("wb_retry_done = true;") == 1)
         check("the group marker rides on all three edits",
               text.count(b72.MARKER) == 3, text.count(b72.MARKER))
-        check("the whole file adds no wait_on_page_writeback",
+        check("the whole file adds exactly one wait_on_page_writeback",
               text.count("wait_on_page_writeback")
-              == pristine.count("wait_on_page_writeback"))
+              == pristine.count("wait_on_page_writeback") + 1)
 
         # Idempotency: second pass already_present, byte-identical.
         ctx2 = make_ctx(tmp + "-b", {b72.VMSAN: text, b72.PAGE_IO: io_pinned})
