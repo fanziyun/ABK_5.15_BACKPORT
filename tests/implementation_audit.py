@@ -1029,7 +1029,7 @@ REQUIRED_CONTENT = {
         ["mm/vmscan.c", "LIST_HEAD(wb_retry_pages);"],
         ["mm/vmscan.c", "bool wb_retry_done = false;"],
         ["mm/vmscan.c", "list_add(&page->lru, &wb_retry_pages);"],
-        ["mm/vmscan.c", "list_move(&page->lru, &ret_pages);"],
+        ["mm/vmscan.c", "wait_on_page_writeback(page);"],
         ["mm/vmscan.c", "list_splice_tail(&wb_retry_pages, page_list);"],
         ["mm/vmscan.c", "SWP_SYNCHRONOUS_IO"],
     ],

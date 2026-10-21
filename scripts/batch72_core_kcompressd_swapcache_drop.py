@@ -32,13 +32,12 @@ entry now instead of on a later scan.  Three steps, all in ``mm/vmscan.c``:
      otherwise keep the pristine ``goto keep;``.  The ``PageDirty`` guard
      stays where it was, after this block.
   3. After the loop's ``keep:`` block and ``/* 'page_list' is always empty
-     here */``: one re-scan.  Pre-filter the pages still under writeback back
-     to ``ret_pages`` first -- re-queueing them would meet the loop-top
-     ``PageWriteback`` branch, which activates them, the exact outcome this
-     pass exists to avoid.  ``list_splice_tail()`` the rest onto
-     ``page_list``, clear ``do_demote_pass`` (a demoted page must not be
-     re-routed), and ``goto retry;``.  ``wb_retry_done`` makes both halves
-     one-shot, so the loop always terminates.
+     here */``: wait for the deferred write to finish (the drain is one
+     per-node thread and the FIFO is small, so the wait is bounded), then
+     ``list_splice_tail()`` the parked pages onto ``page_list``, clear
+     ``do_demote_pass`` (a demoted page must not be re-routed), and
+     ``goto retry;``.  ``wb_retry_done`` makes the wait one-shot, so the loop
+     always terminates.
 
 Why ``SWP_SYNCHRONOUS_IO`` only: the deferred-drain shape this targets is a
 synchronous swap device.  On an asynchronous swap device the page's writeback
@@ -48,10 +47,9 @@ pristine "keep and revisit later" is the right answer and is left untouched.
 Scope notes:
 
 * Removal still goes through the kernel's own ``__remove_mapping()``; this
-  group only decides *when* the page is re-scanned.  It adds no lock, no
-  sleep, no allocation and -- explicitly -- no ``wait_on_page_writeback()``:
-  the hit path is a page-flag test plus list operations, and a page still in
-  flight is returned to the LRU exactly as before.
+  group waits for the deferred write to finish and then lets the normal
+  reclaim tail remove the page.  The wait applies only to pages this module
+  queued, so its bound is the drain's FIFO rather than an arbitrary bio.
 * ``page_swap_info()`` exists only under ``CONFIG_SWAP``, so its one reference
   sits in a ``CONFIG_SWAP`` gate with the pristine ``goto keep;`` as the
   ``#else`` behaviour (AGENTS.md "Step-authoring traps" #7).  Everything else
@@ -68,9 +66,8 @@ Scope notes:
   is pristine text, but the state it acts on (a swap-cache page under
   writeback at ``PAGE_SUCCESS``) is what Batch 71 creates, so the group
   refuses with ``blocked_by_shape`` when Batch 71's graft (its
-  ``sailboat_kcompressd_wb_pin`` marker in ``mm/page_io.c``) is absent.  A
-  page parked without that pin could never be recovered by this pass; the
-  pre-filter would simply hand it back to ``ret_pages``.
+  ``sailboat_kcompressd_wb_pin`` marker in ``mm/page_io.c``) is absent.
+  Without that pin the page is never in the state this wait targets.
 """
 
 from __future__ import annotations
@@ -166,15 +163,14 @@ _RETRY_NEW = (
     "\t/* 'page_list' is always empty here */\n"
     "\n"
     "\t/*\n"
-    "\t * sailboat_kcompressd_swapcache_drop: one re-scan of the pages\n"
-    "\t * parked above because their synchronous swap-out was still under\n"
-    "\t * writeback.  A page that is still under writeback goes back to\n"
-    "\t * @ret_pages untouched: re-queueing it would meet the PageWriteback\n"
-    "\t * branch at the top of the loop, which activates it -- exactly what\n"
-    "\t * this pass exists to avoid.  The rest are clean, unmapped and owned\n"
-    "\t * only by the swap cache, so the normal reclaim tail frees both the\n"
-    "\t * page and its swap cache entry now.  Bounded: taken at most once\n"
-    "\t * per shrink_page_list() call (wb_retry_done).\n"
+    "\t * sailboat_kcompressd_swapcache_drop: wait for the deferred write\n"
+    "\t * to finish, then re-scan the pages parked above.  The wait is on\n"
+    "\t * pages queued by this module, whose FIFO is small, so it is bounded\n"
+    "\t * by the drain rather than by an arbitrary device.  After the\n"
+    "\t * writeback ends the page is clean, unmapped and owned only by the\n"
+    "\t * swap cache, so the normal reclaim tail frees both the page and its\n"
+    "\t * swap cache entry in this pass.  Bounded: taken at most once per\n"
+    "\t * shrink_page_list() call (wb_retry_done).\n"
     "\t */\n"
     "\tif (!wb_retry_done && !list_empty(&wb_retry_pages)) {\n"
     "\t\tstruct page *page, *next;\n"
@@ -182,13 +178,11 @@ _RETRY_NEW = (
     "\t\twb_retry_done = true;\n"
     "\t\tlist_for_each_entry_safe(page, next, &wb_retry_pages, lru) {\n"
     "\t\t\tif (PageWriteback(page))\n"
-    "\t\t\t\tlist_move(&page->lru, &ret_pages);\n"
+    "\t\t\t\twait_on_page_writeback(page);\n"
     "\t\t}\n"
-    "\t\tif (!list_empty(&wb_retry_pages)) {\n"
-    "\t\t\tlist_splice_tail(&wb_retry_pages, page_list);\n"
-    "\t\t\tdo_demote_pass = false;\n"
-    "\t\t\tgoto retry;\n"
-    "\t\t}\n"
+    "\t\tlist_splice_tail(&wb_retry_pages, page_list);\n"
+    "\t\tdo_demote_pass = false;\n"
+    "\t\tgoto retry;\n"
     "\t}\n"
     "\n"
     "\t/* Migrate pages selected for demotion */\n"
@@ -206,7 +200,7 @@ WB_PIN_MARKER = "sailboat_kcompressd_wb_pin"
 DECL_LIST = "LIST_HEAD(wb_retry_pages);"
 DECL_FLAG = "bool wb_retry_done = false;"
 PARK = "list_add(&page->lru, &wb_retry_pages);"
-PRE_FILTER = "list_move(&page->lru, &ret_pages);"
+WAIT_PIN = "wait_on_page_writeback(page);"
 # list_splice_tail() leaves its source list pointing into the entries it just
 # spliced; nothing reads wb_retry_pages after this call and the wb_retry_done
 # latch is what keeps it that way (docstring "Scope notes").
@@ -269,7 +263,7 @@ def build_groups(PatchGroup):
             "writeback at PAGE_SUCCESS is re-scanned once inside the same "
             "shrink_page_list() call, so __remove_mapping() frees its swap "
             "cache entry now instead of on a later scan -- bound to one "
-            "re-scan, no lock, no sleep, no wait_on_page_writeback()",
+            "one bounded wait for the deferred write, then one re-scan; no lock, no allocation",
             [
                 "follow-up to Batch 71 kcompressd_writeback_pin: the pin "
                 "keeps the page (and its slot) alive for the FIFO residency, "

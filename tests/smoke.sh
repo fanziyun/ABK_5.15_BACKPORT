@@ -847,8 +847,8 @@ grep -qF "sailboat_kcompressd_swapcache_drop" "$VMSCAN" \
   || fail "the kcompressd swap-cache drop marker is missing in mm/vmscan.c"
 grep -qF "list_splice_tail(&wb_retry_pages, page_list);" "$VMSCAN" \
   || fail "the one-shot swap-cache re-scan is missing in mm/vmscan.c"
-grep -qF "list_move(&page->lru, &ret_pages);" "$VMSCAN" \
-  || fail "the still-writeback pre-filter is missing in mm/vmscan.c"
+grep -qF "wait_on_page_writeback(page);" "$VMSCAN" \
+  || fail "the still-writeback wait is missing in mm/vmscan.c"
 
 # Batch 73: swapin readahead window -- params+helpers in readahead.c, clamps in
 # swap_state.c, externs in internal.h; one marker per touched file.
