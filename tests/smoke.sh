@@ -840,8 +840,8 @@ grep -A1 "end_page_writeback(page);" "$PAGE_IO" | grep -q "put_page(page);" \
 
 # Batch 72: kcompressd swap-cache drop -- the one-shot re-scan in
 # shrink_page_list().  The pass-1 status says nothing about whether the page
-# is really re-queued, so the splice, the latch and the still-writeback
-# pre-filter are pinned here; and the re-scan must stay sleep-free.
+# is really re-queued, so the splice, the latch, the bounded wait and the
+# drain-context fallback are pinned here.
 VMSCAN="$KERNEL_ROOT/common/mm/vmscan.c"
 grep -qF "sailboat_kcompressd_swapcache_drop" "$VMSCAN" \
   || fail "the kcompressd swap-cache drop marker is missing in mm/vmscan.c"
@@ -849,6 +849,8 @@ grep -qF "list_splice_tail(&wb_retry_pages, page_list);" "$VMSCAN" \
   || fail "the one-shot swap-cache re-scan is missing in mm/vmscan.c"
 grep -qF "wait_on_page_writeback(page);" "$VMSCAN" \
   || fail "the still-writeback wait is missing in mm/vmscan.c"
+grep -qF "PF_KSWAPD" "$VMSCAN" \
+  || fail "the drain-context fallback is missing in mm/vmscan.c"
 
 # Batch 73: swapin readahead window -- params+helpers in readahead.c, clamps in
 # swap_state.c, externs in internal.h; one marker per touched file.
