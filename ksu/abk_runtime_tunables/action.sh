@@ -1,6 +1,5 @@
 #!/system/bin/sh
 # action.sh - manual entry point, also what the KernelSU action button runs.
-#
 #   action.sh [status]   what the module owns, what the kernel exposes (default)
 #   action.sh pass       re-assert the zram policy and run one age-marked pass
 #   action.sh takeover   rewrite zram now (algorithms, cap, swap, writeback),
@@ -148,12 +147,6 @@ abk_status_report() {
   abk_show_or_absent "transparent_hugepage" \
     "$ABK_SYS_ROOT/kernel/mm/transparent_hugepage/enabled"
 
-  # kcompressd is the kernel thread that takes the first swap-out write off the
-  # reclaim path; from here its queue is visible only as the difference of its
-  # three counters.  depth small while SwapCached stays large is the
-  # written-but-not-dropped shape the supervisor warns about, so the two belong
-  # in one place.  vm.page-cluster is printed by the loop above; it sizes the
-  # swap readahead window (2^value pages) that faults pages back out of here.
   echo "-- kcompressd and swap-in --"
   _sr_kcd="$(abk_kcompressd_state_line)"
   abk_show "kcompressd" "${_sr_kcd#kcompressd: }"
@@ -167,10 +160,6 @@ abk_status_report() {
   abk_show_or_absent "swap.vma_ra_enabled" \
     "$ABK_SYS_ROOT/kernel/mm/swap/vma_ra_enabled"
 
-  # The grafts this round added, exposed as module parameters (namespace =
-  # the object's own name, so the sysfs path is module/<name>/parameters/ and
-  # the cmdline form is <name>.<param>=...).  Absent on a kernel without the
-  # graft, printed rather than treated as an error.
   echo "-- swap-in readahead (namespace readahead) --"
   for _sr_ra_par in swapin_window_enable swapin_boost_enable \
       swapin_boost_pages swapin_shrink_enable swapin_shrink_pages \

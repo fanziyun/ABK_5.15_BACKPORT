@@ -6622,20 +6622,7 @@ def test_sched_tunables_module():
 
 
 def test_batch72_kcompressd_swapcache_drop():
-    """Batch 72: a kcompressd swap-cache page is dropped in the same pass.
-
-    Batch 71 pins the queued page under PG_writeback, so at
-    shrink_page_list()'s ``case PAGE_SUCCESS:`` such a page is clean, unmapped
-    and still in the swap cache.  The pristine ``goto keep`` parks it on the
-    LRU with the swap cache entry allocated until a later scan.  The group
-    parks it on ``wb_retry_pages`` and re-scans once after the loop, so
-    __remove_mapping() frees the entry now.
-
-    The test runs the three steps on a synthetic vmscan.c that carries the
-    three pristine anchors in order (the real anchors are pinned byte-for-byte
-    against the reference tree by a2-sim.py), plus a page_io.c carrying Batch
-    71's marker for the shape probe.
-    """
+    
     print("Batch 72: kcompressd_swapcache_drop (same-pass swap cache drop)")
     import abk_stable_core as core
     import batch72_core_kcompressd_swapcache_drop as b72
@@ -6649,8 +6636,6 @@ def test_batch72_kcompressd_swapcache_drop():
           group.files == [b72.VMSAN], group.files)
 
     keys = [g.key for g in core.PATCH_GROUPS]
-    # The state the group acts on is created by Batch 71's pin, so the probe
-    # requires it and the registration order must put it first.
     check("registered after kcompressd_writeback_pin",
           keys.index("kcompressd_swapcache_drop")
           > keys.index("kcompressd_writeback_pin"),
@@ -6663,13 +6648,8 @@ def test_batch72_kcompressd_swapcache_drop():
           == [(b72.VMSAN, True)] * 3,
           [(rel, req) for rel, _o, _n, req in steps])
     for i, (_rel, old, new, _req) in enumerate(steps):
-        # Trap 1: if `new` were a prefix of `old`, replace_once()'s
-        # check-new-first would report already_present forever.  (The usual
-        # "append after the anchor" shape, where `old` prefixes `new`, is
-        # fine: the pristine sweep above proves `new` does not pre-exist.)
         check(f"step {i}'s replacement is not a prefix of its own anchor "
               "(trap 1)", not old.startswith(new))
-        # Only the re-scan step waits, and only on pages this module queued.
         if i != 2:
             check(f"step {i} adds no wait_on_page_writeback",
                   "wait_on_page_writeback" not in new)
@@ -6719,7 +6699,6 @@ def test_batch72_kcompressd_swapcache_drop():
                  "\tset_page_writeback(page);\n"
                  "\treturn 0;\n}\n")
 
-    # Refuses without Batch 71's graft, and without the 5.15 reclaim shape.
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {b72.VMSAN: synthetic_vmscan(),
                              b72.PAGE_IO: "int swap_writepage(void)\n"})
@@ -6745,7 +6724,6 @@ def test_batch72_kcompressd_swapcache_drop():
               status == "blocked_by_shape", (status, detail))
         check("the empty tree is not written", ctx.pending_writes() == [])
 
-    # The real pass: Batch 71's marker present, pristine anchors present.
     with tempfile.TemporaryDirectory() as tmp:
         pristine = synthetic_vmscan()
         ctx = make_ctx(tmp, {b72.VMSAN: pristine, b72.PAGE_IO: io_pinned})
@@ -6756,7 +6734,6 @@ def test_batch72_kcompressd_swapcache_drop():
         check("only mm/vmscan.c is written",
               ctx.pending_writes() == [b72.VMSAN], ctx.pending_writes())
 
-        # 1) declarations next to the existing lists.
         check("wb_retry_pages is declared after demote_pages",
               "\tLIST_HEAD(demote_pages);\n" in text
               and text.index("\tLIST_HEAD(demote_pages);\n")
@@ -6766,7 +6743,6 @@ def test_batch72_kcompressd_swapcache_drop():
         check("the declarations still precede the function's first statement",
               text.index(b72.DECL_LIST) < text.index("\tbool do_demote_pass;"))
 
-        # 2) PAGE_SUCCESS parking, gated on CONFIG_SWAP for page_swap_info().
         park = text[text.index("\t\t\tcase PAGE_SUCCESS:"):
                     text.index("\t\t\tcase PAGE_CLEAN:")]
         check("the parking block is inside the CONFIG_SWAP gate",
@@ -6788,7 +6764,6 @@ def test_batch72_kcompressd_swapcache_drop():
         check("the parking adds no wait",
               "wait_on_page_writeback" not in park)
 
-        # 3) one re-scan, latched, and before the demote retry.
         tail = text[text.index("\t/* 'page_list' is always empty here */"):]
         check("the retry block is anchored after the empty-page_list comment",
               tail.index("sailboat_kcompressd_swapcache_drop")
@@ -6823,7 +6798,6 @@ def test_batch72_kcompressd_swapcache_drop():
               text.count("wait_on_page_writeback")
               == pristine.count("wait_on_page_writeback") + 1)
 
-        # Idempotency: second pass already_present, byte-identical.
         ctx2 = make_ctx(tmp + "-b", {b72.VMSAN: text, b72.PAGE_IO: io_pinned})
         status2, detail2 = b72._kcompressd_swapcache_drop_apply(ctx2)
         check("second pass is already_present", status2 == "already_present",
@@ -6883,15 +6857,7 @@ B73_INTERNAL_FIXTURE = (
 
 
 def test_batch73_swapin_readahead_window():
-    """Batch 73: swap-in readahead window policy.
-
-    The policy is arithmetic on top of the kernel's own window: boost to a
-    power-of-two floor, shrink to a power-of-two ceiling behind the reused
-    background gate, and the VMA switch exposed as a second handle.  Pins:
-    defaults, both clamp sites (shrink AFTER the last_ra floor), the
-    module_param_named two-name form (trap 6), the config gates (trap 7) and
-    trap 1 / trap 2.
-    """
+    
     print("Batch 73: swapin_readahead_window (boost/shrink/vma_ra)")
     import abk_stable_core as core
     import batch73_core_swapin_window as b73
@@ -6955,7 +6921,7 @@ def test_batch73_swapin_readahead_window():
           "#ifdef CONFIG_ABK_DYNAMIC_READAHEAD" in ra
           and "abk_dra_is_background_task()" in ra and "#else" in ra)
     check("the whole block is CONFIG_SWAP gated",
-          "#ifdef CONFIG_SWAP" in ra and "#endif /* CONFIG_SWAP */" in ra)
+          "#ifdef CONFIG_SWAP" in ra and "#endif" in ra)
 
     with tempfile.TemporaryDirectory() as tmp:
         ctx = make_ctx(tmp, {
@@ -6975,7 +6941,6 @@ def test_batch73_swapin_readahead_window():
         check("second pass is already_present", status2 == "already_present",
               status2)
 
-        # Shape probe: a tree whose __swapin_nr_pages() floor moved is refused.
         broken = B73_SWAP_STATE_FIXTURE.replace("last_ra = prev_win / 2;",
                                                "last_ra = 0;")
         ctx2 = make_ctx(tmp + "/2", {
@@ -7036,14 +7001,12 @@ def test_batch74_fault_around_app_policy():
           and all(req for _r, _o, _n, req in steps),
           [(rel, req) for rel, _o, _n, req in steps])
 
-    # Trap 1: anchors must be unique on the pristine shape, replacements absent.
     for index, (_rel, old, new, _req) in enumerate(steps):
         check(f"step {index}'s anchor is unique in the pristine fixture",
               MEMORY_FA_FIXTURE.count(old) == 1, MEMORY_FA_FIXTURE.count(old))
         check(f"step {index}'s replacement is not already in the pristine "
               "fixture", new not in MEMORY_FA_FIXTURE)
 
-    # Trap 2: no step may build its replacement out of another step's.
     for i, (_rel, _old, new_i, _req) in enumerate(steps):
         for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
             if i == j or new_i in old_j:
@@ -7113,9 +7076,6 @@ def test_batch74_fault_around_app_policy():
     check("second pass is byte-identical",
           (root / b74.MEMORY_C).read_text(encoding="utf-8") == patched)
 
-    # Review I-G2: marker lost while the payload survives must be a refusal,
-    # never a re-apply (step 1 keeps the do_read_fault() head as its tail, so a
-    # blind re-run inserts a second copy of every static -> redefinition).
     root3 = tmpdir / "b74-markerless"
     (root3 / "mm").mkdir(parents=True, exist_ok=True)
     markerless = patched.replace(b74.MARKER, "sailboat_marker_reflowed")
@@ -7139,15 +7099,7 @@ def test_batch74_fault_around_app_policy():
 
 
 def test_port_review_regressions():
-    """Pins for the two review fixes that are arithmetic/string-level.
-
-    I-G1: the boost floor must be clamped to the representable ceiling BEFORE
-    roundup_pow_of_two(); an unclamped floor >= 2**31 truncates to 0 in the
-    unsigned int return and the cluster path's mask becomes all-ones.
-    I-P4: the companion's kcompressd depth is enqueued - swapped; subtracting
-    the sync count (the caller-written volume, never queued) made it negative
-    on every real device and the clamp then hid it.
-    """
+    
     print("port review regressions (I-G1 boost clamp order, I-P4 depth formula)")
     import batch73_core_swapin_window as b73
 

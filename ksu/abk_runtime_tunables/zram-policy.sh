@@ -1,35 +1,29 @@
 #!/system/bin/sh
 # zram-policy.sh - the zram half of the ABK 5.15 runtime-tunables module.
-#
 # The policy is fixed, not configurable (see README.md):
 #   primary  = lz4kd   (best fast compressor measured on this SoC)
 #   secondary = zstd   (best ratio per cost; the async worker pays for it)
 #   mem_limit = 25% of RAM
 #   swap size = whatever the ROM already had (preserved), else MemTotal/2
-#
 # Two kernels behave differently, and the module tells them apart instead of
 # assuming:
-#
 #   * with the Batch 11 lock (zram.abk_lock_algo=Y, default) the compressors
 #     are chosen by the kernel at device creation and a later write is accepted
 #     and ignored.  The policy is in force from the first `disksize`, so the
 #     module only re-asserts what a reset drops (the compressed-memory cap) and
 #     verifies the rest.  Nothing has to be taken over, which is what lets the
 #     ROM's own bring-up -- writeback backing device included -- run untouched.
-#
 #   * without the lock, the nodes are only writable before `disksize`, so
 #     whoever wins that window decides the algorithm for the whole boot.  The
 #     module then owns the bring-up: swapoff -> reset -> algorithms -> (writeback)
 #     -> disksize -> mem_limit -> mkswap -> swapon, and a supervisor re-checks
 #     the result every ABK_ZRAM_REASSERT_SECS.
-#
 # Writeback and the algorithm policy used to exclude each other, because the
 # backing device is written in the same pre-`disksize` window and `reset_bdev()`
 # drops it on a reset.  Now the module restores the attachment it found instead
 # of sacrificing it; it attaches one itself only under zram.writeback=auto
 # (opt-in -- the shipped default is off), with the kernel supporting writeback,
 # nobody else owning it and the boot already completed.
-#
 # Interlock that stays: a device whose swap area is in use is never rewritten
 # just to rearrange algorithms -- `swapoff` pulls every swapped page back into
 # RAM first, and that transient spike is what ABK_ZRAM_MIN_FREE_MB bounds.
@@ -322,7 +316,6 @@ abk_zram_drop_stale_backing_file() {
 }
 
 # abk_zram_attach_writeback <reuse-device|''> <reuse-limit|''>
-#
 # Only valid before `disksize`: backing_dev_store() refuses an initialized
 # device, and reset_bdev() has just closed whatever was attached, so this is
 # where the writeback half of a rewrite is put back.
@@ -743,7 +736,6 @@ abk_zram_compact_if_fragmented() {
 # =1, init.svc.mmd_setup=stopped) and this module only *attaches* the backing
 # device -- so `zram.writeback=auto` on its own leaves bd_stat at 0 0 0.  This
 # is the missing trigger.  It is off by default because a sweep spends flash.
-#
 # Mode.  `huge` is the cheap one and the one to prefer: an incompressible page
 # costs a whole page of RAM, so moving it frees 1:1 against the flash it
 # spends.  `idle` moves compressed pages too, freeing only about a third of
@@ -753,7 +745,6 @@ abk_zram_compact_if_fragmented() {
 # kernel without this batch's fix it does not mean "one page" -- it sweeps to
 # the end of the device, and page_index=N with N>=1 walks past zram->table and
 # panics (see zram_writeback_bounds in scripts/batch14_core_zram_writeback.py).
-#
 # Budget.  bd_wb_limit is a decrementing counter, not a per-pass ceiling: it
 # only ever falls, so a budget that is not re-armed is spent once and every
 # later pass returns -EIO.  Re-arming it here is what makes
@@ -835,46 +826,15 @@ abk_zram_writeback_sweep() {
   return 0
 }
 
-# --- kcompressd invariant monitor (rides the recompression tick) ---------
-# Observability only: kcompressd is the kernel thread that takes the first
-# swap-out write off the reclaim path, and from userspace its queue is visible
-# only as `enqueued - swapped` next to its threshold.  A third counter, sync,
-# counts pages that bypassed the queue (the caller wrote them itself), so it is
-# a separate column and NOT part of the depth (see abk_kcompressd_state_line in
-# common.sh).  One state line per kcompressd.monitor_interval_sec, plus the two
-# shapes worth a warning:
-#
-#   depth >= threshold
-#     the queue reached the head-drain point: every new enqueue also writes its
-#     oldest page out on the caller's thread, so reclaim pays a synchronous
-#     write and the offload is no longer free.  Warned on every check while it
-#     holds -- that is a standing cost, not an event.
-#
-#   depth <= threshold && SwapCached >= kcompressd.swapcached_warn_mb,
-#   for two consecutive checks
-#     the queue is NOT the backlog, yet the swap cache keeps holding pages:
-#     written-but-not-dropped.  Two checks in a row because one paired reading
-#     can hold SwapCached high for a moment (an app dying mid-pageout) without
-#     anything being wrong.  After warning, the streak starts over, so a
-#     standing leak stays visible without filling the log every single check.
-#
-# A threshold of 0 means the kernel has kcompressd switched off: the queue
-# cannot build, so neither invariant applies and only the state line is
-# written.  Absent nodes (no graft on this kernel) behave the same way.
 abk_kcompressd_monitor_tick() {
   _kcm_line="$(abk_kcompressd_state_line)"
   abk_log "$_kcm_line"
 
-  # Parsed back out of the line on purpose: the helper runs in the command
-  # substitution's subshell, and re-deriving depth here would be a second
-  # implementation of its two-sample rule.
   _kcm_thr="$(printf '%s\n' "$_kcm_line" \
     | sed -n 's/^kcompressd: .*threshold=\([0-9][0-9]*\).*$/\1/p')"
   _kcm_depth="$(printf '%s\n' "$_kcm_line" \
     | sed -n 's/^kcompressd: .*depth=\([0-9][0-9]*\).*$/\1/p')"
 
-  # kcompressd.depth_warn overrides the kernel's own threshold; empty or 0
-  # means "use the kernel's", which is the head-drain depth it really applies.
   _kcm_limit="$(abk_cfg kcompressd.depth_warn '')"
   abk_is_uint "$_kcm_limit" || _kcm_limit=""
   if [ "$_kcm_limit" = 0 ]; then
@@ -973,7 +933,6 @@ abk_zram_supervisor_main() {
   # drain advances only because a pass clears IDLE and nothing puts it back, so
   # the mark runs on its own, much longer clock and every sweep in between
   # passes --no-mark.
-  #
   # 3600 s (one hour): the drain rate is bounded by sweep cadence x budget
   # (2 x 512 MiB per hour), not by the mark clock -- Batch 47's skip predicate
   # makes re-armed already-optimal pages free -- so an hourly mark only changes
@@ -987,10 +946,6 @@ abk_zram_supervisor_main() {
   _zs_per_mark=$(( _zs_mark_interval / _zs_interval ))
   [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
 
-  # kcompressd observability rides its own, slower clock: one state line per
-  # kcompressd.monitor_interval_sec (600 s default), plus its two invariants.
-  # It is a tick count like every other cadence here, so a reassert interval
-  # longer than the monitor interval still means one check per tick.
   _zs_kcd_interval="$(abk_cfg kcompressd.monitor_interval_sec 600)"
   abk_is_uint "$_zs_kcd_interval" || _zs_kcd_interval=600
   [ "$_zs_kcd_interval" -ge 60 ] || _zs_kcd_interval=60
@@ -1022,8 +977,6 @@ abk_zram_supervisor_main() {
   # and stay alive -- with a log line -- when a pass fails.
   _zs_tick=0
   _zs_wb_tick=0
-  # Seeded like _zs_mark_tick below: the first tick logs the boot baseline
-  # (threshold, counters, depth) instead of waiting a full monitor interval.
   _zs_kcd_tick="$_zs_per_kcd"
   _zs_pol_tick=0
   ABK_KCD_BAD_STREAK=0

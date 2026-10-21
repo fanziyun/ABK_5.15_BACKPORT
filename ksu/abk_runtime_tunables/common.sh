@@ -1,6 +1,5 @@
 #!/system/bin/sh
 # common.sh - shared helpers for the ABK 5.15 runtime-tunables module.
-#
 # Sourced by post-fs-data.sh / service.sh / action.sh.  Keep it POSIX sh:
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
@@ -12,14 +11,12 @@ ABK_VERSION="$(sed -n 's/^version=//p' "${MODDIR:-$(cd "$(dirname "$0")" 2>/dev/
 # Constants on purpose, not configuration.  Measured on the target device
 # (vermeer, android13-5.15-lts 5.15.215) by compressing an exact 64 MiB ELF
 # corpus on a single core, on a throwaway zram device:
-#
 #   algo      compressed   ratio   compress           decompress
 #   lz4       31.19 MB     2.15x   0.60 s (107 MB/s)   865 MB/s
 #   lz4kd     31.06 MB     2.16x   0.57 s (112 MB/s)   955 MB/s
 #   lz4hc     29.31 MB     2.29x   1.13 s  (57 MB/s)   901 MB/s
 #   zstd      24.21 MB     2.77x   0.73 s  (88 MB/s)   330 MB/s
 #   deflate   23.51 MB     2.85x   2.29 s  (28 MB/s)   208 MB/s
-#
 # lz4kd is the best fast primary (fastest both ways, best ratio of the fast
 # family, and the vendor's own CONFIG_ZRAM_DEF_COMP); zstd is the best
 # secondary (22% smaller than lz4kd; the async worker pays the compression and
@@ -58,8 +55,6 @@ ABK_ZRAM_WB_RETRY_SECS=3600
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_PROC_SWAPS="${ABK_PROC_SWAPS:-/proc/swaps}"
 ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
-# kcompressd's threshold and its three counters sit next to the other vm
-# sysctls; redirectable so the sampler can be exercised against a fixture.
 ABK_KCD_VM_DIR="${ABK_KCD_VM_DIR:-/proc/sys/vm}"
 # The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
 # *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
@@ -196,7 +191,6 @@ abk_mul_div() {
 }
 
 # abk_gt <a> <b> / abk_le <a> <b> -> numeric comparison, 64-bit.
-#
 # Same trap as abk_mul_div: on this ROM's mksh even `[ 17179869184 -gt 0 ]` is
 # false (it parses the operands through the same 32-bit arithmetic, where that
 # literal is 0), so a swap size above 2 GiB looked like "no size" and the module
@@ -416,45 +410,7 @@ abk_mem_pct_bytes() {
   return 0
 }
 
-# --- kcompressd observability --------------------------------------------
-# kcompressd moves the first swap-out write off the reclaim path into a
-# per-node thread, and exposes its queue next to it: the threshold
-# (`vm.kcompressd`, the queue depth at which the caller starts head-draining
-# one page per enqueue -- not the ring's capacity; 0 = the mechanism is off)
-# and three monotonic counters, in pages:
-#
-#   enqueued   pages handed to the queue
-#   swapped    pages taken back out of it and written (queue -> disk)
-#   sync       pages that never entered the queue: the caller wrote them
-#              itself (queue full, no thread on that node, or a device/shape
-#              gate refused the offload)
-#
-# so depth = enqueued - swapped is the queue's current length.  `sync` is
-# deliberately NOT part of that difference: it counts pages that bypassed the
-# queue, so subtracting it would measure "enqueued minus all history since
-# boot" and pin the depth at zero as soon as any sync work happened (a device
-# can have far more sync pages than enqueued ones -- that is a normal pairing,
-# not an overload).  It is printed as its own column because it answers the
-# opposite question: how much work the offload is refusing.
-#
-# These are four separate reads and the counters move under any swap load, so
-# the sampler reads swapped/sync FIRST and enqueued LAST: a completion that
-# lands between two reads can then only make the depth read high -- the
-# conservative direction -- never negative.  The state line samples twice and
-# keeps the larger depth for the same reason; the clamp at zero is only the
-# last line of defence against a counter that is not monotonic (a reset node,
-# an odd kernel).  mksh arithmetic is 32-bit on this ROM (the abk_gt trap), so
-# the difference is taken in awk.
-#
-# Missing nodes are the normal case on a kernel without the graft, not a
-# fault: every field degrades to `absent`, nothing warns, nothing exits
-# non-zero.
 
-# One sample.  Sets ABK_KCD_THRESHOLD / _ENQUEUED / _SWAPPED / _SYNC / _DEPTH,
-# each either a decimal number or the string `absent`.  Scratch for the two
-# functions below, not a caller interface: every shipped caller runs
-# abk_kcompressd_state_line() in a command substitution, where the variables
-# do not survive.
 abk_kcompressd_sample() {
   _kcs_swp="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_swapped" | tr -d ' \t\r\n')"
   _kcs_syn="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_sync" | tr -d ' \t\r\n')"
@@ -481,9 +437,6 @@ abk_kcompressd_sample() {
   return 0
 }
 
-# One `kcompressd: threshold=... enqueued=... swapped=... sync=... depth=...`
-# line.  Its contract is stdout only -- print and forget: both call sites use
-# `$( )`, so nothing outside this function can see the sampled numbers.
 abk_kcompressd_state_line() {
   abk_kcompressd_sample
   _kl_thr1="$ABK_KCD_THRESHOLD"
@@ -499,11 +452,6 @@ abk_kcompressd_state_line() {
   _kl_syn2="$ABK_KCD_SYNC"
   _kl_dep2="$ABK_KCD_DEPTH"
 
-  # Keep the whole sample, never a mix: the printed enqueued/swapped must
-  # produce the printed depth (sync is a separate column, not part of it).  A
-  # sample whose depth could not be computed loses to one that could;
-  # otherwise the larger depth wins (conservative for the saturation rule -- a
-  # queue is at least as deep as its busiest sample).
   if [ "$_kl_dep2" = absent ] \
     || { [ "$_kl_dep1" != absent ] && abk_le "$_kl_dep2" "$_kl_dep1"; }; then
     ABK_KCD_THRESHOLD="$_kl_thr1"
@@ -658,12 +606,10 @@ abk_apply_readahead_knob() {
 # task state change, all the way up the hierarchy.  Android's v2 layout creates a
 # group per uid and per pid, so that is hundreds of groups whose numbers nobody
 # reads.
-#
 # Measured on the target (vermeer / 5.15.216, Batch 24): 452 cgroups carried a
 # cgroup.pressure node; lmkd, system_server and mimd were the only pressure
 # readers and all three had the global /proc/pressure/memory open.  No process
 # held a per-cgroup PSI file open.  The cost was real and the consumer was not.
-#
 # The node is this module's own graft, not the baseline's: Batch 21's
 # psi_cgroup_pressure_switch, ported from the android14-6.1 ACK implementation.
 # android13-5.15 has no such file, so a kernel built without that batch simply
@@ -673,13 +619,11 @@ abk_apply_readahead_knob() {
 # disabled group answers -EOPNOTSUPP on its pressure files and refuses poll
 # triggers instead of reporting frozen numbers.  A reader therefore fails loudly
 # rather than tuning on a lie.
-#
 # The tool writes only 0.  Batch 21 frees nothing and can restart accounting, so
 # a round trip works on this kernel; upstream's version of the switch frees the
 # group's per-cpu windows and calls re-enabling not restore safe.  The companion
 # cannot tell the two apart from userspace, so the disabled state is a decision
 # made at boot (psi.cgroup) and the A/B is two boots, not one live flip.
-#
 # keep is the built-in default: a missing key never changes behaviour, and the
 # disabled state stays something that was measured on the device first
 # (docs/psi_field_protocol.md).
@@ -817,7 +761,6 @@ abk_psi_supervisor_main() {
 # Enforcing.  KernelSU can add the rule from a module, which is the only route
 # that does not need a ROM rebuild or a relaxed boot policy; sepolicy.rule ships
 # one deliberately narrow allow (kernel -> zram_data_file, read + write).
-#
 # Nothing here is fatal, and nothing here weakens the policy: where the manager
 # loads module rules itself this call is a redundant no-op, and where the rule
 # cannot be added the device keeps the writeback it had -- which is the silent
