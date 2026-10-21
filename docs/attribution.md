@@ -320,7 +320,7 @@ commit is claimed for them:
   `fault_around_app_policy`);
 - the anchor/step engine, the child registries' glue, the test suite, `tools/`,
   and the two KernelSU companions (`ksu/abk_runtime_tunables`,
-  `ksu/abk_sched_tunables`). The companions use KernelSU's module format and run
+  `ksu/sailboat_addon_2`). The companions use KernelSU's module format and run
   against its GPL-2.0 kernel interface; their shell code is this repository's.
 
 ## Where the rest of the provenance lives

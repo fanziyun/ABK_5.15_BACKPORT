@@ -51,11 +51,11 @@
 
 | child id | content | groups |
 |---|---|---:|
-| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 73 |
+| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 78 |
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 24 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**98 graft groups** in total; one injection string covers `android13-5.15-lts`.
+**103 graft groups** in total (core 78 / perf 24 / display 1); one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
 keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44
@@ -93,10 +93,19 @@ set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_p
 
 ### 3. After flashing
 
-When the build has an AnyKernel3 tree, the **KernelSU module installs itself
-with the flash**: it holds the zram policy, drives the recompression sweeps and
-toggles the pressure switches. Without an AK3 tree the step warns and continues;
-the zip at `build/ksu/abk_runtime_tunables.zip` can also be flashed by hand.
+When the build has an AnyKernel3 tree, **both KernelSU modules install with the
+flash** (every zip under `abk-ksu-modules/` is installed):
+
+- **sailboat addon 1**, `abk_runtime_tunables` — holds the zram policy, drives the
+  recompression sweeps and toggles the pressure switches;
+- **sailboat addon 2**, `sailboat_addon_2` — holds every cpufreq policy on
+  `schedutil` and arms the smart-freq floor/cap (`sched.abk_governor=` left empty
+  stops the governor takeover; the rest of its keys are in
+  [ksu/sailboat_addon_2/README.md](ksu/sailboat_addon_2/README.md)).
+
+Without an AK3 tree the step warns and continues; the zips at
+`build/ksu/abk_runtime_tunables.zip` and `build/ksu/sailboat_addon_2.zip` can also
+be flashed by hand (`python3 scripts/build_ksu_module.py --all` builds them).
 
 Knobs:
 

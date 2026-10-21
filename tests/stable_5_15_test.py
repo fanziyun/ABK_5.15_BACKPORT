@@ -2144,7 +2144,7 @@ def test_introduced_kconfig_tiers():
               "add it to _INTRODUCED_KCONFIG in scripts/abk_stable_core.py")
 
 
-def test_mglru_is_enabled_by_the_default_tier():
+def test_mglru_is_opt_in_only():
     print("MGLRU is OFF by default (device-wedge evidence); opt-in only")
     import abk_stable_core as core
 
@@ -6435,7 +6435,7 @@ def main():
     test_config_tiers()
     test_psi_cmdline_tier()
     test_introduced_kconfig_tiers()
-    test_mglru_is_enabled_by_the_default_tier()
+    test_mglru_is_opt_in_only()
     test_batch10_memcg_v1_reclaim()
     test_batch10_cached_freeze_reclaim()
     test_batch10_daemon_script()

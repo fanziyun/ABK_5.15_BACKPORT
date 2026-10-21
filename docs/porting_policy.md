@@ -196,23 +196,28 @@ suite-preference cross-check.
   absent), snapshots through `.abk-orig`, and refuses to write a defconfig
   outside `KERNEL_ROOT` (`report_only` with the reason). `config_enablement`
   turns on the module's own symbols (`ZRAM_TRACK_ENTRY_ACTIME`,
-  `ZRAM_MULTI_COMP`, `ABK_DYNAMIC_READAHEAD`, `RCU_NOCB_CPU_DEFAULT_ALL`,
-  `LRU_GEN_ENABLED`) by default; `ABK_515_DEFCONFIG_ALIGN=1` additionally
-  aligns the remaining five 6.6-GKI defaults whose 5.15 code exists. CI's
-  `custom_kernel_options` still owns one-off config input; the module only
-  owns its own feature gates.
+  `ZRAM_MULTI_COMP`, `ABK_DYNAMIC_READAHEAD`, `RCU_NOCB_CPU_DEFAULT_ALL`)
+  by default; `ABK_515_DEFCONFIG_ALIGN=1` additionally enables
+  `LRU_GEN_ENABLED` and aligns the remaining five 6.6-GKI defaults whose 5.15
+  code exists. CI's `custom_kernel_options` still owns one-off config input;
+  the module only owns its own feature gates.
 
-  `LRU_GEN_ENABLED` is in the **default** tier, not the align tier, and that
-  placement is a correctness requirement rather than a preference: every
-  android13-5.15 baseline already ships `CONFIG_LRU_GEN=y`, so MGLRU compiles,
-  but this symbol is what selects `DEFINE_STATIC_KEY_ARRAY_TRUE` vs `_FALSE`
-  for `lru_gen_caps` in `mm/vmscan.c`. Without it every MGLRU branch starts
-  false, `/sys/kernel/mm/lru_gen/enabled` reads `0x0000`, and the classic-LRU
-  path runs — measured on the device that shipped the first cut of Batch 38.
-  Batch 37's six MGLRU performance groups were runtime-inert for exactly this
-  reason, which is the same failure class as Batch 8's RCU graft one config
-  layer further down. `tests/stable_5_15_test.py` pins the placement
-  (`test_mglru_is_enabled_by_the_default_tier`).
+  `LRU_GEN_ENABLED` is in the **align** tier and therefore off by default.
+  The android13-5.15 baseline ships `CONFIG_LRU_GEN=y`, so MGLRU compiles
+  either way; the symbol only decides whether `lru_gen_caps` in
+  `mm/vmscan.c` is `DEFINE_STATIC_KEY_ARRAY_TRUE` or `_FALSE`. Without it
+  every MGLRU branch starts false, `/sys/kernel/mm/lru_gen/enabled` reads
+  `0x0000` and the classic-LRU path runs — the same failure class as Batch 8's
+  RCU graft one config layer further down. It was default-on for one release
+  and was taken back out on device evidence: on SM8550 under sustained memory
+  thrash the reworked reclaim loop (Batches 37/49) did not converge, two
+  kworkers sat in `lru_gen_shrink_lruvec` until lmkd starved and the QCOM
+  watchdog cold-reset the machine, and a third-party app crashed with SIGSEGV
+  on its dex-preload mmap path while MGLRU was on; the classic LRU survived the
+  same pressure. The nine MGLRU groups stay registered — compiled in,
+  runtime-off — and `ABK_515_DEFCONFIG_ALIGN=1` is the opt-in. Batch 38's
+  record in `CHANGELOG.md` carries the original decision and its correction;
+  `tests/stable_5_15_test.py::test_mglru_is_opt_in_only` pins the placement.
 - **Family gate.** A non-`android13-5.15` family now produces `report_only`
   for every group without reading files; `--allow-unsupported` (shell:
   `ABK_515_ALLOW_UNSUPPORTED=1`) is the explicit escape hatch. The old
@@ -418,12 +423,18 @@ not be half-patched.  That dependency runs the other way too, which is why Batch
 `already_present`): without it, Batch 41's second pass finds its offload-branch
 and drain anchors rewritten and reports `partial` on a tree Batch 71 already touched.
 
-Batch 8's `rcu_nocb_cpu_default_all` is a three-file opt-in source graft:
-`kernel/rcu/Kconfig` adds the configuration symbol, the kernel-parameter
-documentation records explicit-mask precedence, and `kernel/rcu/tree_nocb.h`
-allocates the 5.15 mask when no boot mask was supplied before setting it to all
-possible CPUs. The option remains `default n`; only a device benchmark may justify
-enabling it in a product defconfig.
+Batch 8's `rcu_nocb_cpu_default_all` is a three-file source graft:
+`kernel/rcu/Kconfig` adds the configuration symbol with a `default n` of its
+own, the kernel-parameter documentation records explicit-mask precedence, and
+`kernel/rcu/tree_nocb.h` allocates the 5.15 mask when no boot mask was supplied
+before setting it to all possible CPUs. That Kconfig default describes a tree
+the config lane never touched: the module tier writes
+`CONFIG_RCU_NOCB_CPU_DEFAULT_ALL=y` into the defconfig, so the default build
+carries the capability. An explicit `rcu_nocbs=` / `nohz_full=` still wins —
+the graft takes its runtime branch only when neither boot parameter supplied a
+mask, so on the target ROM, which boots `rcu_nocbs=0-7`, the group reports
+`applied` and the runtime behaviour is the pristine baseline (Batch 11's device
+survey).
 
 The AOSP android13-5.15 line never took the upstream 5.15.171 Gorman rework:
 the supported `android13-5.15-lts` tree still carries `ALLOC_HARDER 0x10` /
@@ -462,6 +473,12 @@ writes into the kernel tree, and `after_patch` merely packs it
 (`scripts/build_ksu_module.py`) and injects it into the AnyKernel3 tree
 (`scripts/ak3_bundle_ksu_module.py`, idempotent marker-delimited block, skipped
 with a warning when there is no AK3 tree, `ABK_515_KSU_MODULE=0` to disable).
+The scheduling/DVFS half is a **second companion** (`ksu/sailboat_addon_2/`,
+id `sailboat_addon_2`): a KernelSU module is userspace and cannot carry the
+cpufreq grafts, so what ships there is the userspace that holds every policy on
+`schedutil` and arms the smart-freq floor/cap. Both companions are packed and
+injected by that same `after_patch` step, and the installer block installs every
+zip under `abk-ksu-modules/`, so one flash installs both.
 The same change makes the secondary compressor policy a constant instead of a
 knob: `zram.abk_recomp_algo` defaults to `zstd` and is exposed `0444`, so no
 runtime write — not even from KernelSU's root, verified on device — can put the

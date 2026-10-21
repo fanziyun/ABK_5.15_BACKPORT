@@ -45,11 +45,11 @@
 
 | child id | 内容 | 组数 |
 |---|---|---:|
-| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 73 |
+| `stable_backport_core` | 内存 / 回收 / zram / fs-mm 热点路径 | 78 |
 | `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 24 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **98 个移植组**，同一串注入在 `android13-5.15-lts` 上使用。
+共 **103 个移植组**（core 78 / perf 24 / display 1），同一串注入在 `android13-5.15-lts` 上使用。
 
 支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 220）**。
 Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，
@@ -83,9 +83,17 @@ set:https://github.com/fanziyun/ABK_5.15_BACKPORT.git#stable_display_fix;after_p
 
 ### 3. 刷入后
 
-构建产物含 AnyKernel3 时，**KernelSU 模块随刷机自动安装**：固定 zram 策略、驱动
-重压缩扫描、按需切换压力开关。无 AK3 时该步骤仅告警并继续，也可手动刷入
-`build/ksu/abk_runtime_tunables.zip`。
+构建产物含 AnyKernel3 时，**两个 KernelSU 模块随刷机自动安装**（`abk-ksu-modules/`
+下的每个 zip 都会被装上）：
+
+- **sailboat 附加模块（一）** `abk_runtime_tunables` —— 固定 zram 算法、驱动重压缩
+  扫描、按需切换压力开关；
+- **sailboat 附加模块（二）** `sailboat_addon_2` —— 把各 cpufreq policy 钉在
+  `schedutil`，并武装智能调频下限/上限（`sched.abk_governor=` 置空即不再接管
+  governor，其余键见 [ksu/sailboat_addon_2/README.md](ksu/sailboat_addon_2/README.md)）。
+
+无 AK3 时该步骤仅告警并继续，也可手动刷入 `build/ksu/abk_runtime_tunables.zip` 与
+`build/ksu/sailboat_addon_2.zip`（`python3 scripts/build_ksu_module.py --all` 生成）。
 
 可调参数：
 
