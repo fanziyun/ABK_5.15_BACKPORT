@@ -7110,6 +7110,20 @@ def test_batch74_fault_around_app_policy():
     check("second pass is byte-identical",
           (root / b74.MEMORY_C).read_text(encoding="utf-8") == patched)
 
+    # Review I-G2: marker lost while the payload survives must be a refusal,
+    # never a re-apply (step 1 keeps the do_read_fault() head as its tail, so a
+    # blind re-run inserts a second copy of every static -> redefinition).
+    root3 = tmpdir / "b74-markerless"
+    (root3 / "mm").mkdir(parents=True, exist_ok=True)
+    markerless = patched.replace(b74.MARKER, "sailboat_marker_reflowed")
+    (root3 / b74.MEMORY_C).write_text(markerless, encoding="utf-8")
+    result = group.run(GraftContext(root3, 220, "android13-5.15"))
+    check("a tree whose marker was lost but whose payload survives is "
+          "blocked_by_shape", result["status"] == "blocked_by_shape",
+          result["status"])
+    check("the marker-loss refusal writes nothing",
+          (root3 / b74.MEMORY_C).read_text(encoding="utf-8") == markerless)
+
     root2 = tmpdir / "b74-unknown"
     (root2 / "mm").mkdir(parents=True, exist_ok=True)
     unknown = MEMORY_FA_FIXTURE.replace(b74.HOOK_CALL + "\n", "")
@@ -7119,6 +7133,34 @@ def test_batch74_fault_around_app_policy():
           result["status"] == "blocked_by_shape", result["status"])
     check("a blocked group writes nothing",
           (root2 / b74.MEMORY_C).read_text(encoding="utf-8") == unknown)
+
+
+def test_port_review_regressions():
+    """Pins for the two review fixes that are arithmetic/string-level.
+
+    I-G1: the boost floor must be clamped to the representable ceiling BEFORE
+    roundup_pow_of_two(); an unclamped floor >= 2**31 truncates to 0 in the
+    unsigned int return and the cluster path's mask becomes all-ones.
+    I-P4: the companion's kcompressd depth is enqueued - swapped; subtracting
+    the sync count (the caller-written volume, never queued) made it negative
+    on every real device and the clamp then hid it.
+    """
+    print("port review regressions (I-G1 boost clamp order, I-P4 depth formula)")
+    import batch73_core_swapin_window as b73
+
+    blob = "\n".join(new for _rel, _old, new, _req in b73.build_steps())
+    clamped = blob.find("if (boost > ABK_SWAPIN_WINDOW_MAX)")
+    rounded = blob.find("roundup_pow_of_two(boost)")
+    check("I-G1: the boost floor is clamped before round-up",
+          clamped != -1 and rounded != -1 and clamped < rounded,
+          (clamped, rounded))
+
+    common = (Path(__file__).resolve().parent.parent
+              / "ksu" / "abk_runtime_tunables" / "common.sh")
+    text = common.read_text(encoding="utf-8")
+    check("I-P4: depth is enqueued - swapped", "d = e - s" in text)
+    check("I-P4: depth no longer subtracts the sync count",
+          "e - s - y" not in text)
 
 
 def main():
@@ -7186,6 +7228,7 @@ def main():
     test_batch72_kcompressd_swapcache_drop()
     test_batch73_swapin_readahead_window()
     test_batch74_fault_around_app_policy()
+    test_port_review_regressions()
     test_fetch_decode_roundtrip()
     test_workflow_expressions_are_ascii()
 
