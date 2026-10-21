@@ -1,32 +1,4 @@
 #!/system/bin/sh
-# zram-policy.sh - the zram half of the ABK 5.15 runtime-tunables module.
-# The policy is fixed, not configurable (see README.md):
-#   primary  = lz4kd   (best fast compressor measured on this SoC)
-#   secondary = zstd   (best ratio per cost; the async worker pays for it)
-#   mem_limit = 25% of RAM
-#   swap size = whatever the ROM already had (preserved), else MemTotal/2
-# Two kernels behave differently, and the module tells them apart instead of
-# assuming:
-#   * with the Batch 11 lock (zram.abk_lock_algo=Y, default) the compressors
-#     are chosen by the kernel at device creation and a later write is accepted
-#     and ignored.  The policy is in force from the first `disksize`, so the
-#     module only re-asserts what a reset drops (the compressed-memory cap) and
-#     verifies the rest.  Nothing has to be taken over, which is what lets the
-#     ROM's own bring-up -- writeback backing device included -- run untouched.
-#   * without the lock, the nodes are only writable before `disksize`, so
-#     whoever wins that window decides the algorithm for the whole boot.  The
-#     module then owns the bring-up: swapoff -> reset -> algorithms -> (writeback)
-#     -> disksize -> mem_limit -> mkswap -> swapon, and a supervisor re-checks
-#     the result every ABK_ZRAM_REASSERT_SECS.
-# Writeback and the algorithm policy used to exclude each other, because the
-# backing device is written in the same pre-`disksize` window and `reset_bdev()`
-# drops it on a reset.  Now the module restores the attachment it found instead
-# of sacrificing it; it attaches one itself only under zram.writeback=auto
-# (opt-in -- the shipped default is off), with the kernel supporting writeback,
-# nobody else owning it and the boot already completed.
-# Interlock that stays: a device whose swap area is in use is never rewritten
-# just to rearrange algorithms -- `swapoff` pulls every swapped page back into
-# RAM first, and that transient spike is what ABK_ZRAM_MIN_FREE_MB bounds.
 
 ABK_ZRAM_DIR="$ABK_SYS_ROOT/block/zram$ABK_ZRAM_DEV"
 ABK_ZRAM_LOCK_PARAM="$ABK_SYS_ROOT/module/zram/parameters/abk_lock_algo"
@@ -36,9 +8,6 @@ abk_zram_present() {
   [ -d "$ABK_ZRAM_DIR" ] && [ -e "$ABK_ZRAM_DIR/disksize" ]
 }
 
-# Active algorithm of a comp_algorithm-style node: the bracketed token, the
-# `algo=<name>` argument we wrote before disksize, or the last token of the
-# first line.
 abk_zram_active_algo() {
   _za_file="$1"
   [ -f "$_za_file" ] || return 0
@@ -80,8 +49,6 @@ abk_zram_mem_limit() {
   awk '{ print $4 }' "$ABK_ZRAM_DIR/mm_stat" 2>/dev/null || true
 }
 
-# --- /proc/swaps ---------------------------------------------------------
-# Fields: Filename Type Size(KiB) Used(KiB) Priority
 abk_zram_swap_field() {
   awk -v dev="$ABK_ZRAM_NODE" -v f="$1" '
     $1 == dev { print $f; exit }' "$ABK_PROC_SWAPS" 2>/dev/null
@@ -95,9 +62,6 @@ abk_zram_swap_on() {
   [ -n "$(abk_zram_swap_total_kb)" ]
 }
 
-# The rewrite drops whatever is stored in zram, so it only runs while the swap
-# area is effectively idle.  At boot that is the normal state (measured: 0 KiB
-# used); later in the boot the gate protects live pages.
 abk_zram_swap_idle_enough() {
   _si_used="$(abk_zram_swap_used_kb)"
   if [ -z "$_si_used" ]; then
@@ -105,8 +69,6 @@ abk_zram_swap_idle_enough() {
   fi
   abk_is_uint "$_si_used" || return 1
   _si_limit=$(( ABK_ZRAM_MIN_FREE_MB * 1024 ))
-  # abk_le, not [ -le ]: this ROM's mksh parses operands through 32-bit
-  # arithmetic, where a large "used" would compare as negative.
   abk_le "$_si_used" "$_si_limit"
 }
 
@@ -119,7 +81,6 @@ abk_zram_mmd_done() {
   [ "$_md" = "true" ]
 }
 
-# The backing device path, or empty for the kernel's "none".
 abk_zram_backing_dev() {
   _bd_val="$(abk_read "$ABK_ZRAM_DIR/backing_dev" | tr -d ' \n')"
   case "$_bd_val" in none) return 0 ;; esac
@@ -127,19 +88,12 @@ abk_zram_backing_dev() {
   return 0
 }
 
-# Somebody else already relies on writeback here: a live backing device, or a
-# completed ROM setup (mmd_setup only finishes after attaching one).
 abk_zram_writeback_owned() {
   [ -n "$(abk_zram_backing_dev)" ] && return 0
   abk_zram_mmd_done && return 0
   return 1
 }
 
-# auto: attach one during the module's own bring-up when the kernel supports it,
-# nobody owns it and the boot has completed.  off (the shipped default, and the
-# fallback here so a missing key cannot re-enable it): never attach one.  An
-# existing device is still preserved either way, except a backing file this
-# module created itself, which is released (see abk_zram_release_backing_dev).
 abk_zram_writeback_mode() {
   case "$(abk_cfg zram.writeback off)" in
     off|0|no) printf 'off\n' ;;
@@ -147,23 +101,17 @@ abk_zram_writeback_mode() {
   esac
 }
 
-# Writeback auto-attach backoff (see ABK_ZRAM_WB_RETRY_SECS).  A failed auto
-# attach records a deadline; until it passes, "writeback wanted" answers no, so
-# the supervisor stops rebuilding the whole device every tick over an attach it
-# cannot make.  A successful attach clears the deadline immediately.
 abk_zram_wb_backoff_active() {
   _wbo_until="$(abk_state_get zram_wb_retry_after)"
   abk_is_uint "$_wbo_until" || return 1
   _wbo_now="$(abk_now_secs)"
-  abk_is_uint "$_wbo_now" || return 1   # no clock -> never suppress an attach
-  # awk, not [ -gt ]: a deadline is wall-clock seconds, past 2^31 this ROM's
-  # mksh wraps (the abk_gt/abk_le trap documented in common.sh).
+  abk_is_uint "$_wbo_now" || return 1
   abk_gt "$_wbo_until" "$_wbo_now"
 }
 
 abk_zram_wb_backoff_arm() {
   _wba_now="$(abk_now_secs)"
-  abk_is_uint "$_wba_now" || return 0   # no clock -> nothing to defer against
+  abk_is_uint "$_wba_now" || return 0
   abk_state_set zram_wb_retry_after \
     "$(awk -v n="$_wba_now" -v d="$ABK_ZRAM_WB_RETRY_SECS" \
         'BEGIN { printf "%.0f\n", n + d }')"
@@ -173,22 +121,10 @@ abk_zram_wb_backoff_clear() {
   rm -f "$(abk_state_path zram_wb_retry_after)" 2>/dev/null || true
 }
 
-# A backing device may only be attached in the pre-`disksize` window, so the
-# attach is the one thing that has to be ordered against Android's own bring-up:
-# init wipes /data/per_boot and re-creates it under the per-boot key exactly at
-# sys.boot_completed (init.rc), and AOSP's mmd starts its own setup off a
-# property its rc sets at that same point.  Attaching earlier puts the backing
-# file in a directory init is about to empty: the file is unlinked, the loop
-# device keeps the orphan inode, and backing_dev is still non-none so the module
-# never rebuilds it -- writeback is dead for the rest of the boot.  Gate on the
-# property, fail closed when a ROM never sets it.
 abk_boot_completed() {
   [ "$(abk_getprop sys.boot_completed)" = "1" ]
 }
 
-# Is a backing device this module owns unwanted?  Only when the policy says off
-# (or the kernel cannot write back at all): with `auto` a device that reads as
-# "owned" is the normal re-attach case, not an unwanted one.
 abk_zram_writeback_unwanted() {
   abk_zram_writeback_capable || return 0
   [ "$(abk_zram_writeback_mode)" = "off" ] && return 0
@@ -198,7 +134,6 @@ abk_zram_writeback_unwanted() {
 abk_zram_writeback_wanted() {
   abk_zram_writeback_capable || return 1
   [ "$(abk_zram_writeback_mode)" = "auto" ] || return 1
-  # A device somebody else owns is never traded away, before or after boot.
   abk_zram_writeback_owned && return 1
   abk_zram_wb_backoff_active && return 1
   abk_boot_completed || return 1
@@ -213,10 +148,6 @@ abk_zram_writeback_size_mb() {
   printf '%s\n' "$_ws_mb"
 }
 
-# A loop device over a sparse file, the same shape Android's mmd_setup uses.
-# Sparse on purpose: with compressed writeback the kernel only writes the 4 KiB
-# blocks zram actually moves out, and nothing else is ever touched.  Prints the
-# loop device path, or fails with a reason in the log.
 abk_zram_create_backing_dev() {
   _cb_file="$ABK_ZRAM_WB_FILE"
   _cb_mb="$(abk_zram_writeback_size_mb)"
@@ -229,9 +160,6 @@ abk_zram_create_backing_dev() {
   chmod 0770 "$_cb_dir" 2>/dev/null || true
   rm -f "$_cb_file" 2>/dev/null || true
 
-  # seek= writes the last block: the file ends up exactly _cb_mb long while
-  # every other block stays sparse.  (count=0 would leave a zero-length file,
-  # which the kernel rejects as a backing device.)
   if ! "$ABK_DD" if=/dev/zero of="$_cb_file" bs=1048576 count=1 \
        seek="$(( _cb_mb - 1 ))" >/dev/null 2>&1; then
     abk_warn "writeback: cannot create a ${_cb_mb}MiB backing file at $_cb_file"
@@ -254,12 +182,6 @@ abk_zram_create_backing_dev() {
   return 0
 }
 
-# Is this backing device one the module attached itself?  The kernel records the
-# file a loop device came from and keeps reporting that path after the file is
-# gone -- as "<path> (deleted)", which is exactly the shape a per-boot wipe
-# leaves behind (init deletes /data/per_boot while zram still holds the inode).
-# Matching both forms is what lets the module recognise its own stranded
-# attachment and release it instead of preserving a device nothing can use.
 abk_zram_backing_dev_ours() {
   _bo_dev="$1"
   [ -n "$_bo_dev" ] || return 1
@@ -270,10 +192,6 @@ abk_zram_backing_dev_ours() {
   return 1
 }
 
-# Drop an attachment this module owns once the policy no longer wants one.
-# Only ever called after `reset` (backing_dev_store() refuses an initialized
-# device, and reset_bdev() has just closed whatever was attached), and only for
-# the module's own backing file: a device the ROM attached is never touched.
 abk_zram_release_backing_dev() {
   _rb_dev="$1"
   abk_zram_backing_dev_ours "$_rb_dev" || return 0
@@ -290,15 +208,6 @@ abk_zram_release_backing_dev() {
   return 0
 }
 
-# Drop a backing file this module created that nothing is attached to any more.
-# abk_zram_release_backing_dev() cannot cover it: that one runs inside a rewrite,
-# and a rewrite only happens when the device needs rebuilding, so a file an older
-# build -- or a boot that ended between the attach and the reset -- left behind
-# would sit in /data/per_boot until init empties that directory at
-# sys.boot_completed, which is the window this module is trying to get out of.
-# Only the module's own path is removed, and only while zram has no backing
-# device at all: with one attached the file belongs to that attachment and goes
-# through the rewrite's release path (or, for the ROM's file, is left alone).
 abk_zram_drop_stale_backing_file() {
   abk_zram_writeback_unwanted || return 0
   [ -z "$(abk_zram_backing_dev)" ] || return 0
@@ -315,10 +224,6 @@ abk_zram_drop_stale_backing_file() {
   return 0
 }
 
-# abk_zram_attach_writeback <reuse-device|''> <reuse-limit|''>
-# Only valid before `disksize`: backing_dev_store() refuses an initialized
-# device, and reset_bdev() has just closed whatever was attached, so this is
-# where the writeback half of a rewrite is put back.
 abk_zram_attach_writeback() {
   _aw_reuse="$1"
   _aw_limit="$2"
@@ -338,29 +243,18 @@ abk_zram_attach_writeback() {
     return 1
   fi
 
-  # Newer kernels can store the written-back pages still compressed, so the
-  # decompression is deferred to whoever reads the slot back instead of being
-  # paid by the sweep.  It does NOT reduce the flash traffic: the bio is still
-  # one full PAGE_SIZE per slot (the tail is zero-padded), so the backing
-  # device sees the same 4 KiB writes either way -- measured on vermeer,
-  # research/zram/vermeer_batch17_check/FINDINGS.md section 3.2.  The win is
-  # CPU on the write path; the cost is CPU on the read path.
   if [ -e "$ABK_ZRAM_DIR/compressed_writeback" ]; then
     abk_write "$ABK_ZRAM_DIR/compressed_writeback" 1 || true
   fi
 
-  # Bound how much flash the sweeps may consume; the unit is 4 KiB blocks.
   abk_write "$ABK_ZRAM_DIR/writeback_limit" "$_aw_limit" || true
   abk_write "$ABK_ZRAM_DIR/writeback_limit_enable" 1 || true
   abk_log "writeback: backing device $_aw_dev (limit ${_aw_limit} blocks)"
   return 0
 }
 
-# --- bring-up primitives -------------------------------------------------
 abk_zram_saved_disksize() {
   _sd_live="$(abk_zram_disksize)"
-  # abk_gt, not [ -gt ]: a 16 GiB disksize is 0 to this ROM's mksh, which would
-  # make the module treat a perfectly good device as sizeless and halve it.
   if abk_is_uint "$_sd_live" && abk_gt "$_sd_live" 0; then
     printf '%s\n' "$_sd_live"
     return 0
@@ -377,9 +271,6 @@ abk_zram_saved_disksize() {
 }
 
 abk_zram_set_algorithms() {
-  # With the Batch 11 kernel lock these writes are accepted and ignored (the
-  # locked names stay), so the readback below -- not the write -- decides.  On
-  # a kernel without the lock both writes must land.
   abk_write "$ABK_ZRAM_DIR/comp_algorithm" "$ABK_ZRAM_PRIMARY" || true
   abk_write "$ABK_ZRAM_DIR/recomp_algorithm" \
     "algo=$ABK_ZRAM_SECONDARY priority=1" || true
@@ -387,7 +278,6 @@ abk_zram_set_algorithms() {
   abk_zram_algorithms_ok
 }
 
-# Is the measured policy already in force on the device?
 abk_zram_algorithms_ok() {
   _ao_p="$(abk_zram_primary)"
   _ao_s="$(abk_zram_secondary)"
@@ -402,9 +292,6 @@ abk_zram_algorithms_ok() {
   return 0
 }
 
-# The kernel's own lock: with it the compressors are chosen at device creation
-# and a later write cannot change them, so no rewrite of the device is needed
-# for the algorithm half of the policy at all.
 abk_zram_kernel_locked() {
   case "$(abk_read "$ABK_ZRAM_LOCK_PARAM" | tr -d ' \n')" in
     Y|y|1) return 0 ;;
@@ -413,19 +300,13 @@ abk_zram_kernel_locked() {
 }
 
 abk_zram_set_mem_limit() {
-  # 64-bit safe (see abk_mul_div): the product does not fit in the 32-bit
-  # arithmetic this ROM's /system/bin/sh uses, and a wrapped value would be
-  # rejected by the kernel, silently leaving the cap off.
   _ml_val="$(abk_mem_pct_bytes "$ABK_ZRAM_MEM_LIMIT_PCT")" || return 0
   abk_is_uint "$_ml_val" || return 0
-  # Floor to the alignment so the kernel's PAGE_ALIGN() is an identity and the mm_stat readback is exact.
   _ml_val="$(abk_align_down "$_ml_val" "$ABK_ZRAM_MEM_LIMIT_ALIGN")"
   abk_is_uint "$_ml_val" || return 0
-  # 0 means "no cap" to the kernel; the floor must never uncap the device.
   abk_gt "$_ml_val" 0 || return 0
 
   _ml_seen="$(abk_zram_mem_limit)"
-  # Steady state: an unchanged cap is neither rewritten nor logged.
   if [ "$_ml_seen" = "$_ml_val" ]; then
     return 0
   fi
@@ -440,7 +321,6 @@ abk_zram_set_mem_limit() {
   return 0
 }
 
-# abk_zram_mount_swap <disksize> [priority]
 abk_zram_mount_swap() {
   _ms_size="$1"
   _ms_prio="$2"
@@ -499,12 +379,6 @@ abk_zram_mount_swap_area() {
   abk_zram_swap_on
 }
 
-# --- takeover / rewrite --------------------------------------------------
-# The rewrite is the repair path: it rebuilds the device with the measured
-# algorithms, the compressed-memory cap, the swap area it found, and -- on a
-# kernel that has it -- the writeback backing device, which `reset` drops
-# (reset_bdev() closes it) and which is therefore restored in the same
-# pre-`disksize` window it came from.
 abk_zram_takeover() {
   if ! abk_zram_present; then
     abk_warn "no $ABK_ZRAM_DIR; nothing to configure"
@@ -527,11 +401,6 @@ abk_zram_takeover() {
     _to_wb_limit="$(abk_read "$ABK_ZRAM_DIR/writeback_limit" | tr -d ' \n')"
     _to_wb_enable="$(abk_read "$ABK_ZRAM_DIR/writeback_limit_enable" | tr -d ' \n')"
   fi
-  # A backing file this module created is dropped, not put back, once the policy
-  # says off: `reset` below is the only place the attachment can be closed, and
-  # preserving a device nothing will use is what strands a loop over an unlinked
-  # inode when init wipes /data/per_boot.  A device the ROM owns is never
-  # released -- abk_zram_backing_dev_ours only matches this module's own file.
   if [ -n "$_to_wb_dev" ] && abk_zram_writeback_unwanted \
      && abk_zram_backing_dev_ours "$_to_wb_dev"; then
     _to_wb_release="$_to_wb_dev"
@@ -540,6 +409,7 @@ abk_zram_takeover() {
     _to_wb_enable=""
   fi
 
+  # Never reset with swap in use: in-use pages would be lost.
   if ! abk_zram_swap_idle_enough; then
     if [ -n "$_to_wb_dev" ]; then
       abk_warn "swap in use ($(abk_zram_swap_used_kb) KiB): keeping the live writeback device ($_to_wb_dev) instead of rewriting"
@@ -575,8 +445,6 @@ abk_zram_takeover() {
     done
   fi
 
-  # The reset above closed the old attachment, so this is the one place a
-  # stranded backing device of our own can be detached and its file removed.
   if [ -n "$_to_wb_release" ]; then
     abk_zram_release_backing_dev "$_to_wb_release"
   fi
@@ -592,15 +460,6 @@ abk_zram_takeover() {
     return 1
   fi
 
-  # Writeback is attached before disksize: the node is -EBUSY afterwards.
-  # Unified attach handling.  `reset` above already dropped whatever was
-  # attached, so try the device we found first (a preserved ROM/prior
-  # attachment); if that re-attach fails, fall through to a fresh backing device
-  # in the SAME tick when the policy still wants one -- nobody owns it now.  The
-  # backoff is armed only when neither lands, so a genuinely unattachable path
-  # stops driving a full rewrite every tick (see ABK_ZRAM_WB_RETRY_SECS), while
-  # a found device that merely went stale is replaced at once instead of after
-  # the backoff.  Any success clears a prior backoff.
   _to_wb_ok=0
   if [ -n "$_to_wb_dev" ]; then
     if abk_zram_attach_writeback "$_to_wb_dev" "$_to_wb_limit"; then
@@ -650,10 +509,6 @@ abk_zram_takeover() {
   return 0
 }
 
-# Does the device still need the rewrite above?  Only three things justify it:
-# an algorithm the policy does not want (only possible on a kernel without the
-# Batch 11 lock), an uninitialised device, or writeback the
-# kernel supports, our policy wants and nobody has claimed.
 abk_zram_need_rewrite() {
   abk_zram_algorithms_ok || return 0
   [ "$(abk_zram_initstate)" = "1" ] || return 0
@@ -669,17 +524,12 @@ abk_zram_need_swap_area() {
   return 0
 }
 
-# The one entry point the service, the supervisors and action.sh share: put the
-# policy in force, and do nothing (beyond the cap a reset would have dropped)
-# when it already is.
 abk_zram_ensure() {
   if ! abk_zram_present; then
     abk_warn "no $ABK_ZRAM_DIR; nothing to configure"
     return 1
   fi
 
-  # Before the rewrite decision, deliberately: a stale file must not have to wait
-  # for a rewrite that may never come (abk_zram_drop_stale_backing_file).
   abk_zram_drop_stale_backing_file
 
   if ! abk_zram_need_rewrite; then
@@ -703,11 +553,6 @@ abk_zram_ensure() {
   abk_zram_takeover
 }
 
-# Re-check that nothing switched the compressors behind us -- a ROM daemon, a
-# root shell or an app with su can write the nodes before `disksize` and leave
-# the device on an algorithm the policy does not want.  With the Batch 11
-# kernel lock that write is a reported no-op, so this only ever fires on a
-# kernel without it.
 abk_zram_reassert() {
   if abk_zram_present && ! abk_zram_algorithms_ok; then
     abk_warn "algorithms changed behind the module (primary=$(abk_zram_primary) secondary=$(abk_zram_secondary)); re-applying"
@@ -733,22 +578,11 @@ abk_zram_wait_ready() {
   return 0
 }
 
-# --- fragmentation-gated zsmalloc compaction ------------------------------
-# When a process dies its swap slots are freed in the middle of zspages, and
-# those zspages stop serving their size class; the resulting overhead (and the
-# measured kill-storm numbers behind this gate) is documented in README.md.
-# Compacting a healthy device would be pure CPU for nothing, so one full pass
-# runs only when BOTH gates say "fragmented":
-#     mem_used_total - compr_data_size > zram.compact.min_waste_mb (MiB)
-#     mem_used_total > compr_data_size * (1 + zram.compact.waste_pct / 100)
-# All byte math lives in awk: both operands pass 2^31 on big devices and this
-# ROM's shell arithmetic does not survive that (see abk_mul_div in common.sh).
 abk_zram_compact_if_fragmented() {
-  # Same enable convention as every other knob in the module: on only for "1".
   [ "$(abk_cfg zram.compact.enable 1)" = "1" ] || return 0
 
   _cz_node="$ABK_ZRAM_DIR/compact"
-  [ -e "$_cz_node" ] || return 0   # kernel without the compact node
+  [ -e "$_cz_node" ] || return 0
 
   _cz_val="$(abk_cfg zram.compact.min_waste_mb 50)"
   if ! _cz_min_mb="$(abk_clamp_uint "$_cz_val" 1 1024)"; then
@@ -761,8 +595,6 @@ abk_zram_compact_if_fragmented() {
     _cz_pct=15
   fi
 
-  # One awk pass over mm_stat: verdict + f3 (mem_used_total) together, so the
-  # log line can never report numbers from a different parse than the gate.
   _cz_verdict="$(abk_read "$ABK_ZRAM_DIR/mm_stat" \
     | awk -v min_mb="$_cz_min_mb" -v pct="$_cz_pct" '
         NF >= 3 {
@@ -777,8 +609,6 @@ abk_zram_compact_if_fragmented() {
     *) return 0 ;;
   esac
 
-  # "100" = the compact node's pass-size argument: 100 percent of zspages,
-  # i.e. one full compaction pass.
   if abk_write "$_cz_node" 100; then
     _cz_after="$(abk_read "$ABK_ZRAM_DIR/mm_stat" | awk 'NF >= 3 { print $3; exit }')"
     _cz_freed="$(printf '%s %s\n' "$_cz_before" "${_cz_after:-$_cz_before}" \
@@ -788,26 +618,6 @@ abk_zram_compact_if_fragmented() {
   return 0
 }
 
-# --- zram writeback sweep (opt-in, zram.writeback.trigger) ---------------
-# The kernel moves a writeback page only when userspace asks: mark the page
-# idle through the `idle` node, then write the `writeback` node.  Nothing on
-# this device does that -- the ROM's extm/mmd never starts (vendor.zram.disable
-# =1, init.svc.mmd_setup=stopped) and this module only *attaches* the backing
-# device -- so `zram.writeback=auto` on its own leaves bd_stat at 0 0 0.  This
-# is the missing trigger.  It is off by default because a sweep spends flash.
-# Mode.  `huge` is the cheap one and the one to prefer: an incompressible page
-# costs a whole page of RAM, so moving it frees 1:1 against the flash it
-# spends.  `idle` moves compressed pages too, freeing only about a third of
-# the flash it burns at a 3:1 profile -- that mode is for a device genuinely
-# against its mem_limit, where RAM is worth more than the write.  Both modes
-# start at index 0; `page_index=` is deliberately NOT used here, because on a
-# kernel without this batch's fix it does not mean "one page" -- it sweeps to
-# the end of the device, and page_index=N with N>=1 walks past zram->table and
-# panics (see zram_writeback_bounds in scripts/batch14_core_zram_writeback.py).
-# Budget.  bd_wb_limit is a decrementing counter, not a per-pass ceiling: it
-# only ever falls, so a budget that is not re-armed is spent once and every
-# later pass returns -EIO.  Re-arming it here is what makes
-# zram.writeback.budget_mb a per-pass budget.
 abk_zram_writeback_sweep() {
   _wb_trigger="$(abk_cfg zram.writeback.trigger off)"
   case "$_wb_trigger" in
@@ -826,23 +636,14 @@ abk_zram_writeback_sweep() {
     abk_warn "zram.writeback.budget_mb: '$_wb_val' is not a number in 1..65536, using 256"
     _wb_mb=256
   fi
-  # MiB -> 4 KiB blocks, the unit bd_wb_limit is counted in.  awk, not shell
-  # arithmetic: a >1 TiB backing device's sector count passes 2^31, which this
-  # ROM's mksh wraps (the abk_mul_div / abk_gt / abk_le trap in common.sh).
   _wb_blocks="$(abk_mul_div "$_wb_mb" 256 1)"
 
-  # Never budget more than the backing device can hold: running it out of
-  # space mid-sweep returns -ENOSPC after the flash has already been spent.
   _wb_sectors="$(abk_read "$ABK_SYS_ROOT/block/${_wb_bdev##*/}/size" | tr -d ' \n')"
   if abk_is_uint "$_wb_sectors" && abk_gt "$_wb_sectors" 0; then
-    _wb_cap="$(abk_mul_div "$_wb_sectors" 1 8)"   # 512-byte sectors -> 4 KiB blocks
+    _wb_cap="$(abk_mul_div "$_wb_sectors" 1 8)"
     abk_le "$_wb_blocks" "$_wb_cap" || _wb_blocks="$_wb_cap"
   fi
 
-  # idle has to be marked first, and only by age: "all" would move every page
-  # on the device in one pass.  The node takes the age in seconds on a kernel
-  # with actime tracking; if it refuses, skip the pass rather than falling
-  # back to "all".
   if [ "$_wb_trigger" = idle ]; then
     _wb_val="$(abk_cfg zram.writeback.idle_age_sec 7200)"
     if ! _wb_age="$(abk_clamp_uint "$_wb_val" 60 2592000)"; then
@@ -859,13 +660,6 @@ abk_zram_writeback_sweep() {
   abk_write "$ABK_ZRAM_DIR/writeback_limit_enable" 1 || return 0
 
   _wb_before="$(abk_read "$ABK_ZRAM_DIR/bd_stat" | tr -s ' ')"
-  # Deliberately not abk_write().  A sweep that fills its budget leaves the
-  # loop with -EIO after every page it moved has already landed, so the generic
-  # helper printed a "write failed" WARN on every budget-limited pass -- and a
-  # budget-limited pass is the normal outcome, not an error.  Measured on
-  # vermeer / 5.15.216 (2026-09-15): budget=262144 blocks moved exactly 262144
-  # pages and returned rc=1.  The rc is still the only thing that separates a
-  # spent budget from a real bio error, so it is kept and classified below.
   if [ ! -e "$ABK_ZRAM_DIR/writeback" ]; then
     abk_warn "writeback sweep skipped: $ABK_ZRAM_DIR/writeback is missing"
     return 0
@@ -874,9 +668,6 @@ abk_zram_writeback_sweep() {
   _wb_rc=$?
   _wb_after="$(abk_read "$ABK_ZRAM_DIR/bd_stat" | tr -s ' ')"
 
-  # A budget that runs out breaks the sweep with -EIO, the same code a real bio
-  # error returns; bd_stat is the only thing that tells the two apart, which is
-  # also why it is logged on the success path.
   if [ "$_wb_rc" -ne 0 ] && [ "$_wb_before" = "$_wb_after" ]; then
     abk_warn "writeback sweep moved nothing (rc=$_wb_rc, bd_stat $_wb_after): under Enforcing this is the -EIO of a missing sepolicy rule for the backing file's type, or a budget that was already spent"
   else
@@ -932,26 +723,12 @@ abk_kcompressd_monitor_tick() {
   return 0
 }
 
-# --- recompression supervisor -------------------------------------------
-# Two jobs on two different clocks: the policy is re-checked every
-# zram.reassert_interval_sec (a writer that switches the compressors behind the
-# module is repaired within that window), and the recompression sweeps run
-# every zram.recomp.interval_sec.  The sweeps mark pages by age -- never "all",
-# which would recompress everything every round -- and drive the async worker.
-# Every sweep tick then ends with the gated zsmalloc compaction pass (see
-# abk_zram_compact_if_fragmented): it fires only when the overhead gates call
-# it fragmented, so a healthy device never pays for it.
 abk_zram_supervisor_main() {
   abk_pid_write zram "$$"
   _zs_tool="${ABK_RECOMP_TOOL:-$MODDIR/bin/zram_recompress_trigger.sh}"
-  # 900 s: short enough that the first sweep (~30 min after boot) still finds a
-  # cold set -- a 3600 s cutoff never matched that early.
   _zs_age="$(abk_cfg zram.recomp.idle_age_sec 900)"
   _zs_interval="$(abk_cfg zram.recomp.interval_sec 1800)"
   _zs_threshold="$(abk_cfg zram.recomp.threshold 0)"
-  # 131072 attempts = 512 MiB/sweep: the cap bounds pass cost, and re-marks
-  # spend most of it on already-optimal pages, so this size keeps new cold
-  # pages reachable.  A kernel without the max_pages graft ignores the value.
   _zs_max_pages="$(abk_cfg zram.recomp.max_pages 131072)"
   _zs_mode="$(abk_cfg zram.recomp.mode async)"
   _zs_reassert="$(abk_cfg zram.reassert_interval_sec "$ABK_ZRAM_REASSERT_SECS")"
@@ -965,43 +742,18 @@ abk_zram_supervisor_main() {
   [ "$_zs_interval" -ge 60 ] || _zs_interval=60
   [ "$_zs_reassert" -ge 5 ] || _zs_reassert=5
 
-  # Ticks, not `date +%s`: one sleep per tick, and the sweep runs on every
-  # ticks_per_sweep-th tick.  A re-assert interval longer than the sweep
-  # interval simply means one sweep per tick.
   _zs_per_sweep=$(( _zs_interval / _zs_reassert ))
   [ "$_zs_per_sweep" -ge 1 ] || _zs_per_sweep=1
 
-  # Writeback rides the same clock but on its own, much longer cadence: it
-  # spends flash, so its unit of time is hours, not the half hour a
-  # recompression sweep gets.
   _zs_wb_interval="$(abk_cfg zram.writeback.interval_sec 86400)"
   abk_is_uint "$_zs_wb_interval" || _zs_wb_interval=86400
   [ "$_zs_wb_interval" -ge 60 ] || _zs_wb_interval=60
   _zs_per_wb=$(( _zs_wb_interval / _zs_reassert ))
   [ "$_zs_per_wb" -ge 1 ] || _zs_per_wb=1
 
-  # The mark is the one-shot half of the sweep and the pass is the repeatable
-  # half, so they run on different clocks -- and that is load bearing, not
-  # tidiness.  Re-marking before every pass would pin a capped sweep to the same
-  # first max_pages entries forever: mark_idle() *sets* ZRAM_IDLE on every page
-  # older than the cutoff, and a recompressed page never has its age refreshed
-  # (zram_recompress() reads through zram_read_from_zspool(), not
-  # zram_accessed()), so the pages a sweep just drained are handed straight back
-  # to the next one -- while the kernel's sweep always restarts at index 0 and
-  # spends its budget on attempts whether or not they can improve anything.  The
-  # drain advances only because a pass clears IDLE and nothing puts it back, so
-  # the mark runs on its own, much longer clock and every sweep in between
-  # passes --no-mark.
-  # 3600 s (one hour): the drain rate is bounded by sweep cadence x budget
-  # (2 x 512 MiB per hour), not by the mark clock -- Batch 47's skip predicate
-  # makes re-armed already-optimal pages free -- so an hourly mark only changes
-  # how soon newly cold pages enter the sweep.  It must stay slower than the
-  # sweep itself: re-marking between passes would hand the set straight back.
   _zs_mark_interval="$(abk_cfg zram.recomp.mark_interval_sec 3600)"
   abk_is_uint "$_zs_mark_interval" || _zs_mark_interval=3600
   [ "$_zs_mark_interval" -ge 60 ] || _zs_mark_interval=60
-  # _zs_mark_tick counts sweeps, so _zs_per_mark divides by the SWEEP interval
-  # -- dividing by _zs_reassert once made a "24 h" mark land 30 days out.
   _zs_per_mark=$(( _zs_mark_interval / _zs_interval ))
   [ "$_zs_per_mark" -ge 1 ] || _zs_per_mark=1
 
@@ -1024,24 +776,16 @@ abk_zram_supervisor_main() {
 
   abk_log "recompression supervisor up: age=${_zs_age}s interval=${_zs_interval}s mark=${_zs_mark_interval}s mode=$_zs_mode threshold=$_zs_threshold cap=${_zs_max_pages} reassert=${_zs_reassert}s compact=$(abk_cfg zram.compact.enable 1)>$(abk_cfg zram.compact.min_waste_mb 50)MB+$(abk_cfg zram.compact.waste_pct 15)%"
 
-  # Say so when writeback is armed, and stay quiet when it is not: the default
-  # is off, and a line every boot for a feature nobody turned on is noise.
   _zs_wb_mode="$(abk_cfg zram.writeback.trigger off)"
   if [ "$_zs_wb_mode" != "off" ]; then
     abk_log "writeback sweeps armed: mode=$_zs_wb_mode interval=${_zs_wb_interval}s budget=$(abk_cfg zram.writeback.budget_mb 256)MiB"
   fi
 
-  # The tool's own --daemon loop would block this process, and the supervisor
-  # has two jobs the tool cannot do: keep the policy in force between passes,
-  # and stay alive -- with a log line -- when a pass fails.
   _zs_tick=0
   _zs_wb_tick=0
   _zs_kcd_tick="$_zs_per_kcd"
   _zs_pol_tick=0
   ABK_KCD_BAD_STREAK=0
-  # The first sweep marks -- the boot mark is what finds the initial cold set --
-  # and the --no-mark drain begins only after it.  Seeding the counter at
-  # _zs_per_mark makes that first tick fire without a special case.
   _zs_mark_tick="$_zs_per_mark"
   _zs_mark_arg=""
   while :; do
@@ -1086,22 +830,12 @@ abk_zram_supervisor_main() {
         3) abk_warn "recompression sweep refused: the secondary equals the primary" ;;
         *) abk_warn "recompression sweep failed (rc=$_zs_rc)" ;;
       esac
-      # Sweep tick: also give zsmalloc one gated compaction pass (the sweep
-      # itself churns objects, and app deaths between sweeps fragment too).
-      # Rides this clock, so `zram.recomp.enable=0` stops it as well.
       abk_zram_compact_if_fragmented || true
     fi
     sleep "$_zs_reassert"
   done
 }
 
-# --- cgroup proactive reclaim supervisor (opt-in, cfr.enable=1) ----------
-# The sweep itself lives in tools/cached_freeze_reclaim.sh and is shipped into
-# bin/ by embed.conf: one implementation for the CLI and for this supervisor.
-# That tool walks both layouts -- cgroup v2 (memory.current + cgroup.freeze) and
-# cgroup v1, which is how this ROM mounts the memory controller at /dev/memcg
-# (memory.usage_in_bytes + freezer.state + the memory.reclaim file the module's
-# memcg_v1_reclaim graft adds).
 ABK_MEMCG_ROOT="${ABK_MEMCG_ROOT:-/dev/memcg}"
 
 abk_cfr_supervisor_main() {
@@ -1121,9 +855,6 @@ abk_cfr_supervisor_main() {
   case "$_cf_frozen" in 0|1) ;; *) _cf_frozen=0 ;; esac
   case "$_cf_cached" in 0|1) ;; *) _cf_cached=0 ;; esac
   abk_is_uint "$_cf_quota" || _cf_quota=0
-  # The freezer root is only ever read by the frozen filter, so carrying one
-  # with the filter off would put a flag in the argv that does nothing -- and
-  # the log line would then advertise a protection the sweep is not applying.
   [ "$_cf_frozen" = 1 ] || _cf_freezer=""
 
   if [ ! -f "$_cf_tool" ]; then
@@ -1135,8 +866,6 @@ abk_cfr_supervisor_main() {
   for _cf_g in $_cf_group; do
     _cf_group_args="$_cf_group_args --group $_cf_g"
   done
-  # Extra roots are appended to the two built-ins, never substituted for them:
-  # a ROM whose per-UID groups sit deeper still keeps the shallow ones swept.
   _cf_root_args=""
   for _cf_r in $_cf_roots; do
     _cf_root_args="$_cf_root_args --cgroup-root $_cf_r"

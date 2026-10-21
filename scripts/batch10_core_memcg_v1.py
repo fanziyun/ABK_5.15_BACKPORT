@@ -1,43 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Batch 10-4b: cgroup-v1 proactive reclaim + reclaim accounting visibility.
-
-The module's per-memcg proactive reclaim (Batch 5) and the cached-freeze
-reclaim counters (Batch 10-3) both hang off the **cgroup v2** side of
-memcontrol.c: `memory_reclaim()` is wired into `memory_files[]` and the
-counters are printed by `memory_stat_format()`.  On the target device the
-memory controller is mounted **v1** (`/dev/memcg`, with
-`/sys/fs/cgroup/cgroup.controllers` empty), so neither exists there:
-
-  * `memory.reclaim` is absent -- only the vendor's own `memory.reclaim_once`
-    in `/dev/memcg/`, so tools/cached_freeze_reclaim.sh cannot run at all;
-  * `cfr_reclaim_*` never appears -- v1 renders `memory.stat` from
-    `memcg_stat_show()`, not from `memory_stat_format()`.
-
-This group closes both gaps on the v1 side:
-
-  * a forward declaration of the shared `memory_reclaim()` handler, placed
-    before `mem_cgroup_legacy_files[]` (the handler itself is defined much
-    later in the file), plus the `reclaim` cftype entry in that legacy array.
-    The same handler is reused rather than duplicated, and because it sets
-    `MEMCG_RECLAIM_PROACTIVE` the v1 path feeds the Batch 10-3 counters too;
-  * the `cfr_reclaim_*` lines in `memcg_stat_show()`, matching the v2 output.
-
-Every anchor is pristine text.  The two v2-side blocks are deliberately left
-alone (they belong to Batch 5 / Batch 10-3, and editing inside them would
-break those groups' second-pass idempotency).
-
-Anchors verified verbatim on 5.15.167 (2024-11), 5.15.178 (2025-03) and
-5.15.194 (2025-12).
-"""
 
 __all__ = ["build_steps", "T"]
 
 
 T = True
 
-# ---------------------------------------------------------------------------
-# 1) forward declaration + the v1 cftype entry in mem_cgroup_legacy_files[].
-# ---------------------------------------------------------------------------
 
 _LEGACY_HDR_OLD = "static struct cftype mem_cgroup_legacy_files[] = {\n"
 
@@ -67,9 +34,6 @@ _LEGACY_ENT_NEW = (
     "\t},\n"
 )
 
-# ---------------------------------------------------------------------------
-# 2) the counters in the v1 stat renderer.
-# ---------------------------------------------------------------------------
 
 _V1_STAT_OLD = (
     "\tBUILD_BUG_ON(ARRAY_SIZE(memcg1_stat_names) != ARRAY_SIZE(memcg1_stats));\n"

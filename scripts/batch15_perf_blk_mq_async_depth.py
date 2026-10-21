@@ -1,202 +1,3 @@
-"""Batch 15: blk-mq ``async_depth`` -- a queue-level async tag-depth policy.
-
-One group, ``blk_mq_async_depth``, spread over nine files: the queue-level
-``q->async_depth`` member itself (``include/linux/blkdev.h``, ``block/blk-core.c``,
-``block/blk-mq.c``, ``block/blk-mq-sched.c``, ``block/elevator.c``), its sysfs
-surface (``block/blk-sysfs.c``) and its three scheduler consumers
-(``block/mq-deadline.c``, ``block/bfq-iosched.c``, ``block/kyber-iosched.c``).
-
-What the feature is
-===================
-
-A blk-mq queue grows one queue-wide policy value, ``q->async_depth``, expressed
-as a *request count* in ``1..q->nr_requests``:
-
-* ``blk_mq_limit_depth()`` (new, static, ``block/blk-mq.c``) is the only thing
-  ``__blk_mq_alloc_request()`` hands to the elevator's ``limit_depth`` op;
-* the op is invoked *after* ``data->hctx`` is mapped (immediately before
-  ``blk_mq_get_tag()``), because every consumer derives a per-hardware-queue
-  shallow depth from the hctx's sbitmap;
-* ``queue/async_depth`` exposes it read/write, clamped to ``q->nr_requests``,
-  and re-runs each hctx's ``depth_updated`` op so a write takes effect at once;
-* ``blk_mq_update_nr_requests()`` keeps it proportional to ``nr_requests``
-  instead of letting a resize silently turn a relative budget into an absolute
-  one;
-* ``blk_mq_init_sched()`` resets it on every elevator switch, and mq-deadline,
-  bfq and kyber consume it from their own init/``depth_updated`` paths.
-
-Provenance
-==========
-
-Absorbed from ``ABK_ABI_PATCH_SUITE/scripts/abk_feature_porting.py``,
-``patch_blk_mq_async_depth()`` (lines 1565-1891) and its status companion
-``collect_blk_async_depth_status()`` (1893-1955), per Batch 15's suite
-absorption (``docs/survey_suite_absorption.md`` §4, "Suite absorption" in
-``docs/porting_policy.md``).  The suite's own group id, ``blk_mq_async_depth``,
-is kept verbatim, as every absorbed id is.
-
-Two facts about the suite's implementation drive this port:
-
-1. **Its edits are guarded, not anchored.**  Every hunk is
-   ``if old in text: text = text.replace(old, new, 1)``, so a miss is a silent
-   no-op that still reports success.  This module's ``apply_steps()`` is
-   transactional instead: **every** step here is ``required=True``, so a single
-   miss writes nothing and the group degrades to ``blocked_by_shape``.  No step
-   is optional, not even the ones whose suite counterpart was defensive.
-
-2. **It carries a 6.1 branch and a 5.15 fallback branch per hunk.**  Only the
-   5.15 branch is ported; this module grafts android13-5.15 only, so each step
-   below has exactly one target form and ``blk_shape_for_tree()``-style runtime
-   rewriting is not reproduced.
-
-The suite's ``stray_async_depth`` repair (it moves an
-``ANDROID_KABI_USE(1, unsigned int async_depth)`` line that an earlier buggy run
-had left *outside* ``struct request_queue`` back into it) is deliberately NOT
-ported: it repairs the suite's own past damage, the nine baselines audited here
-carry no such line (``q->async_depth``, ``blk_mq_limit_depth`` and
-``async_depth_show`` are all 0-hit in ``abk515_ref_{167,178,194,211}``), and the
-KABI step below is anchored inside the struct with four reserve slots of
-surrounding context, so it cannot land outside it.
-
-5.15 adaptations (each one verified against the 5.15 tree, not the suite)
-=======================================================================
-
-* ``blk_opf_t`` is a 6.1 typedef: on 5.15 the operation is a bare
-  ``unsigned int``.  ``blk_mq_limit_depth()``, the ``limit_depth`` function
-  pointer in ``__blk_mq_alloc_request()`` and mq-deadline's ``dd_limit_depth()``
-  all take/return ``unsigned int`` here (``struct elevator_mq_ops.limit_depth``
-  is ``void (*)(unsigned int, struct blk_mq_alloc_data *)`` in
-  ``include/linux/elevator.h``, and ``op_is_flush(unsigned int)`` /
-  ``blk_op_is_passthrough(unsigned int)`` take ``unsigned int``).
-* ``BLKDEV_DEFAULT_RQ`` is the 6.1 spelling of the same 128 as 5.15's
-  ``BLKDEV_MAX_RQ`` (``block/blk-core.c`` and ``block/blk-mq-sched.c``).
-* ``__blk_mq_alloc_requests()`` is 6.1's name for 5.15's
-  ``__blk_mq_alloc_request()`` (singular).
-* 5.15 has no ``RQF_ELV``/``RQF_RESV`` flags, so its
-  ``__blk_mq_alloc_request()`` keeps the local ``struct elevator_queue *e``
-  captured at entry and keys ``blk_mq_tag_busy()`` off it.  The graft therefore
-  keeps that pointer and only replaces the inline op call with the deferred
-  hand-off -- same effect (``limit_depth`` runs after the hctx mapping), same
-  5.15 register/lifetime shape.
-* ``struct blk_mq_tags.bitmap_tags`` is a *pointer* on 5.15 and an embedded
-  ``struct sbitmap_queue`` from 6.1.  Every ``&tags->bitmap_tags`` in the
-  suite's text becomes ``tags->bitmap_tags``, and ``dd_to_word_depth()`` reads
-  ``hctx->sched_tags->bitmap_tags`` (no ``&``), exactly as the surrounding
-  5.15 mq-deadline code does.
-* 5.15's ``blk_mq_update_nr_requests()`` guards its shared-sbitmap resize with
-  ``if (q->elevator && blk_mq_is_sbitmap_shared(set->flags))`` (no
-  ``blk_mq_is_shared_tags()``); the resize step anchors on that 5.15 line.
-* 5.15's ``bfq_update_depths()`` returns the minimum shallow depth and takes
-  ``struct sbitmap_queue *bt``, while 6.1 returns void and keeps the shift in
-  ``bfqd->full_depth_shift`` (a field 5.15 does not have).  The graft follows the
-  suite's 5.15 branch: it introduces a ``depth`` local keyed off
-  ``q->async_depth`` and rewrites the four ``word_depths[][]`` expressions onto
-  it, ratios (50 / 75 / ~18 / ~37 %) unchanged.
-* ``queue_var_show()`` is ``queue_var_show(unsigned long var, char *page)`` on
-  5.15 and ``queue_for_each_hw_ctx()`` is a ``for`` loop over
-  ``q->queue_hw_ctx[]``, so the sysfs store declares ``unsigned int i``.
-
-Deliberate deviation: the three consumers' depth *units* (the suite's one real
-convention trap on 5.15)
-==============================================================================
-
-``sbitmap_get_shallow()``'s ``shallow_depth``, and therefore
-``data->shallow_depth``, is a **per-word bit cap**: ``__sbitmap_get_shallow()``
-calls ``__sbitmap_get_word(..., min(sb->map[index].depth, shallow_depth), ...)``
-(``lib/sbitmap.c``) and the header documents it as "the maximum number of bits to
-allocate from a single word", the window being ``1..(1 << sb->shift)``.  This is
-why upstream 6.1 grew ``dd_to_word_depth()`` -- its own comment says "'depth' is a
-number in the range 1..INT_MAX representing a number of requests".
-
-``q->async_depth`` is a request count (it is initialised from
-``set->queue_depth``/``nr_requests``, clamped to ``nr_requests`` by the sysfs
-store, and rescaled against ``nr_requests``).  The suite converts it for
-mq-deadline only; for bfq and kyber it assigns the request count straight into a
-per-word cap (``kqd->async_depth``, ``bfqd->word_depths[][]``).  On a 256-deep
-queue (``shift`` 6, so one word is 64 bits) bfq's and kyber's defaults become
-192, which is *above* a word: ``min(word->depth, 192)`` never caps anything, so
-both consumers would be dead code carrying the feature's name only.
-
-This port therefore performs the same conversion ``dd_to_word_depth()`` performs,
-inline, for those two consumers::
-
-    word_depth = ((q->async_depth << shift) + q->nr_requests - 1) / q->nr_requests
-
-* kyber: with the default ``q->async_depth = nr_requests * KYBER_ASYNC_PERCENT /
-  100`` this yields ``(1U << shift) * 75 / 100`` -- byte-identical to the 5.15
-  formula it replaces (256-deep queue: 48 == 48), while making the sysfs write
-  mean "this many tags" instead of "this many bits per word".
-* bfq: the conversion is applied once and bfq's four documented ratios are then
-  applied to it, so the queue-level budget scales all four consistently.  At the
-  suite's declared bfq default (75 % of ``nr_requests``) the async cap becomes
-  37.5 % of a word instead of the 5.15 hard-coded 50 %.  That default is the
-  suite's policy (a 25 % synchronous reservation, mirroring kyber's
-  ``KYBER_ASYNC_PERCENT``), not something this port invented; deployments that
-  want bfq bit-identical to the 5.15 baseline must write ``nr_requests`` to
-  ``queue/async_depth``.  Flagged to the wiring agent as a policy decision.
-* mq-deadline needs no conversion: ``dd_to_word_depth()`` is byte-faithful to
-  the Android 6.1 helper (``common-6.1-src``, SUBLEVEL 176; the 5.15 delta is
-  only the ``&`` on ``bitmap_tags``).  Its default
-  (``q->async_depth = q->nr_requests``) makes
-  ``dd_to_word_depth()`` return a full word, i.e. no async throttle -- which is
-  upstream 6.1's own default (``dd_depth_updated()`` sets
-  ``dd->async_depth = q->nr_requests``), so the knob is opt-in for mq-deadline.
-
-Verified read-only lineage note: the queue-level ``q->async_depth`` member is
-*not* upstream 6.1 or 6.6 -- it is absent from both Android ACK trees on this
-host (``common-6.1-src`` 6.1.176 and ``common-6.6-src`` 6.6.142, both carrying
-``include/trace/hooks/``; only the scheduler-local ``dd->async_depth`` exists
-there).  The ``dd_to_word_depth()`` / ``sbitmap_queue_min_shallow_depth(..., 1)``
-half of the port is upstream's, and was diffed against the 6.1 tree; the
-queue-level member is the suite's own extension of that machinery, which is why
-it needs the KABI slot below.
-
-KMI
-===
-
-``struct request_queue`` slot 1 moves from ``ANDROID_KABI_RESERVE(1)`` to
-``ANDROID_KABI_USE(1, unsigned int async_depth)``; slots 2-4 stay reserved and
-``ANDROID_OEM_DATA(1)`` is untouched, so the type is size-preserving (the macro
-wraps a union of the original ``u64`` and the new member).  Per AGENTS.md Batch 15
-now *owns* this slot, which is exactly the slot ``ABK_ABI_PATCH_SUITE`` claims:
-the two must never be co-injected (a doubly claimed KMI slot is a hard break).
-
-Ordering / anchor overlap
-=========================
-
-This module's only pre-existing rival for a target file is
-``blk_mq_suspend_wakeup_abort`` in ``scripts/abk_stable_perf.py``, which is the
-only other group that touches any of these nine files.  Its ``block/blk-mq.c``
-hunks are the ``#include`` pair at lines 25-26 and
-``blk_mq_hctx_notify_offline()`` at lines 2590-2620, while this group's
-``block/blk-mq.c`` hunks are ``__blk_mq_alloc_request()`` (lines 358-410),
-``blk_mq_init_allocated_queue()`` (3343) and ``blk_mq_update_nr_requests()``
-(3680-3685): **no text overlap in either direction**, so registration order
-between the two is irrelevant.  No other group in this repo touches
-``block/blk-mq-sched.c``, ``block/blk-sysfs.c``, ``block/elevator.c``,
-``block/blk-core.c``, ``block/mq-deadline.c``, ``block/bfq-iosched.c``,
-``block/kyber-iosched.c`` or ``include/linux/blkdev.h``.
-
-Not ported (recorded so it is not relitigated)
-=============================================
-
-* the suite's 6.1-branch variants of every hunk (``blk_opf_t`` signatures,
-  ``BLKDEV_DEFAULT_RQ``, ``QUEUE_FLAG_SQ_SCHED``, ``RQF_ELV``/``RQF_RESV``,
-  ``&tags->bitmap_tags``, the ``full_depth_shift``-based bfq rewrite) -- dead
-  branches on android13-5.15, and keeping them would mean two ``old`` variants
-  per step, which ``replace_once()`` cannot express and ``tests/step_audit.py``
-  would see as ambiguous;
-* the ``stray_async_depth`` repair (see above);
-* the suite's shape-driven runtime rewriting (``blk_shape_for_tree()``) and its
-  ``replace_once_blk()`` helper -- this module writes the 5.15 form directly;
-* ``collect_blk_async_depth_status()``'s ``target_anchors`` report dict -- that
-  is the suite's report layer; here the same facts are the group detail and the
-  pinned strings the wiring agent adds to ``tests/implementation_audit.py``.
-
-Nothing in the feature itself turned out to be unanchorable on 5.15: all 25
-steps were checked to occur exactly once in ``abk515_ref_{167,178,194,211}``.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -211,19 +12,8 @@ MQ_DEADLINE_C = "block/mq-deadline.c"
 BFQ_C = "block/bfq-iosched.c"
 KYBER_C = "block/kyber-iosched.c"
 
-# Alias the required-flag for readability (the other batch modules use T/F).
 T = True
 
-# --- anchors as they exist in the pristine 5.15 tree ------------------------
-# Every ``old`` block below was checked to occur exactly once in
-# abk515_ref_{167,178,194,211} (the 5.15.167 / .178 / .194 / .216 reference
-# trees) and every ``new`` block to be absent from all four.  The step order is
-# also checked: no ``new`` block contains another step's ``new`` verbatim, so
-# ``replace_once()``'s check-the-replacement-first idempotency test cannot
-# short-circuit a later step to ``already_present`` (docs/group_recipe.md
-# traps 1 and 2).
-
-# --- include/linux/blkdev.h: struct request_queue KABI slot 1 ----------------
 
 _A_KABI = (
     "\tANDROID_KABI_RESERVE(1);\n"
@@ -248,7 +38,6 @@ _A_KABI_NEW = (
     "};\n"
 )
 
-# --- block/blk-core.c: the non-MQ / pre-init default ------------------------
 
 _B_DEFAULT = (
     "\tq->nr_requests = BLKDEV_MAX_RQ;\n"
@@ -265,7 +54,6 @@ _B_DEFAULT_NEW = (
     "\treturn q;\n"
 )
 
-# --- block/blk-mq.c: the helper, the deferred hand-off, the call site -------
 
 _C_HELPER = (
     "/*\n"
@@ -304,9 +92,6 @@ _C_ALLOC_HEAD_NEW = (
     "\tstruct request_queue *q = data->q;\n"
 )
 
-# The 5.15 body calls the elevator op inline, before data->hctx exists, and keys
-# blk_mq_tag_busy() off the local `e`.  Replace the inline call with the
-# deferred hand-off and keep everything else 5.15-shaped.
 _C_LIMIT = (
     "\tif (e) {\n"
     "\t\t/*\n"
@@ -403,7 +188,6 @@ _C_RESIZE_NEW = (
     "\t\tif (q->elevator && blk_mq_is_sbitmap_shared(set->flags))\n"
 )
 
-# --- block/blk-mq-sched.c: both arms of blk_mq_init_sched() -----------------
 
 _D_SCHED_NONE = (
     "\tif (!e) {\n"
@@ -437,7 +221,6 @@ _D_SCHED_DEFAULT_NEW = (
     "\tq->async_depth = q->nr_requests;\n"
 )
 
-# --- block/blk-sysfs.c: the queue/async_depth read/write attributes ---------
 
 _E_SYSFS_ANCHOR = (
     "static ssize_t\n"
@@ -516,10 +299,6 @@ _E_SYSFS_ATTR_NEW = (
     "\t&queue_ra_entry.attr,\n"
 )
 
-# --- block/elevator.c: the switch-to-none path ------------------------------
-# blk_mq_init_sched(q, NULL) already resets q->async_depth through
-# block/blk-mq-sched.c above; this step repeats it on the elevator-switch path
-# so the reset does not depend on that group's arm staying in place.
 
 _F_ELEVATOR = (
     "\tret = blk_mq_init_sched(q, new_e);\n"
@@ -537,7 +316,6 @@ _F_ELEVATOR_NEW = (
     "\t\tq->async_depth = q->tag_set->queue_depth;\n"
 )
 
-# --- block/mq-deadline.c: the first consumer ---------------------------------
 
 _G_DD_HELPER = (
     "/*\n"
@@ -614,7 +392,6 @@ _G_DD_INIT_NEW = (
     "\treturn 0;\n"
 )
 
-# --- block/bfq-iosched.c: the second consumer --------------------------------
 
 _H_BFQ_DECL = "\tunsigned int i, j, min_shallow = UINT_MAX;\n"
 
@@ -663,7 +440,6 @@ _H_BFQ_INIT_NEW = (
     "\tq->async_depth = (q->nr_requests * 3) >> 2;\n"
 )
 
-# --- block/kyber-iosched.c: the third consumer -------------------------------
 
 _I_KYBER_DEPTH = (
     "\tstruct kyber_queue_data *kqd = hctx->queue->elevator->elevator_data;\n"
@@ -717,70 +493,36 @@ _I_KYBER_INIT_NEW = (
 
 
 def build_blk_mq_async_depth_steps():
-    """``blk_mq_async_depth``: the queue-level async depth and its consumers.
-
-    25 steps, all required, in file order.  They are one group (not five) for
-    the same reason the suite declared one: the KABI field, the sysfs surface
-    and the three consumers are a single policy -- a tree carrying only part of
-    it would expose ``queue/async_depth`` whose writes reach no scheduler, or a
-    ``blk_mq_limit_depth()`` nothing calls.  Being transactional, a miss
-    anywhere writes nothing at all rather than half the policy.
-
-    None of these replacements contains another's ``new`` text (docs/group_recipe.md
-    trap 2); the three consumer conversions in particular are written out inline
-    for bfq and kyber rather than sharing a helper, so the two ``new`` blocks stay
-    textually distinct from mq-deadline's helper insertion.
-    """
     return [
-        # include/linux/blkdev.h
         (BLKDEV_H, _A_KABI, _A_KABI_NEW, T),
-        # block/blk-core.c
         (BLK_CORE_C, _B_DEFAULT, _B_DEFAULT_NEW, T),
-        # block/blk-mq.c
         (BLK_MQ_C, _C_ALLOC_HEAD, _C_ALLOC_HEAD_NEW, T),
         (BLK_MQ_C, _C_LIMIT, _C_LIMIT_NEW, T),
         (BLK_MQ_C, _C_GET_TAG, _C_GET_TAG_NEW, T),
         (BLK_MQ_C, _C_QUEUE_INIT, _C_QUEUE_INIT_NEW, T),
         (BLK_MQ_C, _C_RESIZE, _C_RESIZE_NEW, T),
-        # block/blk-mq-sched.c
         (BLK_MQ_SCHED_C, _D_SCHED_NONE, _D_SCHED_NONE_NEW, T),
         (BLK_MQ_SCHED_C, _D_SCHED_DEFAULT, _D_SCHED_DEFAULT_NEW, T),
-        # block/blk-sysfs.c
         (BLK_SYSFS_C, _E_SYSFS_ANCHOR, _E_SYSFS_FUNCS_NEW, T),
         (BLK_SYSFS_C, _E_SYSFS_ENTRY, _E_SYSFS_ENTRY_NEW, T),
         (BLK_SYSFS_C, _E_SYSFS_ATTR, _E_SYSFS_ATTR_NEW, T),
-        # block/elevator.c
         (ELEVATOR_C, _F_ELEVATOR, _F_ELEVATOR_NEW, T),
-        # block/mq-deadline.c
         (MQ_DEADLINE_C, _G_DD_HELPER, _G_DD_HELPER_NEW, T),
         (MQ_DEADLINE_C, _G_DD_SHALLOW, _G_DD_SHALLOW_NEW, T),
         (MQ_DEADLINE_C, _G_DD_DEPTH, _G_DD_DEPTH_NEW, T),
         (MQ_DEADLINE_C, _G_DD_INIT, _G_DD_INIT_NEW, T),
-        # block/bfq-iosched.c
         (BFQ_C, _H_BFQ_DECL, _H_BFQ_DECL_NEW, T),
         (BFQ_C, _H_BFQ_WORD00, _H_BFQ_WORD00_NEW, T),
         (BFQ_C, _H_BFQ_WORD01, _H_BFQ_WORD01_NEW, T),
         (BFQ_C, _H_BFQ_WORD10, _H_BFQ_WORD10_NEW, T),
         (BFQ_C, _H_BFQ_WORD11, _H_BFQ_WORD11_NEW, T),
         (BFQ_C, _H_BFQ_INIT, _H_BFQ_INIT_NEW, T),
-        # block/kyber-iosched.c
         (KYBER_C, _I_KYBER_DEPTH, _I_KYBER_DEPTH_NEW, T),
         (KYBER_C, _I_KYBER_INIT, _I_KYBER_INIT_NEW, T),
     ]
 
 
 def _blk_mq_async_depth_apply(ctx):
-    """Shape probe, then the 25 required steps -- or nothing.
-
-    The probes are deliberately chosen to survive a successful pass: each one is
-    text this group never rewrites (a function signature, a ``nr_requests``
-    assignment, a macro invocation), so the second pass reaches ``apply_steps()``
-    and reports ``already_present`` instead of ``blocked_by_shape``.  Probes are
-    *not* used to detect a tree that already carries the feature: no audited
-    5.15 baseline does (``q->async_depth`` is 0-hit in all four reference trees),
-    so such a check would be dead code, and an early ``already_present`` return
-    is exactly trap 4 -- it would stop every step from running.
-    """
     probes = (
         (BLKDEV_H, "struct request_queue {", "struct request_queue"),
         (BLKDEV_H, "\tANDROID_KABI_RESERVE(4);", "request_queue KABI reserve run"),
@@ -821,7 +563,6 @@ def _blk_mq_async_depth_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the single PatchGroup record for this batch module."""
     return [
         PatchGroup(
             "blk_mq_async_depth",

@@ -1,272 +1,3 @@
-"""Batch 15: the ABK_ABI_PATCH_SUITE EEVDF scheduler family, absorbed.
-Batch 28: the same family rebuilt onto the upstream data structure and policy.
-
-Three groups, all rewritten as ``required`` anchor steps:
-
-* ``sched_eevdf_pick_logic`` -- ``kernel/sched/fair.c``: the ``abk_eevdf_*``
-  helper set, the ``cfs_rq`` virtual-time accumulators that feed it, and the
-  rewiring of ``update_curr()``, ``update_min_vruntime()``,
-  ``__enqueue_entity()`` / ``__dequeue_entity()``, ``pick_next_entity()``,
-  ``reweight_entity()``, ``enqueue_entity()`` / ``dequeue_entity()`` /
-  ``place_entity()``, ``check_preempt_tick()``, ``check_preempt_wakeup()``,
-  ``set_next_entity()`` and ``yield_task_fair()``.
-* ``sched_eevdf_core_fields`` -- ``include/linux/sched.h``: the four
-  ``ANDROID_KABI_USE`` claims in ``struct sched_entity`` (slot 1 ``u64
-  deadline``, slot 2 ``u64 min_vruntime``, slot 3 ``s64 vlag``, slot 4 ``u64
-  slice``) that the fair.c half reads.
-* ``sched_eevdf_modern_fields`` -- ``kernel/sched/sched.h`` (the two
-  ``struct cfs_rq`` accumulators) and ``kernel/sched/features.h`` (the
-  ``RUN_TO_PARITY`` / ``PREEMPT_SHORT`` switches).
-
-Provenance.  Every anchor and every replacement of the Batch 15 payload is the
-payload of ``ABK_ABI_PATCH_SUITE/scripts/abk_feature_porting.py``,
-``patch_sched_entity_fields()`` (:454-518, group ``sched_eevdf_core_fields``) and
-``patch_sched_pick_logic()`` (:592-1018, group ``sched_eevdf_pick_logic``), the
-design of which is documented in that repo's
-``docs/feature_porting_eevdf_pid.md``.  The absorption decision is
-``docs/survey_suite_absorption.md``; the KABI ownership change is recorded in
-``AGENTS.md`` ("Red lines") and ``docs/porting_policy.md``.
-
-What changed in the absorption (why this is not a copy):
-
-1. **``required`` anchors instead of ``if old in text:``.**  The suite guards
-   every edit with ``if old in text:`` and then calls ``text.replace(old, new,
-   1)``, so an anchor miss is a silent no-op that still reports success.  Here
-   every step is ``required=True``: a miss aborts the whole group
-   transactionally and the group reports ``blocked_by_missing_anchor``.
-2. **An explicit uniqueness probe.**  Before emitting the fair.c steps this
-   module counts every ``old`` block in the file and refuses the group
-   (``blocked_by_shape``) if any of them occurs more than once.  ``replace_once``
-   itself replaces the first occurrence only, so a context that grew a second
-   copy in a real tree would otherwise be edited in the wrong place.
-3. **A registration-order inversion.**  The slot claim is gated on the fair.c
-   logic really having landed (see item 4), so ``sched_eevdf_pick_logic`` must be
-   registered *before* ``sched_eevdf_core_fields`` -- the opposite of the
-   suite's own order.  The suite's gate tested ``"abk_eevdf_" in fair.c`` on a
-   tree where the fields had already been claimed by an earlier run; inverting
-   the order makes the gate meaningful on a *first* pass.
-4. **The core-fields group is an anti-drift gate, not a standalone edit.**  The
-   four fields exist only to carry state that ``kernel/sched/fair.c`` maintains.
-   ``_eevdf_core_fields_apply()`` therefore reads fair.c and requires the
-   module's own helper marker plus five call sites (the accumulator, the
-   deadline refresh in ``update_curr()``, the placement hook, the selector
-   routing and the run-to-parity stash).  If fair.c did not carry the logic --
-   a tree where the pick-logic group was blocked, or where a later group
-   reverted it -- the group reports ``blocked_by_shape`` and slots 1-4 stay
-   ``ANDROID_KABI_RESERVE``.  A half-claimed pair (fields without the logic, or
-   logic without the fields) can therefore never be produced.
-
-Feasibility finding (measured, not assumed).  The suite is described as ported
-"onto the 6.1 rb-tree layout", so the fair.c anchors were probed against the four
-5.15 reference trees before a line was written.  They all exist, in the *same*
-shape, because 5.15 already carries the 6.1-era CFS body for every function the
-suite touches: ``entity_before()``, ``sched_vslice()``, ``reweight_entity()``,
-``place_entity()``, ``enqueue_entity()``, ``dequeue_entity()``,
-``check_preempt_tick()``, ``set_next_entity()``, ``pick_next_entity()`` and
-``entity_tick()``.  Four shape differences had to be absorbed, and each is a
-deliberate *literal* re-anchor rather than the suite's runtime
-``fair_shape_for_tree()`` adaptation:
-
-* the stats helpers are spelled without the ``_fair`` suffix on 5.15
-  (``update_stats_dequeue`` / ``update_stats_wait_end`` /
-  ``update_stats_wait_start``), where 6.1 uses ``*_fair``;
-* 5.15 ``dequeue_entity()`` has no ``int action = UPDATE_TG;`` head, which is
-  what the suite's ``_FAIR_6_1_DEQUEUE_ACTION`` substitution removes;
-* 5.15 ``place_entity()`` ends with the AOSP
-  ``trace_android_rvh_place_entity()`` hook *after* the
-  ``max_vruntime()`` assignment;
-* ``reweight_entity()`` grew the AOSP ``trace_android_vh_reweight_entity(se);``
-  hook between ``update_load_set()`` and the ``CONFIG_SMP`` PELT block in
-  5.15.194 (and 5.15.216); 5.15.167/.178 do not have it.  The suite's
-  whole-body ``reweight_entity()`` replacement therefore matches neither
-  sublevel's body in full -- it would have silently dropped the hook on
-  .194/.216.  This module rewrites the function in two steps split at that seam,
-  which is correct on all four trees and leaves anything a later sublevel adds
-  in the gap untouched.
-
---------------------------------------------------------------------------
-Batch 28: what the 6.x EEVDF work changed, and why this payload was rebuilt
---------------------------------------------------------------------------
-
-The Batch 15 payload was a *reconstruction* of EEVDF, not EEVDF.  It kept the
-legacy rb-tree ordering and re-derived every EEVDF quantity by scanning the
-tree, because 5.15 has no ``cfs_rq`` accumulator.  That made the selector
-O(n^2)-O(n^3) -- ``abk_eevdf_refresh_deadline()`` was called per tree node and
-each call itself walked the whole tree twice -- on every context switch and
-every tick, and it *mutated* ``deadline`` / ``vlag`` / ``vruntime`` as a side
-effect of merely choosing who runs.
-
-``docs/survey_eevdf_gap.md`` is the difference audit against Linux 6.6 -> 7.3.
-Batch 28 lands its S and A tiers, in upstream's own order:
-
-* ``af4cf40470c2`` (v6.6) ``sched/fair: Add cfs_rq::avg_vruntime`` -- the
-  ``avg_vruntime`` / ``avg_load`` accumulators, maintained by
-  ``__enqueue_entity()`` / ``__dequeue_entity()`` and re-based by
-  ``update_min_vruntime()``, so ``avg_vruntime()`` is O(1).
-* ``147f3efaa241`` (v6.6) -- ``update_deadline()`` semantics: the deadline is
-  refreshed from ``update_curr()`` and the entity's own ``se->slice``, not by
-  scanning the tree from the selector.
-* ``63304558ba5d`` (v6.6) ``sched/eevdf: Curb wakeup-preemption`` -- adds
-  ``RUN_TO_PARITY``.  The selector now returns ``curr`` for as long as it is
-  eligible and its deadline has not been refreshed since it was picked;
-  upstream's measurement for that switch is -31% context switches on
-  ``perf bench sched messaging``.
-* ``ee4373dc902c`` (v6.8) -- the O(1) front door: the leftmost eligible entity
-  is taken before any further search.
-* the ``check_preempt_wakeup()`` half of ``147f3efaa241`` -- wakeup preemption
-  now asks the selector instead of the CFS granularity ladder, so placement and
-  preemption cannot disagree.  That ladder is not deleted: it becomes the
-  ``!sched_feat(EEVDF)`` half of the same switch, which is what keeps
-  ``wakeup_preempt_entity()`` and ``wakeup_gran()`` live (and
-  ``__pick_next_entity()`` with them, through ``pick_next_entity()``'s own
-  ``!EEVDF`` half).
-* ``85e511df3cec`` (v6.12) ``sched/eevdf: Allow shorter slices to
-  wakeup-preempt`` -- ``PREEMPT_SHORT``, gated exactly as upstream's
-  ``do_preempt_short()`` (shorter request, wakee eligible, and not already
-  ahead of an eligible current).  Its *producer* -- the per-task request size
-  that ``sched_setattr(sched_runtime)`` writes -- is ported with it, in
-  ``__setscheduler_params()``; see "The per-task request size" below.
-* ``79104becf42b`` (v6.17) plus the ``yield_task_fair()`` half of
-  ``147f3efaa241`` -- EEVDF yield: forfeit the remaining vruntime and push the
-  deadline one slice ahead, but only while the entity is eligible, because
-  core scheduling prefers running an ineligible task over force-idling and an
-  unguarded forfeit makes vruntime run away in a yield loop.
-* ``c40dd90ac045`` (v6.12) -- a new task starts on the rq it will actually run
-  on, so ``place_entity(cfs_rq, se, 1)`` places it at ``avg_vruntime()`` rather
-  than at the vruntime it inherited from its parent.
-
-The per-task request size, and why it is not optional.  ``se->slice`` is what
-``PREEMPT_SHORT`` compares, and a comparison is only a comparison if the two
-sides can differ.  Upstream gets that from ``sched_setattr(sched_runtime)``,
-which ``__setparam_fair()`` turns into ``se->custom_slice = 1; se->slice = r``.
-The first draft of this batch ported the *consumer* and not the producer, so
-``se->slice`` could only ever hold ``sysctl_sched_min_granularity`` and
-``abk_eevdf_slice(pse) >= abk_eevdf_slice(se)`` was ``X >= X``: the guard always
-rejected, the switch was static-branch-true and did nothing, and KABI slot 4
-was spent on a constant.  Two things follow, and both are load-bearing:
-
-* ``__setscheduler_params()`` writes ``p->se.slice`` from ``attr->sched_runtime``
-  (clamped 100us..100ms, upstream's bounds).  It lives in ``core.c`` rather than
-  in a ``__setparam_fair()`` in ``fair.c`` because 5.15's ``fair.c`` does not
-  see ``struct sched_attr`` at all; the behaviour is upstream's.
-* the two writers of ``se->slice`` -- ``abk_eevdf_refresh_deadline()`` and
-  ``abk_eevdf_place_entity()`` -- only fill in the default when the field is
-  zero, so a request survives them.  Zero is the flag; there is no
-  ``custom_slice`` bit because the reserve run is exhausted.  See
-  ``abk_eevdf_slice()``.
-
-``tests/implementation_audit.py`` pins this pairing so the consumer cannot come
-back without the producer.
-
-Deliberately NOT ported, and why (they need a ``sched_entity`` field that does
-not fit -- see below):
-
-* ``152e11f6df29`` and the delayed-dequeue family (v6.12): needs
-  ``se->sched_delayed``, ``cfs_rq->nr_delayed`` and a ``dequeue_task()`` core
-  rework, and carries ~20 follow-up fixes.
-* slice protection (``se->vprot``, v6.15+) and ``min_slice`` / ``max_slice``
-  propagation (v6.12/v6.15): three more ``sched_entity`` fields.
-* ``2227a957e1d5`` (v6.8) ``sched/eevdf: Sort the rbtree by virtual deadline``
-  and the augmented-tree heap search it enables: this re-keys the rb-tree on
-  ``deadline``, which changes ``__pick_first_entity()`` semantics for every
-  other caller (``update_min_vruntime()``, ``check_preempt_tick()``) and
-  requires ``rb_add_augmented_cached()``, which does not exist before 6.6.
-  Batch 28 already removes the quadratic cost; the remaining O(n) -> O(log n)
-  is a separate, higher-risk batch.
-* upstream's ``SCHED_FEAT(EEVDF)`` gate itself.  The EEVDF series carried it
-  from ``147f3efaa241`` until ``5e963f2bd465`` "Commit to EEVDF" removed it.
-  This port restores it around the two places where a wrong decision is worst
-  -- selection and wakeup preemption -- so the tree can be returned to CFS
-  behaviour without a reflash.  It is not a full revert: ``place_entity()``
-  keeps its EEVDF placement, which is why the switch is documented as a
-  selection fallback rather than as "EEVDF off".
-* ``e8f331bcc270`` (v6.6) lag-based cross-runqueue placement: 5.15 still
-  renormalises ``vruntime`` against ``min_vruntime`` in ``enqueue_entity()``,
-  ``dequeue_entity()``, ``detach_task_cfs_rq()``, ``attach_task_cfs_rq()`` and
-  ``task_fork_fair()``; replacing that handshake is a migration-path rewrite,
-  not a bounded graft.
-* ``sched_eevdf_runtime_state_phase3``.  ``patch_sched_runtime_state_phase3()``
-  (:1020-1068) only inserts one comment in front of ``if (queued) {`` in
-  ``reweight_entity()`` and then probes for ``DEQUEUE_DELAYED``/``DELAY_DEQUEUE``.
-  Creating a group for it would be a phantom group whose entire content is a
-  comment; ``docs/survey_suite_absorption.md`` §4 reaches the same verdict.
-* ``_patch_fair_reweight_compat()`` (:519-590).  A regex rewrite of a
-  *different* ``reweight_entity()`` body; all four 5.15 trees match
-  ``reweight_old`` verbatim, so the fallback is unreachable here and a regex
-  substitution is not expressible as an anchor step.
-* the ``struct sched_rt_entity`` slot *restore*.  Nothing in this repo writes
-  those slots, so the restore's anchor is absent from a pristine tree; as a
-  ``required`` step it could only ever fail the group.
-* ``u64 avg_vruntime()`` is kept exactly as the suite wrote it (non-``static``,
-  no prototype).  ``avg_vruntime`` occurs nowhere else in the 5.15 tree
-  (0 hits in ``kernel/`` and ``include/``), and ``-Wmissing-prototypes`` is a
-  ``W=1``-only flag in 5.15 (``scripts/Makefile.extrawarn:28``), so the suite's
-  form is warning-clean at the default ``CONFIG_WERROR=y`` level.
-
-KABI / ``sizeof(struct sched_entity)``.  ``ANDROID_KABI_USE(n, type)`` expands to
-``_ANDROID_KABI_REPLACE(_ANDROID_KABI_RESERVE(n), type)``, i.e. an anonymous
-union of the new declaration and ``struct { u64 android_kabi_reserved##n; }``,
-with ``__ANDROID_KABI_CHECK_SIZE_ALIGN()`` asserting
-``sizeof(struct{type;}) <= sizeof(struct{u64 ...;})`` (8) and equal alignment.
-All four replacements are one 8-byte scalar of alignment 8, so the struct is
-bit-for-bit unchanged *and the header's own ``_Static_assert`` is the
-compile-time proof of it*.  ``CONFIG_ANDROID_KABI_RESERVE`` is ``default y`` with
-no dependencies (``drivers/android/Kconfig:77``, sourced unconditionally from
-``drivers/Kconfig:206``), so the ``RESERVE`` side is a real ``u64`` on every
-baseline.  ``__GENKSYMS__`` keeps the ``RESERVE`` form, so the symbol CRCs are
-unchanged too.  The same pattern already compiles in this tree
-(``include/linux/hid.h:635``).
-
-Batch 28 consumes the **last** free reserve slot.  Upstream's 6.12+ EEVDF carries
-seven ``sched_entity`` fields plus three flag bits (``deadline``,
-``min_vruntime``, ``min_slice``, ``max_slice``, ``vlag``, ``vprot``, ``slice``,
-``rel_deadline``, ``custom_slice``, ``sched_delayed``); four is all the Android
-reserve run has, which is the concrete reason the 6.12+ features above are out
-of scope rather than merely unattempted.
-
-The ``struct cfs_rq`` accumulators (group ``sched_eevdf_modern_fields``) are not
-a KMI concern: ``cfs_rq`` lives in ``kernel/sched/sched.h``, is not an exported
-type and appears in no KMI-checked symbol.
-
-Runtime caveat inherited from the suite (not a porting defect, recorded so it is
-not mistaken for one): the graft does not touch ``__sched_fork()``, so
-``se->deadline`` / ``se->vlag`` / ``se->min_vruntime`` begin as a copy of the
-parent's ``struct sched_entity`` (zero for ``init_task``).  The lifecycle closes
-at ``task_fork_fair()`` -> ``place_entity(cfs_rq, se, 1)``, which is called
-unconditionally and overwrites ``deadline``, ``vlag`` and ``slice`` on both of
-``abk_eevdf_place_entity()``'s paths, so the inherited values do not survive a
-fork.  ``se->slice`` is additionally made self-healing in
-``abk_eevdf_slice()`` (a zero slice reads as ``sysctl_sched_min_granularity``),
-so a path that reaches the helpers before any placement cannot divide by or
-compare against zero.
-
-Registration order required by this module (see item 3 and "Anchor overlap"
-below): ``sched_eevdf_pick_logic`` first, then ``sched_eevdf_core_fields``, then
-``sched_eevdf_modern_fields``, and all three **after** every existing
-``stable_perf_backport`` group that touches ``kernel/sched/fair.c``.
-
-Anchor overlap with the existing ``stable_perf_backport`` children:
-``sched_nohz_idle_balance_series`` (``nohz_balancer_kick()``,
-``_nohz_idle_balance()``), ``sched_dst_group_allowed_stats``
-(``update_sg_wakeup_stats()``), ``sched_lazy_preemption_hooks``
-(``#include <trace/hooks/sched.h>``, the ``delta_exec > ideal_runtime`` arm of
-``check_preempt_tick()``, the ``CONFIG_SCHED_HRTICK`` arm of ``entity_tick()``,
-and ``check_preempt_wakeup()``'s ``preempt:`` label) and
-``schedutil_smart_policy`` (``cpufreq_schedutil.c``) each rewrite regions
-disjoint from every ``old`` block here.  The nearest call is
-``sched_lazy_preemption_hooks``: it edits the *head* of ``check_preempt_tick()``
-while this module edits the tail, it edits ``entity_tick()``'s HRTICK branch
-while this module no longer edits ``entity_tick()`` at all, and its
-``preempt:`` label edit starts *below* the ``return;`` this module's
-``check_preempt_wakeup()`` step anchors on.  One *semantic* interaction is worth
-recording: the EEVDF preemption points this module adds flag
-``cfs_rq``/``se`` through the ``preempt:`` label, which the lazy group has
-already wrapped in ``trace_android_vh_resched_curr_lazy()``, so they inherit
-that policy for free; only the direct ``resched_curr()`` inside
-``abk_eevdf_refresh_deadline()`` is eager rather than deferred.  It is a policy
-overlap, not an anchor overlap.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -277,22 +8,12 @@ SCHED_H_INTERNAL = "kernel/sched/sched.h"
 FEATURES_H = "kernel/sched/features.h"
 CORE_C = "kernel/sched/core.c"
 
-# Alias the required-flag for readability (the other batch modules use T/F).
 T = True
 
-# --- provenance markers and shape probes ------------------------------------
-#
-# The fair.c marker doubles as the idempotency anchor for the pick-logic group
-# and as the "did the logic really land" tell for the slot claim.
 EEVDF_FAIR_MARKER = (
     "/* ABK stable_515_backport: EEVDF runtime-state graft (Batch 28 shape). */"
 )
 
-# Present only when the *whole* fair.c half of the family landed.  Each string
-# is emitted by a different step of the pick-logic group, so requiring all of
-# them proves the accumulators, the helpers, the placement hook, the deadline
-# refresh in update_curr(), the selector routing and the run-to-parity stash all
-# landed -- not merely that some earlier step wrote its comment.
 _FAIR_LANDED_PROBES = (
     EEVDF_FAIR_MARKER,
     "abk_avg_vruntime_add(cfs_rq, se);",
@@ -305,10 +26,6 @@ _FAIR_LANDED_PROBES = (
     "!abk_eevdf_eligible(curr, avruntime)",
 )
 
-# The 5.15 fair.c idiom this module is anchored to.  A tree that does not carry
-# it is a tree whose anchors were never measured, so the group refuses instead
-# of guessing (this is the concrete replacement for the suite's
-# fair_shape_for_tree() adaptation -- see the module docstring).
 _FAIR_SHAPE_PROBES = (
     ("update_stats_dequeue(cfs_rq, se, flags);",
      "the 5.15 update_stats_dequeue() spelling (6.1 uses *_fair)"),
@@ -322,16 +39,6 @@ _FAIR_SHAPE_PROBES = (
      "the 5.15 place_entity() definition (7.0 moved its body to place_entity_deadline())"),
 )
 
-
-# ---------------------------------------------------------------------------
-# include/linux/sched.h -- struct sched_entity KABI reserve slots 1-4
-# ---------------------------------------------------------------------------
-#
-# The anchor is the whole sched_entity tail, from the CONFIG_SMP sched_avg block
-# through the four reserves and the struct's closing brace.  ``struct
-# sched_rt_entity`` carries an identical four-line RESERVE run, so the sched_avg
-# context is what pins this to sched_entity; a bare
-# ``ANDROID_KABI_RESERVE(1..4)`` run would match twice in the file.
 
 _SCHED_H_SE_TAIL = (
     "#ifdef CONFIG_SMP\n"
@@ -351,12 +58,6 @@ _SCHED_H_SE_TAIL = (
     "};"
 )
 
-# The pre-release draft the suite upgrades: slots 3 and 4 packed two u64 each.
-# It cannot compile (ANDROID_KABI_USE's own static assert rejects a 16-byte
-# payload in an 8-byte slot), so it can only exist in a tree a *draft* of this
-# payload touched.  It is kept as a named shape rather than as a second step
-# because the two forms are mutually exclusive and a required step whose anchor
-# cannot exist would fail the group every time.
 _SCHED_H_SE_TAIL_BROKEN = (
     "#ifdef CONFIG_SMP\n"
     "\t/*\n"
@@ -381,10 +82,6 @@ _SCHED_H_SE_TAIL_BROKEN = (
     "};"
 )
 
-# The Batch 15 form: slots 1-3 claimed, slot 4 released back to RESERVE.  A tree
-# already carrying it is upgraded to the Batch 28 form, which claims slot 4 as
-# ``u64 slice`` -- the per-entity request size update_deadline(), the EEVDF yield
-# and PREEMPT_SHORT all read (see docs/survey_eevdf_gap.md).
 _SCHED_H_SE_TAIL_V15 = (
     "#ifdef CONFIG_SMP\n"
     "\t/*\n"
@@ -457,19 +154,6 @@ _SCHED_H_SE_TAIL_NEW = (
 )
 
 
-# ---------------------------------------------------------------------------
-# kernel/sched/sched.h -- struct cfs_rq virtual-time accumulators
-# ---------------------------------------------------------------------------
-#
-# Upstream af4cf40470c2 (v6.6).  The anchor is the two u64 timing fields at the
-# top of struct cfs_rq plus the CONFIG_SCHED_CORE guard that follows them; the
-# guard is what makes it unique (``u64 min_vruntime`` alone also appears in the
-# CONFIG_SCHED_CORE block as ``u64 min_vruntime_fi``, and in the
-# !CONFIG_64BIT block as ``u64 min_vruntime_copy``).
-#
-# struct cfs_rq is not an exported type and appears in no KMI-checked symbol, so
-# these three fields are free to add.
-
 _SCHED_H_CFS_RQ = (
     "\tu64\t\t\texec_clock;\n"
     "\tu64\t\t\tmin_vruntime;\n"
@@ -504,20 +188,6 @@ _SCHED_H_CFS_RQ_NEW = (
 )
 
 
-# ---------------------------------------------------------------------------
-# kernel/sched/core.c -- the per-task request size producer
-# ---------------------------------------------------------------------------
-#
-# Upstream puts __setparam_fair() in fair.c and calls it from
-# __setscheduler_params(); 5.15's fair.c does not see `struct sched_attr` at
-# all (it includes only "sched.h" and the AOSP hook header), so the body is
-# inlined at the one call site rather than dragging a uapi include into
-# fair.c.  The behaviour is upstream's: sched_runtime != 0 sets the request,
-# 0 clears it, and the clamp is upstream's 100us..100ms.
-#
-# Without this step `se->slice` could only ever hold the global default,
-# which made abk_eevdf_preempt_short() a tautology -- see the file docstring.
-
 _CORE_SETSCHED_PARAMS = (
     "\tif (dl_policy(policy))\n"
     "\t\t__setparam_dl(p, attr);\n"
@@ -550,15 +220,6 @@ _CORE_SETSCHED_PARAMS_NEW = (
     "\t}\n"
 )
 
-# ---------------------------------------------------------------------------
-# kernel/sched/features.h -- the EEVDF policy switches
-# ---------------------------------------------------------------------------
-#
-# The anchor is the Android tail of the file.  ``sched_feat()`` is
-# available with and without CONFIG_SCHED_DEBUG: without it, features.h is
-# expanded into a compile-time constant bitmask seeded from the ``enabled``
-# column (kernel/sched/sched.h:2045-2052), so ``true`` here is the default on
-# every config.
 
 _FEATURES_TAIL = (
     "SCHED_FEAT(ALT_PERIOD, true)\n"
@@ -589,18 +250,6 @@ _FEATURES_TAIL_NEW = (
 )
 
 
-# ---------------------------------------------------------------------------
-# kernel/sched/fair.c -- anchors as they exist in the pristine 5.15 trees
-# ---------------------------------------------------------------------------
-#
-# Every block below was measured to occur exactly once in the pristine
-# abk515_ref_{167,178,194,216} trees.  The tabs are the tree's own; a mistyped
-# indent shows up as a 0-count anchor in tests/step_audit.py rather than as a
-# silent no-op, because every step is required.
-
-# Step 1: the cfs_rq accumulators, inserted between entity_before() and
-# __node_2_se().  They are placed this high in the file because
-# update_min_vruntime() (fair.c:544) has to call abk_avg_vruntime_update().
 _FAIR_ENTITY_BEFORE = (
     "static inline bool entity_before(struct sched_entity *a,\n"
     "\t\t\t\tstruct sched_entity *b)\n"
@@ -663,7 +312,6 @@ _FAIR_ENTITY_BEFORE_NEW = (
     "}\n"
 )
 
-# Step 2: update_min_vruntime() re-bases the accumulators when v0 moves.
 _FAIR_MIN_VRUNTIME = (
     "static void update_min_vruntime(struct cfs_rq *cfs_rq)\n"
     "{\n"
@@ -737,9 +385,6 @@ _FAIR_MIN_VRUNTIME_NEW = (
     "}\n"
 )
 
-# Step 3: the tree insert/remove maintain the accumulators.  Upstream adds
-# before the insert and subtracts after the erase, so that the entity is
-# accounted for exactly while it is in the tree.
 _FAIR_ENQ_DEQ = (
     "static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)\n"
     "{\n"
@@ -770,10 +415,6 @@ _FAIR_ENQ_DEQ_NEW = (
     "}\n"
 )
 
-# Step 4: the helper set, inserted between sched_vslice() and ``#include
-# "pelt.h"``.  sched_slice() (fair.c:681), calc_delta_fair() (fair.c:651),
-# scale_load_down() and __node_2_se() are all defined above this point on 5.15,
-# and so are the accumulators step 1 added.
 _FAIR_VSLICE = (
     "static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)\n"
     "{\n"
@@ -1172,10 +813,6 @@ static inline bool abk_eevdf_preempt_short(struct cfs_rq *cfs_rq,
 
 _FAIR_VSLICE_NEW = _FAIR_VSLICE + _FAIR_HELPERS
 
-# Step 5: update_curr() is where upstream refreshes the deadline
-# (update_deadline(), v6.6).  This is the other half of the quadratic-cost fix:
-# the selector no longer has to refresh anything, because the entity that is
-# running has its deadline maintained as its vruntime advances.
 _FAIR_UPDATE_CURR = (
     "\tcurr->vruntime += calc_delta_fair(delta_exec, curr);\n"
     "\tupdate_min_vruntime(cfs_rq);\n"
@@ -1193,24 +830,11 @@ _FAIR_UPDATE_CURR_NEW = (
     "\tupdate_min_vruntime(cfs_rq);\n"
 )
 
-# __pick_next_entity(): probe-only, deliberately NOT a step.
-#
-# Batch 15 added __maybe_unused to this definition because routing
-# pick_next_entity() through abk_pick_eevdf() took away its only caller, and
-# -Wall -Wunused-function is -Werror here.  Batch 28 keeps it live instead: the
-# !EEVDF half of pick_next_entity() calls it.  The pristine definition is
-# therefore already the target form, and a step whose old == new is a no-op
-# that replace_once reports as already_present forever -- docs/group_recipe.md
-# trap 1.  The anchor stays here so the uniqueness probe still covers the
-# context; there is no entry for it in build_pick_logic_steps().
 _FAIR_NEXT_PICK = (
     "static struct sched_entity *__pick_next_entity(struct sched_entity *se)\n"
 )
 
 
-# Step 7: reweight_entity() (fair.c:3082) calls place_entity() (fair.c:4346), so
-# the reweight rewrite needs a forward declaration.  The anchor is the !SMP
-# dequeue_load_avg() stub, which on 5.15 sits immediately above reweight_entity.
 _FAIR_LOAD_AVG_STUB = (
     "static inline void\n"
     "dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }\n"
@@ -1232,7 +856,6 @@ _FAIR_LOAD_AVG_STUB_NEW = (
     "place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial);\n"
 )
 
-# Step 8: reweight_entity() HEAD.
 _FAIR_REWEIGHT_HEAD = (
     "\tif (se->on_rq) {\n"
     "\t\t/* commit outstanding execution time */\n"
@@ -1276,8 +899,6 @@ _FAIR_REWEIGHT_HEAD_NEW = (
     "\tupdate_load_set(&se->load, weight);\n"
 )
 
-# Step 9: reweight_entity() TAIL.  Split from the head at the AOSP hook so the
-# hook -- and anything a later sublevel adds in the same gap -- stays put.
 _FAIR_REWEIGHT_TAIL = (
     "\tenqueue_load_avg(cfs_rq, se);\n"
     "\tif (se->on_rq)\n"
@@ -1297,8 +918,6 @@ _FAIR_REWEIGHT_TAIL_NEW = (
     "}\n"
 )
 
-# Step 10: enqueue_entity() must re-place an entity that carries preserved state
-# even when it is not a wakeup (e.g. a requeued one).
 _FAIR_ENQUEUE_PLACE = (
     "\tif (flags & ENQUEUE_WAKEUP)\n"
     "\t\tplace_entity(cfs_rq, se, 0);\n"
@@ -1311,9 +930,6 @@ _FAIR_ENQUEUE_PLACE_NEW = (
     "\t\tplace_entity(cfs_rq, se, 0);\n"
 )
 
-# Step 11: dequeue_entity() head.  5.15 has no ``int action = UPDATE_TG;`` here
-# (the suite's _FAIR_6_1_DEQUEUE_ACTION substitution removes it from the 6.1
-# form), so the anchor is the definition line plus the opening brace.
 _FAIR_DEQUEUE_HEAD = (
     "static void\n"
     "dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)\n"
@@ -1330,8 +946,6 @@ _FAIR_DEQUEUE_HEAD_NEW = (
     "\tbool sleep = flags & DEQUEUE_SLEEP;\n"
 )
 
-# Step 12: capture lag and the relative deadline while the entity is still in the
-# tree.  The anchor is the 5.15 ``update_stats_dequeue`` spelling.
 _FAIR_DEQUEUE_BODY = (
     "\tupdate_stats_dequeue(cfs_rq, se, flags);\n"
     "\n"
@@ -1356,9 +970,6 @@ _FAIR_DEQUEUE_BODY_NEW = (
     "\t\t__dequeue_entity(cfs_rq, se);\n"
 )
 
-# Step 13: place_entity() tail.  The anchor carries the AOSP place hook, which is
-# what distinguishes the 5.15 shape from the 6.1 one (the suite's
-# _FAIR_5_15_PLACE_TAIL substitution appends it at runtime; here it is literal).
 _FAIR_PLACE_TAIL = (
     "\tif (entity_is_long_sleeper(se))\n"
     "\t\tse->vruntime = vruntime;\n"
@@ -1382,8 +993,6 @@ _FAIR_PLACE_TAIL_NEW = (
     "}\n"
 )
 
-# Step 14: check_preempt_tick() tail.  The lazy-preemption group edits the head of
-# this function, not this block.
 _FAIR_PREEMPT = (
     "\tse = __pick_first_entity(cfs_rq);\n"
     "\tdelta = curr->vruntime - se->vruntime;\n"
@@ -1418,9 +1027,6 @@ _FAIR_PREEMPT_NEW = (
     "}\n"
 )
 
-# Step 15: set_next_entity().  The 5.15 spelling is update_stats_wait_end (no
-# _fair suffix).  This is also where the RUN_TO_PARITY stash is taken: the
-# deadline the entity had at the moment it was picked.
 _FAIR_SET_NEXT = (
     "\t\tupdate_stats_wait_end(cfs_rq, se);\n"
     "\t\t__dequeue_entity(cfs_rq, se);\n"
@@ -1438,8 +1044,6 @@ _FAIR_SET_NEXT_NEW = (
     "\t\tupdate_load_avg(cfs_rq, se, UPDATE_TG);\n"
 )
 
-# Step 16: pick_next_entity().  Matches the pristine 5.15 body verbatim,
-# including the AOSP vendor hook.
 _FAIR_PICK = (
     "static struct sched_entity *\n"
     "pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)\n"
@@ -1562,12 +1166,6 @@ _FAIR_PICK_NEW = (
     "}\n"
 )
 
-# wakeup_preempt_entity() and wakeup_gran(): probe-only, deliberately NOT steps.
-#
-# Batch 28 originally marked all three __maybe_unused because the EEVDF wakeup
-# rule took away their last caller; Batch 28's repair keeps them live instead,
-# as the !EEVDF half of check_preempt_wakeup().  Their pristine definitions are
-# therefore already the target form -- same trap 1 as __pick_next_entity().
 _FAIR_WPE_DECL = (
     "static int\n"
     "wakeup_preempt_entity(struct sched_entity *curr, struct sched_entity *se);\n"
@@ -1587,9 +1185,6 @@ _FAIR_WPE_DEF = (
 )
 
 
-# Step 20: wakeup preemption asks the selector (upstream 147f3efaa241, v6.6).
-# The anchor stops at the ``return;`` above the ``preempt:`` label, which
-# sched_lazy_preemption_hooks wraps separately.
 _FAIR_WAKEUP_PREEMPT = (
     "\tupdate_curr(cfs_rq_of(se));\n"
     "\ttrace_android_rvh_check_preempt_wakeup(rq, p, &preempt, &ignore,\n"
@@ -1658,8 +1253,6 @@ _FAIR_WAKEUP_PREEMPT_NEW = (
     "\treturn;\n"
 )
 
-# Step 21: EEVDF yield (upstream 147f3efaa241's yield_task_fair() hunk, v6.6,
-# plus the forfeit of 79104becf42b, v6.17).
 _FAIR_YIELD = (
     "\tclear_buddies(cfs_rq, se);\n"
     "\n"
@@ -1718,8 +1311,6 @@ _FAIR_YIELD_NEW = (
 )
 
 
-# (label, pristine ``old`` block) for the uniqueness probe.  The labels are the
-# report text when a real tree turns out to carry a context twice.
 _FAIR_ANCHORS = (
     ("entity_before() / __node_2_se()", _FAIR_ENTITY_BEFORE),
     ("update_min_vruntime() body", _FAIR_MIN_VRUNTIME),
@@ -1746,29 +1337,12 @@ _FAIR_ANCHORS = (
 
 
 def build_pick_logic_steps():
-    """``sched_eevdf_pick_logic``: 21 ordered, all-required steps.
-
-    Order matters in four places, and the steps are not split across groups:
-
-    * step 1 must precede steps 2-4, which call the accumulators it inserts;
-    * step 4 must precede steps 5 and 14-21, which call the helpers it inserts;
-    * step 3 (the ``place_entity()`` forward declaration) must precede step 8,
-      which calls ``place_entity()`` from ``reweight_entity()``;
-    * step 11 introduces ``sleep``, which step 12 consumes; step 8 introduces
-      ``queued`` and ``curr``, which step 9 consumes.
-
-    Every step's ``new`` block is textually distinct from every other step's, so
-    no step can satisfy another's idempotency check (``replace_once`` tests the
-    replacement first) -- the failure mode ``docs/group_recipe.md`` calls trap 2.
-    """
     return [
         (FAIR_C, _FAIR_ENTITY_BEFORE, _FAIR_ENTITY_BEFORE_NEW, T),
         (FAIR_C, _FAIR_MIN_VRUNTIME, _FAIR_MIN_VRUNTIME_NEW, T),
         (FAIR_C, _FAIR_ENQ_DEQ, _FAIR_ENQ_DEQ_NEW, T),
         (FAIR_C, _FAIR_VSLICE, _FAIR_VSLICE_NEW, T),
         (FAIR_C, _FAIR_UPDATE_CURR, _FAIR_UPDATE_CURR_NEW, T),
-        # __pick_next_entity() has no step: the pristine text is already the
-        # target form (see the note at its anchor).  Probe-only.
         (FAIR_C, _FAIR_LOAD_AVG_STUB, _FAIR_LOAD_AVG_STUB_NEW, T),
         (FAIR_C, _FAIR_REWEIGHT_HEAD, _FAIR_REWEIGHT_HEAD_NEW, T),
         (FAIR_C, _FAIR_REWEIGHT_TAIL, _FAIR_REWEIGHT_TAIL_NEW, T),
@@ -1779,28 +1353,12 @@ def build_pick_logic_steps():
         (FAIR_C, _FAIR_PREEMPT, _FAIR_PREEMPT_NEW, T),
         (FAIR_C, _FAIR_SET_NEXT, _FAIR_SET_NEXT_NEW, T),
         (FAIR_C, _FAIR_PICK, _FAIR_PICK_NEW, T),
-        # wakeup_preempt_entity()'s declaration: pristine form, no step needed.
-        # wakeup_gran(): pristine form, no step needed (live under !EEVDF).
-        # wakeup_preempt_entity()'s definition: pristine form, no step needed.
         (FAIR_C, _FAIR_WAKEUP_PREEMPT, _FAIR_WAKEUP_PREEMPT_NEW, T),
         (FAIR_C, _FAIR_YIELD, _FAIR_YIELD_NEW, T),
     ]
 
 
 def build_core_fields_steps(text):
-    """``sched_eevdf_core_fields``: exactly one step, for the shape ``text`` has.
-
-    Four mutually exclusive shapes, so the selection happens here and the
-    emitted step is ``required`` either way:
-
-    * the Batch 28 claim is already in place -> ``old == new`` (already_present);
-    * the Batch 15 form (slots 1-3, slot 4 released) -> upgraded;
-    * the pre-release draft -> upgraded;
-    * the pristine four-reserve run -> claimed.
-
-    Returns ``None`` for a shape none of the four describe; the caller reports
-    ``blocked_by_shape`` rather than guessing which reserve run to rewrite.
-    """
     if _SCHED_H_SE_TAIL_NEW in text:
         return [(SCHED_H, _SCHED_H_SE_TAIL_NEW, _SCHED_H_SE_TAIL_NEW, T)]
     if _SCHED_H_SE_TAIL_V15 in text:
@@ -1813,12 +1371,6 @@ def build_core_fields_steps(text):
 
 
 def build_modern_fields_steps():
-    """``sched_eevdf_modern_fields``: accumulators, producer, switches.
-
-    Three plain idempotent steps -- each ``old`` occurs exactly once in a
-    pristine tree and each ``new`` occurs zero times, so a second pass reports
-    ``already_present`` for all three.
-    """
     return [
         (SCHED_H_INTERNAL, _SCHED_H_CFS_RQ, _SCHED_H_CFS_RQ_NEW, T),
         (CORE_C, _CORE_SETSCHED_PARAMS, _CORE_SETSCHED_PARAMS_NEW, T),
@@ -1827,7 +1379,6 @@ def build_modern_fields_steps():
 
 
 def _occurrences(text, block):
-    """Occurrence count of ``block`` in ``text``, EOL-insensitively."""
     return text.replace("\r\n", "\n").count(block.replace("\r\n", "\n"))
 
 
@@ -1837,12 +1388,6 @@ def _eevdf_core_fields_apply(ctx):
     except FileNotFoundError:
         return "blocked_by_shape", f"{SCHED_H}: file absent"
 
-    # Anti-drift gate.  The four slots encode state that only the fair.c half of
-    # this family reads; claiming them without the logic would leave dead members
-    # in a frozen-struct ABI.  Require the *payload* -- the marker, the
-    # accumulators, the deadline refresh, the placement hook, the selector
-    # routing and the run-to-parity stash -- not just the marker, because the
-    # marker alone is written by the first step of the pick-logic group.
     try:
         fair = ctx.read(FAIR_C)
     except FileNotFoundError:
@@ -1880,7 +1425,6 @@ def _sched_eevdf_pick_logic_apply(ctx):
     except FileNotFoundError:
         return "blocked_by_shape", f"{FAIR_C}: file absent"
 
-    # Shape probe: the 5.15-vs-6.1 differences this module re-anchors.
     missing = [why for probe, why in _FAIR_SHAPE_PROBES if probe not in text]
     if missing:
         return "blocked_by_shape", (
@@ -1888,11 +1432,6 @@ def _sched_eevdf_pick_logic_apply(ctx):
             f"missing: {'; '.join(missing)}"
         )
 
-    # Uniqueness probe (the suite had none).  replace_once edits the first
-    # occurrence only, so an anchor that a real tree carries twice would be
-    # edited in the wrong place while still reporting applied.  Anchors that are
-    # legitimately gone (an already-applied tree) are left to apply_steps, which
-    # reports them per step.
     ambiguous = [
         (label, count) for label, block in _FAIR_ANCHORS
         for count in (_occurrences(text, block),) if count > 1
@@ -1910,15 +1449,6 @@ def _sched_eevdf_pick_logic_apply(ctx):
 
 
 def _eevdf_modern_fields_apply(ctx):
-    """The cfs_rq accumulators + the two EEVDF switches.
-
-    Gated on the same fair.c payload as the slot claim: the accumulators are
-    read by abk_avg_vruntime_add()/sub() from __enqueue_entity()/
-    __dequeue_entity() and by avg_vruntime(), and the switches are read from
-    abk_pick_eevdf()/abk_eevdf_preempt_short().  Adding them to a tree without
-    the fair.c half would be dead state (and the switches would be unused
-    enum members, which is harmless but meaningless).
-    """
     try:
         fair = ctx.read(FAIR_C)
     except FileNotFoundError:
@@ -1961,18 +1491,6 @@ def _eevdf_modern_fields_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the three PatchGroup records, in registration order.
-
-    ``sched_eevdf_pick_logic`` **must** be registered before
-    ``sched_eevdf_core_fields`` and ``sched_eevdf_modern_fields``: both are gated
-    on fair.c carrying the logic, which only holds once the pick-logic group has
-    run in the same invocation (see the module docstring, item 4).  All three
-    must come after every existing ``stable_perf_backport`` group that touches
-    ``kernel/sched/fair.c`` (``sched_nohz_idle_balance_series``,
-    ``sched_dst_group_allowed_stats``, ``sched_lazy_preemption_hooks``); no
-    anchor is shared, so the order is a safety margin rather than a correctness
-    requirement.
-    """
     return [
         PatchGroup(
             "sched_eevdf_pick_logic",

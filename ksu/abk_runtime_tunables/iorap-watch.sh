@@ -1,20 +1,4 @@
 #!/system/bin/sh
-# iorap-watch.sh - Stage 2b: the launch watcher that takes iorapd's place.
-#
-# Re-entered as `service.sh --supervise-iorap`.  The kernel owns the mechanism
-# (bg_launch_prefetch); this watcher owns the policy -- when a uid is recorded
-# and when it is kicked, which is what iorapd's /dev/iorap handshake decided.
-#
-# Trigger: /proc polling.  This ROM ships no per-launch logcat signal (no
-# "START u0", no am_start -- both verified on vermeer), so the watcher diffs
-# /proc every ~300 ms and reacts to new app-uid processes.  The record table
-# is keyed by uid, so the package name is never needed.
-#
-# Economics: a cold launch touches hundreds of files, so recording on every
-# launch churns the table (kicks=0 for all but the most recent app, measured).
-# Instead: record a uid once per generation (first sighting or after
-# record_cool_min), kick it on every other launch.  Kick-only launches do not
-# touch the table (collection is window-gated), so a hot app's records survive.
 
 abk_iorap_main() {
   abk_pid_write iorap-watch "$$"
@@ -50,8 +34,6 @@ abk_iorap_main() {
       sleep 0.3
       continue
     fi
-    # pids present now but absent last tick; comm is a C utility, so the
-    # per-tick cost stays O(n log n) no matter how busy /proc is.
     _io_new=$(comm -13 "$_io_run/prev" "$_io_run/cur" 2>/dev/null)
     cp "$_io_run/cur" "$_io_run/prev" 2>/dev/null
     if [ -n "$_io_new" ]; then
@@ -61,17 +43,13 @@ abk_iorap_main() {
                   "/proc/$_io_pid/status" 2>/dev/null)
         [ -n "$_io_uid" ] || continue
         [ "$_io_uid" -ge "$_io_min_uid" ] 2>/dev/null || continue
-        # per-uid kick cooldown: a spawn burst of the same app counts once
         _io_kt=0
         [ -f "$_io_st/kick.$_io_uid" ] && _io_kt=$(cat "$_io_st/kick.$_io_uid" 2>/dev/null)
         [ $(( _io_now - _io_kt )) -ge "$_io_kick_cool" ] 2>/dev/null || continue
-        # global gap: a launcher fan-out of several apps still triggers one
-        # at a time, oldest first; the rest are picked up on their next spawn
         [ $(( _io_now - _io_last )) -ge "$_io_gap" ] 2>/dev/null || continue
         _io_last=$_io_now
         echo "$_io_now" > "$_io_st/kick.$_io_uid" 2>/dev/null
         echo "$_io_uid" > "$_io_k/abk_lp_prefetch_uid" 2>/dev/null
-        # record only once per generation
         _io_rt=-999999
         [ -f "$_io_st/rec.$_io_uid" ] && _io_rt=$(cat "$_io_st/rec.$_io_uid" 2>/dev/null)
         if [ $(( _io_now - _io_rt )) -ge $(( _io_rec_cool * 60 )) ] 2>/dev/null; then

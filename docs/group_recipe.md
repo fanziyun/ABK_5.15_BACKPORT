@@ -17,7 +17,8 @@ published, in `tools/`.)
   (`curl -L https://github.com/gregkh/linux/commit/<sha>.patch -o <sha>.patch`).
 - Convert it to old/new blocks with the dev helper:
   `python3 tools/hunks.py research/upstream-5.15.y/patches`.
-- Add a checkbox line to `plan.md` with the sublevel and target child.
+- Add a checkbox line to the `CHANGELOG.md` backlog appendix with the sublevel
+  and target child.
 
 ## 2. Implement the group
 
@@ -75,8 +76,8 @@ published, in `tools/`.)
 - Extend `tests/smoke.sh` grep assertions if the group lands a load-bearing
   marker — gate the assertion on `sublevel_matrix.applies()` when the marker
   only exists on baselines where the group really rewrites the file.  Then tick
-  the `plan.md` checkbox and bump `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION`
-  in `module.conf`.
+  the appendix checkbox in `CHANGELOG.md` and bump
+  `ABK_MODULE_VERSION`/`ABK_MODULE_SET_VERSION` in `module.conf`.
 
 ## Step-authoring traps (compile-breaking, hidden at group level)
 

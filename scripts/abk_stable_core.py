@@ -1,20 +1,3 @@
-"""Child ``stable_backport_core``: upstream 5.15.y feature grafts (fs/mm/cgroup).
-
-Carries the 5.15.191 fd-table allocation conventions, the ALLOC_MIN_RESERVE
-rename with RT-task semantics (5.15.171), the __GFP_THISNODE THP no-reclaim
-change (5.15.202), the cpuset insane-config early bail-out (5.15.191), the
-percpu_pagelist_high_fraction lock-free read (5.15.200), the cgroup root_list
-RCU conversion (5.15.168), and the cgroup destroy-workqueue split (5.15.194).
-
-The fd-table group is hard: on a tree whose fs/file.c matches neither the
-pristine monthly shape, the upstream shape, nor an already-processed shape
-it aborts the build instead of half-patching.
-
-Coexistence: standalone by default; if storage-rollback or other feature-
-graft modules are injected in the same build, keep this child between them
-(injection order in docs/porting_policy.md).
-"""
-
 from __future__ import annotations
 
 import os
@@ -32,13 +15,9 @@ from abk_backport_engine import (  # noqa: E402
     run_child,
 )
 
-T = True  # required step
-F = False  # optional step
+T = True
+F = False
 
-
-# ---------------------------------------------------------------------------
-# fd table allocation conventions (5.15.191: 04a2c4b4511d + 1d3b4bec3ce5)
-# ---------------------------------------------------------------------------
 
 _FD_DOC_TAIL_OLD = """ * The ALIGN(nr, BITS_PER_LONG) here is for clarity: since we just multiplied
  * by that "1024/sizeof(ptr)" before, we already know there are sufficient
@@ -180,16 +159,6 @@ out:
 }
 """
 
-# Vanilla punch_hole dup_fd tail: the AOSP/vanilla trees carrying
-# `sane_fdtable_size(old_fdt, punch_hole)` end dup_fd() with an
-# out_release: cleanup label and `return ERR_PTR(error);`.  Upstream
-# 5.15.191 merges that path into ERR_CAST early returns, so the whole
-# tail block must be replaced by the plain `return newf;` form.  The old
-# label-only step ("out_release:\n...\n}\n" -> "}\n") was a no-op because
-# replace_once() treats a bare "}\n" as already_present (any closing brace
-# in the file matches), leaving an unused label that -Werror,-Wunused-label
-# rejects.  The old text therefore spans from `return newf;` through the
-# closing brace and the replacement is the target tail verbatim.
 _FD_DUPFD_LABEL_VANILLA_OLD = """	return newf;
 
 out_release:
@@ -201,11 +170,6 @@ _FD_DUPFD_LABEL_VANILLA_NEW = """	return newf;
 }
 """
 
-# Vanilla punch_hole dup_fd no longer uses `int error;`: the ERR_CAST early
-# returns replace both `error = -ENOMEM; goto out_release;` paths, and the
-# label tail that read `error` is gone.  Upstream 5.15.191 drops the
-# declaration; keep the anchor scoped to the dup_fd header so other
-# functions' `int error;` locals are untouched.
 _FD_DUPFD_ERR_DECL_OLD = """	struct fdtable *old_fdt, *new_fdt;
 	int error;
 
@@ -247,12 +211,6 @@ _FD_REPLACE_FD_NEW = """	err = do_dup2(files, file, fd, flags);
 	return 0;
 """
 
-# Suite-fallback variants: when ABK_ABI_PATCH_SUITE ran first, alloc_fdtable()
-# carries its "fd allocation hotpath" fallback (legacy nr parameter, helper
-# local, ALIGN capacity, round-up clamp, INT_MAX -> return NULL).  These steps
-# convert that body onto the same upstream 5.15.191 target as the pristine
-# variant; the suite's helpers and expand_files()/alloc_fd() prechecks stay in
-# place and keep working (the slot-count helper simply becomes unused).
 _FD_SUITE_DOC_TAIL_OLD = """ * The ALIGN(nr, BITS_PER_LONG) here is for clarity: since we just multiplied
  * by that "1024/sizeof(ptr)" before, we already know there are sufficient
  * clear low bits. Clang seems to realize that, gcc ends up being confused.
@@ -303,7 +261,6 @@ _FD_SUITE_CLAMP_OLD = """	 * Note that this can drive nr *below* what we had pas
 
 
 def _suite_fallback_shape(text):
-    """True for the suite's fallback alloc_fdtable() body we can compose onto."""
     return (
         "alloc_fdtable(unsigned int nr)" in text
         and "unsigned int slots_wanted = abk_fdtable_slots_wanted(nr);" in text
@@ -338,20 +295,15 @@ def _suite_composed_steps(dup_fd_aosp):
 
 
 def _fdtable_apply(ctx):
-    # Order matters: the composed-after-suite check must see the upstream
-    # shape through the suite's leftover (unused) helper, so it comes first.
     if ctx.fdtable_upstream_shape():
         return "already_present", "upstream fdtable conventions already present"
     text_probe = ctx.read("fs/file.c")
     if _suite_fallback_shape(text_probe):
-        # Suite ran first: compose the upstream conventions over its fallback.
         dup_fd_aosp = "sane_fdtable_size(old_fdt, max_fds)" in text_probe
         status, _results, detail = apply_steps(
             ctx, _suite_composed_steps(dup_fd_aosp)
         )
         if status is None:
-            # Suite text drifted from the shape we compose against; yield
-            # gracefully instead of aborting the user's build.
             return (
                 "skip_suite_processed",
                 "suite fallback shape not recognized for composition; " + detail,
@@ -373,7 +325,6 @@ def _fdtable_apply(ctx):
         ("fs/file.c", _FD_DUPFD_AOSP_OLD, _FD_DUPFD_AOSP_NEW, T),
         ("fs/file.c", _FD_DUPFD_LABEL_OLD, _FD_DUPFD_LABEL_NEW, T),
     ]
-    # Vanilla punch_hole dup_fd variant: accepted in place of the AOSP one.
     if "sane_fdtable_size(old_fdt, max_fds)" not in text_probe:
         steps[6] = ("fs/file.c", _FD_DUPFD_VANILLA_OLD, _FD_DUPFD_VANILLA_NEW, T)
         steps[7] = ("fs/file.c", _FD_DUPFD_LABEL_VANILLA_OLD, _FD_DUPFD_LABEL_VANILLA_NEW, T)
@@ -388,18 +339,7 @@ def _fdtable_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# replace_fd() propagates do_dup2() errors (5.15.195, ff8ec0dbe0150)
-# ---------------------------------------------------------------------------
-
 def _replace_fd_errno_apply(ctx):
-    """Own group so the fix lands on trees that already carry 5.15.191.
-
-    The fdtable conventions group short-circuits to ``already_present`` the
-    moment ``fdtable_upstream_shape()`` holds, which is true from 5.15.191
-    onwards.  This hunk only appeared in 5.15.195, so as a step inside that
-    group it could never reach a .191-.194 baseline.
-    """
     status, _results, detail = apply_steps(
         ctx, [("fs/file.c", _FD_REPLACE_FD_OLD, _FD_REPLACE_FD_NEW, T)]
     )
@@ -407,10 +347,6 @@ def _replace_fd_errno_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# page_alloc ALLOC_MIN_RESERVE semantics (5.15.171: 9cfe015 follow-ups)
-# ---------------------------------------------------------------------------
 
 def _min_reserve_apply(ctx):
     steps = [
@@ -443,33 +379,17 @@ def _min_reserve_apply(ctx):
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
-        # The high-atomic reserve chain (pagealloc_highatomic_reserve_semantics)
-        # restructures this group's __zone_watermark_ok() hunk onto the final
-        # 5.15.218 form; recognize that superseding shape as our own end state.
         if "ALLOC_RESERVES" in ctx.read("mm/internal.h"):
             return "already_present", "superseded by pagealloc_highatomic_reserve_semantics"
         return "blocked_by_shape", detail
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# High-atomic / min-reserve semantics, complete form
-# (5.15.188-.218: ca8527f25736 + c1b8856c5a7d + 17dedfd6de69 + 85f58ee33c6c
-#  + 4c4e238d3ada + 735457683e23)
-#
-# Runs after pagealloc_min_reserve_semantics, whose ALLOC_HIGH ->
-# ALLOC_MIN_RESERVE rename this chain builds on.  The AOSP tree already
-# carries the rmqueue_buddy() split (ca8527f) plus vendor traces, so only
-# the flag-semantics hunks are grafted; the vendor CMA-first block and
-# trace_mm_page_alloc_zone_locked() inside rmqueue_buddy() are preserved.
-# ---------------------------------------------------------------------------
-
 _ALLOC_CONT = "\t\t\t\t       "
 
 
 def _highatomic_reserve_apply(ctx):
     steps = [
-        # mm/internal.h: ALLOC_HARDER -> ALLOC_NON_BLOCK, aligned comments.
         ("mm/internal.h",
          "#define ALLOC_HARDER\t\t 0x10 /* try to alloc harder */\n"
          "#define ALLOC_MIN_RESERVE\t 0x20 /* __GFP_HIGH set. Allow access to 50%\n"
@@ -483,7 +403,6 @@ def _highatomic_reserve_apply(ctx):
          + _ALLOC_CONT + "* of the min watermark.\n"
          + _ALLOC_CONT + "*/",
          T),
-        # mm/internal.h: ALLOC_HIGHATOMIC + the below-min-watermark set.
         ("mm/internal.h",
          "#define ALLOC_KSWAPD\t\t0x800 /* allow waking of kswapd, __GFP_KSWAPD_RECLAIM set */",
          "#define ALLOC_HIGHATOMIC\t0x200 /* Allows access to MIGRATE_HIGHATOMIC */\n"
@@ -492,7 +411,6 @@ def _highatomic_reserve_apply(ctx):
          "/* Flags that allow allocations below the min watermark. */\n"
          "#define ALLOC_RESERVES (ALLOC_NON_BLOCK|ALLOC_MIN_RESERVE|ALLOC_HIGHATOMIC|ALLOC_OOM)",
          T),
-        # __zone_watermark_unusable_free(): reserves set, not just harder.
         ("mm/page_alloc.c",
          "\tconst bool alloc_harder = (alloc_flags & (ALLOC_HARDER|ALLOC_OOM));\n"
          "\tlong unusable_free = (1 << order) - 1;\n"
@@ -514,7 +432,6 @@ def _highatomic_reserve_apply(ctx):
          "\tif (likely(!(alloc_flags & ALLOC_RESERVES)))\n"
          "\t\tunusable_free += z->nr_reserved_highatomic;",
          T),
-        # __zone_watermark_ok(): reserve rights restructured.
         ("mm/page_alloc.c",
          "\tlong min = mark;\n"
          "\tint o;\n"
@@ -573,7 +490,6 @@ def _highatomic_reserve_apply(ctx):
          "\t\t\tmin -= min / 2;\n"
          "\t}",
          T),
-        # __zone_watermark_ok(): HIGHATOMIC/OOM may use the highatomic area.
         ("mm/page_alloc.c",
          "\t\tif (alloc_harder && !free_area_empty(area, MIGRATE_HIGHATOMIC))\n"
          "\t\t\treturn true;\n"
@@ -584,15 +500,12 @@ def _highatomic_reserve_apply(ctx):
          "\t\t}\n"
          "\t}",
          T),
-        # get_page_from_freelist(): reserve highatomic only for HIGHATOMIC.
         ("mm/page_alloc.c",
          "\t\t\tif (unlikely(order && (alloc_flags & ALLOC_HARDER)))\n"
          "\t\t\t\treserve_highatomic_pageblock(page, zone, order);",
          "\t\t\tif (unlikely(alloc_flags & ALLOC_HIGHATOMIC))\n"
          "\t\t\t\treserve_highatomic_pageblock(page, zone, order);",
          T),
-        # rmqueue_buddy(): HIGHATOMIC flag gates the highatomic steal
-        # (AOSP's trace_mm_page_alloc_zone_locked stays).
         ("mm/page_alloc.c",
          "\t\tif (order > 0 && alloc_flags & ALLOC_HARDER) {\n"
          "\t\t\tpage = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);\n"
@@ -605,8 +518,6 @@ def _highatomic_reserve_apply(ctx):
          "\t\t\t\ttrace_mm_page_alloc_zone_locked(page, order, migratetype);\n"
          "\t\t}",
          T),
-        # rmqueue_buddy(): OOM and non-blocking failures may fall back to
-        # the highatomic area before giving up.
         ("mm/page_alloc.c",
          "\t\t\tif (!page)\n"
          "\t\t\t\tpage = __rmqueue(zone, order, migratetype,\n"
@@ -627,7 +538,6 @@ def _highatomic_reserve_apply(ctx):
          "\t\t\t}\n"
          "\t\t}",
          T),
-        # gfp_to_alloc_flags(): order parameter for the HIGHATOMIC decision.
         ("mm/page_alloc.c",
          "gfp_to_alloc_flags(gfp_t gfp_mask)\n"
          "{\n"
@@ -640,8 +550,6 @@ def _highatomic_reserve_apply(ctx):
          "\talloc_flags = gfp_to_alloc_flags(gfp_mask);",
          "\talloc_flags = gfp_to_alloc_flags(gfp_mask, order);",
          T),
-        # gfp_to_alloc_flags(): non-blocking means !__GFP_DIRECT_RECLAIM;
-        # HIGHATOMIC only for __GFP_HIGH; cpuset bypass only with reserves.
         ("mm/page_alloc.c",
          "\t * policy or is asking for __GFP_HIGH memory.  GFP_ATOMIC requests will\n"
          "\t * set both ALLOC_HARDER (__GFP_ATOMIC) and ALLOC_MIN_RESERVE(__GFP_HIGH).\n"
@@ -687,7 +595,6 @@ def _highatomic_reserve_apply(ctx):
          "\t\tif (alloc_flags & ALLOC_MIN_RESERVE)\n"
          "\t\t\talloc_flags &= ~ALLOC_CPUSET;",
          T),
-        # slowpath: non-failing allocations get reserve access, not harder.
         ("mm/page_alloc.c",
          "\t\t/*\n"
          "\t\t * Help non-failing allocations by giving them access to memory\n"
@@ -708,9 +615,6 @@ def _highatomic_reserve_apply(ctx):
     ]
     status, _results, detail = apply_steps(ctx, steps)
     if status is None:
-        # Batch 8 adds the mode argument to the same rmqueue_buddy() call
-        # after this group has installed the highatomic retry block.  Treat
-        # that composed end state as already present on a second pass.
         page_alloc = ctx.read("mm/page_alloc.c")
         if ("enum rmqueue_mode rmqm = RMQUEUE_NORMAL" in page_alloc and
                 "If the allocation fails, allow OOM handling" in page_alloc):
@@ -718,10 +622,6 @@ def _highatomic_reserve_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# THP __GFP_THISNODE: compact only, never reclaim (5.15.202, 0eac511c7657)
-# ---------------------------------------------------------------------------
 
 def _thisnode_thp_apply(ctx):
     old = """			    compact_result == COMPACT_DEFERRED)
@@ -755,10 +655,6 @@ def _thisnode_thp_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# cpuset insane-config early bail-out (5.15.191, c635a42d9b74)
-# ---------------------------------------------------------------------------
 
 def _cpuset_bailout_apply(ctx):
     steps = [
@@ -871,10 +767,6 @@ def _cpuset_bailout_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# percpu_pagelist_high_fraction lock-free reads (5.15.200, eda99622e6f3)
-# ---------------------------------------------------------------------------
-
 def _pagelist_lockfree_apply(ctx):
     old = """	int old_percpu_pagelist_high_fraction;
 	int ret;
@@ -913,10 +805,6 @@ def _pagelist_lockfree_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# cgroup root_list RCU safety (5.15.168, de77545c72c4)
-# ---------------------------------------------------------------------------
 
 def _cgroup_rcu_apply(ctx):
     steps = [
@@ -963,10 +851,6 @@ def _cgroup_rcu_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-
-# ---------------------------------------------------------------------------
-# cgroup destroy workqueue split (5.15.194, f2795d1b9250)
-# ---------------------------------------------------------------------------
 
 def _cgroup_wq_split_apply(ctx):
     steps = [
@@ -1035,20 +919,7 @@ def _cgroup_wq_split_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# memcg memory.reclaim: per-memcg proactive reclaim (android14-6.1, 6.1.y)
-# ---------------------------------------------------------------------------
-
 def _memcg_reclaim_apply(ctx):
-    # docs/group_recipe.md trap 5, and a chain rather than a single later
-    # edit: Batch 37 rewrites the memory_reclaim() handler this group
-    # generates -- its call site three times over (the SWAP_CLUSTER_MAX cap,
-    # the decaying batch, the swappiness= argument) and its failure path
-    # (-ERESTARTSYS) -- so on a second pass the handler's `new` block no
-    # longer matches while its `old` anchor (the pristine
-    # `static struct cftype memory_files[] = {`) still does, and the whole
-    # function would be appended a second time.  The group stops on its own
-    # marker instead: text it alone writes, and which no later group touches.
     try:
         _probe = ctx.read("mm/memcontrol.c")
     except FileNotFoundError:
@@ -1057,7 +928,6 @@ def _memcg_reclaim_apply(ctx):
         return "already_present", (
             "memory.reclaim is already in memcontrol.c")
     steps = [
-        # swap.h: reclaim option bits next to the try_to_free prototypes
         ("include/linux/swap.h",
          "extern unsigned long try_to_free_pages(struct zonelist *zonelist, int order,\n"
          "\t\t\t\t\tgfp_t gfp_mask, nodemask_t *mask);\n"
@@ -1076,7 +946,6 @@ def _memcg_reclaim_apply(ctx):
          "\t\t\t\t\t\t  gfp_t gfp_mask,\n"
          "\t\t\t\t\t\t  unsigned int reclaim_options);",
          T),
-        # vmscan.c: scan_control learns the proactive bit
         ("mm/vmscan.c",
          "\t/* Can pages be swapped as part of reclaim? */\n"
          "\tunsigned int may_swap:1;\n",
@@ -1086,7 +955,6 @@ def _memcg_reclaim_apply(ctx):
          "\t/* ABK stable_515_backport: set for proactive memory.reclaim requests. */\n"
          "\tunsigned int proactive:1;\n",
          T),
-        # vmscan.c: try_to_free_mem_cgroup_pages() takes reclaim options
         ("mm/vmscan.c",
          "unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,\n"
          "\t\t\t\t\t   unsigned long nr_pages,\n"
@@ -1126,7 +994,6 @@ def _memcg_reclaim_apply(ctx):
          "\t\t.proactive = !!(reclaim_options & MEMCG_RECLAIM_PROACTIVE),\n"
          "\t};",
          T),
-        # vmscan.c: proactive reclaim does not pollute vmpressure (optional)
         ("mm/vmscan.c",
          "\t\t/* Record the group's reclaim efficiency */\n"
          "\t\tvmpressure(sc->gfp_mask, memcg, false,\n"
@@ -1160,7 +1027,6 @@ def _memcg_reclaim_apply(ctx):
          "\t\t\t\t\tsc->priority);\n"
          "\t\tsc->nr_scanned = 0;",
          F),
-        # memcontrol.c: charge locals carry reclaim options instead of may_swap
         ("mm/memcontrol.c",
          "\tbool passed_oom = false;\n"
          "\tbool may_swap = true;\n"
@@ -1210,10 +1076,6 @@ def _memcg_reclaim_apply(ctx):
          "\t\t\tret = -EBUSY;\n"
          "\t\t\tbreak;",
          T),
-        # memcontrol.c: the three remaining bool call sites.  Left as `true`
-        # they would silently mean "no swap": true converts to 1, while
-        # MEMCG_RECLAIM_MAY_SWAP is (1 << 1), so vmscan's
-        # `!!(reclaim_options & MEMCG_RECLAIM_MAY_SWAP)` evaluates to 0.
         ("mm/memcontrol.c",
          "\t\tprogress = try_to_free_mem_cgroup_pages(memcg, 1,\n"
          "\t\t\t\t\t\t\tGFP_KERNEL, true);\n",
@@ -1232,7 +1094,6 @@ def _memcg_reclaim_apply(ctx):
          "\t\t\tif (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,\n"
          "\t\t\t\t\tGFP_KERNEL, MEMCG_RECLAIM_MAY_SWAP))\n",
          T),
-        # memcontrol.c: the memory.reclaim write handler (android14-6.1 form)
         ("mm/memcontrol.c",
          "static struct cftype memory_files[] = {",
          "/* ABK stable_515_backport: per-memcg proactive reclaim (android14-6.1 memory.reclaim). */\n"
@@ -1280,7 +1141,6 @@ def _memcg_reclaim_apply(ctx):
          "\n"
          "static struct cftype memory_files[] = {",
          T),
-        # memcontrol.c: the memory.reclaim cgroup-v2 file entry
         ("mm/memcontrol.c",
          "\t{\n"
          "\t\t.name = \"oom.group\",\n"
@@ -1302,13 +1162,6 @@ def _memcg_reclaim_apply(ctx):
          "\t},\n"
          "\t{ }\t/* terminate */",
          T),
-        # cgroup-v2.rst: document the file itself.  5.15's manual predates
-        # memory.reclaim (94968384dde1 lands in v5.16), so without this the
-        # module would add a UAPI file that the kernel's own manual does not
-        # describe -- and the swappiness= group below amends this very section,
-        # so it has to exist for that hunk to be the upstream amendment rather
-        # than an invention.  Text is 94968384dde1's, at the same place in the
-        # list (after memory.max, before memory.oom.group).
         ("Documentation/admin-guide/cgroup-v2.rst",
          "\tutility is limited to providing the final safety net.\n"
          "\n"
@@ -1345,33 +1198,8 @@ def _memcg_reclaim_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# MGLRU performance optimizations, v4 (v6.14, Yu Zhao) -- re-authored onto the
-# 6.1-shape (page-based) MGLRU the android13-5.15 ACK carries.  The upstream
-# diffs are folio-era and assume 6.2-6.13 intermediates that this baseline
-# never gained, so every anchor below is the baseline's own text, not the
-# upstream old block.
-# ---------------------------------------------------------------------------
-
 def _mglru_clean_workingset_apply(ctx):
-    """v6.14 9cbfd1c3c83b (clean up workingset), portable remainder.
-
-    Upstream moves the workingset_refault() lock assertion to cover both the
-    conventional and the MGLRU paths.  This baseline's workingset_refault()
-    already covers both paths from a single entry (lru_gen_refault() is called
-    inline), so the assertion lands at the entry.  The other two hunks of the
-    commit restructure workingset_test_recent()/lru_gen_test_recent(), which
-    the 6.1-shape baseline does not have, and pin the eviction memcg for a
-    caller that sleeps outside RCU -- the baseline path stays inside one
-    rcu_read_lock() section and has no tryget/put pair to mirror, so those
-    hunks are intentionally not carried.
-    """
     steps = [
-        # Anchored on the last two declarations: 5.15.194+ inserts the
-        # android_vh_count_workingset_refault() hook between them and the MGLRU
-        # dispatch, so a wider block only matches on .167/.178.  The
-        # workingset_eviction() decl block also ends in "int memcgid;", hence
-        # the leading "bool workingset;".
         ("mm/workingset.c",
          "\tbool workingset;\n"
          "\tint memcgid;\n",
@@ -1388,19 +1216,7 @@ def _mglru_clean_workingset_apply(ctx):
 
 
 def _mglru_optimize_deactivation_apply(ctx):
-    """v6.14 cc8ec7be78ff (optimize deactivation), pagevec re-authoring.
-
-    Upstream short-circuits deactivate_file_folio()/folio_deactivate() under
-    MGLRU: instead of shuffling the page between LRU lists just to drop its
-    refs, clear LRU_REFS in place and skip the move entirely when the page
-    already sits in the oldest generation.  This baseline drains deactivations
-    through pagevecs (pagevec_lru_move_fn), so the same semantics land in
-    deactivate_file_page()/deactivate_page()/lru_lazyfree_fn() with a
-    page-based lru_gen_clear_refs() helper.
-    """
     steps = [
-        # lru_gen_clear_refs(): clear LRU_REFS in place, report whether the
-        # page can avoid the LRU shuffle (already in the oldest generation).
         ("mm/swap.c",
          "#else\n"
          "static void page_inc_refs(struct page *page)\n"
@@ -1445,8 +1261,6 @@ def _mglru_optimize_deactivation_apply(ctx):
          "}\n"
          "#endif /* CONFIG_LRU_GEN */\n",
          T),
-        # PGDEACTIVATE accounting: under MGLRU every deactivation counts, not
-        # just ones coming off the active list.
         ("mm/swap.c",
          "static void lru_deactivate_file_fn(struct page *page, struct lruvec *lruvec)\n"
          "{\n"
@@ -1455,7 +1269,6 @@ def _mglru_optimize_deactivation_apply(ctx):
          "{\n"
          "\tbool active = PageActive(page) || lru_gen_enabled();\n",
          T),
-        # lazyfree: drop the tier refs instead of the conventional PG_referenced.
         ("mm/swap.c",
          "\t\tdel_page_from_lru_list(page, lruvec);\n"
          "\t\tClearPageActive(page);\n"
@@ -1471,7 +1284,6 @@ def _mglru_optimize_deactivation_apply(ctx):
          "\t\t/*\n"
          "\t\t * Lazyfree pages are clean anonymous pages.  They have\n",
          T),
-        # deactivate_file_page(): pages in the oldest generation need no move.
         ("mm/swap.c",
          "\tif (PageUnevictable(page))\n"
          "\t\treturn;\n"
@@ -1487,8 +1299,6 @@ def _mglru_optimize_deactivation_apply(ctx):
          "\tif (likely(get_page_unless_zero(page))) {\n"
          "\t\tstruct pagevec *pvec;\n",
          T),
-        # deactivate_page(): MGLRU decides via refs, the conventional LRU via
-        # PG_active.
         ("mm/swap.c",
          "void deactivate_page(struct page *page)\n"
          "{\n"
@@ -1517,11 +1327,6 @@ def _mglru_optimize_deactivation_apply(ctx):
     return status, detail
 
 
-# Batch 49 trap-5 probes (docs/group_recipe.md): the batch-49 chain rewrites
-# text these three groups generate, so each probes one of its own added
-# symbols that its successors keep -- a second pass then reports
-# already_present instead of re-appending through stale anchors (the Batch
-# 21/24/37 remedy).  Registered content and step bytes stay untouched.
 _MGLRU_AGING_FEEDBACK_PROBE = "#define evictable_min_seq(min_seq, swappiness)"
 _MGLRU_TYPE_SELECTION_PROBE = "static int get_type_to_scan(struct lruvec *lruvec, int swappiness)"
 _MGLRU_WAKE_FLUSHERS_PROBE = (
@@ -1530,29 +1335,6 @@ _MGLRU_WAKE_FLUSHERS_PROBE = (
 
 
 def _mglru_rework_aging_feedback_apply(ctx):
-    """v6.14 798c0330c2ca (rework aging feedback), int-swappiness port.
-
-    Carries: min_seq[] may drift apart by up to MAX_NR_GENS-MIN_NR_GENS-1;
-    protected[] gains the first tier (tier-1 -> tier reindex); lru_gen_mm_walk
-    carries the full swappiness value instead of a can_swap bool with the
-    >MAX_SWAPPINESS "anon only" sentinel; the aging feedback simplifies to
-    "age when the oldest evictable generation is exactly MIN_NR_GENS behind".
-    Re-authored for the 6.1-shape functions (lru_gen_struct/lists, sort_page,
-    evict_pages, age_lruvec, get_nr_to_scan with need_aging); the per-memcg
-    swappiness read stays on the baseline's mem_cgroup_swappiness().
-    MIN_SWAPPINESS/MAX_SWAPPINESS are NOT added here: upstream
-    410abb20acae/68cd9050d871 own them and this module lands that series as
-    the batch37 reclaim chain, registered after this group -- adding them
-    twice would duplicate the defines and pull the anchor out from under the
-    swappiness-argument group.  get_swappiness()'s !may_swap short-circuit,
-    however, IS added here: neither of those commits carries it and the
-    baseline get_swappiness() lacks it (the may_swap dance removed above was
-    the baseline's only holder), so landing the unconditional call without
-    the guard would let a may_swap=0 cgroup reclaim (memsw limit,
-    memory.reclaim noswap=1) run with the full swappiness and add_to_swap()
-    its way past a memory+swap limit.  The guard is upstream's own shape:
-    mainline get_swappiness() opens with it (verified on v6.11).
-    """
     try:
         _probe = ctx.read("mm/vmscan.c")
     except FileNotFoundError:
@@ -1560,8 +1342,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
     if _MGLRU_AGING_FEEDBACK_PROBE in _probe:
         return "already_present", "the aging-feedback rework is already applied"
     steps = [
-        # -- include/linux/mmzone.h: min_seq[] semantics, protected[] tier 0,
-        #    walk swappiness --
         ("include/linux/mmzone.h",
          " * stored in min_seq[] separately for anon and file types as clean file pages\n"
          " * can be evicted regardless of swap constraints.\n"
@@ -1589,7 +1369,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\tint swappiness;\n"
          "\tbool full_scan;\n",
          T),
-        # -- mm/vmscan.c: the two evictable-type macros --
         ("mm/vmscan.c",
          "#define for_each_gen_type_zone(gen, type, zone)\t\t\t\t\\\n"
          "\tfor ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)\t\t\t\\\n"
@@ -1606,7 +1385,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "#define for_each_evictable_type(type, swappiness)\t\t\t\\\n"
          "\tfor ((type) = !(swappiness); (type) <= ((swappiness) <= MAX_SWAPPINESS); (type)++)\n",
          T),
-        # -- seq_is_valid(): each type may drift within its own bounds --
         ("mm/vmscan.c",
          "static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)\n"
          "{\n"
@@ -1627,14 +1405,12 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\n"
          "\treturn true;\n",
          T),
-        # -- iterate_mm_list(): size check over the evictable types --
         ("mm/vmscan.c",
          "\tfor (type = !walk->can_swap; type < ANON_AND_FILE; type++) {\n"
          "\t\tsize += type ? get_mm_counter(mm, MM_FILEPAGES) :",
          "\tfor_each_evictable_type(type, walk->swappiness) {\n"
          "\t\tsize += type ? get_mm_counter(mm, MM_FILEPAGES) :",
          T),
-        # -- should_skip_vma(): swappiness is the full value now --
         ("mm/vmscan.c",
          "\tif (vma_is_anonymous(vma))\n"
          "\t\treturn !walk->can_swap;\n",
@@ -1656,7 +1432,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t/* to exclude special mappings like dax, etc. */\n"
          "\treturn !mapping->a_ops->readpage;\n",
          T),
-        # -- get_pfn_page(): the COW guard goes away with real swappiness --
         ("mm/vmscan.c",
          "static struct page *get_pfn_page(unsigned long pfn, struct mem_cgroup *memcg,\n"
          "\t\t\t\t struct pglist_data *pgdat, bool can_swap)\n"
@@ -1738,7 +1513,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\n"
          "\t\tif (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))\n",
          T),
-        # -- inc_min_seq(): account protection at the page's own tier --
         ("mm/vmscan.c",
          "static bool inc_min_seq(struct lruvec *lruvec, int type, bool can_swap)\n"
          "{\n"
@@ -1806,7 +1580,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\t}\n"
          "\t}\n",
          T),
-        # -- try_to_inc_min_seq(): per-type drift bound --
         ("mm/vmscan.c",
          "static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)\n"
          "{\n"
@@ -1897,7 +1670,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\treturn success;\n"
          "}\n",
          T),
-        # -- inc_max_seq(): no WARN, no while-retry --
         ("mm/vmscan.c",
          "static void inc_max_seq(struct lruvec *lruvec, bool can_swap, bool full_scan)\n"
          "{\n"
@@ -1950,7 +1722,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\tgoto restart;\n"
          "\t}\n",
          T),
-        # -- try_to_inc_max_seq(): carry swappiness into the walk --
         ("mm/vmscan.c",
          "static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,\n"
          "\t\t\t       struct scan_control *sc, bool can_swap, bool full_scan)\n",
@@ -1967,7 +1738,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\tinc_max_seq(lruvec, can_swap, full_scan);\n",
          "\t\tinc_max_seq(lruvec, swappiness, full_scan);\n",
          T),
-        # -- should_run_aging(): evictable-only totals, simpler feedback --
         ("mm/vmscan.c",
          "static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,\n"
          "\t\t\t     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)\n"
@@ -2058,14 +1828,12 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\treturn evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;\n"
          "}\n",
          T),
-        # -- age_lruvec(): birth time of the oldest evictable generation --
         ("mm/vmscan.c",
          "\tif (min_ttl) {\n"
          "\t\tint gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);\n",
          "\tif (min_ttl) {\n"
          "\t\tint gen = lru_gen_from_seq(evictable_min_seq(min_seq, swappiness));\n",
          T),
-        # -- get_nr_to_scan(): int swappiness end to end --
         ("mm/vmscan.c",
          "static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,\n"
          "\t\t\t\t    bool can_swap, bool *need_aging)\n",
@@ -2087,14 +1855,12 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\treturn evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS <= max_seq ?\n"
          "\t\tnr_to_scan : 0;\n",
          T),
-        # -- sort_page(): protection counters reindex with the array --
         ("mm/vmscan.c",
          "\t\tWRITE_ONCE(lrugen->protected[hist][type][tier - 1],\n"
          "\t\t\t   lrugen->protected[hist][type][tier - 1] + delta);\n",
          "\t\tWRITE_ONCE(lrugen->protected[hist][type][tier],\n"
          "\t\t\t   lrugen->protected[hist][type][tier] + delta);\n",
          T),
-        # -- reset_ctrl_pos(): tier 0 participates in the EMA --
         ("mm/vmscan.c",
          "\t\t\tsum = lrugen->avg_total[type][tier] +\n"
          "\t\t\t      atomic_long_read(&lrugen->evicted[hist][type][tier]);\n"
@@ -2119,7 +1885,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\t\tWRITE_ONCE(lrugen->protected[hist][type][tier], 0);\n"
          "\t\t}\n",
          T),
-        # -- evict_pages(): stall detection over the evictable types --
         ("mm/vmscan.c",
          "\tstruct lru_gen_mm_walk *walk;\n"
          "\tbool skip_retry = false;\n"
@@ -2139,13 +1904,11 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\tif (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)\n"
          "\t\tscanned = 0;\n",
          T),
-        # -- seq_show: the first tier's protection is real now --
         ("mm/vmscan.c",
          "\t\t\t\tif (tier)\n"
          "\t\t\t\t\tn[2] = READ_ONCE(lrugen->protected[hist][type][tier - 1]);\n",
          "\t\t\t\tn[2] = READ_ONCE(lrugen->protected[hist][type][tier]);\n",
          T),
-        # -- lru_gen_shrink_lruvec(): get_swappiness() owns the whole value --
         ("mm/vmscan.c",
          "\twhile (true) {\n"
          "\t\tint delta;\n"
@@ -2167,16 +1930,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\n"
          "\t\tnr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);\n",
          T),
-        # -- get_swappiness(): the !may_swap short-circuit.  The dance removed
-        #    above was the baseline's only may_swap gate, and the unconditional
-        #    call upstream pairs with this rework is only safe because its
-        #    get_swappiness() opens with this guard (v6.11+, verified).  The
-        #    baseline function lacks it, and neither 410abb20acae nor
-        #    68cd9050d871 adds it, so without this step a may_swap=0 cgroup
-        #    reclaim (memsw limit, memory.reclaim noswap=1) would run with the
-        #    full swappiness and add_to_swap() its way past a memory+swap
-        #    limit.  Same group as the dance removal on purpose: one required
-        #    miss aborts both, so the protection can never land half-way.
         ("mm/vmscan.c",
          "static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)\n"
          "{\n"
@@ -2194,7 +1947,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
          "\t\treturn 0;\n"
          "\n",
          T),
-        # -- run_aging()/run_cmd(): debugfs paths follow the same rules --
         ("mm/vmscan.c",
          "static int run_aging(struct lruvec *lruvec, unsigned long seq, struct scan_control *sc,\n"
          "\t\t     bool can_swap, bool full_scan)\n"
@@ -2243,16 +1995,6 @@ def _mglru_rework_aging_feedback_apply(ctx):
 
 
 def _mglru_rework_type_selection_apply(ctx):
-    """v6.14 37a260870f2c (rework type selection).
-
-    read_ctrl_pos() sums every tier up to the requested one (tier 0 gains a
-    protection history via 798c0330c2ca); get_tier_idx() tightens the margin
-    to 2:3; get_type_to_scan() compares the summed tiers of anon vs file and
-    owns the swappiness sentinels itself; isolate_pages() drops the
-    min_seq-based pre-choice and the shared tier index.  Lands after
-    mglru_rework_aging_feedback, whose evictable_min_seq/for_each_evictable_type
-    macros and reindexed protected[] this group's new code requires.
-    """
     try:
         _probe = ctx.read("mm/vmscan.c")
     except FileNotFoundError:
@@ -2432,21 +2174,7 @@ def _mglru_rework_type_selection_apply(ctx):
 
 
 def _mglru_rework_refault_detection_apply(ctx):
-    """v6.14 b1a71694fb00 (rework refault detection).
-
-    The MGLRU recency test compared the shadow token against min_seq[type]
-    exactly, so every token whose generation had aged out of the minimal
-    window reported "not recent" and its refault was misattributed as a
-    workingset activation; the reworked test accepts any eviction within the
-    last MAX_NR_GENS generations of max_seq.  This is the bulk of the TPC-C
-    workingset_refault_file reduction (-57%) the series reports.  The
-    baseline's recency test is inlined in lru_gen_refault() (there is no
-    lru_gen_test_recent() helper), and abs_diff() postdates 5.15, so the
-    distance is computed locally.
-    """
     steps = [
-        # Anchored through memcg_id (with the underscore): lru_gen_eviction()
-        # declares the same token/min_seq/lruvec trio and must stay untouched.
         ("mm/workingset.c",
          "\tint memcg_id;\n"
          "\tbool workingset;\n"
@@ -2485,16 +2213,6 @@ def _mglru_rework_refault_detection_apply(ctx):
 
 
 def _mglru_wake_flushers_apply(ctx):
-    """v6.13 1bc542c6a0d1 (wake up flushers conditionally to avoid cgroup OOM).
-
-    The MGLRU eviction path never woke flushers, so a cgroup full of dirty
-    file pages at the tail of its LRU thrashed straight into memcg OOM.  Track
-    dirty/unqueued-dirty file pages through sort_page()/scan_pages(), carry
-    the unqueued-dirty count out of shrink_page_list(), and wake flushers when
-    every file page taken turned out to be unqueued dirty.  The upstream
-    hunk's shrink_node memset is unnecessary here: this baseline's
-    shrink_node() already memsets sc->nr on every iteration.
-    """
     try:
         _probe = ctx.read("mm/vmscan.c")
     except FileNotFoundError:
@@ -2571,32 +2289,8 @@ def _mglru_wake_flushers_apply(ctx):
         return "blocked_by_shape", detail
     return status, detail
 
-# reclaim-path chain (Batch 37): the memory.reclaim batch fidelity, the
-# swappiness= argument, the suspend abort and the lru_add drain.
-# Steps live in scripts/batch37_core_reclaim_paths.py.  Registered on its own
-# below (after memcg_memory_reclaim / cached_freeze_reclaim / memcg_v1_reclaim,
-# whose generated text it edits) for the trap-5 reason spelled out there.
-# ---------------------------------------------------------------------------
-
 
 def _zram_recompression_apply(ctx):
-    """Port zram multi-compression recompression (android15-6.6 / 6.2 series).
-
-    Adds ``ZRAM_MULTI_COMP`` (a second, possibly-slower-but-more-effective
-    compressor) and ``ZRAM_TRACK_ENTRY_ACTIME`` (idle age tracking) to the
-    5.15 zram driver, so idle/small pages can be re-compressed in place to
-    shrink zram footprint.  The 6.6 source keeps ``ZRAM_FLAG_SHIFT 24`` (the
-    priority bits live in free high bits of ``flags``); ``zram->comp`` becomes
-    ``comps[ZRAM_PRIMARY_COMP]`` and ``zram->compressor`` becomes
-    ``comp_algs[0]``.  ``zs_lookup_class_index()`` (a 6.6 zsmalloc API the
-    recompress sizing path needs) is added to zsmalloc.
-    """
-    # docs/group_recipe.md trap 5: zram_recompress_max_pages rewrites text this
-    # group appends -- recompress_store() is not pristine 5.15, it is generated
-    # right here -- so per-step idempotency alone would let a second pass append
-    # a second copy.  Probe one of this group's own symbols: no android13-5.15
-    # baseline carries a zram_recompress() helper, so a first pass always
-    # rewrites and only a second pass stops.
     try:
         _probe = ctx.read("drivers/block/zram/zram_drv.c")
     except FileNotFoundError:
@@ -2605,7 +2299,6 @@ def _zram_recompression_apply(ctx):
         return "already_present", ("the recompression graft is already in zram_drv.c")
     T = True
     steps = [
-        # -- Kconfig -----------------------------------------------------
         ("drivers/block/zram/Kconfig",
          "config ZRAM_MEMORY_TRACKING\n"
          "\tbool \"Track zRam block status\"\n"
@@ -2640,7 +2333,6 @@ def _zram_recompression_apply(ctx):
          "\t  compression algorithm. Note, that IDLE page recompression\n"
          "\t  requires ZRAM_TRACK_ENTRY_ACTIME.",
          T),
-        # -- zram_drv.h --------------------------------------------------
         ("drivers/block/zram/zram_drv.h",
          "#define ZRAM_FLAG_SHIFT 24\n\n"
          "/* Flags for zram pages (table[page_no].flags) */",
@@ -2698,14 +2390,12 @@ def _zram_recompression_apply(ctx):
          "\tconst char *comp_algs[ZRAM_MAX_COMPS];\n"
          "\ts8 num_active_comps;\n",
          T),
-        # -- zsmalloc.h --------------------------------------------------
         ("include/linux/zsmalloc.h",
          "size_t zs_huge_class_size(struct zs_pool *pool);",
          "size_t zs_huge_class_size(struct zs_pool *pool);\n"
          "unsigned int zs_lookup_class_index(struct zs_pool *pool,\n"
          "\t\t\t\t\t unsigned int size);",
          T),
-        # -- zsmalloc.c --------------------------------------------------
         ("mm/zsmalloc.c",
          "unsigned long zs_get_total_pages(struct zs_pool *pool)",
          "unsigned int zs_lookup_class_index(struct zs_pool *pool,\n"
@@ -2718,7 +2408,6 @@ def _zram_recompression_apply(ctx):
          "EXPORT_SYMBOL_GPL(zs_lookup_class_index);\n\n"
          "unsigned long zs_get_total_pages(struct zs_pool *pool)",
          T),
-        # -- zram_drv.c: comp-priority helpers (insert after zram_set_obj_size) --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_set_obj_size(struct zram *zram,\n"
          "\t\t\t\t\tu32 index, size_t size)\n"
@@ -2746,14 +2435,6 @@ def _zram_recompression_apply(ctx):
          "\treturn prio & ZRAM_COMP_PRIORITY_MASK;\n"
          "}",
          T),
-        # -- zram_drv.c: __zram_bvec_read becomes a thin wrapper over the new
-        #    zram_read_from_zspool() helper (upstream 6.6 shape).  This MUST run
-        #    before the write-path zcomp_stream_put() steps below: those anchors
-        #    are bare `zcomp_stream_put(zram->comp);` lines whose first match in
-        #    file order lives in this function, so rewriting the read path first
-        #    is what keeps them landing in __zram_bvec_write.  It also removes
-        #    the duplicate decompress path and defines the helper that
-        #    zram_recompress() calls. --
         ("drivers/block/zram/zram_drv.c",
          "static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,\n"
          "\t\t\t\tstruct bio *bio, bool partial_io)\n"
@@ -2862,14 +2543,12 @@ def _zram_recompression_apply(ctx):
          "\tret = zram_read_from_zspool(zram, page, index);\n"
          "\tzram_slot_unlock(zram, index);",
          T),
-        # -- zram_drv.c: __zram_bvec_write uses primary comp --
         ("drivers/block/zram/zram_drv.c",
          "compress_again:\n"
          "\tzstrm = zcomp_stream_get(zram->comp);",
          "compress_again:\n"
          "\tzstrm = zcomp_stream_get(zram->comps[ZRAM_PRIMARY_COMP]);",
          T),
-        # -- zram_drv.c: write-path stream puts use primary comp (4 sites) --
         ("drivers/block/zram/zram_drv.c",
          "\t\tzcomp_stream_put(zram->comp);",
          "\t\tzcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);",
@@ -2894,11 +2573,6 @@ def _zram_recompression_apply(ctx):
          "\tzcomp_stream_put(zram->comps[ZRAM_PRIMARY_COMP]);\n"
          "\tzs_unmap_object(zram->mem_pool, handle);",
          T),
-        # -- zram_drv.c: zram_free_page resets priority + INCOMPRESSIBLE so a
-        #    reused slot is never decompressed with a stale comp priority.  The
-        #    trailing WARN_ON_ONCE mask needs no change: the reset runs before
-        #    the `out:` label, so every path reaching the WARN has priority 0
-        #    (this is why upstream 6.6 leaves that mask alone). --
         ("drivers/block/zram/zram_drv.c",
          "\tif (zram_test_flag(zram, index, ZRAM_HUGE)) {\n"
          "\t\tzram_clear_flag(zram, index, ZRAM_HUGE);\n"
@@ -2914,7 +2588,6 @@ def _zram_recompression_apply(ctx):
          "\tzram_set_priority(zram, index, 0);\n\n"
          "\tif (zram_test_flag(zram, index, ZRAM_WB)) {",
          T),
-        # -- zram_drv.c: zram_free_page ac_time reset follows the new guard --
         ("drivers/block/zram/zram_drv.c",
          "\tunsigned long handle;\n\n"
          "#ifdef CONFIG_ZRAM_MEMORY_TRACKING\n"
@@ -2925,15 +2598,6 @@ def _zram_recompression_apply(ctx):
          "\tzram->table[index].ac_time = 0;\n"
          "#endif",
          T),
-        # -- zram_drv.c: zram_accessed must write ac_time whenever the new
-        #    ZRAM_TRACK_ENTRY_ACTIME guard is set.  The 5.15 baseline keeps two
-        #    definitions (debugfs on / off) and only the debugfs-on one writes
-        #    ac_time, so with MEMORY_TRACKING off (the GKI default) the field
-        #    would be read by mark_idle() and never written -- every page then
-        #    looks infinitely old.  Both definitions are rewritten in place;
-        #    upstream 6.6 instead collapses them, but a pure deletion cannot be
-        #    expressed as a replace_once step (the replacement would be a
-        #    subset of the anchor and short-circuit to already_present). --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_accessed(struct zram *zram, u32 index)\n"
          "{\n"
@@ -2961,7 +2625,6 @@ def _zram_recompression_apply(ctx):
          "#endif\n"
          "};",
          T),
-        # -- zram_drv.c: zram_destroy_comps helper tears down every active comp --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_reset_device(struct zram *zram)",
          "static void zram_destroy_comps(struct zram *zram)\n"
@@ -2978,7 +2641,6 @@ def _zram_recompression_apply(ctx):
          "}\n\n"
          "static void zram_reset_device(struct zram *zram)",
          T),
-        # -- zram_drv.c: zram_reset_device destroys all comps --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_reset_device(struct zram *zram)\n"
          "{\n"
@@ -3027,8 +2689,6 @@ def _zram_recompression_apply(ctx):
          "\treset_bdev(zram);\n"
          "}",
          T),
-        # -- zram_drv.c: recompression machinery (needs zram_read_from_zspool,
-        #    which the read-path rewrite above defines earlier in the file) --
         ("drivers/block/zram/zram_drv.c",
          "static void zram_bio_discard(struct zram *zram, u32 index,",
          "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
@@ -3209,7 +2869,6 @@ def _zram_recompression_apply(ctx):
          "#endif\n\n"
          "static void zram_bio_discard(struct zram *zram, u32 index,",
          T),
-        # -- zram_drv.c: mark_idle + idle_store age-marks idle pages -------
         ("drivers/block/zram/zram_drv.c",
          "static ssize_t idle_store(struct device *dev,\n"
          "\t\tstruct device_attribute *attr, const char *buf, size_t len)\n"
@@ -3291,7 +2950,6 @@ def _zram_recompression_apply(ctx):
          "\treturn len;\n"
          "}",
          T),
-        # -- zram_drv.c: comp_algorithm machinery (primary + secondary) --
         ("drivers/block/zram/zram_drv.c",
          "static ssize_t comp_algorithm_show(struct device *dev,\n"
          "\t\tstruct device_attribute *attr, char *buf)\n"
@@ -3460,8 +3118,6 @@ def _zram_recompression_apply(ctx):
          "\treturn len;\n"
          "}",
          T),
-        # -- zram_drv.c: disksize_store creates primary comp into comps[0] --
-        # -- zram_drv.c: disksize_store creates every configured comp --
         ("drivers/block/zram/zram_drv.c",
          "\tcomp = zcomp_create(zram->compressor);\n"
          "\tif (IS_ERR(comp)) {\n"
@@ -3487,7 +3143,6 @@ def _zram_recompression_apply(ctx):
          "\t}\n"
          "\tzram->disksize = disksize;",
          T),
-        # -- zram_drv.c: disksize_store gains the prio loop variable --
         ("drivers/block/zram/zram_drv.c",
          "\tu64 disksize;\n"
          "\tstruct zcomp *comp;\n"
@@ -3499,7 +3154,6 @@ def _zram_recompression_apply(ctx):
          "\tint err;\n"
          "\tu32 prio;\n",
          T),
-        # -- zram_drv.c: disksize_store error path frees every comp --
         ("drivers/block/zram/zram_drv.c",
          "out_free_meta:\n"
          "\tzram_meta_free(zram, disksize);\n"
@@ -3509,13 +3163,11 @@ def _zram_recompression_apply(ctx):
          "\tzram_meta_free(zram, disksize);\n"
          "out_unlock:",
          T),
-        # -- zram_drv.c: zram_add sets default primary comp --
         ("drivers/block/zram/zram_drv.c",
          "\tstrlcpy(zram->compressor, default_compressor, sizeof(zram->compressor));",
          "\tzram->comp_algs[ZRAM_PRIMARY_COMP] = default_compressor;\n"
          "\tzram->num_active_comps = 1;",
          T),
-        # -- zram_drv.c: sysfs attrs for recompress/recomp_algorithm --
         ("drivers/block/zram/zram_drv.c",
          "static DEVICE_ATTR_RW(comp_algorithm);\n"
          "#ifdef CONFIG_ZRAM_WRITEBACK",
@@ -3545,130 +3197,38 @@ def _zram_recompression_apply(ctx):
     return status, detail
 
 
-# ---------------------------------------------------------------------------
-# build config enablement (config lane)
-#
-# Everything before this batch shipped code and Kconfig symbols that nothing
-# ever turned on: the defconfig was parsed off the command line and never
-# written.  Default tier enables only what this module itself introduces; the
-# wider android15-6.6 GKI config picture is opt-in so a plain injection never
-# silently changes device behaviour.
-# ---------------------------------------------------------------------------
-
 _MODULE_CONFIGS = [
-    # zram recompression (Batch 4): ZRAM_MULTI_COMP depends on the age tracking
-    # symbol, and Kconfig leaves both off by default.
     ("ZRAM_TRACK_ENTRY_ACTIME", "y"),
     ("ZRAM_MULTI_COMP", "y"),
-    # dynamic readahead (Batch 9-1): the grafted callbacks are inert until
-    # this module-owned symbol is on, mirroring the OPLUS/Xiaomi module's
-    # opt-in enablement.
     ("ABK_DYNAMIC_READAHEAD", "y"),
-    # RCU_NOCB_CPU_DEFAULT_ALL (Batch 8): the graft adds the Kconfig symbol and
-    # the ``offload_all`` machinery in kernel/rcu/tree_nocb.h, but every path
-    # that sets ``offload_all = true`` is inside ``#if defined(CONFIG_...)``.
-    # With the symbol unset the whole graft reduced to an always-false branch
-    # (found by Batch 16's emptiness audit), so the tier has to enable it.
     ("RCU_NOCB_CPU_DEFAULT_ALL", "y"),
-    # LRU_GEN_ENABLED (MGLRU) is deliberately NOT in the default tier -- it
-    # moved to the opt-in align tier below.  The symbol is what
-    # DEFINE_STATIC_KEY_ARRAY_TRUE vs _FALSE selects for ``lru_gen_caps``
-    # (mm/vmscan.c); with it unset every MGLRU branch starts false,
-    # /sys/kernel/mm/lru_gen/enabled reads 0x0000, and the baseline's
-    # classic-LRU path runs -- which device evidence makes the safe default.
-    # On SM8550 vermeer (5.15.220) with MGLRU runtime-on, a sustained-thrash
-    # memory load wedged the device: two kworker/*:*H pinned at 100% kernel
-    # CPU in the MGLRU shrink path (evict_pages -> lru_gen_shrink_lruvec),
-    # lmkd starved, QCOM watchdog bite; and a third-party app (bilibili)
-    # SIGSEGV'd on launch in the dex-preload mmap path.  The identical thrash
-    # load with MGLRU OFF rode out -- zram took 8.6 GB, PSI some-avg10 peaked
-    # 24% and fell back to 2% on its own, no wedge.  So this module's MGLRU
-    # reclaim-loop rewrite (Batch 37/49) does not converge under thrash on this
-    # baseline, and turning it on by default was trap 8: an upstream mechanism
-    # made active without the self-defence the stock kernel relied on.  The
-    # MGLRU grafts stay compiled-in but runtime-inert until the shrink loop is
-    # made to converge (a dedicated follow-up PR); ABK_515_DEFCONFIG_ALIGN=1
-    # turns the symbol on for testing.
 ]
 
 _ALIGN_CONFIGS = [
-    # Enabled in the android15-6.6 GKI defconfig, absent from every
-    # android13-5.15 baseline, and the code already exists in 5.15 for all of
-    # them -- config-only deltas, so they change runtime behaviour.
-    # LRU_GEN_ENABLED is here (opt-in), not in the module tier: on SM8550
-    # vermeer this module's MGLRU reclaim-loop rewrite (Batch 37/49) does not
-    # converge under sustained thrash and wedges the device, and makes a
-    # third-party app SIGSEGV on launch (see the _MODULE_CONFIGS note and
-    # trap 8).  Keeping it opt-in leaves the MGLRU grafts compiled-in but
-    # runtime-off by default; a tester turns the whole 6.6-align set on with
-    # ABK_515_DEFCONFIG_ALIGN=1 to exercise them.
     ("LRU_GEN_ENABLED", "y"),
-    ("TCP_CONG_ADVANCED", "y"),      # prerequisite for BBR
+    ("TCP_CONG_ADVANCED", "y"),
     ("TCP_CONG_BBR", "y"),
-    ("BLK_WBT", "y"),                # writeback throttling
-    ("BLK_DEV_THROTTLING", "y"),     # cgroup io throttling
-    ("TASK_DELAY_ACCT", "y"),        # delay accounting
+    ("BLK_WBT", "y"),
+    ("BLK_DEV_THROTTLING", "y"),
+    ("TASK_DELAY_ACCT", "y"),
 ]
 
-# ROM-integration tier (ABK_515_DEFCONFIG_ROM=1), off by default: these change
-# who owns a device, not just how fast it is, so they are never enabled by a
-# plain injection.
 _ROM_CONFIGS = [
-    # This ROM's memory daemon (init.rc starts mmd_setup, Android 16's Rust
-    # implementation) sets up a per-process zram writeback backing device and
-    # only then sets mmd.setup_complete -- which is what enables the mmd
-    # service.  Without CONFIG_ZRAM_WRITEBACK the writeback nodes do not exist,
-    # mmd_setup never completes on a ROM that relies on it, and mmd stays dead
-    # (`vendor.zram.disable=1` on the target ROM disables its setup outright).
-    # It used to be mutually exclusive with the zram algorithm policy (both
-    # write in the pre-`disksize` window); Batch 11's kernel-side lock removed
-    # that, so the writeback owner and the algorithm policy now coexist.
     ("ZRAM_WRITEBACK", "y"),
 ]
 
-# Every Kconfig symbol this module introduces into a baseline tree, mapped to
-# the tier that enables it.  ``None`` means Kconfig itself supplies a workable
-# default (a bool defaulting to ``y``, or a non-bool), so no tier is needed.
-# tests/stable_5_15_test.py asserts this table and the tier lists agree, which
-# is what stops a graft from being added with no way to ever compile: the
-# Batch 8 RCU graft sat behind a symbol no tier enabled, so its whole payload
-# compiled out and the group still reported "applied".
+# Every Kconfig symbol this module adds, and the tier that enables it.
 _INTRODUCED_KCONFIG = {
     "ZRAM_TRACK_ENTRY_ACTIME": "module",
     "ZRAM_MULTI_COMP": "module",
     "ABK_DYNAMIC_READAHEAD": "module",
     "RCU_NOCB_CPU_DEFAULT_ALL": "module",
-    # Pre-existing baseline symbol (mm/Kconfig), like ZRAM_WRITEBACK below --
-    # this table records what the module turns on, not only what it declares.
-    # It is in the align (opt-in) tier, NOT the module tier: this module's
-    # MGLRU reclaim-loop rewrite wedges SM8550 vermeer under sustained thrash
-    # (two kworker at 100% kernel CPU in lru_gen_shrink_lruvec) and SIGSEGVs a
-    # third-party app on launch, so MGLRU is off by default until the shrink
-    # loop converges -- see the _MODULE_CONFIGS note and trap 8.
     "LRU_GEN_ENABLED": "align",
-    "ZSMALLOC_CHAIN_SIZE": None,   # int, Kconfig default 8
-    "ZRAM_WRITEBACK": "rom",       # pre-existing symbol, enabled by the rom tier
+    "ZSMALLOC_CHAIN_SIZE": None,
+    "ZRAM_WRITEBACK": "rom",
 }
 
 
-# Per-cgroup PSI accounting tier (ABK_515_DEFCONFIG_PSI=1), off by default.
-#
-# The AOSP android13-5.15-lts gki_defconfig ships
-# ``CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off
-# kvm-arm.mode=protected cgroup_disable=pressure"`` with
-# CONFIG_CMDLINE_EXTEND=y, so the token is in every boot of every build from
-# this tree.  It makes ``cgroup_psi_enabled()`` false, which does two things:
-# ``psi_init()`` disables the ``psi_cgroups_enabled`` static branch (the
-# per-cgroup accounting itself), and every ``CFTYPE_PRESSURE`` file is skipped
-# at creation -- ``io.pressure``, ``memory.pressure``, ``cpu.pressure`` and
-# **this module's ``cgroup.pressure``**.
-#
-# Batch 21's switch and the runtime companion's per-cgroup PSI policy both need
-# that one file to exist, and the accounting they are meant to switch off has to
-# be running for the switch to mean anything.  So the tier drops the token.  It
-# is off by default because the trade is device-wide: with the token gone every
-# one of the ~450 groups derives and times its own states until the companion's
-# policy pass turns it off group by group, which is what the token did for free.
 _PSI_CMDLINE_TOKEN = "cgroup_disable=pressure"
 
 
@@ -3688,6 +3248,7 @@ def _config_enablement_apply(ctx):
         tiers.append("per-cgroup PSI accounting")
     status, detail = ctx.enable_configs(configs)
     if psi:
+        # The PSI tier also drops the boot token; a missing token fails the lane.
         psi_status, psi_detail = ctx.defconfig_drop_cmdline_token(
             _PSI_CMDLINE_TOKEN)
         if psi_status == "blocked_by_missing_anchor":
@@ -3843,23 +3404,6 @@ def main():
               enabled=enabled)
 
 
-# ============================================================================
-# Batch 6 additions.  Kept after the original module body so the diff of the
-# earlier batches stays untouched; they are appended to PATCH_GROUPS at the
-# bottom of the file, before the __main__ guard.
-# ============================================================================
-# ---------------------------------------------------------------------------
-# zsmalloc zspage chain size (android15-6.6; the 6.2 class-sizing rework).
-#
-# The 5.15 baseline fixes a zspage at 2^2 pages and picks the chain length by
-# best-used-percentage; 6.2 made the ceiling a tunable and minimised absolute
-# waste instead, which is what actually shrinks small size classes.  The
-# correlated ISOLATED_BITS widening ships too (a chain-size-8 zspage overflows
-# the 5.15 3-bit `isolated` counter); the 6.3+ fullness rename, zs_page_migrate
-# rework and zs_size_stat growth stay out, so NR_ZS_FULLNESS and the exported
-# API hold.
-# ---------------------------------------------------------------------------
-
 _ZS_KCONFIG_STAT = (
     "config ZSMALLOC_STAT\n"
     "\tbool \"Export zsmalloc statistics\"\n"
@@ -3957,11 +3501,6 @@ _ZS_SIZING_NEW = (
 )
 
 
-# ISOLATED_BITS accompanies the chain-size ceiling: the 5.15 baseline gives
-# `isolated` 3 bits (max 7), which is enough for a 2^2-page zspage but not for
-# CONFIG_ZSMALLOC_CHAIN_SIZE (default 8).  Without this, an 8-page zspage
-# overflows `isolated`, corrupts the isolate/putback pairing and trips
-# list_add double add in putback_zspage() under memory compaction.
 _ZS_ISOLATED_BITS_OLD = "#define ISOLATED_BITS\t3\n"
 _ZS_ISOLATED_BITS_NEW = "#define ISOLATED_BITS\t5\n"
 
@@ -3980,36 +3519,18 @@ def _zsmalloc_chain_size_apply(ctx):
     if status is None:
         return "blocked_by_shape", detail
     return status, detail
-# ---------------------------------------------------------------------------
-# MADV_COLLAPSE (android14-6.1 / mainline 6.1)
-#
-# Synchronous THP collapse on demand.  The 6.1 form drives the 6.x
-# hpage_collapse_scan_*() helpers with a caller-owned collapse_control; on
-# this baseline those helpers still own the preallocated huge page, so the
-# port drives them the way the khugepaged thread does and lifts the scan
-# verdict through two new out-parameters (the thread passes NULL).
-# ---------------------------------------------------------------------------
 
 _MC_UAPI_ANCHOR = ("#define MADV_POPULATE_WRITE\t23\t"
                    "/* populate (prefault) page tables writable */")
-# MADV_COLLAPSE keeps the upstream number and comment; the group marker
-# lives with the implementation in mm/khugepaged.c.
 _MC_UAPI_NEW = ("#define MADV_COLLAPSE\t25\t\t"
                 "/* Synchronous hugepage collapse */")
 
-# include/linux/huge_mm.h -- upstream 6.1's own declaration site, right after
-# hugepage_madvise().  That header reaches mm/madvise.c through linux/mm.h, so
-# no include has to be grafted, and mm/khugepaged.c gets the prototype for free
-# (which keeps -Wmissing-prototypes quiet for the new non-static definition).
-# No !THP stub is needed: the switch arm is wrapped in the same ifdef.
 _MC_HEADER_ANCHOR = ("int hugepage_madvise(struct vm_area_struct *vma, unsigned long *vm_flags,\n"
                      "\t\t     int advice);")
 _MC_HEADER_DECL = ("int madvise_collapse(struct vm_area_struct *vma,\n"
                    "\t\t     struct vm_area_struct **prev,\n"
                    "\t\t     unsigned long start, unsigned long end);")
 
-# mm/madvise.c: three switch arms.  Collapse is fine under the read side of
-# the mmap_lock, so it joins the madvise_need_mmap_write() exceptions.
 _MC_NEED_MMAP_OLD = ("\tcase MADV_POPULATE_READ:\n"
                      "\tcase MADV_POPULATE_WRITE:\n"
                      "\t\treturn 0;")
@@ -4018,9 +3539,6 @@ _MC_NEED_MMAP_NEW = ("\tcase MADV_POPULATE_READ:\n"
                      "\tcase MADV_COLLAPSE:\n"
                      "\t\treturn 0;")
 
-# The visit itself.  Upstream 6.1 leaves this case unconditional because it
-# ships a !CONFIG_TRANSPARENT_HUGEPAGE stub in the header; on this baseline
-# the ifdef is the cheaper equivalent and keeps THP-off trees untouched.
 _MC_CASE_OLD = ("\tcase MADV_POPULATE_READ:\n"
                 "\tcase MADV_POPULATE_WRITE:\n"
                 "\t\treturn madvise_populate(vma, prev, start, end, behavior);")
@@ -4031,9 +3549,6 @@ _MC_CASE_NEW = (_MC_CASE_OLD + "\n"
                 "\t\treturn madvise_collapse(vma, prev, start, end);\n"
                 "#endif")
 
-# Acceptance list.  Deliberately not added to process_madvise_behavior_valid():
-# the 5.15 process_madvise() path does not carry the range bookkeeping the
-# collapse needs, so callers there keep getting -EINVAL.
 _MC_VALID_OLD = ("#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
                  "\tcase MADV_HUGEPAGE:\n"
                  "\tcase MADV_NOHUGEPAGE:\n"
@@ -4044,8 +3559,6 @@ _MC_VALID_NEW = ("#ifdef CONFIG_TRANSPARENT_HUGEPAGE\n"
                  "\tcase MADV_COLLAPSE:\n"
                  "#endif")
 
-# The scan helpers signatures are unchanged in shape across 167/.178/.194/.216,
-# so every step below is a single anchor set (see docs/porting_policy.md).
 _MC_PMD_SIG_OLD = ("static int khugepaged_scan_pmd(struct mm_struct *mm,\n"
                    "\t\t\t       struct vm_area_struct *vma,\n"
                    "\t\t\t       unsigned long address,\n"
@@ -4065,20 +3578,6 @@ _MC_PMD_OUT_NEW = ('\t\t\t\t     none_or_zero, result, unmapped);\n'
                    '\treturn ret;\n'
                    '}')
 
-# Both khugepaged_scan_file() definitions move to the new signature.  The
-# CONFIG_SHMEM-off stub goes first because its old block (signature plus the
-# BUILD_BUG() body) is unique, which leaves the bare two-line signature unique
-# for the step that follows -- neither step depends on which occurrence
-# str.replace() happens to hit.
-#
-# The stub's replacement must not contain _MC_FILE_SIG_NEW verbatim.  It is
-# written first and replace_once() checks the *replacement* before the anchor
-# (idempotency), so a stub carrying the next step's exact text makes that step
-# short-circuit to already_present: the real CONFIG_SHMEM=y definition stays at
-# four parameters while its body and every caller move to five, which is a
-# compile error the group-level status cannot see (it did reach CI once).
-# Hence the deliberately different line wrapping below -- same C signature,
-# text that cannot collide with the step that follows.
 _MC_FILE_STUB_OLD = ('static void khugepaged_scan_file(struct mm_struct *mm,\n'
                      '\t\tstruct file *file, pgoff_t start, struct page **hpage)\n'
                      '{\n'
@@ -4095,9 +3594,6 @@ _MC_FILE_STUB_NEW = ('static void khugepaged_scan_file(struct mm_struct *mm, str
                      '\tBUILD_BUG();\n'
                      '}')
 
-# Verdict for the file/shmem path.  collapse_file() is void on this baseline,
-# so only the pre-scan verdict is actionable; a range that passes every check
-# is reported as collapsed, which is exactly what the kthread assumes too.
 _MC_FILE_OUT_OLD = ('\t\t\tcollapse_file(mm, file, start, hpage, node);\n'
                     '\t\t}\n'
                     '\t}\n'
@@ -4114,7 +3610,6 @@ _MC_FILE_OUT_NEW = ('\t\t\tcollapse_file(mm, file, start, hpage, node);\n'
                     '\t/* TODO: tracepoints */\n'
                     '}')
 
-# The khugepaged thread itself passes NULL for both new out-parameters.
 _MC_CALLER_OLD = ('\t\t\t\tkhugepaged_scan_file(mm, file, pgoff, hpage);\n'
                   '\t\t\t\tfput(file);\n'
                   '\t\t\t} else {\n'
@@ -4131,10 +3626,6 @@ _MC_CALLER_NEW = ('\t\t\t\tkhugepaged_scan_file(mm, file, pgoff, hpage,\n'
                   '\t\t\t\t\t\thpage, NULL);\n'
                   '\t\t\t}')
 
-# madvise_collapse() itself, inserted right before khugepaged_scan_mm_slot().
-# Split into line tuples so the C text stays readable and diffable; the
-# semantics follow mainline 6.1: iterate PMD-aligned addresses, tolerate the
-# whitelisted scan results, and map the last failure to an errno.
 _MC_IMPL_A = (
     '/*\n'
     ' * ABK stable_515_backport: MADV_COLLAPSE (android14-6.1 / mainline 6.1)\n'
@@ -4321,9 +3812,6 @@ _MC_IMPL_NEW = (_MC_IMPL_A + _MC_IMPL_B + _MC_IMPL_C + _MC_IMPL_D +
 
 
 def _madvise_collapse_apply(ctx):
-    # UAPI number and the extern declaration are single lines behind unique
-    # anchors, which is what common.ensure_after() is for; both are required,
-    # because a switch arm without the define would not compile.
     singles = (
         ("include/uapi/asm-generic/mman-common.h", _MC_UAPI_ANCHOR, _MC_UAPI_NEW),
         ("include/linux/huge_mm.h", _MC_HEADER_ANCHOR, _MC_HEADER_DECL),
@@ -4359,8 +3847,6 @@ def _madvise_collapse_apply(ctx):
     return status, detail
 
 
-# Batch 6 groups.  Registered last so the graft order inside the child stays
-# "code first, then the config that makes it reachable".
 PATCH_GROUPS = PATCH_GROUPS + [
     PatchGroup(
         "config_enablement",
@@ -4386,16 +3872,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-
-# ===========================================================================
-# Batch 8: page allocator fallback reuse (android15-6.6 / 6.12 series)
-# ===========================================================================
-#
-# The 5.15 allocator has the same fallback policy as the source series, but
-# still folds claiming and single-page stealing into __rmqueue_fallback().
-# Keep the AOSP vendor hooks and 5.15's steal_suitable_fallback() contract,
-# while separating the two modes so rmqueue_bulk() can remember which search
-# phase produced the previous page under one zone lock.
 
 _B8_FIND_OLD = """/*
  * Check whether there is a suitable fallback freepage with requested order.
@@ -4810,9 +4286,6 @@ _B8_BUDDY_CALL_NEW = """\t\t\t\tif (try_cma)
 \t\t\t\t\t\talloc_flags, &rmqm);
 \t\t\t}"""
 
-# The CMA probe itself is nested one level deeper than the following fallback
-# in the 5.15 function.  Build the highatomic variant from the exact compact
-# anchor instead of indenting the whole mixed-scope block.
 _B8_BUDDY_HIGHATOMIC_TAIL_OLD = """\t\t\tif (!page)
 				page = __rmqueue(zone, order, migratetype,
 						alloc_flags);"""
@@ -4952,22 +4425,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-
-
-# ---------------------------------------------------------------------------
-# Batch 9-1: dynamic readahead (OPLUS mi_dynamic_readahead, GKI built-in)
-#
-# Source: OPLUS "dynamic_readahead" kernel module (Copyright 2020-2022 Oplus),
-# shipped by Xiaomi as xiaomi-modules/mi_dynamic_readahead in
-# MiCode/Xiaomi_Kernel_OpenSource.  The module only registered two android
-# vendor-hook callbacks; android13-5.15 already carries both hook call
-# sites (mm/readahead.c ondemand_readahead(), mm/filemap.c mmap read-around),
-# so the port is a self-contained core_initcall registration in
-# mm/readahead.c behind CONFIG_ABK_DYNAMIC_READAHEAD.  The xring
-# (soc/xring/qos_inherit.h) key-task check is replaced by the original
-# OPLUS cgroup test (cpuset "background"), which the Xiaomi copy still
-# carries as a comment.
-# ---------------------------------------------------------------------------
 
 _DRA_RA_TAIL = (
     "/*\n"
@@ -5154,21 +4611,10 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 10-1: zram async recompress (plan A, kcompressd-style soft
-# decoupling).  Steps live in scripts/batch10_core_zram_async.py; the sysfs
-# scan stays synchronous while the recompress work drains on a per-device
-# "zram_recompd" kthread_worker (QPACE generic-queue skeleton, no QTI).
-# ============================================================================
 import batch10_core_zram_async as _b10_zram  # noqa: E402
 
 
 def _zram_async_recompress_apply(ctx):
-    # Trap 5 again: zram_recompress_max_pages edits the body of
-    # recompress_async_store(), which this group appends, so the group has to
-    # stop on its own payload rather than on per-step idempotency.  The probe
-    # is the forward declaration this group writes next to the include it
-    # anchors on, i.e. text no other group produces.
     try:
         _probe = ctx.read("drivers/block/zram/zram_drv.c")
     except FileNotFoundError:
@@ -5194,13 +4640,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 10-3: cached freeze reclaim (generic name for memory-freeze).
-# Steps live in scripts/batch10_core_cached_freeze_reclaim.py: per-reclaim
-# accounting in the memory.reclaim handler + freezer tracepoints, all on
-# pristine anchors (mm/memcontrol.c, kernel/cgroup/cgroup.c); the userspace
-# daemon half is tools/cached_freeze_reclaim.sh.
-# ============================================================================
 import batch10_core_cached_freeze_reclaim as _b10_cfr  # noqa: E402
 
 
@@ -5224,22 +4663,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 10-4: make the zram recompression and the memcg side actually reachable
-# on the target device.  Steps live in scripts/batch10_core_zram_secondary.py
-# and scripts/batch10_core_memcg_v1.py.
-#
-#  * zram_secondary_comp  -- ZRAM_MULTI_COMP was enabled but every secondary
-#    comp slot stayed NULL (recomp_algorithm_store() only accepts a write
-#    before disksize, which Android has already done by then), so both the
-#    synchronous and the asynchronous recompress paths returned without
-#    touching a page.  The secondary compressor is now registered in
-#    zram_add(), before any disksize write can race it.
-#  * memcg_v1_reclaim     -- the device mounts the memory controller as
-#    cgroup v1, where memory.reclaim and the reclaim counters do not exist
-#    (they are v2-only in this module).  The shared handler is declared for
-#    the legacy cftype table and the counters are added to memcg_stat_show().
-# ============================================================================
 import batch10_core_zram_secondary as _b10_zsec  # noqa: E402
 import batch10_core_memcg_v1 as _b10_v1  # noqa: E402
 
@@ -5281,20 +4704,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 11: the zram algorithm lock.  Steps live in
-# scripts/batch11_core_zram_algo_lock.py.
-#
-# Batch 10-4 made the secondary compressor reachable and the runtime companion
-# module forces the primary, but both live in userspace and both nodes close at
-# `disksize`: the policy belonged to whoever won that one window.  The lock
-# selects the primary at device creation from a read-only parameter and makes
-# every later write to comp_algorithm/recomp_algorithm a reported no-op, which
-# is what lets the algorithm policy and CONFIG_ZRAM_WRITEBACK coexist -- a
-# writeback backing device is attached in the same pre-`disksize` window and is
-# dropped by `reset`, so repairing a bad algorithm choice used to cost the
-# writeback setup.
-# ============================================================================
 import batch11_core_zram_algo_lock as _b11_zlock  # noqa: E402
 
 
@@ -5318,32 +4727,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 13: the android_vh_customize_alloc_gfp hook and its ABK policy.
-# Steps live in scripts/batch13_core_gfp_customize_vh.py.
-#
-# The hook (android15-6.6 commit 4466afd69452, absent from every android13-5.15
-# baseline and from 6.1) hands a module the slowpath gfp by pointer right
-# before __alloc_pages_slowpath(): a rewrite point for high-order allocation
-# policy.  The upstream graft is verbatim upstream-shape (no ABK marker), and
-# the 5.15 slowpath-entry block is byte-identical to 6.6's because the cpuset
-# fast-path series landed on android13-5.15 long ago.  The policy group is the
-# consumer: while memory is low, order >= abk_gfp_fastfail_order (default 9)
-# slowpath attempts gain __GFP_NORETRY|__GFP_NOWARN, so a fragmented
-# near-full phone fails those requests into their callers' fallback (4K
-# fault, -ENOMEM) after one direct-reclaim try instead of stalling the
-# faulting task in the reclaim/compaction loop.  Measured at .167 the
-# default is not a no-op for THP: GFP_TRANSHUGE_LIGHT carries no
-# __GFP_NORETRY, so the defrag=madvise madvised fault and khugepaged's
-# defrag allocations are exactly the retryable class the gate catches (see
-# batch13_core_gfp_customize_vh.py).  Both groups refuse to apply without
-# proof the hook can fire and compile (mm.h declare + page_alloc.c call
-# site + header include), so a blocked hook group never leaves a payload
-# calling an undeclared register_trace_ (compile trap, AGENTS.md trap 4/5).
-# The companion finding -- android_rvh_wake_up_new_task is already present
-# on all four baselines and needs no graft -- is pinned in
-# tests/stable_5_15_test.py.
-# ============================================================================
 import batch13_core_gfp_customize_vh as _b13_gfp  # noqa: E402
 
 
@@ -5352,10 +4735,6 @@ def _customize_alloc_gfp_vh_apply(ctx):
         pa = ctx.read("mm/page_alloc.c")
     except OSError as exc:
         return "blocked_by_shape", f"cannot read mm/page_alloc.c: {exc}"
-    # The grafted call line needs the hook header in the same TU; every
-    # probed baseline includes it, but an include drop upstream would turn
-    # the graft into a compile error no text anchor notices (AGENTS.md
-    # trap 5).  Refuse instead of grafting C that cannot compile.
     if "#include <trace/hooks/mm.h>" not in pa:
         return "blocked_by_shape", ("mm/page_alloc.c does not include "
                                     "<trace/hooks/mm.h>; the hook call "
@@ -5375,9 +4754,6 @@ def _gfp_pressure_fastfail_apply(ctx):
     if "android_vh_customize_alloc_gfp" not in mm_h:
         return "blocked_by_shape", ("customize_alloc_gfp hook not grafted yet "
                                     "(the policy needs customize_alloc_gfp_vh)")
-    # The declaration alone is not enough for the payload to do anything:
-    # probe the call site (a declared-but-never-called hook is inert) and
-    # the header include the callback's register_trace_ symbol needs.
     if "trace_android_vh_customize_alloc_gfp(&alloc_gfp, order);" not in pa:
         return "blocked_by_shape", ("customize_alloc_gfp hook is not called "
                                     "in mm/page_alloc.c; the policy would be "
@@ -5414,236 +4790,34 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 14: zram writeback correctness fixes.
-# Steps live in scripts/batch14_core_zram_writeback.py.
-#
-# android13-5.15 froze its zram writeback code around 2022: the writeback
-# correctness work that followed in mainline never reached the branch, and it
-# never reached linux-5.15.y either (verified against the linux-5.15.y tree at
-# SUBLEVEL 220, which differs from the 5.15.194 baseline only by the
-# zero-sized-backing-device hunk that arrived through ACK).
-#
-# Three independent defects, all confined to drivers/block/zram/zram_drv.c:
-#
-#   zram_wb_teardown       a backing device attached before `disksize` is never
-#                          released (74363ec674cb), pinning the backing block
-#                          device and zram itself until the module is unloaded.
-#                          The NULL-table guard that keeps the reset path safe
-#                          ships in the same transaction.
-#   zram_writeback_bounds  the writeback scan bound comes from zram->disksize
-#                          before init_lock, so a reset that re-initialises a
-#                          smaller disksize lets the loop index past the new
-#                          table (894913e2d35c, Cc: stable), plus the missing
-#                          cond_resched() in the sweep (424d0e5828ad).
-#   zram_wb_limit_align    writeback_limit underflows on PAGE_SIZE > 4KiB and
-#                          silently stops capping flash wear.
-#
-# Ordering is load-bearing: registered after zram_recompression (whose graft
-# rewrites writeback_store()'s callee and the comps teardown inside
-# zram_reset_device()) and after zram_algo_lock (which owns the neighbouring
-# comp_algorithm stores).  zram_wb_teardown deliberately does NOT edit
-# zram_reset_device(): that function belongs to the recompression group, and
-# removing its early return here made the recompression group miss its own
-# anchor on every second pass (it anchors on the *whole* pristine body of the
-# function, guard included).  The leak is therefore closed in zram_remove() --
-# same effect, no shared text.
-# ============================================================================
 import batch14_core_zram_writeback as _b14_zwb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b14_zwb.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 15: ABK_ABI_PATCH_SUITE absorption -- core fs/pid allocation hot paths.
-# Steps live in scripts/batch15_core_fs_pid_hotpaths.py.
-#
-# Batch 15 retires the suite-preference rule (docs/porting_policy.md, "Suite
-# absorption"), so the suite's optimization inventory is re-registered here
-# instead of being deferred to a second external module.  Three groups:
-#
-#   pid_alloc_hotpath_phase2  retries idr_preload(GFP_KERNEL) once after a
-#                             GFP_ATOMIC -ENOMEM inside alloc_pid().  NOTE: the
-#                             suite's version used `continue;` in
-#                             `for (i = ns->level; i >= 0; i--)`, which runs the
-#                             increment expression -- on the common single-level
-#                             namespace it left the loop and returned a pid whose
-#                             numbers[0].nr was never written.  The absorbed form
-#                             retries the SAME level through a retry_preload:
-#                             label instead.
-#   fd_alloc_hotpath          the abk_expand_files_needed() precheck helper plus
-#                             its two call sites.  The suite's capacity half is
-#                             deliberately NOT ported: this child's
-#                             fdtable_alloc_conventions already owns that text
-#                             (upstream 5.15.191 slots_wanted shape), and the
-#                             suite's helper name is one of this module's own
-#                             suite-detection markers.
-#   close_range_hotpath       walks open_fds under rcu_read_lock() in
-#                             __range_close(), the 5.15 shape.  The suite's
-#                             caller-locked 6.1 helpers are not ported because on
-#                             5.15 pick_file() takes files->file_lock itself, so
-#                             the suite's lockdep assertion would be knowingly
-#                             false.
-#
-# Ordering is load-bearing and enforced by a shape probe in _fd_alloc_apply():
-# these groups must run AFTER fdtable_alloc_conventions (and
-# fdtable_replace_fd_errno), and they report blocked_by_shape rather than
-# half-grafting a precheck onto a table allocator whose shape they do not
-# recognise.  Both fs/file.c groups return skip_suite_processed when the tree
-# already carries ABK_ABI_PATCH_SUITE markers, because the suite inserts the same
-# helper names -- re-grafting would be a duplicate definition.
-# ============================================================================
 import batch15_core_fs_pid_hotpaths as _b15_fspid  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b15_fspid.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 15: ABK_ABI_PATCH_SUITE absorption -- core MM hot paths.
-# Steps live in scripts/batch15_core_mm_hotpaths.py.
-#
-#   slab_alloc_free_hotpath      a shared bulk-free backend, a free-side
-#                                validation split and a bulk-alloc prefetch in
-#                                mm/slub.c.
-#   hugepage_fault_alloc_fastpath a file-local helper split for anonymous THP
-#                                fault-time allocation that keeps the THP
-#                                fault-fallback tracking and the PMD fault
-#                                routing intact (mm/huge_memory.c, mm/memory.c).
-#
-# Both are appended after every pre-existing core group, so their mm/*.c anchors
-# see the output of the khugepaged / MADV_COLLAPSE / THP and page_alloc groups
-# that already touch the same files.
-# ============================================================================
 import batch15_core_mm_hotpaths as _b15_mm  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b15_mm.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 17: zram writeback bio batching + compressed writeback.
-# Steps live in scripts/batch17_core_zram_writeback.py.
-#
-# android13-5.15 froze its zram writeback code around 2022, so neither the
-# v6.19 batching series (f405066a1f0d + e828cccb72ed, plus the two post-merge
-# fixes bf62f69574b1 and 3e8d8eb8d7f5) nor the v7.0 compressed-writeback series
-# (d38fab605c66 + 4c1d61389e8e, renamed by ba4c3698e696, fixed by 3bf1c285dc40)
-# ever reached the branch.  Three groups:
-#
-#   zram_writeback_batching    several writeback bios in flight instead of one
-#                              submit_bio_wait() per page.  Upstream drives the
-#                              batch from its post-processing slot machinery,
-#                              which 5.15 does not have, so the in-flight state
-#                              is expressed with ZRAM_UNDER_WB + ZRAM_IDLE.
-#                              The wb_ctl UAF fix (kfree_rcu + rcu_read_lock in
-#                              the completion callback) and the blk_idx leak fix
-#                              are written in from the first new line, so the
-#                              buggy shapes never exist in this tree.  Carries
-#                              the write half of compressed writeback, because
-#                              a later group may not edit this group s
-#                              replacement blocks (see the graft-boundary
-#                              contract in batch10_core_zram_async.py).
-#   zram_wb_batch_size         the sysfs surface of e828cccb72ed, with a
-#                              bounded pool (upstream stores any non-zero u32
-#                              and allocates per unit).
-#   zram_compressed_writeback  store raw zspool objects and decompress on
-#                              demand on the read path; probes for the flag
-#                              field the first group adds and degrades rather
-#                              than half-patching a tree that cannot compile.
-#
-# Ordering is load-bearing: these run AFTER batch14, whose
-# zram_writeback_bounds anchors inside writeback_store() -- and batch14 was
-# re-anchored in the same change (its _B_POSTLOCK used to reach the
-# page = alloc_page() line this batch owns) so that no group edits another
-# group s replacement block.  They also run after zram_recompression, whose
-# comps[]/priority bits and zram_read_from_zspool() these groups build on.
-# ============================================================================
 import batch17_core_zram_writeback as _b17_zwb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b17_zwb.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 24: bound a recompression pass (max_pages).
-# Steps live in scripts/batch24_core_zram_max_pages.py.
-#
-#   zram_recompress_max_pages  mainline 34efe1c3b688 (v6.10) adds max_pages to
-#                              recompress_store() and 2f529e73d720 (v7.1)
-#                              rejects an unrecognised type=; neither ever
-#                              reached android13-5.15, whose recompression
-#                              surface this module itself generated from
-#                              android15-6.6.  The companion drives a sweep
-#                              every zram.recomp.interval_sec, so without a cap
-#                              one pass is an unbounded amount of CPU.
-#
-# Registered last and deliberately the first group in this module that rewrites
-# another group's replacement block: its target is the generated
-# recompress_store()/recompress_async_store(), not pristine text.  That is only
-# safe because zram_recompression and zram_async_recompress now probe for their
-# own payload (see the trap-5 notes there) -- register anything else in this
-# region in the same dependency order.
-# ============================================================================
 import batch24_core_zram_max_pages as _b24_zmp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b24_zmp.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 47: a recompression sweep skips entries that cannot be improved.
-# Steps live in scripts/batch47_core_zram_recomp_skip.py.  Registered after
-# zram_recompression / zram_async_recompress / zram_recompress_max_pages:
-# both scans are text those groups generate (trap 5, same remedy as Batch 24).
-# ============================================================================
 import batch47_core_zram_recomp_skip as _b47_skip  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b47_skip.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 30: concurrent faults no longer double-decrement mmap_miss.
-# Steps live in scripts/batch30_core_mmap_miss_races.py.
-#
-#   readahead_mmap_miss_race  mainline e338d8353154 (v6.18) puts the
-#                             do_async_mmap_readahead() mmap_miss decrement
-#                             behind a page-lock test, so several threads
-#                             faulting the same page cannot each decrement the
-#                             per-file counter for that one page (which used to
-#                             keep mmap read-around enabled under memory
-#                             pressure).  No Cc: stable, so 5.15.y never got it.
-#
-# Independent of every other group: mm/filemap.c is otherwise untouched by this
-# module, and the anchor is unique in the file.  Position carries no meaning
-# here, but keep this region append-only so the registration order in reports
-# stays chronological.
-# ============================================================================
 import batch30_core_mmap_miss_races as _b30_mmr  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b30_mmr.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 31: arm64 pte_mkwrite() stops dirtying a clean PTE.
-#
-# Mainline 143937ca51cc (v6.18, Huang Ying) makes pte_mkwrite_novma() clear
-# PTE_RDONLY only when the PTE is already software-dirty, so a page can be
-# mapped writable *and* clean.  linux-5.15.y took the same patch as
-# 8a2375b0e9b8 and it is in v5.15.196 onwards; android13-5.15-lts (SUBLEVEL
-# 216) carries it, the three release baselines (167/178/194) do not.
-#
-# Why it matters on this baseline: arm64's protection_map defines PAGE_SHARED
-# as "shared+writable pages are clean by default, hence PTE_RDONLY|PTE_WRITE",
-# so clearing PTE_RDONLY is precisely what marks a page hardware-dirty
-# (pte_hw_dirty() == pte_write() && !(pte_val(pte) & PTE_RDONLY)).  Every
-# caller that makes a *clean* pte writable therefore reported the page dirty
-# with nobody having written it, and try_to_unmap() turns that into
-# set_page_dirty() at reclaim -- an unwritten page gets written back.  The live
-# 5.15 call sites are the ones that restore a writable mapping after a
-# transient unmap (remove_migration_pte(), do_numa_page(), userfaultfd); the
-# motivating do_swap_page() case in the commit message is mainline-only, since
-# 5.15's do_swap_page() pairs pte_mkwrite with pte_mkdirty.
-#
-# The target form is the 5.15.y form, not mainline's: 5.15 has pte_mkwrite(),
-# not pte_mkwrite_novma() (that name arrives with the v6.6 rename 2f0584f3f4bd,
-# the first step of the vma-aware pte_mkwrite() series), so a verbatim mainline
-# hunk anchors nowhere on any of the four baselines.
-#
-# No ABK marker comment, deliberately: this is an upstream-shape rewrite, so the
-# target form doubles as the idempotency probe -- on 216 the file is left
-# byte-identical and the group reports already_present (PRE_APPLIED there).  A
-# marker line would break that probe and turn 216 into blocked_by_shape.
-# ============================================================================
 
 _ARM64_PTE_MKWRITE_OLD = (
     "static inline pte_t pte_mkwrite(pte_t pte)\n"
@@ -5666,7 +4840,6 @@ _ARM64_PTE_MKWRITE_NEW = (
 
 
 def _arm64_pte_mkwrite_clean_apply(ctx):
-    """5.15.196's pte_mkwrite(): only clear PTE_RDONLY for a sw-dirty PTE."""
     status, _results, detail = apply_steps(
         ctx, [("arch/arm64/include/asm/pgtable.h",
                _ARM64_PTE_MKWRITE_OLD, _ARM64_PTE_MKWRITE_NEW, True)]
@@ -5688,51 +4861,10 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 32: a written-back slot keeps its metadata, and ->huge_pages is
-# decremented once.  Steps live in
-# scripts/batch32_core_zram_wb_slot_preserve.py.
-#
-#   zram_wb_slot_preserve  mainline b0377ee80429 (mm-hotfixes-stable 2026-03,
-#                          Fixes: d38fab605c667) / ACK android16-6.12
-#                          37b72d525502.  It rewrites the
-#                          zram_writeback_complete() that zram_writeback_batching
-#                          generates and the huge block of zram_free_page()
-#                          -- the second is a no-op on the *text*, but the
-#                          accounting it guards is the other half of the fix.
-#
-# Registered last, after the two groups whose replacement blocks it edits
-# (zram_writeback_batching) or which own the surrounding shape
-# (zram_recompression).  Both are safe for the reason trap 5 describes: each
-# probes its own payload, so a second pass reports already_present instead of
-# re-appending.  zram_writeback_batching learned that probe in this batch; keep
-# any further group that edits its text in the same dependency order.  (The
-# mm/ and arch/arm64 groups above -- Batch 30, Batch 31 -- are independent of
-# this one: different files, pristine anchors, so this dependency is only about
-# the zram groups.)
-# ============================================================================
 import batch32_core_zram_wb_slot_preserve as _b32_zwbsp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b32_zwbsp.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 33: a dead zspage's pages go back to the buddy allocator outside
-# class->lock.
-# Steps live in scripts/batch33_core_zsmalloc_free.py.
-#
-#   zsmalloc_free_zspage_out_of_lock
-#                              mainline 7ef28e8b8142, patch 3 of the v6 series
-#                              "mm/zsmalloc: reduce lock contention in
-#                              zs_free()".  Patches 1-2 of that series delete a
-#                              pool-level rwlock read side, and android13-5.15
-#                              has no pool->lock at all (see the plan.md
-#                              exclusion record), so only patch 3 applies --
-#                              and it is the part this module's own
-#                              zsmalloc_chain_size graft made longer.  No other
-#                              group writes into zs_free(), __free_zspage() or
-#                              free_zspage(), so there is nothing to order
-#                              against.
-# ============================================================================
 import batch33_core_zsmalloc_free as _b33_zsf  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
@@ -5740,211 +4872,43 @@ PATCH_GROUPS = PATCH_GROUPS + _b33_zsf.build_groups(PatchGroup)
 import batch35_core_pagecache_pt as _b35_pcpt  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b35_pcpt.build_groups(PatchGroup)
-# ============================================================================
-# Batch 34: the non-return per-CPU atomics become load LSE atomics.
-# Steps live in scripts/batch34_core_arm64_lse_percpu.py.
-#
-#   arm64_lse_percpu_load_atomics
-#                              mainline 535fdfc5a228 (v6.18, arm64-fixes).
-#                              The LSE branch of __PERCPU_OP_CASE() grows a
-#                              [tmp] destination and the three PERCPU_OP()
-#                              instantiations flip from stadd/stclr/stset to
-#                              ldadd/ldclr/ldset, so the instructions execute
-#                              "near" (L1) instead of "far".  No other group
-#                              writes arch/arm64/include/asm/percpu.h, so
-#                              there is nothing to order against.  The
-#                              upstream-measured BPF-fentry regression and why
-#                              it does not apply to a 5.15 arm64 build, plus
-#                              the no-speedup-claim rule, are in the child's
-#                              module docstring and CHANGELOG.md (Batch 34).
-# ============================================================================
 import batch34_core_arm64_lse_percpu as _b34_alpa  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b34_alpa.build_groups(PatchGroup)
 
-# ============================================================================
 import batch36_core_memcg_stats_slim as _b36_mss  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b36_mss.build_groups(PatchGroup)
 
-# Batch 35: the FUSE write path stops prefaulting its source buffer on every
-# retry.  Steps live in scripts/batch35_core_fuse_erofs.py.
-#
-#   fuse_prefault_out_of_write_path
-#                              mainline faa794dd2e17 (v6.16).  One file, and
-#                              the module's first group in fs/fuse/ -- the
-#                              file carries no other group's text, so there is
-#                              nothing to order against.
-#
-# The erofs half of this batch does not land: fb176750266a + 6422cde1b0d5
-# stand on the 5.15 -> 6.12 erofs evolution (erofs_buf/erofs_bread, the
-# parallel erofs_fileio_aops, fs/erofs/fileio.c), none of which exists on any
-# tracked baseline -- see the group module's docstring and the plan.md
-# exclusion record.  770c8d55c428 (lib/iov_iter) is inapplicable: 5.15 has no
-# page_folio()/folio_test_slab() in that file.  FUSE passthrough stays
-# unported by decision (android13-5.15 ships its own on _IOW(229,126)).
-#
-# Renumbered from 34 when this branch merged main: the arm64 LSE group landed
-# there first with the same number and the same version.  Its file keeps the
-# batch34_ prefix because it was registered under that number on main; this
-# one is batch35_.
-# ============================================================================
 import batch35_core_fuse_erofs as _b35_fuse  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b35_fuse.build_groups(PatchGroup)
-# Batch 36: the memcg per-cpu stats objects shrink to the accounted items.
-# Steps live in scripts/batch36_core_memcg_stats_slim.py.
-#
-#   memcg_stats_percpu_slim   mainline 70a64b7919cb + ff48c71c26aa (v6.10,
-#                             Shakeel Butt) -- index the memcg stats arrays
-#                             through item -> slot tables so the per-memcg,
-#                             per-cpu objects only carry items memcg actually
-#                             accounts.  Both commits land as one group: the
-#                             dynamic-allocation half alone buys nothing.
-#
-# KMI reshape, deliberately not the upstream shape: the ABI XML
-# (android/abi_gki_aarch64.xml) tracks struct mem_cgroup and struct
-# mem_cgroup_per_node with full layouts, and 5.15 embeds the memcg_vmstats /
-# lruvec_stats aggregates in them, so upstream's embedded-array shrink cannot
-# land (see plan.md and the batch docstring for the measured verdict).  What
-# lands instead keeps the header byte-identical and compacts only the two
-# per-cpu heap objects behind the unchanged __percpu pointer fields, via
-# private structs and __alloc_percpu_gfp().  The aggregates stay raw-indexed,
-# so the rstat flush maps compact slots back to items.  The item tables are
-# re-derived for 5.15 (memory_stats[]/memcg1_stats[] readers vs the full
-# count_memcg_events* writer set) -- a missing item reads as zero and no text
-# audit can see it, hence the implementation_audit pins.
-#
-# The header edit moves lruvec_page_state_local() out of line (its inline body
-# would index the compacted object with raw offsets); static inline, no
-# struct member moves, no export added.  No other group writes into the stats
-# accessors, the rstat flush or this header, so there is nothing to order
-# against.
-# =====================================================================
 
-# ============================================================================
-# Batch 37: the memory-reclaim path -- proactive reclaim's batch fidelity, its
-# swappiness= argument, the suspend abort, and the lru_add drain.
-# Steps live in scripts/batch37_core_reclaim_paths.py.
-#
-#   proactive_reclaim_batch_fidelity  mainline 0388536ac291 (v6.6)
-#   proactive_reclaim_decaying_batches
-#                                     mainline 287d5fedb377 (v6.9,
-#                                     Fixes: 0388536ac291)
-#   reclaim_swappiness_defines        mainline 410abb20acae (v6.11 series p.2)
-#   proactive_reclaim_swappiness_arg  mainline 68cd9050d871 (v6.11 series p.3)
-#   proactive_reclaim_suspend_abort   mainline dc37771a43d4 (v7.2,
-#                                     Fixes: 287d5fedb377)
-#   lru_add_drain_dead_folios         mainline 9669b87065a6 (v7.2)
-#
-# Registered last, after memcg_memory_reclaim and cached_freeze_reclaim whose
-# generated text they rewrite, and in dependency order among themselves: the
-# first three rewrite the same memory_reclaim() call site in turn, and
-# reclaim_swappiness_defines must precede the group whose parser validates
-# against the constants it adds.  Each superseded group probes for content
-# that outlives its successor, which is what keeps the second pass a no-op --
-# docs/group_recipe.md trap 5, the Batch 21/24 remedy.  Keep any further group
-# that edits this chain in the same order.
-#
-# Renumbered from 34 when this branch merged main: main had already released
-# its own Batch 34 (arm64_lse_percpu_load_atomics), 35 and 36, so the
-# reclaim-path chain takes the next free number and the next version.
-# ============================================================================
 import batch37_core_reclaim_paths as _b37_rp  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b37_rp.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 38: Linux 7.2 MM/Reclaim grafts, selected by docs/survey_7_2_mm_reclaim.md.
-#
-# Registered after the Batch-37 reclaim-path chain because nothing here edits
-# that chain's generated text; the groups are independent of each other and of
-# every earlier group except where noted in the batch file's own docstring.
-# ============================================================================
 import batch38_core_mm_safety_perf as _b38  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b38.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 39: the v7.2 mm/page_alloc batch clear, from the same survey.
-#
-# Registered last and independent of everything: kernel_init_free_pages() is
-# static and no other group writes it, so there is no ordering constraint and
-# no trap-5 exposure.  See the batch file's docstring for why the per-page
-# KASAN tag pair can be dropped here.
-# ============================================================================
 import batch39_core_pagealloc_batch_clear as _b39  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b39.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 40: the erofs readahead temporary-buffer relaxation (d9281660ff3f).
-#
-# The module's first fs/erofs/ group.  Registered last and independent of
-# everything: no other group writes any of its five files and it edits no
-# generated text, so there is no ordering constraint.  It probes its own
-# payload instead, so a baseline that already carries the commit reports
-# already_present rather than half-applying.  See the batch file's docstring
-# for the 5.15 shape differences (the pcluster lives in zdata.h here; 5.15
-# needs no new ``ra`` parameter because the frontend already carries
-# ``readahead``) and for the ``besteffort`` polarity trap.
-# ============================================================================
 import batch40_core_erofs_readahead as _b40_erofs  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b40_erofs.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 41: kcompressd -- kswapd's swap-out compression moves to its own thread.
-# Steps live in scripts/batch41_core_vm_kcompressd.py.
-#
-#   vm_kcompressd_swapout   Kcompressd-Unofficial 0.5 (Masahito Suzuki, forked
-#                           from MediaTek's Kcompressd by Qun-Wei Lin), whose
-#                           upstream carrier cannot be used here: it adds four
-#                           fields to struct pglist_data, which
-#                           android/abi_gki_aarch64.xml pins at 56320 bits
-#                           across 22 members with no KABI reserve run and no
-#                           usable ANDROID_OEM_DATA slot.  So the payload is
-#                           re-carried entirely inside mm/page_io.c -- private
-#                           per-node state indexed by page_to_nid(), a
-#                           late_initcall instead of kswapd_run()/kswapd_stop(),
-#                           and a file-static knob registered with
-#                           register_sysctl() instead of a vm_table[] entry.
-#                           mm/vmscan.c is not touched at all, which also
-#                           removes upstream's kswapd_run() trap.
-#
-# Registered last and independent of everything: mm/page_io.c is in zero other
-# groups' file lists, so nothing can edit these blocks and no trap-5 ordering
-# applies.  The one ordering constraint is a *read* dependency on Batch 38's
-# memcg_dying_bailout, whose memcg_is_dying() the store path calls; it is
-# registered above and reports applied on all four baselines (the header's
-# mem_cgroup_init() or stub anchor is not part of that group's step set on any
-# of them).  If it ever degrades, the failure is a compile error naming
-# memcg_is_dying, not a half-applied group.
-#
-# The only per-baseline variance is a *text* variant, not a CONFIG gate: 216
-# carries AOSP's android_vh_shrink_page_lock_owner_clear() vendor hook at
-# swap_writepage()'s unlock points (added along with the DECLARE_HOOK in
-# include/trace/hooks/vmscan.h), and 167/178/194 have neither.  The shape is
-# probed against the frontswap branch and the engine text follows; a tree
-# matching neither shape reports blocked_by_shape and writes nothing rather
-# than dropping a vendor-hook contract the tree does honour.
-# ============================================================================
 import batch41_core_vm_kcompressd as _b41_kc  # noqa: E402
 
 
 def _vm_kcompressd_swapout_apply(ctx):
-    """Off-load kswapd's swap-out compression to a per-node kcompressd thread."""
     body = _b41_kc.swapout_body(ctx)
     if body is None:
         return ("blocked_by_shape",
                 "mm/page_io.c matches neither the 167/178/194 nor the lts "
                 "shape of swap_writepage()'s frontswap_store() branch")
-    # Trap-5 successor probe: Batch 71 rewrites this group's generated text
-    # (set_page_writeback at enqueue + end_page_writeback at the drain's lock
-    # site).  Without this probe the second pass would see the step-4 engine
-    # anchor (still present) but miss the rewritten lines and report partial
-    # instead of already_present.  The probe lives on the successor's own
-    # marker, which the successor keeps.
     try:
         _b41_text = ctx.read(_b41_kc.PAGE_IO)
     except FileNotFoundError:
@@ -5971,60 +4935,14 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 46: the erofs readmore EOF bound (936aa701d82d).
-#
-# The module's second fs/erofs/ group.  One step in fs/erofs/zdata.c, a file
-# Batch 40 already brought into the fixture.  Registered last and independent
-# of everything: the three-line anchor is text none of that batch's seven steps
-# in the same file touches, so there is no ordering constraint and no trap-5
-# exposure.  Nothing is probed because there is nothing to probe -- one
-# upstream-shape step, and replace_once already checks the new block first.
-# See the batch file's docstring for the v6.5-vs-5.15 function diff that makes
-# upstream's reasoning transfer, and for the include chain that declares
-# i_size_read() in this TU.
-# ============================================================================
 import batch46_core_erofs_readmore_eof as _b46_erofs  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b46_erofs.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 49: the MGLRU v7.2 reclaim-loop rework (Kairui Song's 0491e9f75c15
-# series, 12 commits) -- the "honest route" docs/survey_7_2_mm_reclaim.md §1
-# named instead of grafting the series onto the 6.1-shape loop.
-#
-# Registered last: every step of these three groups rewrites text the inline
-# MGLRU groups generate (mglru_rework_aging_feedback's try_to_inc_min_seq()/
-# evict_pages()/get_nr_to_scan()/lru_gen_shrink_lruvec(),
-# mglru_rework_type_selection's isolate_pages(), and -- mglru_dirty_reclaim_
-# rework in particular -- ALL FIVE steps of mglru_wake_flushers).  Dependency
-# order plus per-group shape probes is what keeps pass two idempotent
-# (docs/group_recipe.md trap 5, Batch 21/24/37 remedy): the probes live on
-# symbols the successors keep (lruvec_evictable_size(), the moved flusher
-# comment, the placement marker), and the superseded groups carry probes of
-# their own now.  See the batch file's docstring for the 12-commit mapping,
-# the 5.15-shape deviations and the per-hunk provenance.
-# ============================================================================
 import batch49_core_mglru_reclaim_loop as _b49_mglru  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b49_mglru.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 50: background readahead suppression -- Stage 1 of the iorap2 backport.
-#
-# iorap2.ko ("mi_lb_*" family, v3.0.0) registers six ACK vendor hooks; four
-# are a policy with no userspace dependency and are transcribed here from the
-# decompiled sym.should_skip_fault_around / sym.mi_lb_skip_async_mmap_readahead
-# / sym.adjust_readahead / sym.adjust_readaround, offsets resolved against this
-# tree.  Tasks in the "background" cpuset cgroup past their launch burst
-# (nvcsw > 99) get readahead trimmed: fault-around skipped, async mmap
-# readahead skipped, ondemand cap halved, read-around window shrunk.
-#
-# Not ported: the per-UID exemption table iorapd feeds over /dev/iorap (no
-# userspace contract here) and the collect/preread half (Stage 2, below).
-# Appends at EOF; the anchor is pristine text, but the shape probes require
-# the four call sites to still be present verbatim.
-# ============================================================================
 
 _BG_RA_ANCHOR = """EXPORT_SYMBOL(try_to_release_page);
 """
@@ -6129,9 +5047,6 @@ def _bg_readahead_tune_apply(ctx):
         memory = ctx.read("mm/memory.c")
     except OSError as exc:
         return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
-    # The handlers only ever fire if the tree actually calls the hooks; probe
-    # every call site the way customize_alloc_gfp_vh probes its own.  A
-    # declared-but-uncalled hook would register a policy that never runs.
     texts = {"mm/filemap.c": filemap, "mm/readahead.c": readahead,
              "mm/memory.c": memory}
     for rel, needle in (
@@ -6147,9 +5062,6 @@ def _bg_readahead_tune_apply(ctx):
             return "blocked_by_shape", (f"{rel} does not call "
                                         f"{needle.split('(')[0]}; the policy "
                                         "would be registered but never fire")
-    # The callback's register_trace_ symbol is a static inline of the hook
-    # header; an include drop upstream would turn the graft into a compile
-    # error no text audit notices (docs/group_recipe.md trap 5).
     if "#include <trace/hooks/mm.h>" not in filemap:
         return "blocked_by_shape", ("mm/filemap.c does not include "
                                     "<trace/hooks/mm.h>; the payload's "
@@ -6186,24 +5098,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# bg_launch_prefetch -- Stage 2 of the iorap2 port: the collect/preread loop
-# rebuilt kernel-side, without iorapd.
-#
-# A record window opens when a UID is written to abk_lp_record_uid (open for
-# abk_lp_record_ms); during it the android_vh_filemap_read and
-# android_vh_filemap_map_pages hooks snapshot the pages the launching process
-# touches, keyed by (dev, ino, mtime, uid) into an inline 4096-page bitmap.
-# Records hold scalars + bitmap + a path copy, no stored pointers, so nothing
-# can dangle.  Writing a UID to abk_lp_prefetch_uid queues a workqueue kick
-# that filp_open()s each recorded path and prefetches it before the app
-# starts (best-effort: SELinux may deny the kernel-domain open).  512 B
-# bitmap + 160 B path per slot, 4096 slots, LRU eviction, one spinlock, no
-# allocation on any fault path.  at-fault replay is kept behind
-# abk_lp_fault_replay (default 0: it hard-reset the SoC from fault context).
-# abk_lp_young_max is its own knob, NOT abk_bg_ra_nvcsw_min (that one is
-# inside the CONFIG_CPUSETS gate of the Stage-1 payload; trap 7).
-# ============================================================================
 
 _BG_LP_ANCHOR = """fs_initcall(abk_bg_ra_tune_init);
 #endif /* CONFIG_CPUSETS */
@@ -6621,10 +5515,6 @@ def _bg_launch_prefetch_apply(ctx):
         memory = ctx.read("mm/memory.c")
     except OSError as exc:
         return "blocked_by_shape", f"cannot read hook call-site files: {exc}"
-    # Both collection hooks must actually fire on this tree, and the
-    # map_pages site must sit after pte_unmap_unlock (no PTE lock held in
-    # the callback).  The replay rides the same should_fault_around site
-    # the suppression group probes.
     for rel, needle in (
             ("mm/filemap.c",
              "trace_android_vh_filemap_read(filp, iocb->ki_pos, "
@@ -6674,31 +5564,10 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
-# ============================================================================
-# Batch 70: the smaps migration-entry PageLocked race guard
-# (field panic MD_RST_STAT.BIN.txt:777 -- smaps_rollup -> smaps_pte_range ->
-# pfn_swap_entry_to_page -> swapops.h:267 BUG_ON).  One helper plus five
-# caller guards, all in fs/proc/task_mmu.c -- a file no earlier group
-# touches, so registration order is free; registered last.  Nothing is
-# probed except the helper itself (the group's own idempotency probe): the
-# five anchors are byte-identical pristine text with no per-baseline
-# variance, and device-private / device-exclusive entries keep the direct
-# call because their contract is not PageLocked.
 import batch70_core_smaps_migration_guard as _b70_smaps  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b70_smaps.build_groups(PatchGroup)
 
-# ============================================================================
-# Batch 71: kcompressd pins the swap slot with PG_writeback across the FIFO
-# (device A/B verify_swap -- kcompressd offload on corrupted 10/614400 swapped
-# pages, off 0/614400, SM8550 vermeer 5.15.220; surfaced as ART SIGSEGV in
-# random apps and /data corruption).  The deferred swap-out left the page
-# unlocked and not-writeback across the queue, so try_to_free_swap() freed and
-# reused the slot mid-queue and the deferred write corrupted another page.
-# Second-pass group over Batch 41's generated text (trap 5): set_page_writeback
-# at enqueue, end_page_writeback once the drain holds the lock.  Registered
-# after vm_kcompressd_swapout, refuses when that engine is absent.  mm/page_io.c
-# is otherwise untouched by any other group, so no further ordering applies.
 import batch71_core_kcompressd_wb_pin as _b71_wb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)

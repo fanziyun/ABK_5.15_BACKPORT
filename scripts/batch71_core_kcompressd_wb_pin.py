@@ -1,77 +1,3 @@
-"""Batch 71: kcompressd pins the swap slot with PG_writeback across the queue.
-
-Field evidence: device A/B/A on SM8550 vermeer (5.15.220).  With kcompressd's
-swap-out offload on, a sustained memory-thrash load corrupts swapped page data
--- a page-fingerprint harness (verify_swap) saw 10 corrupt pages of 614400
-across three verifiers; with the offload off (``/proc/sys/vm/kcompressd=0``)
-the identical load gave 0/614400.  The corruption surfaces up the stack as
-ART heap/dex SIGSEGV in random apps (bilibili, system_server, camera) and, when
-a reused page frame or slot carries file data to f2fs, as /data corruption.
-
-Root cause (confirmed against mm/swapfile.c + mm/page_io.c on the device tree):
-Batch 41 defers swap-out to a per-node FIFO.  Its offload branch in
-swap_writepage() does ``unlock_page(page); return 0;`` -- the page leaves the
-reclaimer UNLOCKED and NOT under writeback, pinned only by the enqueue
-``get_page()``.  For the whole FIFO residency the swap slot is therefore
-unprotected: ``try_to_free_swap()`` frees a slot only when the page is NOT under
-writeback (``if (PageWriteback(page)) return 0;`` is its second guard), so a
-swap-in fault during residency frees the slot, it is reused for another page,
-and kcompressd's deferred write then lands in a slot that now belongs to a
-different page -- silent cross-page / cross-file data corruption.  Batch 41's
-only guard was ``PageSwapCache``, which the author documented as a believed-
-unreachable risk; thrash makes it reachable.
-
-What this group does (second-pass rewrite of Batch 41's generated text, trap 5):
-restore the normal asynchronous-writeback contract that the deferral broke.
-
-  1. Offload branch (enqueue, page still locked): ``set_page_writeback(page)``
-     before ``unlock_page()``.  PG_writeback now pins the slot for the whole
-     residency -- ``try_to_free_swap()`` bails, and shrink_page_list() keeps the
-     page (its PAGE_SUCCESS path does ``if (PageWriteback) goto keep``) until the
-     drain completes.  This is like a normal in-flight swap bio with one
-     difference worth stating: the page stays under writeback for its whole FIFO
-     residency drained by a single per-node thread, not the milliseconds of a
-     real bio, so a sync compaction / migration / direct-reclaim ``wait_on_
-     page_writeback`` on a queued page waits for the drain, not for I/O.  The
-     queue is self-limiting (it degrades to synchronous at the soft limit), so
-     the residency is bounded, but it is not free.
-  2. Drain head of abk_kcompressd_do_swapout() (page arrives unlocked + under
-     writeback): ``lock_page(page)`` then ``end_page_writeback(page)``, returning
-     the page to the locked / not-writeback state the write body expects.  The
-     body (frontswap_store, or __swap_writepage -> bdev_write_page for zram)
-     re-sets and ends writeback itself, self-balanced.  The lock covers the
-     end_page_writeback -> body gap: try_to_free_swap() needs the page lock,
-     which the drain holds.
-  3. Drop path of abk_kcompressd_do_swapout(): Batch 41's ``!PageSwapCache``
-     guard returns ``put_page(page)`` *above* the lock_page()/end_page_writeback()
-     of step 2, so a page reaching it would be dropped still under the
-     writeback set in step 1 -- stuck under writeback forever (unreclaimable,
-     and freed with the bit set trips bad_page()).  So that exit ends the
-     writeback too.  The pin closes the paths that could clear PageSwapCache
-     mid-queue, so this guard is believed unreachable -- but Batch 41's guard
-     was likewise "believed unreachable" and thrash defeated it, so the pin's
-     "a page under writeback MUST be drained" invariant is honoured on every
-     exit, not just the common one.
-
-Why lock_page (not trylock-skip): a page under writeback MUST be drained --
-end_page_writeback has to run or the page is stuck under writeback forever and
-can never be reclaimed again.  The page is unlocked for the whole residency, so
-the drain's lock is brief (it waits only for a transient swap-in faulter that
-maps the up-to-date page and releases), not the stall the earlier trylock draft
-targeted.
-
-Scope notes:
-
-* Second-pass group over Batch 41's generated text: registered after
-  ``vm_kcompressd_swapout`` and refuses (``blocked_by_shape``) when that group's
-  engine is absent, so an unknown tree is never half-patched.  The ``sailboat_``
-  marker rides in the new comments.
-* All three edits sit in text that is byte-identical in the hook and plain
-  engine variants -- swap_writepage()'s offload branch (enqueue) and the
-  abk_kcompressd_do_swapout() prologue above the ``@@ABK_KCOMPRESS_SWAPOUT_BODY@@``
-  join point (drain + drop path) -- so one set of anchors covers both shapes.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -80,9 +6,6 @@ PAGE_IO = "mm/page_io.c"
 
 T = True
 
-# 1) Enqueue: set_page_writeback() in swap_writepage()'s offload branch, before
-# the page is unlocked.  Anchored on the tail of Batch 41's offload comment,
-# which is unique in the file.
 _WB_SET_OLD = (
     "\t\t * same defect on 6.12, whose pageout() has the identical\n"
     "\t\t * PAGE_SUCCESS branch. */\n"
@@ -111,12 +34,6 @@ _WB_SET_NEW = (
     "\t}\n"
 )
 
-# 2) Drain: end_page_writeback() right after the drain re-acquires the lock,
-# balancing the enqueue set and returning the page to the locked /
-# not-writeback state the write body expects.  The anchor spans the lock line
-# through the head of the write body (frontswap_store, byte-identical in both
-# engine variants) so the replacement is not a pure prefix-extension of its
-# anchor (trap 1) and lands the end between the lock and the body.
 _WB_END_OLD = (
     "\t * freed underneath us no matter who else locked it.\n"
     "\t */\n"
@@ -145,24 +62,6 @@ _WB_END_NEW = (
     "\tif (frontswap_store(page) == 0) {\n"
 )
 
-# 3) Drop path: abk_kcompressd_do_swapout()'s `!PageSwapCache` early return
-# (Batch 41) fires *above* the drain's lock_page()/end_page_writeback(), so a
-# page that reaches it is dropped while still carrying the PG_writeback set at
-# enqueue -- stuck under writeback forever (unreclaimable; freed with the bit
-# set trips bad_page()).  End the writeback on this exit too.  Anchored on the
-# `put_page(page); return; }` of that block, which is the file's only
-# two-tab `put_page(page);` immediately followed by `return;` (the body's
-# put_page is one-tab and not followed by return, abk_kcompressd_enqueue()'s is
-# followed by `}`), so the anchor is unique.  The marker rides in the comment.
-#
-# Reachability: the writeback pin itself closes the paths that could clear
-# PageSwapCache mid-queue (try_to_free_swap() bails on PageWriteback, the
-# enqueue get_page() blocks __remove_mapping()'s ref-freeze), so this exit is
-# believed unreachable -- but Batch 41's own `PageSwapCache` guard was likewise
-# "believed unreachable" and thrash defeated it, so the pin's invariant ("a
-# page under writeback MUST be drained") is honoured on every exit, not just
-# the common one.  end_page_writeback() needs no page lock (it runs from bio
-# completion) and the page is still under writeback here (nothing has ended it).
 _WB_DROP_OLD = (
     "\t\tput_page(page);\n"
     "\t\treturn;\n"
@@ -185,20 +84,14 @@ _WB_DROP_NEW = (
     "\t}\n"
 )
 
-# Pins for the audits and the unit test.
 WB_MARKER = "sailboat_kcompressd_wb_pin"
 WB_SET = "set_page_writeback(page);"
 WB_END = "end_page_writeback(page);"
-# The drop-path end, pinned by its unique context (end immediately before the
-# two-tab put_page/return) so it cannot be confused with the drain's end.
 WB_DROP_END = "end_page_writeback(page);\n\t\tput_page(page);"
 DO_SWAPOUT_PROBE = "abk_kcompressd_do_swapout"
 
 
 def build_steps():
-    """Three required steps: set writeback at enqueue, end it at the drain, and
-    end it on the drain's `!PageSwapCache` drop path (which returns before the
-    drain's own end)."""
     return [
         (PAGE_IO, _WB_SET_OLD, _WB_SET_NEW, T),
         (PAGE_IO, _WB_END_OLD, _WB_END_NEW, T),
@@ -223,7 +116,6 @@ def _kcompressd_wb_pin_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the single Batch-71 kcompressd writeback-pin PatchGroup record."""
     return [
         PatchGroup(
             "kcompressd_writeback_pin",

@@ -124,8 +124,7 @@ bash tests/smoke.sh build/abk-trees/216                        # 端到端 + 回
 | `docs/` | 项目文档、开源声明                     |
 | `tools/` | 5 个设备侧 CLI                    |
 | `ksu/` | KernelSU 模块源码                 |
-| `plan.md` | 实现清单                          |
-| `CHANGELOG.md` | 各批次报告                         |
+| `CHANGELOG.md` | 各批次报告 + 批次索引/待办（原 `plan.md`，已并入） |
 | `research/` | 上游 patch 归档与参考树|
 
 ---

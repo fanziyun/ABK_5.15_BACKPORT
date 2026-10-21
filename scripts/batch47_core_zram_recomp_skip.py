@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Batch 47: a recompression sweep skips entries no higher priority can improve.
-
-Re-marks re-hand already-optimal pages every cycle (a recompressed page's age is
-never refreshed), so the sweep's cap was spent before reaching new cold pages;
-the skip filter sits at both grafted scan call sites (sync: in front of the
-max_pages decrement; async: in front of `candidate = true`).  No upstream commit
--- upstream has no separate mark/drain clock.  Adds only
-`abk_zram_recompress_pointless` and the `sailboat_zram_recomp_skip` marker, and
-registers after `zram_recompress_max_pages` (its sync anchor's decrement).
-"""
 
 from __future__ import annotations
 
@@ -18,7 +8,6 @@ ZRAM_C = "drivers/block/zram/zram_drv.c"
 
 T = True
 
-# Step 1: the predicate, on the pristine block boundary in front of the machinery.
 
 _HELP_OLD = (
     " * @offset: byte offset within physical block\n"
@@ -59,7 +48,6 @@ _HELP_NEW = (
     "#endif\n"
 )
 
-# Step 2: the synchronous node (recompress_store(), after the earlier groups' text).
 
 _SYNC_OLD = (
     "\t\tif (zram_test_flag(zram, index, ZRAM_WB) ||\n"
@@ -91,7 +79,6 @@ _SYNC_NEW = (
     "\t\terr = zram_recompress(zram, index, page, threshold, prio, prio_max);\n"
 )
 
-# Step 3: the asynchronous node (recompress_async_store(), after the earlier groups' text).
 
 _ASYNC_OLD = (
     "\t\tif (zram_test_flag(zram, index, ZRAM_WB) ||\n"
@@ -127,13 +114,6 @@ SKIP_MARKER = "ABK stable_515_backport: Batch 47"
 
 
 def build_steps():
-    """Three steps: the predicate, then one filter per recompression node.
-
-    All required.  A node that learned the predicate but not one of its two
-    filters would keep spending its budget on the entries the other node now
-    skips, which is exactly the half-grafted state the companion's cadence
-    change is supposed to remove.
-    """
     return [
         (ZRAM_C, _HELP_OLD, _HELP_NEW, T),
         (ZRAM_C, _SYNC_OLD, _SYNC_NEW, T),
@@ -146,8 +126,6 @@ def _skip_apply(ctx):
         text = ctx.read(ZRAM_C)
     except FileNotFoundError:
         return "blocked_by_shape", ZRAM_C + ": file absent"
-    # Both scans are generated text from earlier groups; without all three the
-    # anchors cannot exist, so such a tree must be refused.
     if RECOMPRESS_HELPER not in text:
         return "blocked_by_shape", ("zram_recompress() not found: "
                                     "zram_recompression must apply first")
@@ -165,7 +143,6 @@ def _skip_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the single Batch-47 PatchGroup record."""
     return [
         PatchGroup(
             "zram_recomp_best_prio_skip",

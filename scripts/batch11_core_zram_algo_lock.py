@@ -1,56 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Batch 11: the zram algorithm lock.
-
-Batch 10-4 registered the secondary compressor at device-creation time and the
-runtime companion module (ksu/abk_runtime_tunables) forces the primary.  Both
-live in userspace, and userspace cannot defend the two nodes:
-
-  * `comp_algorithm` / `recomp_algorithm` are writable only *before* `disksize`
-    (`init_done()` -> `-EBUSY` afterwards), and `disksize` is written once per
-    boot by whoever brings zram up.  The algorithm is therefore decided by
-    whichever writer wins that single window -- the ROM's boot script, a ROM
-    daemon, or a root shell.  On the target device a root writer did win it
-    after the companion module's takeover and left the primary on `deflate`,
-    with nothing in userspace able to repair it without a `swapoff` + `reset`.
-  * That repair is what made the algorithm policy and CONFIG_ZRAM_WRITEBACK
-    mutually exclusive: a writeback backing device is attached in the same
-    pre-`disksize` window (`backing_dev` is `-EBUSY` once initialized) and
-    `reset_bdev()` drops it on `reset`.
-
-The lock moves the decision into the kernel, so the window stops mattering:
-
-  * the primary is selected in `zram_add()` from a read-only parameter
-    (`zram.abk_comp_algo`, default `lz4kd`, keeping the build's
-    `CONFIG_ZRAM_DEF_COMP` when that backend is not compiled in);
-  * `late_initcall()` points the `.store` callback of both attributes at a
-    function that reports the attempt and returns success.
-
-Accepting the write instead of failing it is deliberate: Android 16's
-`mmd_setup` aborts its whole zram bring-up -- writeback backing device and the
-`mmd.setup_complete` property that enables the `mmd` daemon included -- when an
-algorithm write fails, so `-EPERM` there would re-create the exclusivity this
-batch exists to remove.
-
-The selection also survives `reset`: `zram_destroy_comps()` clears `comps[]`,
-never `comp_algs[]` (Batch 10-4), and no later write can change what a rebuild
-picks up.
-
-Insertion points are block *boundaries*, never the inside of a replacement an
-earlier group owns (a later edit inside e.g. `__comp_algorithm_store()`'s text
-would break that group's idempotency): the pristine
-`static const char *default_compressor = ...` line that Batch 10-4's parameter
-block opens with, the pristine `zram_debugfs_register(zram);` call that follows
-the primary assignment in `zram_add()`, and the pristine
-`module_init(zram_init);` line that Batch 10-1's engine is inserted *before*.
-"""
 
 __all__ = ["build_steps", "T"]
 
 
 T = True
 
-# --- the read-only policy parameters --------------------------------------
-# Inserted ahead of Batch 10-4's parameter block, which opens with this line.
 _PARAM_OLD = "static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;\n"
 
 _PARAM_NEW = (
@@ -95,10 +49,6 @@ _PARAM_NEW = (
     "static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;\n"
 )
 
-# --- the primary is chosen at device creation ------------------------------
-# Inserted directly after the primary assignment, before the next pristine
-# statement of zram_add(), so Batch 10-4's block and the recompression group's
-# `comp_algs[]` assignment both stay byte-identical.
 _PRIMARY_OLD = "\tzram_debugfs_register(zram);\n"
 
 _PRIMARY_NEW = (
@@ -125,10 +75,6 @@ _PRIMARY_NEW = (
     "\tzram_debugfs_register(zram);\n"
 )
 
-# --- and no later write can change it -------------------------------------
-# Appended after module_init() rather than before it: Batch 10-1's engine is
-# inserted immediately in front of that line, and inserting between the two
-# would break that group's replacement block.
 _LOCK_OLD = "module_init(zram_init);\n"
 
 _LOCK_BODY = (

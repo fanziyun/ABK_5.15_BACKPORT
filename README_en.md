@@ -141,8 +141,7 @@ bash tests/smoke.sh build/abk-trees/216                        # end-to-end + ro
 | `docs/` | project documentation, attribution |
 | `tools/` | 5 device-facing CLIs |
 | `ksu/` | KernelSU module sources |
-| `plan.md` | implementation checklist |
-| `CHANGELOG.md` | per-batch reports |
+| `CHANGELOG.md` | per-batch reports + batch index/backlog (former `plan.md`, merged in) |
 | `research/` | upstream patch archive and reference trees |
 
 ---

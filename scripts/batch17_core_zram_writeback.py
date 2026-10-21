@@ -1,86 +1,3 @@
-"""Batch 17: zram writeback bio batching + compressed writeback (5.15 re-anchored).
-
-Three groups, all confined to ``drivers/block/zram/{zram_drv.c,zram_drv.h}``.
-They exist because android13-5.15 froze its zram writeback code around 2022:
-neither the v6.19 batching series nor the v7.0 compressed-writeback series ever
-reached the branch (nor ``linux-5.15.y``, verified against the tree at SUBLEVEL
-220, which differs from the 5.15.194 baseline only by the zero-sized-backing-
-device hunk that arrived through ACK).
-
-Provenance (every commit below was read as a real patch, not from memory):
-
-* ``zram_writeback_batching`` -- upstream ``f405066a1f0d`` ("zram: introduce
-  writeback bio batching", Sergey Senozhatsky, 2025-11-22, series v6, merged for
-  v6.19) plus its two fixes, which are built in from the first new line so the
-  buggy shape never exists in this tree:
-    - ``bf62f69574b1`` ("zram: fix use-after-free in zram_writeback_endio",
-      Richard Chang, 2026-05-12, Cc: stable, ``Fixes: f405066a1f0d``): the
-      writeback task can free ``wb_ctl`` after ``num_inflight`` hits zero but
-      before the completion callback reaches ``wake_up()``.  Fixed with
-      ``kfree_rcu()`` + an RCU read section around the whole callback, exactly
-      as upstream does;
-    - ``3e8d8eb8d7f5`` ("zram: do not leak blk idx at the end of writeback",
-      Sergey Senozhatsky, 2026-05-26, ``Fixes: f405066a1f0d``): a reserved but
-      unused block index must be released before returning.  On 5.15 the index
-      lives in a local (upstream moved it into the request), so the equivalent
-      is the ``if (blk_idx) free_block_bdev(...)`` cleanup that must stay ahead
-      of the drain -- and a request that is recycled must have its own
-      ``blk_idx`` cleared, or it would free the slot block twice.
-  The per-device ``wb_batch_size`` field and its ``32`` default come from
-  ``e828cccb72ed`` ("zram: add writeback batch size device attr", same series),
-  and the write half of ``d38fab605c66`` plus ``3bf1c285dc40`` are folded in
-  here as well -- see the next bullet for why.
-
-* ``zram_wb_batch_size`` -- the sysfs surface of ``e828cccb72ed`` only.
-
-* ``zram_compressed_writeback`` -- the read half of ``d38fab605c66`` ("zram:
-  introduce compressed data writeback", Richard Chang/Sergey Senozhatsky,
-  2025-12-01, merged 2026-01-21 for v7.0) plus its attribute
-  ``4c1d61389e8e``, under the renamed ABI ``ba4c3698e696``
-  ("compressed_writeback", 2026-02-26, ``Fixes: 4c1d61389e8e``).  The only
-  commit with ``Fixes: d38fab605c66`` is ``3bf1c285dc40`` ("clear trailing
-  bytes of compressed writeback pages", 2026-05-26): the zeroing lives in
-  ``zram_read_from_zspool_raw()`` in this batch first group.
-
-Why the write half of compressed writeback is in the batching group: a later
-group may not edit text an earlier group produced (``replace_once`` idempotency
-test requires every earlier replacement block to survive as a contiguous string
--- the graft-boundary contract documented in
-``scripts/batch10_core_zram_async.py``).  The write path is a branch inside the
-batched loop and inside the completion helper, both of which this batch owns, so
-the branch has to be part of that group.  The read path only redirects two
-pristine ``__zram_bvec_read()`` call sites and adds a block of its own, so it
-can be a separate group -- and it probes for the flag field the first group
-adds, so a missing batching group degrades instead of half-patching.
-
-5.15 equivalence notes (the parts of the upstream series that are NOT portable
-verbatim, each verified against the target tree):
-
-* upstream drives batching from the post-processing slot machinery
-  (``zram_pp_ctl``/``zram_pp_slot``/``ZRAM_PP_SLOT``, v6.13 era) which 5.15 does
-  not have; the in-flight window is expressed with the markers 5.15 already
-  uses for it (``ZRAM_UNDER_WB`` + ``ZRAM_IDLE``);
-* upstream reads raw objects with the modern ``zs_obj_read_begin()/end()`` API;
-  5.15 ``zs_map_object()`` already returns a contiguous copy of the object
-  (``mm/zsmalloc.c`` per-cpu ``vm_buf`` exists precisely for objects spanning
-  two pages), so no zsmalloc rewrite is needed and ``zstrm->local_copy`` has no
-  5.15 counterpart (``zstrm->buffer`` is the equivalent scratch buffer);
-* 5.15 convention traps pinned by ``tests/implementation_audit.py``:
-  ``zcomp_stream_put(zram->comps[prio])`` takes the comp (not the stream),
-  ``zcomp_decompress()`` takes four arguments, ``zram_set_element()`` (not
-  ``zram_set_handle()``) stores the block index, ``bio_init(&bio, &bvec, 1)`` +
-  ``bio_set_dev()`` and ``bio_alloc(GFP_NOIO, 1)`` are the two- and three-
-  argument forms, and ``zero_user()`` replaces 6.19 ``memset_page()``.
-
-Ordering: registered after ``zram_recompression`` (whose ``comps[]``, priority
-bits and ``zram_read_from_zspool()`` this batch builds on), after
-``zram_algo_lock``, and after the Batch-14 writeback groups --
-``zram_writeback_batching`` rewrites the sweep body that
-``zram_writeback_bounds`` anchors in, and Batch 14 was re-anchored in the same
-change so that neither group reaches into the other replacement block.  No group
-here edits text another one produces.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -88,20 +5,9 @@ from abk_backport_engine import apply_steps
 ZRAM_C = "drivers/block/zram/zram_drv.c"
 ZRAM_H = "drivers/block/zram/zram_drv.h"
 
-# Alias the required-flag for readability (the other batch modules use T/F).
 T = True
 
-# ---------------------------------------------------------------------------
-# Group 1: zram_writeback_batching -- f405066a1f0d (+ bf62f69574b1,
-# 3e8d8eb8d7f5, e828cccb72ed field/default, d38fab605c66 write half,
-# 3bf1c285dc40).  Every anchor below is pristine text: the sweep rewrite stops
-# one line short of the "next:" label Batch 14 writes, and starts one line after
-# the bounds/range check it writes.
-# ---------------------------------------------------------------------------
 
-# -- zram_drv.c: rcu_read_lock()/kfree_rcu() need rcupdate.h.  Anchored on an
-#    include pair no other group touches: the part_stat.h/zram_drv.h pair is
-#    batch10's include block, and inserting between its lines would break it. --
 _A_INC_OLD = (
     "#include <linux/highmem.h>\n"
     "#include <linux/slab.h>\n"
@@ -114,7 +20,6 @@ _A_INC_NEW = (
     "#include <linux/slab.h>\n"
 )
 
-# -- zram_drv.h: the two new per-device knobs, in upstream's field order ------
 _A_FIELDS_OLD = (
     "\tbool wb_limit_enable;\n"
     "\tu64 bd_wb_limit;\n"
@@ -133,11 +38,6 @@ _A_FIELDS_NEW = (
     "\tu64 bd_wb_limit;\n"
 )
 
-# -- zram_drv.c: the batch machinery.  Inserted before the page_index signature
-#    define, i.e. after read_from_bdev_async() and inside CONFIG_ZRAM_WRITEBACK,
-#    so every helper it defines is in scope before writeback_store() uses it.
-#    Anchoring on the define (not on read_from_bdev_async() tail) keeps the read
-#    path free for a later group. --
 _A_HELPERS_OLD = (
     "#define PAGE_WB_SIG \"page_index=\"\n"
 )
@@ -461,7 +361,6 @@ _A_HELPERS_NEW = (
     "#define PAGE_WB_SIG \"page_index=\"\n"
 )
 
-# -- zram_drv.c: the two defaults, next to the writeback lock init ------------
 _A_DEFAULT_OLD = (
     "#ifdef CONFIG_ZRAM_WRITEBACK\n"
     "\tspin_lock_init(&zram->wb_limit_lock);\n"
@@ -477,7 +376,6 @@ _A_DEFAULT_NEW = (
     "#endif\n"
 )
 
-# -- zram_drv.c writeback_store(): declarations ------------------------------
 _A_DECL_OLD = (
     "\tstruct bio bio;\n"
     "\tstruct bio_vec bio_vec;\n"
@@ -501,7 +399,6 @@ _A_DECL_NEW = (
     "\tunsigned long blk_idx = 0;\n"
 )
 
-# -- zram_drv.c writeback_store(): allocate the batch instead of one page ----
 _A_ALLOC_OLD = (
     "\tpage = alloc_page(GFP_KERNEL);\n"
     "\tif (!page) {\n"
@@ -523,9 +420,6 @@ _A_ALLOC_NEW = (
     "\t}\n"
 )
 
-# -- zram_drv.c writeback_store(): the batched sweep.  The replacement stops
-#    right before the "next:" label Batch 14's cond_resched() block owns, so
-#    that block keeps living as a contiguous replacement of that group. -------
 _A_LOOP_OLD = (
     "\tfor (; nr_pages != 0; index++, nr_pages--) {\n"
     "\t\tstruct bio_vec bvec;\n"
@@ -752,15 +646,6 @@ _A_LOOP_NEW = (
     "\t\tcontinue;\n"
 )
 
-# -- zram_drv.c writeback_store(): drain and release.  The "if (blk_idx)" line
-#    belongs to Batch 14's _B_LOOP_TAIL_NEW and stays untouched: this step only
-#    supplies its body, then the unsubmitted request and the whole pool. -------
-# The old block deliberately starts at the pristine free_block_bdev() line:
-# Batch 14's _B_LOOP_TAIL_NEW ends at "if (blk_idx)", so that call is still
-# the if's body and must be *replaced* (to carry the leak-fix comment), not
-# re-emitted after it.  Re-emitting it produced a duplicated release plus a
-# -Werror=misleading-indentation build failure -- the second C-level bug of
-# this batch that every text-only audit passed.
 _A_TAIL_OLD = (
     "\t\tfree_block_bdev(zram, blk_idx);\n"
     "\t__free_page(page);\n"
@@ -799,9 +684,6 @@ _A_TAIL_NEW = (
     "release_init_lock:\n"
 )
 
-# ---------------------------------------------------------------------------
-# Group 2: zram_wb_batch_size -- the e828cccb72ed sysfs surface.
-# ---------------------------------------------------------------------------
 
 _B_HANDLERS_OLD = (
     "static void reset_bdev(struct zram *zram)\n"
@@ -880,10 +762,6 @@ _B_ATTRS_NEW = (
     "#endif\n"
 )
 
-# ---------------------------------------------------------------------------
-# Group 3: zram_compressed_writeback -- the d38fab605c66 read half, the
-# compressed_writeback attribute (4c1d61389e8e, renamed by ba4c3698e696).
-# ---------------------------------------------------------------------------
 
 _C_READ_OLD = (
     "static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,\n"
@@ -893,14 +771,6 @@ _C_READ_OLD = (
     "\tstruct page *page;\n"
 )
 
-# The whole block below is compressed-writeback code: it reads zram->bdev and
-# zram->wb_compressed, and struct zram only declares those under
-# CONFIG_ZRAM_WRITEBACK (zram_drv.h).  ABK's dispatch does not have to enable the
-# symbol -- the ROM tier does, and the option is documented as optional -- so the
-# block carries the same guard the upstream writeback code does.  Without it the
-# module builds a kernel that fails with "no member named 'bdev' in 'struct
-# zram'" the moment the config is off (the smoke build of 2026-09-14 hit exactly
-# that in CI, see CHANGELOG.md#batch-23).
 _C_READ_NEW = (
     "#ifdef CONFIG_ZRAM_WRITEBACK\n"
     "/*\n"
@@ -1116,10 +986,6 @@ _C_CALL1_OLD = (
     "\tret = __zram_bvec_read(zram, page, index, bio, is_partial_io(bvec));\n"
 )
 
-# The redirects have to follow the same guard as the code they call: with
-# CONFIG_ZRAM_WRITEBACK off there are no compressed WB slots, so the plain
-# __zram_bvec_read() of the pristine tree is the right call (and the only one
-# that exists).
 _C_CALL1_NEW = (
     "\t/* ABK stable_515_backport: d38fab605c66 -- compressed WB slots */\n"
     "#ifdef CONFIG_ZRAM_WRITEBACK\n"
@@ -1205,12 +1071,6 @@ _C_ATTRS_NEW = (
 
 
 def build_batching_steps():
-    """Group 1: f405066a1f0d plus its two fixes.
-
-    All eight steps are required, so a missing anchor writes nothing: the pool
-    creation, the sweep body, the completion helper and the drain are one
-    logical change and half of it does not compile.
-    """
     return [
         (ZRAM_C, _A_INC_OLD, _A_INC_NEW, T),
         (ZRAM_H, _A_FIELDS_OLD, _A_FIELDS_NEW, T),
@@ -1224,7 +1084,6 @@ def build_batching_steps():
 
 
 def build_batch_size_steps():
-    """Group 2: the e828cccb72ed sysfs surface."""
     return [
         (ZRAM_C, _B_HANDLERS_OLD, _B_HANDLERS_NEW, T),
         (ZRAM_C, _B_ATTRDECL_OLD, _B_ATTRDECL_NEW, T),
@@ -1233,13 +1092,6 @@ def build_batch_size_steps():
 
 
 def build_compressed_steps():
-    """Group 3: the d38fab605c66 read-back half.
-
-    The two call-site redirects are one logical change with the dispatcher they
-    call; the attribute steps are additive and use anchors disjoint from the
-    batch-size group's, so the two groups cannot break each other's replacement
-    blocks.
-    """
     return [
         (ZRAM_C, _C_READ_OLD, _C_READ_NEW, T),
         (ZRAM_C, _C_CALL1_OLD, _C_CALL1_NEW, T),
@@ -1254,13 +1106,6 @@ def _batching_apply(ctx):
         text = ctx.read(ZRAM_C)
     except FileNotFoundError:
         return "blocked_by_shape", f"{ZRAM_C}: file absent"
-    # docs/group_recipe.md trap 5: Batch 32's zram_wb_slot_preserve rewrites
-    # zram_writeback_complete() -- text this group generates -- so per-step
-    # idempotency alone would leave this group's own anchors unmatched on a
-    # second pass (its replacement block is no longer in the file, and the
-    # pristine anchor it replaced is gone).  Probe one of this group's own
-    # symbols instead: no android13-5.15 baseline carries it, so a first pass
-    # always rewrites and only a second pass stops.
     if "static void zram_account_writeback_submit(struct zram *zram)" in text:
         return "already_present", ("the writeback batching graft is already in "
                                    "zram_drv.c")
@@ -1302,9 +1147,6 @@ def _compressed_apply(ctx):
         header = ctx.read(ZRAM_H)
     except FileNotFoundError:
         return "blocked_by_shape", f"{ZRAM_C}/{ZRAM_H}: file absent"
-    # The read-back half is meaningless without the write half: without
-    # zram_writeback_batching's flag field the dispatcher cannot compile, so
-    # degrade instead of writing a tree that does not build.
     if "bool wb_compressed;" not in header:
         return "blocked_by_shape", ("zram->wb_compressed is absent: "
                                     "zram_writeback_batching must apply first")
@@ -1314,10 +1156,6 @@ def _compressed_apply(ctx):
     ):
         if probe not in text:
             return "blocked_by_shape", f"{why} not found in zram_drv.c"
-    # The redirect step replaces this call with abk_zram_bvec_read(), so the
-    # probe has to accept either shape: an early return on the pristine form
-    # alone would make this group report blocked_by_shape on every second pass
-    # (step_audit trap 4).
     if ("\t\tret = __zram_bvec_read(zram, page, index, bio, true);\n" not in text
             and "\t\tret = abk_zram_bvec_read(zram, page, index, bio, true);\n"
             not in text):
@@ -1330,7 +1168,6 @@ def _compressed_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the three PatchGroup records, in registration order."""
     return [
         PatchGroup(
             "zram_writeback_batching",

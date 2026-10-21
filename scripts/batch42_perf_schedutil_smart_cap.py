@@ -1,41 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Batch 42: schedutil smart_freq cap -- the ``freq_cap[]`` half of the quartet.
-
-Batch 10-2 scoped the WALT ``smart_freq`` control-downport as "reason election
-+ deactivation hysteresis + **frequency cap** + per-cluster threshold table".
-``schedutil_smart_policy`` (scripts/batch10_perf_sched_policy.py) landed the
-reason election and the frequency *floor*; the cap itself -- upstream's
-``if (freq > smart_freq) freq = smart_freq;`` in ``get_smart_freq_limit()`` --
-was scoped in that draft and never landed.  This module is that half and
-nothing else.  Group ``schedutil_smart_cap``, file
-``kernel/sched/cpufreq_schedutil.c``, hook ``android_vh_cpufreq_resolve_freq``.
-
-Coupling with ``schedutil_smart_policy``, which shares the hook, the file and
-the anchor.  Registration order is execution order for ``android_vh`` probes,
-so this group is registered *after* that one and grafted *in front of* the
-``cpufreq_governor_init(schedutil_gov);`` line that group's payload is appended
-behind.  That is the only placement that is all of:
-
-- textually ahead of the floor payload, so this payload's ``late_initcall``
-  runs first and the clamp is what the floor sees;
-- independent of which group the engine happened to run first -- ``_TAIL_OLD``
-  stays a complete anchor for either group after either has fired, so both
-  orders converge on the same file;
-- idempotent for *both* groups.  Inserting after that anchor instead would put
-  this payload between the anchor and the floor payload, and on the second pass
-  the floor group's replacement would stop matching while its anchor still did,
-  so it would append a second copy of the floor payload -- the Batch-21
-  ``psi_account_irqtime()`` duplicate-definition trap (group_recipe.md §2 trap
-  5), which only ever shows up on the patched-tree pass.
-
-The payload's state is per-policy under a raw spinlock, not a lock-free per-CPU
-step counter: ``__resolve_freq()`` runs on the ``fast_switch`` path under
-``rq->lock`` and every CPU of a shared policy can be inside it at once, so an
-unlocked index is a data race.  The community ``schedhorizon`` fork of this idea
-carries exactly that shape (an unlocked ``current_step`` with a type mismatch, a
-threshold table whose length disagrees with itself and leftover debug prints),
-and none of it is copied.
-"""
 
 import hashlib
 import re
@@ -55,10 +18,6 @@ def _tabs(text):
 T = True
 
 _INC_OLD = "#include <trace/hooks/sched.h>\n"
-# The include block schedutil_smart_policy's step leaves behind.  Its last line
-# is this group's shape probe (see has_header_block): the whole block is added
-# in one step, so finding that line means the header block is already in the
-# tree.
 _INC_NEW = (
     "#include <trace/hooks/sched.h>\n"
     "#include <trace/hooks/cpufreq.h>\n"
@@ -71,7 +30,6 @@ _INC_HINT = "#include <linux/string.h>\n"
 _TAIL_OLD = "cpufreq_governor_init(schedutil_gov);\n"
 _REL = "kernel/sched/cpufreq_schedutil.c"
 
-# --- payload ---------------------------------------------------------------
 _CAP = _tabs(r"""/*
  * ABK stable_515_backport: Batch 42 schedutil smart_freq cap -- the
  * freq_cap[] -> freq = min(freq, cap) half of the WALT smart_freq quartet.
@@ -535,8 +493,6 @@ static int __init abk_sc_reassert_init(void)
 
 late_initcall_sync(abk_sc_reassert_init);
 """)
-# One blank line between the payload and the anchor it is grafted in front of,
-# so the grafted file does not read as one run-on block.
 _CAP = _CAP + "\n"
 
 
@@ -545,55 +501,24 @@ def _norm(text):
 
 
 def has_header_block(text):
-    """True when the shared header block is already in the tree.
-
-    ``schedutil_smart_policy``'s include step adds this block, and it is the
-    same block this group needs.  Probing for it keeps this group from emitting
-    an include step that ``replace_once`` would short-circuit to
-    ``already_present`` on a tree that group has already helped -- which
-    ``step_audit.py`` rejects in a must-apply group (trap 1b) -- while a tree
-    that has neither still gets the step and a genuinely unrecognised include
-    shape degrades to a missing anchor.
-    """
     return _INC_HINT in _norm(text)
 
 
 def has_current_cap(text):
-    """True when the tree already carries this payload."""
     return _norm(_CAP) in _norm(text)
 
 
 def has_unknown_cap(text):
-    """True when a smart-freq cap payload is present that matches no anchor.
-
-    Same transactionality argument as ``batch10_perf_sched_policy``'s
-    ``has_unknown_policy``: a shape this module cannot name still leaves
-    ``_TAIL_OLD`` in place, so the plain insert would put a second copy of the
-    payload in front of it -- duplicate definitions, and a group still
-    reporting ``applied``.
-    """
     text = _norm(text)
     return ("static bool abk_sc_enable" in text
             and not has_current_cap(text))
 
 
 def cap_sha256():
-    """Short fingerprint of the live payload, reported in the graft detail.
-
-    The payload cannot carry its own digest (embedding it would move it), so
-    "which generation did this build write" belongs in the report, exactly as
-    ``batch10_perf_sched_policy.policy_sha256`` does for the floor.
-    """
     return hashlib.sha256(_CAP.encode()).hexdigest()[:16]
 
 
 def build_steps(add_headers):
-    """Steps for a tree without this cap (or one already carrying it).
-
-    ``add_headers`` is :func:`has_header_block` negated: on a tree
-    ``schedutil_smart_policy`` has already helped, adding the shared include
-    block again would be a duplicate include and the step would never run.
-    """
     steps = []
     if add_headers:
         steps.append((_REL, _INC_OLD, _INC_NEW, T))

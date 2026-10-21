@@ -1,87 +1,3 @@
-"""Batch 36: compact the memcg per-cpu stats objects.
-
-Sources: mainline ``70a64b7919cb`` ("memcg: dynamically allocate lruvec_stats")
-+ ``ff48c71c26aa`` ("memcg: reduce memory for the lruvec and memcg stats"),
-both v6.10 by Shakeel Butt.  Upstream pairs them on purpose: the dynamic
-allocation alone is one extra kzalloc per node with no saving, the saving only
-appears once the arrays are cut down.  This batch lands them as one group.
-
-What the pair buys: memcg only accounts a subset of node_stat_item and
-vm_event_item, yet 5.15 sizes every stats array with the full enums
-(``NR_VM_NODE_STAT_ITEMS`` = 40 on this tree, ``MEMCG_NR_STAT`` = 43,
-``NR_VM_EVENT_ITEMS`` = 90).  Indexing through an item -> slot table drops the
-dead slots.  These objects exist once per memcg per node (aggregate) and once
-per memcg per node per cpu (per-cpu), so the saving scales with cgroup count
-times cpu count.
-
-Why the reshape instead of the upstream shape -- the KMI verdict, measured:
-
-* ``struct mem_cgroup`` is KMI-visible (``mem_cgroup_from_task()``,
-  ``get_mem_cgroup_from_mm()``, ``mem_cgroup_from_id()``,
-  ``lock_page_memcg()`` are exported) and 5.15 embeds
-  ``struct memcg_vmstats vmstats`` in it; ``struct mem_cgroup_per_node`` is in
-  the KMI type graph through ``mem_cgroup::nodeinfo[]`` and embeds
-  ``struct lruvec_stats``.  Both carry full layouts in the android13-5.15
-  ``android/abi_gki_aarch64.xml`` (class-decl entries with size-in-bits), and
-  neither struct has an ``ANDROID_KABI_RESERVE`` slot.
-* Upstream ``ff48c71c26aa`` shrinks ``state[]``/``state_pending[]`` inside the
-  embedded aggregate and upstream ``70a64b7919cb`` turns the embedded
-  ``lruvec_stats`` into a pointer -- both move members of KMI-visible structs,
-  and shrinking cannot be masked with reserve slots.  The previous survey's
-  "lruvec_stats is not KABI-visible" premise is wrong; the landing decision
-  (recorded in plan.md) is that no KMI-visible layout change is accepted, so
-  the faithful upstream shape is not landable here.
-* What *is* landable with a byte-identical header: only the two per-cpu
-  objects change.  They are heap objects behind ``__percpu`` pointer fields,
-  so their real layout is whatever ``mm/memcontrol.c`` allocates.  The header
-  definitions stay untouched (the ABI XML cannot see a difference), the
-  pointer fields keep their declared types, and the real objects are the
-  private ``struct abk_vmstats_percpu`` / ``struct abk_lruvec_stats_percpu``
-  below, allocated with ``__alloc_percpu_gfp()`` at the reduced size.
-
-Consequences of keeping the aggregates full-width and raw-indexed:
-
-* ``memcg_page_state()`` and ``lruvec_page_state()`` (header inlines reading
-  the embedded aggregates) stay untouched;
-* the rstat flush maps each compact per-cpu slot back to its item when it
-  propagates into the raw-indexed aggregates;
-* items with no memcg accounting answer -1 from
-  ``memcg_stats_index()``/``memcg_events_index()`` and their per-cpu updates
-  are dropped -- exactly what 6.10 drops after its own index tables.
-
-The item tables are re-derived for 5.15, not copied from 6.10 (which has
-``NR_SECONDARY_PAGETABLE``, ``MEMCG_VMALLOC``/``MEMCG_KMEM``/``MEMCG_ZSWAP_*``
-and the PGSCAN/PGSTEAL_KHUGEPAGED + ZSWP* events -- none exist here).  Cross
-validation: the state set equals the readers in ``memory_stats[]`` plus the
-``memcg1_stats[]`` v1 table (the two agree with 6.10's own
-``memcg_node_stat_items[]`` minus ``NR_SECONDARY_PAGETABLE``); the event set
-equals every ``count_memcg_events()``/``count_memcg_page_event()``/
-``count_memcg_event_mm()``/``__count_memcg_events()`` call site in the tree
-(filemap.c, huge_memory.c, khugepaged.c, memcontrol.c, memory.c, shmem.c,
-swap.c, vmscan.c -- the only files that reference them on this baseline) and
-covers every ``memcg_events()``/``memcg_events_local()`` reader.  A missing
-item would silently read zero -- the compile and the text audits cannot see
-it -- which is why both tables are pinned in ``implementation_audit.py``.
-
-Header edit: ``lruvec_page_state_local()`` moves out of line because its
-inline body indexes the (now compact) per-cpu lruvec object directly.  That is
-not a KMI change -- the inline was static, nothing enters or leaves the
-exported surface, and no struct member moves.  Its only in-tree callers are
-``mm/memcontrol.c`` and ``mm/workingset.c`` (both built-in, so no export is
-added).
-
-Savings on this tree (arm64 GKI, SCS=y, single node, 8 cpus, per memcg):
-vmstats_percpu 2152 -> 736 B, lruvec_stats_percpu 640 -> 424 B, i.e.
-~13.6 KB/memcg resident (the faithful upstream pair would only reach ~4 KB
-here, because it does not compact the 90-slot event arrays that 5.15 still
-carries).  Several hundred memcgs on a phone put that in the MB range.
-
-Graft boundary: no other group writes into the stats accessors, the rstat
-flush, the per-node/memcg stats allocations or ``include/linux/memcontrol.h``
-(the memcontrol.c groups touch the charge/reclaim paths only), so no shape
-probe and no ordering constraint is needed.
-"""
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps
@@ -91,10 +7,6 @@ MEMCONTROL_H = "include/linux/memcontrol.h"
 
 T = True
 
-# ---------------------------------------------------------------------------
-# Step 1: the tables, index helpers, compact per-cpu structs and the out of
-# line lruvec_page_state_local(), inserted ahead of the stats-flushing block.
-# ---------------------------------------------------------------------------
 
 _SLIM_BLOCK_OLD = (
     "/*\n"
@@ -309,10 +221,6 @@ _SLIM_BLOCK_NEW = (
     " * Many codepaths leading to stats update or read are performance sensitive and\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 2: __mod_memcg_state() -- index the percpu state slot, drop items with
-# no memcg accounting.
-# ---------------------------------------------------------------------------
 
 _MOD_STATE_OLD = (
     "void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)\n"
@@ -342,9 +250,6 @@ _MOD_STATE_NEW = (
     "}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 3: memcg_page_state_local() -- same indexing for the percpu read side.
-# ---------------------------------------------------------------------------
 
 _PAGE_STATE_LOCAL_OLD = (
     "/* idx can be of type enum memcg_stat_item or node_stat_item. */\n"
@@ -384,10 +289,6 @@ _PAGE_STATE_LOCAL_NEW = (
     "}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 4: __mod_memcg_lruvec_state() -- one slot serves both the memcg and the
-# lruvec percpu objects (node items occupy the same leading slots).
-# ---------------------------------------------------------------------------
 
 _MOD_LRUVEC_OLD = (
     "void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,\n"
@@ -433,9 +334,6 @@ _MOD_LRUVEC_NEW = (
     "}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 5: __count_memcg_events() -- events get their own item -> slot table.
-# ---------------------------------------------------------------------------
 
 _COUNT_EVENTS_OLD = (
     "void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,\n"
@@ -467,9 +365,6 @@ _COUNT_EVENTS_NEW = (
     "}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 6: memcg_events_local() -- v1 read side over the compact event slots.
-# ---------------------------------------------------------------------------
 
 _EVENTS_LOCAL_OLD = (
     "static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)\n"
@@ -499,10 +394,6 @@ _EVENTS_LOCAL_NEW = (
     "}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 7: the v1 page-event accounting (nr_page_events / targets live at the
-# tail of the compact struct, unchanged widths).
-# ---------------------------------------------------------------------------
 
 _NR_PAGE_EVENTS_OLD = (
     "\t__this_cpu_add(memcg->vmstats_percpu->nr_page_events, nr_pages);\n"
@@ -532,12 +423,6 @@ _RATELIMIT_WRITE_NEW = (
     "\t\t\t\t next);\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 7b: the v1 uncharge path -- uncharge_batch() adds to nr_page_events
-# directly (found by re-enumerating every vmstats_percpu dereference on the
-# patched tree; the first enumeration pass stopped at the charge/ratelimit
-# sites and missed this one).
-# ---------------------------------------------------------------------------
 
 _UNCHARGE_OLD = (
     "\t__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_memory);\n"
@@ -548,10 +433,6 @@ _UNCHARGE_NEW = (
     "\t\t\t ug->nr_memory);\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 8: the two allocation sites.  The declared pointer types are unchanged;
-# the objects behind them shrink to the compact structs.
-# ---------------------------------------------------------------------------
 
 _PN_ALLOC_OLD = (
     "\tpn->lruvec_stats_percpu = alloc_percpu_gfp(struct lruvec_stats_percpu,\n"
@@ -577,10 +458,6 @@ _MEMCG_ALLOC_NEW = (
     "\t\t\t\t   GFP_KERNEL_ACCOUNT);\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 9: build the item -> slot tables before the root memcg starts
-# accounting (its own stats go through the same index).
-# ---------------------------------------------------------------------------
 
 _CSS_ALLOC_OLD = (
     "\t} else {\n"
@@ -595,11 +472,6 @@ _CSS_ALLOC_NEW = (
     "\t\tpage_counter_init(&memcg->memory, NULL);\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 10: the rstat flush.  The per-cpu object is compact and slot-indexed,
-# the embedded aggregates stay raw-indexed (their layout is KMI-frozen), so
-# every aggregate access goes through the slot's item.
-# ---------------------------------------------------------------------------
 
 _FLUSH_DECL_OLD = (
     "\tstruct mem_cgroup *parent = parent_mem_cgroup(memcg);\n"
@@ -795,11 +667,6 @@ _FLUSH_LRUVEC_NEW = (
     "\t}\n"
 )
 
-# ---------------------------------------------------------------------------
-# Step 11: the header inline comes out; the real function lives in
-# mm/memcontrol.c now (see the block comment there).  Static inline, so this
-# is not a KMI change -- and no struct member moves anywhere in this header.
-# ---------------------------------------------------------------------------
 
 _HEADER_LOCAL_OLD = (
     "static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,\n"
@@ -834,7 +701,6 @@ _HEADER_LOCAL_NEW = (
     "\t\t\t\t      enum node_stat_item idx);\n"
 )
 
-# Symbols the unit test and the audits probe for.
 MARKER = "ABK stable_515_backport: memcg_stats_percpu_slim"
 ABK_VMSTATS_STRUCT = "struct abk_vmstats_percpu"
 ABK_LRUVEC_STRUCT = "struct abk_lruvec_stats_percpu"
@@ -846,17 +712,6 @@ INIT_PAIR = "init_memcg_stats();\n\t\tinit_memcg_events();"
 
 
 def build_steps():
-    """Nineteen required steps (tables+helpers insert, accessors -- charge,
-    ratelimit and the v1 uncharge_batch() page-event add -- allocations, the
-    index-table init call site, the rstat flush, and the header move), all
-    on one transaction.
-
-    All required: a tree that compacts the allocation but leaves one raw
-    ``vmstats_percpu->state[idx]`` access behind compiles fine and corrupts
-    stats for whoever reads that item -- the silent half-port this batch must
-    not be.  The header step is required for the same reason: keeping the
-    inline would make workingset.c read the compact object with raw offsets.
-    """
     return [
         (MEMCONTROL_C, _SLIM_BLOCK_OLD, _SLIM_BLOCK_NEW, T),
         (MEMCONTROL_C, _MOD_STATE_OLD, _MOD_STATE_NEW, T),
@@ -888,7 +743,6 @@ def _memcg_stats_percpu_slim_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    """Return the Batch-36 PatchGroup record."""
     return [
         PatchGroup(
             "memcg_stats_percpu_slim",

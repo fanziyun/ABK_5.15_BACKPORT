@@ -1,10 +1,4 @@
 #!/system/bin/sh
-# service.sh - late stage of the ABK 5.15 runtime-tunables module.
-#
-# Waits for the ROM's own zram bring-up to settle, takes the configuration over
-# with the fixed best-algorithm policy (see zram-policy.sh), then supervises
-# the recompression sweeps.  Also re-enters itself for the long-running
-# supervisors, so each of them can record its own pid.
 set -u
 
 MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -22,18 +16,11 @@ esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
 
-# abk_spawn <re-entry argument> <pid name>
 abk_spawn() {
   _sp_arg="$1"
   _sp_name="$2"
 
-  # A module update or a second service.sh run can leave an older supervisor
-  # behind; it would keep sweeping with the previous copy of the script.  Kill
-  # the matching ones first -- this process's own cmdline has no such argument,
-  # so it never matches itself.  SIGKILL on purpose: the supervisor spends its
-  # life in `sleep 1800`, and a shell holding a foreground child defers SIGTERM
-  # until that child exits, so a polite signal leaves it running for half an
-  # hour (measured on device).  It owns no state, so there is nothing to flush.
+  # SIGKILL: a sleeping supervisor defers SIGTERM for up to 30 min; it holds no state.
   if command -v pkill >/dev/null 2>&1; then
     pkill -9 -f "service.sh $_sp_arg" 2>/dev/null || true
     sleep 1
@@ -78,29 +65,20 @@ if [ "$(abk_cfg cfr.enable 0)" = "1" ]; then
   abk_spawn --supervise-cfr cfr
 fi
 
-# Per-cgroup PSI accounting: a full tree walk with a blocking write per
-# group, so it never belongs in post-fs-data -- it belongs to a supervisor that
-# can take its time and catch the groups the apps create later.  With
-# psi.cgroup=keep nothing is spawned at all: one decision here, no silent loop.
+# A full cgroup walk with a blocking write per group: supervisor, not post-fs-data.
 if [ "$(abk_psi_mode)" = keep ]; then
   abk_log "psi.cgroup=keep: per-cgroup pressure accounting left as the kernel set it"
 else
   abk_spawn --supervise-psi psi
 fi
 
-# MGLRU: the ROM's init rewrites this node to 0 after post-fs-data, so give it
-# the same reassert supervisor the zram policy has (only on lru_gen.enable=1).
+# The ROM's init rewrites lru_gen/enabled to 0 after post-fs-data.
 if [ "$(abk_cfg lru_gen.enable 0)" = "1" ] \
   && [ -e "$ABK_SYS_ROOT/kernel/mm/lru_gen/enabled" ]; then
   abk_spawn --supervise-lru-gen lru_gen
 fi
 
-# Stage 2b: the iorapd replacement.  Watches /proc for new app-uid processes
-# and drives the kernel's launch record/prefetch knobs -- record a uid once
-# per generation, kick it on every other launch (the economics are documented
-# in iorap-watch.sh).  Requires the bg_launch_prefetch kernel group (v0.54+);
-# without it the watcher exits after logging, so the spawn is gated on the
-# knob existing rather than on a kernel version.
+# Gated on the knob, not a version: without bg_launch_prefetch the watcher exits.
 if [ -e /sys/module/filemap/parameters/abk_lp_enable ] \
   && [ "$(abk_cfg iorap.watch 1)" = "1" ]; then
   abk_spawn --supervise-iorap iorap-watch

@@ -1,68 +1,4 @@
 #!/usr/bin/env python3
-"""Config-gate audit: no ABK-added code that the built .config compiles out.
-
-step_audit.py proves the anchors land; implementation_audit.py proves the
-content is real; smoke.sh proves the child path end to end.  All three run
-without a kernel build, so none of them can see the failure this one exists
-for: code this module *adds* behind a CONFIG gate that the build turns **off**.
-The group reports ``applied``, the tree looks patched, and the compiler deletes
-the payload.
-
-That is not hypothetical.  Batch 8 added the RCU ``offload_all`` machinery
-behind ``CONFIG_RCU_NOCB_CPU_DEFAULT_ALL`` and no tier ever enabled the symbol,
-so ``if (offload_all)`` was provably false on every baseline while the group
-reported applied (found by the Batch 16 emptiness audit; the module tier
-enables it now).  ``scripts/abk_stable_core.py`` grew ``_INTRODUCED_KCONFIG``
-from that finding, but that table only covers symbols this module *introduces*
--- symbols it merely *depends on* were invisible to it.
-
-**What this audit cannot see, by construction.**  It looks for added lines
-*inside* a gate.  A symbol that only picks a static-branch initialiser has no
-added line to find, so a whole class of "compiles in but never runs" survives
-it.  ``CONFIG_LRU_GEN_ENABLED`` is that class: ``mm/vmscan.c`` selects
-``DEFINE_STATIC_KEY_ARRAY_TRUE`` vs ``_FALSE`` for ``lru_gen_caps`` on it, and
-with it unset every MGLRU branch starts false and
-``/sys/kernel/mm/lru_gen/enabled`` reads ``0x0000`` while ``CONFIG_LRU_GEN=y``
-still compiles the whole implementation.  Verified on the device that shipped
-the first cut of Batch 38: the audit reports OK against that config *and*
-against a fixed one, because the gate never appears in the diff.  Batch 37's
-six MGLRU groups were runtime-inert for exactly this reason.  Do not read
-"CONFIG GATE AUDIT OK" as "every feature this module touches is running" --
-for runtime-default symbols, the guard is
-``test_mglru_is_enabled_by_the_default_tier`` in
-``tests/stable_5_15_test.py``.
-
-Attribution is exact rather than heuristic.  Every file this module writes has
-a pristine ``<file>.abk-orig`` snapshot next to it (the same snapshots
-``scripts/abk_rollback.sh`` restores from), so "did we add this line?" is a diff
-against the baseline, not a guess about nearby markers.  Without that, an
-upstream ``IS_ENABLED(CONFIG_PREEMPT_RT)`` two lines above one of our edits
-reads as our gate -- and the Batch 16 RCU gate, whose marker sits *above* the
-``#if``, reads as upstream.  Both mistakes were observed while writing this.
-
-Two classes are checked:
-
-* A -- a gate line this module added (``#ifdef CONFIG_X``, ``#if defined(...)``,
-  ``IS_ENABLED(CONFIG_X)``) whose symbol the build has off.
-* B -- an added code line sitting inside an *upstream* gate whose symbol the
-  build has off (adding live code to a block that is compiled out).
-
-Either way the symbol must be on, or the darkness must be recorded in
-``DARK_GATES`` below with a reason.  A gate whose symbol a tier of this module
-claims to enable but whose .config says ``not set`` is a hard failure on its
-own: that is the signature of an unmet Kconfig dependency, the one way a tier
-can silently fail to take effect.
-
-Usage:
-  python3 tests/config_gate_audit.py <grafted-common-dir> --config <path>
-
-``--config`` may be omitted when the tree sits in the standard Android layout
-(``<workspace>/kernel/common`` with ``<workspace>/kernel/out/<target>/common``)
-or when ``ABK_CONFIG`` names it.  Without a .config there is nothing to compare
-against, so the audit refuses to run rather than print a green that means
-nothing -- and it refuses a tree with no ``.abk-orig`` snapshots for the same
-reason: an unpatched tree passing this check says nothing at all.
-"""
 
 from __future__ import annotations
 
@@ -83,16 +19,11 @@ GATE_RE = re.compile(
 )
 IS_ENABLED_RE = re.compile(r"IS_ENABLED\(\s*(CONFIG_[A-Za-z0-9_]+)\s*\)")
 
-# SCHED_FEAT is a gate too.  `features.h` is expanded into either a sysctl
-# bitmask or a set of static keys, and the second argument is the default, so
-# the line itself says whether the gate is on.  See scan_sched_feats().
 SCHED_FEAT_RE = re.compile(
     r"^\s*SCHED_FEAT\(\s*([A-Za-z0-9_]+)\s*,\s*(true|false)\s*\)"
 )
 SCHED_FEAT_USE_RE = re.compile(r"sched_feat\(\s*([A-Za-z0-9_]+)\s*\)")
 
-# Dark gates this audit accepts.  Every entry needs a reason, because an
-# unrecorded dark gate is exactly the Batch 8 RCU bug.  Keep it small.
 DARK_GATES = {
     "CONFIG_ZRAM_WRITEBACK": (
         "ROM-integration tier, opt-in by decision (Batch 14): the target ROM "
@@ -150,7 +81,6 @@ DARK_GATES = {
 
 
 def config_state(path: Path) -> tuple[set[str], set[str], set[str]]:
-    """Return (on, off, known) symbol sets for a .config."""
     on, off, known = set(), set(), set()
     for line in path.read_text(errors="replace").splitlines():
         m = re.match(r"(CONFIG_[A-Za-z0-9_]+)=(.*)", line)
@@ -166,7 +96,6 @@ def config_state(path: Path) -> tuple[set[str], set[str], set[str]]:
 
 
 def added_lines(original: list[str], patched: list[str]) -> set[int]:
-    """1-based line numbers in ``patched`` that the graft inserted or rewrote."""
     added: set[int] = set()
     matcher = difflib.SequenceMatcher(a=original, b=patched, autojunk=False)
     for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
@@ -176,7 +105,6 @@ def added_lines(original: list[str], patched: list[str]) -> set[int]:
 
 
 def guarded_span(lines: list[str], start: int) -> int:
-    """Index of the ``#endif`` closing the gate that opens at ``start``."""
     depth = 0
     for i in range(start, len(lines)):
         stripped = lines[i].lstrip()
@@ -204,7 +132,6 @@ def find_config(common: Path, explicit: str | None) -> Path | None:
 
 
 def tier_claims(symbol: str) -> str | None:
-    """Which tier of this module claims to enable ``symbol``, if any."""
     short = symbol[len("CONFIG_"):]
     for attr, tier in (
         ("_MODULE_CONFIGS", "module"),
@@ -218,11 +145,6 @@ def tier_claims(symbol: str) -> str | None:
 
 
 def scan(common: Path) -> tuple[list, list, int]:
-    """Classify every gate on module-added code.
-
-    Returns (class_a, class_b, files_checked); each hit is
-    (rel, line, symbol, kind).
-    """
     class_a, class_b = [], []
     snapshots = sorted(common.rglob("*.abk-orig"))
     for snapshot in snapshots:
@@ -253,14 +175,6 @@ def scan(common: Path) -> tuple[list, list, int]:
 
 
 def scan_sched_feats(common: Path) -> tuple[list, list]:
-    """Module-added SCHED_FEAT lines, split by their default.
-
-    Returns (enabled, disabled); each hit is (rel, line, name, default).
-
-    A `true` entry that nothing reads is the Batch 28 failure: the switch is
-    on, the symbol exists, and toggling it changes nothing because no
-    module-added line consults it.
-    """
     enabled, disabled = [], []
     for snapshot in sorted(common.rglob("*.abk-orig")):
         target = Path(str(snapshot)[:-len(".abk-orig")])
@@ -287,7 +201,6 @@ def scan_sched_feats(common: Path) -> tuple[list, list]:
 
 def _sched_feat_has_reader(common: Path, name: str, defined_in: str,
                            defined_at: int) -> bool:
-    """Is there a sched_feat(<name>) on a module-added line, in any file?"""
     for snapshot in sorted(common.rglob("*.abk-orig")):
         target = Path(str(snapshot)[:-len(".abk-orig")])
         if not target.is_file():
@@ -301,7 +214,7 @@ def _sched_feat_has_reader(common: Path, name: str, defined_in: str,
         for i, line in enumerate(patched):
             lineno = i + 1
             if rel == defined_in and lineno == defined_at:
-                continue          # the definition itself does not count
+                continue
             if lineno not in added:
                 continue
             for use in SCHED_FEAT_USE_RE.finditer(line):
@@ -347,10 +260,6 @@ def run(common: Path, config: Path) -> list[str]:
                     f"it"
                 )
 
-    # SCHED_FEAT gates.  A default-off switch is dark by construction and
-    # needs a reason; a default-on one needs a reader, because "enabled" is not
-    # "effective" -- that is exactly how Batch 28 shipped a switch that could
-    # not change anything.
     for rel, line, name, _default in feats_off:
         if name in DARK_GATES:
             dark.append(("SF", rel, line, name))
@@ -378,7 +287,8 @@ def run(common: Path, config: Path) -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description="Audit graft CONFIG gates against a build's .config")
     parser.add_argument("common_dir",
                         help="the grafted <KERNEL_ROOT>/common tree")
     parser.add_argument("--config", default=None,

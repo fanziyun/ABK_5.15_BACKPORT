@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 from abk_backport_engine import apply_steps

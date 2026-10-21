@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import re
@@ -31,7 +29,6 @@ GATE_APP_ONLY = "if (!READ_ONCE(fault_around_app_only) &&"
 
 
 def _tabs(text):
-    
     text = re.sub(r"(?m)^    +", lambda m: "\t" * (len(m.group(0)) // 4), text)
     return text.rstrip("\n") + "\n"
 
@@ -64,7 +61,6 @@ DO_READ_FAULT_PROBE = "static vm_fault_t do_read_fault(struct vm_fault *vmf)"
 
 
 def build_steps():
-    
     return [
         (MEMORY_C, _DEF_OLD, _DEF_NEW, T),
         (MEMORY_C, _CALL_OLD, _CALL_NEW, T),
@@ -97,7 +93,6 @@ def _fault_around_app_policy_apply(ctx):
 
 
 def build_groups(PatchGroup):
-    
     return [
         PatchGroup(
             "fault_around_app_policy",

@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""Bundle the runtime-tunables KernelSU module into an AnyKernel3 zip.
-
-Flashing a kernel and installing the runtime policy are one action for the
-user: without the module the kernel's zram recompression machinery stays inert
-and the ROM's own zram owner keeps the dominated lz4hc primary.  So the module
-rides inside the AnyKernel3 zip instead of being a second download:
-
-* the module zip is stored at ``abk-ksu-modules/<module id>.zip`` in the AK3
-  tree, which the AK3 installer unzips into ``$AKHOME``;
-* an idempotent installer block is appended to ``anykernel.sh``.  AK3 runs
-  ``anykernel.sh`` after writing the boot image, so the block installs the
-  module through ``ksud``/``apd``/``magisk`` and falls back to unpacking it into
-  ``/data/adb/modules/<id>`` when none of them is usable (for example in
-  recovery).
-
-Both halves are additive: no AK3 file is removed and no property of the
-upstream ``anykernel.sh`` changes.  The block is delimited by markers, so
-re-running the injector replaces it instead of stacking copies.
-
-The ABK build hook calls this automatically (see ``scripts/stable_backport.sh``);
-the same CLI also patches a finished zip by hand:
-
-    python3 scripts/ak3_bundle_ksu_module.py inject \\
-        --zip Android13-5.15.215-AnyKernel3.zip --output AK3-with-tunables.zip
-    python3 scripts/ak3_bundle_ksu_module.py verify --zip AK3-with-tunables.zip
-"""
 
 from __future__ import annotations
 
@@ -114,7 +88,7 @@ _BLOCK_PATTERN = re.compile(
 
 
 class InjectionError(SystemExit):
-    """A condition the caller must fix; the CLI reports it and exits non-zero."""
+    pass
 
 
 def module_id(source: Path = MODULE_SOURCE) -> str:
@@ -122,7 +96,6 @@ def module_id(source: Path = MODULE_SOURCE) -> str:
 
 
 def module_zip_id(module_zip: Path) -> str:
-    """The module id inside a built zip; KernelSU names the directory after it."""
     with zipfile.ZipFile(module_zip) as archive:
         if "module.prop" not in archive.namelist():
             raise InjectionError(f"{module_zip} has no module.prop")
@@ -133,21 +106,12 @@ def module_zip_id(module_zip: Path) -> str:
 
 
 def build_module_zip(source: Path = MODULE_SOURCE, output: Path | None = None) -> Path:
-    """Build the module zip; without an explicit output it lands in a temp dir."""
     if output is None:
         output = Path(tempfile.mkdtemp(prefix="abk-tunables-ksu-")) / f"{module_id(source)}.zip"
     return build_module(source, output)
 
 
 def inject_script(text: str) -> str:
-    """Append the installer block, or replace an existing one in place.
-
-    Line endings are normalised to LF first: the device sources this script with
-    ``ash``, where a trailing ``\\r`` becomes part of the last token.  A Windows
-    checkout (``core.autocrlf``) is the usual way a CRLF ``anykernel.sh`` reaches
-    the injector, and the block must never be appended to a script that cannot
-    run.
-    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if _BLOCK_PATTERN.search(text):
         return _BLOCK_PATTERN.sub(lambda _: INSTALLER_BLOCK.rstrip("\n"), text)
@@ -156,7 +120,6 @@ def inject_script(text: str) -> str:
 
 
 def discover_ak3_dir(hint: str | None = None, start: Path | None = None) -> Path | None:
-    """Locate an extracted AnyKernel3 tree without relying on ABK's env names."""
     candidates: list[Path] = []
     if hint:
         candidates.append(Path(hint))
@@ -173,8 +136,6 @@ def discover_ak3_dir(hint: str | None = None, start: Path | None = None) -> Path
             candidates.extend(path.parent for path in sorted(root.glob(pattern)))
 
     origin = (start or Path.cwd()).resolve()
-    # Bounded walk: ABK's module checkout sits next to AnyKernel3, so two levels
-    # are enough. Never climb to a drive root, where globbing can be enormous.
     for parent in [origin, *origin.parents[:2]]:
         candidates.append(parent)
         candidates.extend(path.parent for path in sorted(parent.glob("*/anykernel.sh")))
@@ -194,7 +155,6 @@ def discover_ak3_dir(hint: str | None = None, start: Path | None = None) -> Path
 
 
 def inject_dir(ak3_dir: Path, module_zip: Path) -> tuple[Path, Path]:
-    """Patch an extracted AnyKernel3 tree in place."""
     script = ak3_dir / ANY_KERNEL_SCRIPT
     if not script.is_file():
         raise InjectionError(f"no {ANY_KERNEL_SCRIPT} in {ak3_dir}")
@@ -206,8 +166,6 @@ def inject_dir(ak3_dir: Path, module_zip: Path) -> tuple[Path, Path]:
     target = bundle / f"{module_zip_id(module_zip)}.zip"
     target.write_bytes(module_zip.read_bytes())
 
-    # write_bytes, not write_text: text mode would turn the LF endings back into
-    # CRLF on Windows and hand the device an unparsable script.
     script.write_bytes(inject_script(script.read_text(encoding="utf-8")).encode("utf-8"))
     script.chmod(script.stat().st_mode | 0o111)
     return script, target
@@ -215,14 +173,13 @@ def inject_dir(ak3_dir: Path, module_zip: Path) -> tuple[Path, Path]:
 
 def _zip_info(name: str, mode: int, date_time: tuple[int, int, int, int, int, int]) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(name, date_time=date_time)
-    info.create_system = 3  # unix, so external_attr carries the mode
+    info.create_system = 3
     info.external_attr = mode << 16
     info.compress_type = zipfile.ZIP_DEFLATED
     return info
 
 
 def inject_zip(source: Path, output: Path, module_zip: Path) -> tuple[Path, str]:
-    """Rewrite an AnyKernel3 zip with the module and the installer block added."""
     if not source.is_file():
         raise InjectionError(f"ak3 zip not found: {source}")
 
@@ -337,7 +294,6 @@ def verify_zip(source: Path) -> list[str]:
         names = archive.namelist()
         if ANY_KERNEL_SCRIPT not in names:
             return [f"{source} has no {ANY_KERNEL_SCRIPT} at the zip root"]
-        # `zip -r` stores directory entries too; only files can be module zips.
         pairs = [
             (name, archive.read(name))
             for name in names
@@ -348,7 +304,8 @@ def verify_zip(source: Path) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description="Bundle the KernelSU runtime companion into the AnyKernel3 zip")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_targets(target: argparse.ArgumentParser) -> None:
