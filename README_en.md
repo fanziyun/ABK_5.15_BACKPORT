@@ -51,11 +51,11 @@
 
 | child id | content | groups |
 |---|---|---:|
-| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 73 |
+| `stable_backport_core` | memory / reclaim / zram / fs-mm hot paths | 78 |
 | `stable_perf_backport` | scheduler / PSI / block / DVFS policy | 24 |
 | `stable_display_fix` | the drm black-screen fix | 1 |
 
-**98 graft groups** in total; one injection string covers `android13-5.15-lts`.
+**103 graft groups** in total (core 78 / perf 24 / display 1); one injection string covers `android13-5.15-lts`.
 
 Supported baseline: **`android13-5.15-lts`** (rolling branch; the matrix row is
 keyed to the tree's current Makefile `SUBLEVEL`, 220 as of 2026-09). Batch 44
