@@ -162,7 +162,7 @@ GROUP_COUNTS = {
     # Batch 41's generated text (set_page_writeback at enqueue + end at drain,
     # device A/B swap-corruption fix), so it cannot arrive pre-applied either;
     # it refuses when the Batch 41 engine is absent.
-    "stable_backport_core": 75,
+    "stable_backport_core": 78,
     # 41 on the merged base (Batch 34 arm64_lse_percpu_load_atomics took it
     # from 40 to 41) + Batch 35 (four page-cache/page-table groups) + the
     # Batch-36 FUSE write-path prefault below = 46.

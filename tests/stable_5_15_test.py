@@ -3259,7 +3259,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.74.0", "0.74.0"], _versions)
+          _versions == ["0.75.0", "0.75.0"], _versions)
 
     # The zram writeback data path is kernel-side: the loop worker -- a kernel
     # thread, so u:r:kernel:s0, whoever attached the loop device -- is what reads
@@ -6735,6 +6735,504 @@ def test_sched_tunables_module():
           "92-94%" in tunables_conf)
 
 
+
+def test_batch72_kcompressd_swapcache_drop():
+    
+    print("Batch 72: kcompressd_swapcache_drop (same-pass swap cache drop)")
+    import abk_stable_core as core
+    import batch72_core_kcompressd_swapcache_drop as b72
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "kcompressd_swapcache_drop"), None)
+    check("kcompressd_swapcache_drop group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly mm/vmscan.c",
+          group.files == [b72.VMSAN], group.files)
+
+    keys = [g.key for g in core.PATCH_GROUPS]
+    check("registered after kcompressd_writeback_pin",
+          keys.index("kcompressd_swapcache_drop")
+          > keys.index("kcompressd_writeback_pin"),
+          keys[keys.index("kcompressd_swapcache_drop") - 1:
+               keys.index("kcompressd_swapcache_drop") + 1])
+
+    steps = b72.build_steps()
+    check("three required steps, all in mm/vmscan.c",
+          [(rel, req) for rel, _o, _n, req in steps]
+          == [(b72.VMSAN, True)] * 3,
+          [(rel, req) for rel, _o, _n, req in steps])
+    for i, (_rel, old, new, _req) in enumerate(steps):
+        check(f"step {i}'s replacement is not a prefix of its own anchor "
+              "(trap 1)", not old.startswith(new))
+        if i != 2:
+            check(f"step {i} adds no wait_on_page_writeback",
+                  "wait_on_page_writeback" not in new)
+
+    def synthetic_vmscan():
+        """The three pristine anchors, in file order, in a minimal caller."""
+        return (
+            "static unsigned int shrink_page_list(struct list_head *page_list)\n"
+            "{\n"
+            + b72._DECL_OLD +
+            "\tunsigned int nr_reclaimed = 0;\n"
+            "\tbool do_demote_pass;\n"
+            "\n"
+            "retry:\n"
+            "\twhile (!list_empty(page_list)) {\n"
+            "\t\tstruct page *page;\n"
+            "\n"
+            "\t\tpage = lru_to_page(page_list);\n"
+            "\t\tlist_del(&page->lru);\n"
+            "\t\tswitch (pageout(page, mapping)) {\n"
+            "\t\t\tcase PAGE_KEEP:\n"
+            "\t\t\t\tgoto keep_locked;\n"
+            + b72._PARK_OLD +
+            "\t\t\t\tif (!trylock_page(page))\n"
+            "\t\t\t\t\tgoto keep;\n"
+            "\t\t\tcase PAGE_CLEAN:\n"
+            "\t\t\t\t;\n"
+            "\t\t}\n"
+            "keep_locked:\n"
+            "\t\tunlock_page(page);\n"
+            "keep:\n"
+            "\t\tlist_add(&page->lru, &ret_pages);\n"
+            "\t}\n"
+            + b72._RETRY_OLD +
+            "\tnr_reclaimed += demote_page_list(&demote_pages, pgdat);\n"
+            "\tif (!list_empty(&demote_pages)) {\n"
+            "\t\tlist_splice_init(&demote_pages, page_list);\n"
+            "\t\tdo_demote_pass = false;\n"
+            "\t\tgoto retry;\n"
+            "\t}\n"
+            "\treturn nr_reclaimed;\n"
+            "}\n"
+        )
+
+    io_pinned = ("int swap_writepage(struct page *page)\n{\n"
+                 "\t/* sailboat_kcompressd_wb_pin: marker */\n"
+                 "\tset_page_writeback(page);\n"
+                 "\treturn 0;\n}\n")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b72.VMSAN: synthetic_vmscan(),
+                             b72.PAGE_IO: "int swap_writepage(void)\n"})
+        status, detail = b72._kcompressd_swapcache_drop_apply(ctx)
+        check("a tree without Batch 71's pin reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the refusal names the missing pin",
+              b72.WB_PIN_MARKER in detail, detail)
+        check("the refused tree is not written", ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {b72.VMSAN: "int shrink_page_list(void) {}\n",
+                             b72.PAGE_IO: io_pinned})
+        status, detail = b72._kcompressd_swapcache_drop_apply(ctx)
+        check("an unknown reclaim loop reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the unknown shape is not written", ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {})
+        status, detail = b72._kcompressd_swapcache_drop_apply(ctx)
+        check("a missing file reports blocked_by_shape",
+              status == "blocked_by_shape", (status, detail))
+        check("the empty tree is not written", ctx.pending_writes() == [])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pristine = synthetic_vmscan()
+        ctx = make_ctx(tmp, {b72.VMSAN: pristine, b72.PAGE_IO: io_pinned})
+        status, detail = b72._kcompressd_swapcache_drop_apply(ctx)
+        check("the group applies on the pristine 5.15 shape",
+              status == "applied", (status, detail))
+        text = ctx.read(b72.VMSAN)
+        check("only mm/vmscan.c is written",
+              ctx.pending_writes() == [b72.VMSAN], ctx.pending_writes())
+
+        check("wb_retry_pages is declared after demote_pages",
+              "\tLIST_HEAD(demote_pages);\n" in text
+              and text.index("\tLIST_HEAD(demote_pages);\n")
+              < text.index("\tLIST_HEAD(wb_retry_pages);\n"))
+        check("the one-shot latch is declared with the lists",
+              b72.DECL_FLAG in text)
+        check("the declarations still precede the function's first statement",
+              text.index(b72.DECL_LIST) < text.index("\tbool do_demote_pass;"))
+
+        park = text[text.index("\t\t\tcase PAGE_SUCCESS:"):
+                    text.index("\t\t\tcase PAGE_CLEAN:")]
+        check("the parking block is inside the CONFIG_SWAP gate",
+              park.index("#ifdef CONFIG_SWAP") < park.index("page_swap_info(page)")
+              < park.index("#endif"), "page_swap_info outside its gate")
+        check("the parking block keeps the pristine goto keep as the "
+              "#else behaviour", "#endif\n\t\t\t\t\tgoto keep;\n" in park)
+        check("the parked page continues the loop on the retry list",
+              b72.PARK in park and "\t\t\t\t\t\tcontinue;\n" in park)
+        check("PageSwapCache is tested before page_swap_info()",
+              park.index("PageSwapCache(page)")
+              < park.index("page_swap_info(page)"))
+        check("the SWP_SYNCHRONOUS_IO filter is present",
+              "SWP_SYNCHRONOUS_IO" in park)
+        check("the latch guards the parking",
+              park.index("!wb_retry_done") < park.index(b72.PARK))
+        check("the PageDirty guard stays after the parking block",
+              park.index("goto keep;\n\t\t\t\t}") < park.index("PageDirty(page)"))
+        check("the parking adds no wait",
+              "wait_on_page_writeback" not in park)
+
+        tail = text[text.index("\t/* 'page_list' is always empty here */"):]
+        check("the retry block is anchored after the empty-page_list comment",
+              tail.index("sailboat_kcompressd_swapcache_drop")
+              < tail.index("wb_retry_done = true;"))
+        check("the latch is set before the re-scan",
+              tail.index(b72.RETRY_LATCH) < tail.index(b72.SPLICE))
+        check("still-writeback pages wait for the deferred write",
+              b72.WAIT_PIN in tail
+              and tail.index("list_for_each_entry_safe(page, next, "
+                             "&wb_retry_pages, lru)")
+              < tail.index(b72.WAIT_PIN))
+        check("the wait is guarded by PageWriteback",
+              "if (!PageWriteback(page))\n\t\t\t\tcontinue;" in tail)
+        check("the drain context falls back to the ret_pages pre-filter",
+              b72.DRAIN_GUARD in tail and "PF_SWAPWRITE" in tail
+              and "list_move(&page->lru, &ret_pages);" in tail)
+        check("the remaining pages are spliced onto page_list",
+              b72.SPLICE in tail)
+        check("do_demote_pass is cleared before the retry",
+              tail.index(b72.SPLICE)
+              < tail.index("\t\t\tdo_demote_pass = false;")
+              < tail.index("\t\t\tgoto retry;"))
+        check("the retry precedes the demotion retry",
+              tail.index("\t\t\tgoto retry;")
+              < tail.index("list_splice_init(&demote_pages, page_list);"))
+        check("both halves are bounded by the one-shot latch",
+              tail.count("!wb_retry_done && !list_empty(&wb_retry_pages)") == 1
+              and tail.count("wb_retry_done = true;") == 1)
+        check("the group marker rides on all three edits",
+              text.count(b72.MARKER) == 3, text.count(b72.MARKER))
+        check("the whole file adds exactly one wait_on_page_writeback",
+              text.count("wait_on_page_writeback")
+              == pristine.count("wait_on_page_writeback") + 1)
+
+        ctx2 = make_ctx(tmp + "-b", {b72.VMSAN: text, b72.PAGE_IO: io_pinned})
+        status2, detail2 = b72._kcompressd_swapcache_drop_apply(ctx2)
+        check("second pass is already_present", status2 == "already_present",
+              (status2, detail2))
+        check("second pass is byte-identical", ctx2.read(b72.VMSAN) == text)
+        check("second pass writes nothing", ctx2.pending_writes() == [])
+        st = next(g for g in core.PATCH_GROUPS
+                  if g.key == "kcompressd_swapcache_drop").run(ctx2)["status"]
+        check("the registered group is idempotent", st == "already_present", st)
+
+
+B73_READAHEAD_FIXTURE = (
+    "#include <linux/kernel.h>\n"
+    "#include <linux/fadvise.h>\n"
+    "#include <linux/sched/mm.h>\n"
+    "#include <trace/hooks/mm.h>\n"
+    "\n"
+    '#include "internal.h"\n'
+    "\n"
+    "void abk_fixture(void) { }\n"
+    "EXPORT_SYMBOL(readahead_expand);\n"
+)
+
+B73_SWAP_STATE_FIXTURE = (
+    "static bool enable_vma_readahead __read_mostly = true;\n"
+    "\n"
+    "static unsigned int __swapin_nr_pages(unsigned long prev_offset,\n"
+    "\t\t\t\t      int prev_win)\n"
+    "{\n"
+    "\tunsigned int pages, last_ra;\n"
+    "\n"
+    "\tpages = 2;\n"
+    "\t/* Don't shrink readahead too fast */\n"
+    "\tlast_ra = prev_win / 2;\n"
+    "\tif (pages < last_ra)\n"
+    "\t\tpages = last_ra;\n"
+    "\n"
+    "\treturn pages;\n"
+    "}\n"
+    "\n"
+    "static unsigned long swapin_nr_pages(unsigned long offset)\n"
+    "{\n"
+    "\tunsigned int pages;\n"
+    "\tstatic atomic_t last_readahead_pages;\n"
+    "\n"
+    "\tpages = 2;\n"
+    "\tatomic_set(&last_readahead_pages, pages);\n"
+    "\n"
+    "\treturn pages;\n"
+    "}\n"
+)
+
+B73_INTERNAL_FIXTURE = (
+    "extern int isolate_lru_page(struct page *page);\n"
+    "extern void putback_lru_page(struct page *page);\n"
+)
+
+
+def test_batch73_swapin_readahead_window():
+    
+    print("Batch 73: swapin_readahead_window (boost/shrink/vma_ra)")
+    import abk_stable_core as core
+    import batch73_core_swapin_window as b73
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "swapin_readahead_window"), None)
+    check("swapin_readahead_window group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly its three mm files",
+          group.files == [b73.READAHEAD, b73.SWAP_STATE, b73.INTERNAL_H],
+          group.files)
+
+    steps = b73.build_steps()
+    fixture_all = (B73_READAHEAD_FIXTURE + B73_SWAP_STATE_FIXTURE
+                   + B73_INTERNAL_FIXTURE)
+    check("six required steps", len(steps) == 6 and all(s[3] for s in steps))
+    for i, (rel, old, new, _req) in enumerate(steps):
+        check(f"step {i} ({rel}) anchor is unique in the fixtures",
+              fixture_all.count(old) == 1, fixture_all.count(old))
+        check(f"step {i} ({rel}) replacement is not already present (trap 1)",
+              new not in fixture_all)
+    for i, (_r, _o, new_i, _q) in enumerate(steps):
+        for j, (_r2, old_j, _q2, _q3) in enumerate(steps):
+            if i != j:
+                check(f"step {i} does not pre-create step {j}'s anchor (trap 2)",
+                      old_j not in new_i)
+
+    ra = b73._RA_TAIL_NEW
+    ss = b73._SS_SWAPIN_NEW
+    check("defaults: boost 8 pages / shrink 1 page / background-only",
+          "static unsigned int swapin_boost_pages __read_mostly = 8;" in ra
+          and "static unsigned int swapin_shrink_pages __read_mostly = 1;" in ra
+          and "static bool swapin_window_background_only __read_mostly = true;"
+          in ra)
+    check("swapin_vma_ra is a handle, not a new variable (trap 6)",
+          "module_param_named(swapin_vma_ra, enable_vma_readahead, bool, 0644);"
+          in ra and "swapin_vma_ra __read_mostly" not in ra)
+    check("all seven knobs use the two-name form",
+          ra.count("module_param_named(") == 7
+          and "module_param(" not in ra.replace("module_param_named(", ""))
+    check("the vma switch is de-staticized for the second handle",
+          "static bool enable_vma_readahead" not in b73._SS_VMA_RA_NEW
+          and "bool enable_vma_readahead __read_mostly = true;"
+          in b73._SS_VMA_RA_NEW)
+    check("clamp comes after the don't-shrink-too-fast floor",
+          ss.index("last_ra = prev_win / 2;") < ss.index(b73.CLAMP_CALL))
+    check("the policy is applied exactly once per clamp site",
+          ss.count(b73.CLAMP_CALL) == 1
+          and b73._SS_CLUSTER_NEW.count(b73.CLAMP_CALL) == 1)
+    check("the cluster path's early one-page return is untouched",
+          "if (max_pages <= 1)" not in b73._SS_CLUSTER_NEW)
+    check("both helpers are declared in the swap block of mm/internal.h",
+          "extern unsigned int abk_swapin_window_clamp(unsigned int pages);"
+          in b73._INTERNAL_NEW
+          and "extern bool abk_swapin_shrink_gate(void);" in b73._INTERNAL_NEW)
+    check("the fault-path helper carries no lock/sleep/allocation",
+          not any(x in ra for x in ("mutex_lock", "GFP_KERNEL", "schedule(",
+                                    "wait_on_page")))
+    check("the classifier reuse carries its own config gate (trap 7)",
+          "#ifdef CONFIG_ABK_DYNAMIC_READAHEAD" in ra
+          and "abk_dra_is_background_task()" in ra and "#else" in ra)
+    check("the whole block is CONFIG_SWAP gated",
+          "#ifdef CONFIG_SWAP" in ra and "#endif" in ra)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = make_ctx(tmp, {
+            b73.READAHEAD: B73_READAHEAD_FIXTURE,
+            b73.SWAP_STATE: B73_SWAP_STATE_FIXTURE,
+            b73.INTERNAL_H: B73_INTERNAL_FIXTURE,
+        })
+        status, detail = b73._swapin_window_apply(ctx)
+        check("the group applies on the 5.15 shape", status == "applied",
+              (status, detail))
+        text = ctx.read(b73.SWAP_STATE)
+        check("both call sites got the clamp", text.count(b73.CLAMP_CALL) == 2,
+              text.count(b73.CLAMP_CALL))
+        check("the de-static landed",
+              "bool enable_vma_readahead __read_mostly" in text)
+        status2, _d2 = b73._swapin_window_apply(ctx)
+        check("second pass is already_present", status2 == "already_present",
+              status2)
+
+        broken = B73_SWAP_STATE_FIXTURE.replace("last_ra = prev_win / 2;",
+                                               "last_ra = 0;")
+        ctx2 = make_ctx(tmp + "/2", {
+            b73.READAHEAD: B73_READAHEAD_FIXTURE,
+            b73.SWAP_STATE: broken,
+            b73.INTERNAL_H: B73_INTERNAL_FIXTURE,
+        })
+        status3, detail3 = b73._swapin_window_apply(ctx2)
+        check("a moved window computation blocks the group",
+              status3 == "blocked_by_shape", (status3, detail3))
+
+
+MEMORY_FA_FIXTURE = (
+    "static vm_fault_t do_read_fault(struct vm_fault *vmf)\n"
+    "{\n"
+    "\tstruct vm_area_struct *vma = vmf->vma;\n"
+    "\tvm_fault_t ret = 0;\n"
+    "\tbool should_around = true;\n"
+    "\n"
+    "\ttrace_android_vh_tune_fault_around_bytes(&fault_around_bytes);\n"
+    "\n"
+    "\t/*\n"
+    "\t * Let's call ->map_pages() first and use ->fault() as fallback\n"
+    "\t * if page by the offset is not ready to be mapped (cold cache or\n"
+    "\t * something).\n"
+    "\t */\n"
+    "\ttrace_android_vh_should_fault_around(vmf, &should_around);\n"
+    "\tif (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1 && should_around) {\n"
+    "\t\tif (likely(!userfaultfd_minor(vmf->vma)))\n"
+    "\t\t\tret = do_fault_around(vmf);\n"
+    "\t}\n"
+    "\treturn ret;\n"
+    "}\n"
+)
+
+
+def test_batch74_fault_around_app_policy():
+    import tempfile
+    from pathlib import Path as _Path
+
+    tmpdir = _Path(tempfile.mkdtemp(prefix="abk-b74-"))
+    """Batch 74: per-uid fault-around policy after the vendor hook."""
+    print("Batch 74: fault_around_app_policy (per-uid fault-around)")
+    import abk_stable_core as core
+    import batch74_core_fault_around_app_policy as b74
+
+    group = next((g for g in core.PATCH_GROUPS
+                  if g.key == "fault_around_app_policy"), None)
+    check("fault_around_app_policy group registered", group is not None)
+    if group is None:
+        return
+    check("the group owns exactly mm/memory.c",
+          group.files == [b74.MEMORY_C], group.files)
+
+    steps = b74.build_steps()
+    check("two required steps, both in mm/memory.c",
+          [rel for rel, _o, _n, req in steps] == [b74.MEMORY_C] * 2
+          and all(req for _r, _o, _n, req in steps),
+          [(rel, req) for rel, _o, _n, req in steps])
+
+    for index, (_rel, old, new, _req) in enumerate(steps):
+        check(f"step {index}'s anchor is unique in the pristine fixture",
+              MEMORY_FA_FIXTURE.count(old) == 1, MEMORY_FA_FIXTURE.count(old))
+        check(f"step {index}'s replacement is not already in the pristine "
+              "fixture", new not in MEMORY_FA_FIXTURE)
+
+    for i, (_rel, _old, new_i, _req) in enumerate(steps):
+        for j, (_rel2, old_j, new_j, _req2) in enumerate(steps):
+            if i == j or new_i in old_j:
+                continue
+            check(f"step {i} does not pre-create step {j}'s replacement",
+                  new_j not in new_i)
+
+    def_step, call_step = steps
+    check("the policy block is inserted above do_read_fault(), keeping its "
+          "head verbatim",
+          def_step[2].endswith(def_step[1])
+          and def_step[2].startswith(b74._POLICY_BLOCK), def_step[2][:80])
+    hook_line, if_line = call_step[1].split("\n")[:2]
+    check("the call is inserted between the hook and the if it feeds",
+          call_step[2].startswith(hook_line + "\n")
+          and call_step[2].endswith(if_line + "\n"))
+    check("the call site adds exactly one abk_fa_adjust() call",
+          call_step[2].count(b74.CALL_SITE) == 1, call_step[2])
+
+    policy = b74._POLICY_BLOCK
+    check("defaults are performance-first (enable/sys_uid on, app_only off)",
+          "static bool fault_around_enable __read_mostly = true;" in policy
+          and "static bool fault_around_sys_uid __read_mostly = true;" in policy
+          and re.search(r"static bool fault_around_app_only __read_mostly;",
+                        policy) is not None, policy[:200])
+    check("the uid is read through current_uid()/from_kuid(), not a cred "
+          "offset", b74.UID_READ in policy
+          and "current_cred()" not in policy
+          and "->cred" not in policy
+          and "cred->uid" not in policy)
+    check("the bitmap is 90000 bits indexed by uid - 10000",
+          b74.BITMAP_DEF in policy
+          and "uid - ABK_FA_APP_UID_BASE" in policy)
+    check("the bitmap access is range-checked before indexing",
+          "if (uid > ABK_FA_APP_UID_LAST)" in policy)
+    check("writers take the mutex, the fault path is lockless",
+          b74.LOCK_DEF in policy
+          and "mutex_lock(&abk_fa_app_lock);" in policy
+          and "test_bit(uid - ABK_FA_APP_UID_BASE" in policy)
+    check("the three policy gates are present in order",
+          b74.GATE_ENABLE in policy and b74.GATE_SYS_UID in policy
+          and b74.GATE_APP_ONLY in policy)
+    check("write 0 clears the list", b74.CLEAR_CALL in policy)
+    check("the getter caps the printed list at 64 uids and guards the buffer",
+          b74.READ_BOUND in policy and "if (len > PAGE_SIZE - 16)" in policy)
+    check("the parameters are the four documented knobs",
+          all(pin in policy for pin in (b74.PARAM_ENABLE, b74.PARAM_SYS_UID,
+                                        b74.PARAM_APP_ONLY, b74.PARAM_APP)))
+    check("the marker rides in the payload", b74.MARKER in policy)
+
+    root = tmpdir / "b74"
+    (root / "mm").mkdir(parents=True, exist_ok=True)
+    (root / b74.MEMORY_C).write_text(MEMORY_FA_FIXTURE, encoding="utf-8")
+    ctx = GraftContext(root, 220, "android13-5.15")
+    status, _results, detail = apply_steps(ctx, steps)
+    check("both steps land on the pristine fixture", status == "applied",
+          (status, detail))
+    patched = (root / b74.MEMORY_C).read_text(encoding="utf-8")
+    check("the call follows the hook call",
+          patched.index(b74.CALL_SITE) > patched.index(b74.HOOK_CALL))
+    check("the policy block precedes its only caller",
+          patched.index(b74.ADJUST_DEF) < patched.index(b74.DO_READ_FAULT_PROBE))
+
+    result = group.run(GraftContext(root, 220, "android13-5.15"))
+    check("second pass is already_present",
+          result["status"] == "already_present", result["status"])
+    check("second pass is byte-identical",
+          (root / b74.MEMORY_C).read_text(encoding="utf-8") == patched)
+
+    root3 = tmpdir / "b74-markerless"
+    (root3 / "mm").mkdir(parents=True, exist_ok=True)
+    markerless = patched.replace(b74.MARKER, "sailboat_marker_reflowed")
+    (root3 / b74.MEMORY_C).write_text(markerless, encoding="utf-8")
+    result = group.run(GraftContext(root3, 220, "android13-5.15"))
+    check("a tree whose marker was lost but whose payload survives is "
+          "blocked_by_shape", result["status"] == "blocked_by_shape",
+          result["status"])
+    check("the marker-loss refusal writes nothing",
+          (root3 / b74.MEMORY_C).read_text(encoding="utf-8") == markerless)
+
+    root2 = tmpdir / "b74-unknown"
+    (root2 / "mm").mkdir(parents=True, exist_ok=True)
+    unknown = MEMORY_FA_FIXTURE.replace(b74.HOOK_CALL + "\n", "")
+    (root2 / b74.MEMORY_C).write_text(unknown, encoding="utf-8")
+    result = group.run(GraftContext(root2, 220, "android13-5.15"))
+    check("a tree without the hook call site is blocked_by_shape",
+          result["status"] == "blocked_by_shape", result["status"])
+    check("a blocked group writes nothing",
+          (root2 / b74.MEMORY_C).read_text(encoding="utf-8") == unknown)
+
+
+def test_port_review_regressions():
+    
+    print("port review regressions (I-G1 boost clamp order, I-P4 depth formula)")
+    import batch73_core_swapin_window as b73
+
+    blob = "\n".join(new for _rel, _old, new, _req in b73.build_steps())
+    clamped = blob.find("if (boost > ABK_SWAPIN_WINDOW_MAX)")
+    rounded = blob.find("roundup_pow_of_two(boost)")
+    check("I-G1: the boost floor is clamped before round-up",
+          clamped != -1 and rounded != -1 and clamped < rounded,
+          (clamped, rounded))
+
+    common = (Path(__file__).resolve().parent.parent
+              / "ksu" / "abk_runtime_tunables" / "common.sh")
+    text = common.read_text(encoding="utf-8")
+    check("I-P4: depth is enqueued - swapped", "d = e - s" in text)
+    check("I-P4: depth no longer subtracts the sync count",
+          "e - s - y" not in text)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -6797,6 +7295,10 @@ def main():
     test_batch42_schedutil_smart_cap()
     test_batch70_smaps_migration_guard()
     test_batch71_kcompressd_wb_pin()
+    test_batch72_kcompressd_swapcache_drop()
+    test_batch73_swapin_readahead_window()
+    test_batch74_fault_around_app_policy()
+    test_port_review_regressions()
     test_fetch_decode_roundtrip()
     test_workflow_expressions_are_ascii()
 

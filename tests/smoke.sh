@@ -837,6 +837,30 @@ grep -A2 "set_page_writeback(page);" "$PAGE_IO" | grep -q "return 0;" \
 # Drop-path edit: end_page_writeback immediately followed by put_page.
 grep -A1 "end_page_writeback(page);" "$PAGE_IO" | grep -q "put_page(page);" \
   || fail "the drop-path writeback end is missing"
+
+VMSCAN="$KERNEL_ROOT/common/mm/vmscan.c"
+grep -qF "sailboat_kcompressd_swapcache_drop" "$VMSCAN" \
+  || fail "the kcompressd swap-cache drop marker is missing in mm/vmscan.c"
+grep -qF "list_splice_tail(&wb_retry_pages, page_list);" "$VMSCAN" \
+  || fail "the one-shot swap-cache re-scan is missing in mm/vmscan.c"
+grep -qF "wait_on_page_writeback(page);" "$VMSCAN" \
+  || fail "the still-writeback wait is missing in mm/vmscan.c"
+grep -qF "PF_KSWAPD" "$VMSCAN" \
+  || fail "the drain-context fallback is missing in mm/vmscan.c"
+
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/readahead.c" \
+  || fail "swapin readahead window marker missing in mm/readahead.c"
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/swap_state.c" \
+  || fail "swapin readahead window marker missing in mm/swap_state.c"
+grep -qF "sailboat_swapin_readahead_window" "$KERNEL_ROOT/common/mm/internal.h" \
+  || fail "swapin readahead window marker missing in mm/internal.h"
+
+MEMORY_C="$KERNEL_ROOT/common/mm/memory.c"
+[ "$(grep -c "sailboat_fault_around_app_policy" "$MEMORY_C")" = "2" ] \
+  || fail "mm/memory.c: fault-around policy marker count != 2"
+grep -A2 "trace_android_vh_should_fault_around(vmf, &should_around);" "$MEMORY_C" \
+  | grep -q "abk_fa_adjust(&should_around);" \
+  || fail "mm/memory.c: abk_fa_adjust() not after the vendor hook"
 if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
   fail "the superseded trylock-skip survived in the drain"
 fi

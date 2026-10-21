@@ -1,6 +1,5 @@
 #!/system/bin/sh
 # common.sh - shared helpers for the ABK 5.15 runtime-tunables module.
-#
 # Sourced by post-fs-data.sh / service.sh / action.sh.  Keep it POSIX sh:
 # /system/bin/sh is Android's mksh and there is no bash on the device.
 
@@ -12,14 +11,12 @@ ABK_VERSION="$(sed -n 's/^version=//p' "${MODDIR:-$(cd "$(dirname "$0")" 2>/dev/
 # Constants on purpose, not configuration.  Measured on the target device
 # (vermeer, android13-5.15-lts 5.15.215) by compressing an exact 64 MiB ELF
 # corpus on a single core, on a throwaway zram device:
-#
 #   algo      compressed   ratio   compress           decompress
 #   lz4       31.19 MB     2.15x   0.60 s (107 MB/s)   865 MB/s
 #   lz4kd     31.06 MB     2.16x   0.57 s (112 MB/s)   955 MB/s
 #   lz4hc     29.31 MB     2.29x   1.13 s  (57 MB/s)   901 MB/s
 #   zstd      24.21 MB     2.77x   0.73 s  (88 MB/s)   330 MB/s
 #   deflate   23.51 MB     2.85x   2.29 s  (28 MB/s)   208 MB/s
-#
 # lz4kd is the best fast primary (fastest both ways, best ratio of the fast
 # family, and the vendor's own CONFIG_ZRAM_DEF_COMP); zstd is the best
 # secondary (22% smaller than lz4kd; the async worker pays the compression and
@@ -59,6 +56,7 @@ ABK_ZRAM_WB_RETRY_SECS=3600
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_PROC_SWAPS="${ABK_PROC_SWAPS:-/proc/swaps}"
 ABK_MEMINFO="${ABK_MEMINFO:-/proc/meminfo}"
+ABK_KCD_VM_DIR="${ABK_KCD_VM_DIR:-/proc/sys/vm}"
 # The v2 hierarchy root.  Whether its per-group cgroup.pressure nodes are
 # *writable* is what abk_psi_pass reports: a refusal is an SELinux answer,
 # not a missing feature.
@@ -194,7 +192,6 @@ abk_mul_div() {
 }
 
 # abk_gt <a> <b> / abk_le <a> <b> -> numeric comparison, 64-bit.
-#
 # Same trap as abk_mul_div: on this ROM's mksh even `[ 17179869184 -gt 0 ]` is
 # false (it parses the operands through the same 32-bit arithmetic, where that
 # literal is 0), so a swap size above 2 GiB looked like "no size" and the module
@@ -276,6 +273,21 @@ iorap.min_uid
 iorap.record_cool_min
 iorap.kick_cool_sec
 iorap.global_gap_sec
+kcompressd.monitor_interval_sec
+kcompressd.swapcached_warn_mb
+kcompressd.depth_warn
+fault_around.enable
+fault_around.sys_uid
+fault_around.app_only
+fault_around.app_uids
+swapin.window_enable
+swapin.boost_enable
+swapin.boost_pages
+swapin.shrink_enable
+swapin.shrink_pages
+swapin.background_only
+swapin.vma_ra
+policy.reassert_interval_sec
 report.logcat
 EOF
 }
@@ -396,6 +408,69 @@ abk_mem_total_bytes() {
 abk_mem_pct_bytes() {
   _mp_bytes="$(abk_mem_total_bytes)" || return 1
   abk_mul_div "$_mp_bytes" "$1" 100
+  return 0
+}
+
+
+abk_kcompressd_sample() {
+  _kcs_swp="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_swapped" | tr -d ' \t\r\n')"
+  _kcs_syn="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_sync" | tr -d ' \t\r\n')"
+  _kcs_enq="$(abk_read "$ABK_KCD_VM_DIR/kcompressd_enqueued" | tr -d ' \t\r\n')"
+  _kcs_thr="$(abk_read "$ABK_KCD_VM_DIR/kcompressd" | tr -d ' \t\r\n')"
+
+  case "$_kcs_thr" in ''|*[!0-9]*) _kcs_thr=absent ;; esac
+  case "$_kcs_enq" in ''|*[!0-9]*) _kcs_enq=absent ;; esac
+  case "$_kcs_swp" in ''|*[!0-9]*) _kcs_swp=absent ;; esac
+  case "$_kcs_syn" in ''|*[!0-9]*) _kcs_syn=absent ;; esac
+
+  _kcs_dep=absent
+  if [ "$_kcs_enq" != absent ] && [ "$_kcs_swp" != absent ]; then
+    _kcs_dep="$(awk -v e="$_kcs_enq" -v s="$_kcs_swp" \
+      'BEGIN { d = e - s; if (d < 0) d = 0; printf "%.0f\n", d }' 2>/dev/null)"
+    case "$_kcs_dep" in ''|*[!0-9]*) _kcs_dep=absent ;; esac
+  fi
+
+  ABK_KCD_THRESHOLD="$_kcs_thr"
+  ABK_KCD_ENQUEUED="$_kcs_enq"
+  ABK_KCD_SWAPPED="$_kcs_swp"
+  ABK_KCD_SYNC="$_kcs_syn"
+  ABK_KCD_DEPTH="$_kcs_dep"
+  return 0
+}
+
+abk_kcompressd_state_line() {
+  abk_kcompressd_sample
+  _kl_thr1="$ABK_KCD_THRESHOLD"
+  _kl_enq1="$ABK_KCD_ENQUEUED"
+  _kl_swp1="$ABK_KCD_SWAPPED"
+  _kl_syn1="$ABK_KCD_SYNC"
+  _kl_dep1="$ABK_KCD_DEPTH"
+
+  abk_kcompressd_sample
+  _kl_thr2="$ABK_KCD_THRESHOLD"
+  _kl_enq2="$ABK_KCD_ENQUEUED"
+  _kl_swp2="$ABK_KCD_SWAPPED"
+  _kl_syn2="$ABK_KCD_SYNC"
+  _kl_dep2="$ABK_KCD_DEPTH"
+
+  if [ "$_kl_dep2" = absent ] \
+    || { [ "$_kl_dep1" != absent ] && abk_le "$_kl_dep2" "$_kl_dep1"; }; then
+    ABK_KCD_THRESHOLD="$_kl_thr1"
+    ABK_KCD_ENQUEUED="$_kl_enq1"
+    ABK_KCD_SWAPPED="$_kl_swp1"
+    ABK_KCD_SYNC="$_kl_syn1"
+    ABK_KCD_DEPTH="$_kl_dep1"
+  else
+    ABK_KCD_THRESHOLD="$_kl_thr2"
+    ABK_KCD_ENQUEUED="$_kl_enq2"
+    ABK_KCD_SWAPPED="$_kl_swp2"
+    ABK_KCD_SYNC="$_kl_syn2"
+    ABK_KCD_DEPTH="$_kl_dep2"
+  fi
+
+  printf 'kcompressd: threshold=%s enqueued=%s swapped=%s sync=%s depth=%s\n' \
+    "$ABK_KCD_THRESHOLD" "$ABK_KCD_ENQUEUED" "$ABK_KCD_SWAPPED" \
+    "$ABK_KCD_SYNC" "$ABK_KCD_DEPTH"
   return 0
 }
 
@@ -532,12 +607,10 @@ abk_apply_readahead_knob() {
 # task state change, all the way up the hierarchy.  Android's v2 layout creates a
 # group per uid and per pid, so that is hundreds of groups whose numbers nobody
 # reads.
-#
 # Measured on the target (vermeer / 5.15.216, Batch 24): 452 cgroups carried a
 # cgroup.pressure node; lmkd, system_server and mimd were the only pressure
 # readers and all three had the global /proc/pressure/memory open.  No process
 # held a per-cgroup PSI file open.  The cost was real and the consumer was not.
-#
 # The node is this module's own graft, not the baseline's: Batch 21's
 # psi_cgroup_pressure_switch, ported from the android14-6.1 ACK implementation.
 # android13-5.15 has no such file, so a kernel built without that batch simply
@@ -547,13 +620,11 @@ abk_apply_readahead_knob() {
 # disabled group answers -EOPNOTSUPP on its pressure files and refuses poll
 # triggers instead of reporting frozen numbers.  A reader therefore fails loudly
 # rather than tuning on a lie.
-#
 # The tool writes only 0.  Batch 21 frees nothing and can restart accounting, so
 # a round trip works on this kernel; upstream's version of the switch frees the
 # group's per-cpu windows and calls re-enabling not restore safe.  The companion
 # cannot tell the two apart from userspace, so the disabled state is a decision
 # made at boot (psi.cgroup) and the A/B is two boots, not one live flip.
-#
 # keep is the built-in default: a missing key never changes behaviour, and the
 # disabled state stays something that was measured on the device first
 # (docs/psi_field_protocol.md).
@@ -691,7 +762,6 @@ abk_psi_supervisor_main() {
 # Enforcing.  KernelSU can add the rule from a module, which is the only route
 # that does not need a ROM rebuild or a relaxed boot policy; sepolicy.rule ships
 # one deliberately narrow allow (kernel -> zram_data_file, read + write).
-#
 # Nothing here is fatal, and nothing here weakens the policy: where the manager
 # loads module rules itself this call is a redundant no-op, and where the rule
 # cannot be added the device keeps the writeback it had -- which is the silent
@@ -718,8 +788,107 @@ abk_selinux_apply_rules() {
   return 0
 }
 
+abk_norm_yn() {
+  case "$1" in
+    1|y|Y|yes|on|true) printf 'Y\n' ;;
+    0|n|N|no|off|false) printf 'N\n' ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+abk_sync_node() {
+  _sn_path="$1"
+  _sn_want="$2"
+  _sn_tag="$3"
+  [ -e "$_sn_path" ] || return 0
+  _sn_cur="$(abk_read "$_sn_path" | tr -d ' \t\r\n')"
+  [ "$_sn_cur" = "$_sn_want" ] && return 0
+  abk_write "$_sn_path" "$_sn_want" && abk_log "$_sn_tag=$_sn_want"
+  return 0
+}
+
+abk_apply_fault_around_knobs() {
+  _fa_d="$ABK_SYS_ROOT/module/memory/parameters"
+  _fa_v="$(abk_cfg fault_around.enable '')"
+  if [ -n "$_fa_v" ]; then
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_enable" "$_fa_v" fault_around.enable
+  fi
+  _fa_v="$(abk_cfg fault_around.sys_uid '')"
+  if [ -n "$_fa_v" ]; then
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_sys_uid" "$_fa_v" fault_around.sys_uid
+  fi
+  _fa_v="$(abk_cfg fault_around.app_only '')"
+  if [ -n "$_fa_v" ]; then
+    _fa_v="$(abk_norm_yn "$_fa_v")" || _fa_v=""
+    [ -n "$_fa_v" ] && abk_sync_node \
+      "$_fa_d/fault_around_app_only" "$_fa_v" fault_around.app_only
+  fi
+  _fa_list="$(abk_cfg fault_around.app_uids '')"
+  [ -e "$_fa_d/fault_around_app" ] || return 0
+  _fa_norm="$(printf '%s' "$_fa_list" | tr ',' ' ')"
+  _fa_exp="$(for _fa_u in $_fa_norm; do
+    if abk_is_uint "$_fa_u" && [ "$_fa_u" -ge 10000 ] && [ "$_fa_u" -le 99999 ]; then
+      printf '%s\n' "$_fa_u"
+    elif [ "$_fa_u" != "0" ]; then
+      abk_warn "fault_around.app_uids: '$_fa_u' ignored"
+    fi
+  done | sort -n -u | head -n 64 | tr '\n' ',')"
+  _fa_exp="${_fa_exp%,}"
+  _fa_cur="$(abk_read "$_fa_d/fault_around_app" | tr -d ' \t\r\n')"
+  [ "$_fa_cur" = "$_fa_exp" ] && return 0
+  abk_write "$_fa_d/fault_around_app" 0 || return 0
+  for _fa_u in $(printf '%s' "$_fa_exp" | tr ',' ' '); do
+    abk_write "$_fa_d/fault_around_app" "$_fa_u" || return 0
+  done
+  abk_log "fault_around.app_uids=$_fa_exp"
+  return 0
+}
+
+abk_apply_swapin_knobs() {
+  _si_d="$ABK_SYS_ROOT/module/readahead/parameters"
+  for _si_pair in \
+      "swapin_window_enable:swapin.window_enable" \
+      "swapin_boost_enable:swapin.boost_enable" \
+      "swapin_boost_pages:swapin.boost_pages" \
+      "swapin_shrink_enable:swapin.shrink_enable" \
+      "swapin_shrink_pages:swapin.shrink_pages" \
+      "swapin_window_background_only:swapin.background_only"; do
+    _si_node="${_si_pair%%:*}"
+    _si_key="${_si_pair#*:}"
+    _si_v="$(abk_cfg "$_si_key" '')"
+    [ -n "$_si_v" ] || continue
+    case "$_si_key" in
+      swapin.boost_pages|swapin.shrink_pages) ;;
+      *) _si_v="$(abk_norm_yn "$_si_v")" || { abk_warn "$_si_key: '$_si_v' ignored"; continue; } ;;
+    esac
+    abk_sync_node "$_si_d/$_si_node" "$_si_v" "$_si_key"
+  done
+  _si_v="$(abk_cfg swapin.vma_ra '')"
+  [ -n "$_si_v" ] || return 0
+  case "$_si_v" in
+    1|true|on) _si_w=true ;;
+    0|false|off) _si_w=false ;;
+    *) abk_warn "swapin.vma_ra: '$_si_v' ignored"; return 0 ;;
+  esac
+  abk_sync_node "$ABK_SYS_ROOT/kernel/mm/swap/vma_ra_enabled" \
+    "$_si_w" swapin.vma_ra
+  return 0
+}
+
+abk_apply_policy_knobs() {
+  abk_apply_fault_around_knobs
+  abk_apply_swapin_knobs
+  return 0
+}
+
 abk_apply_early_knobs() {
   abk_apply_vm_knobs
+  abk_apply_policy_knobs
   abk_apply_lru_gen
   abk_apply_thp
   abk_apply_readahead_knob

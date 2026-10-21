@@ -1,6 +1,5 @@
 #!/system/bin/sh
 # action.sh - manual entry point, also what the KernelSU action button runs.
-#
 #   action.sh [status]   what the module owns, what the kernel exposes (default)
 #   action.sh pass       re-assert the zram policy and run one age-marked pass
 #   action.sh takeover   rewrite zram now (algorithms, cap, swap, writeback),
@@ -149,6 +148,33 @@ abk_status_report() {
   abk_show_or_absent "lru_gen/min_ttl_ms" "$ABK_SYS_ROOT/kernel/mm/lru_gen/min_ttl_ms"
   abk_show_or_absent "transparent_hugepage" \
     "$ABK_SYS_ROOT/kernel/mm/transparent_hugepage/enabled"
+
+  echo "-- kcompressd and swap-in --"
+  _sr_kcd="$(abk_kcompressd_state_line)"
+  abk_show "kcompressd" "${_sr_kcd#kcompressd: }"
+  _sr_swc="$(abk_meminfo_kb SwapCached)"
+  case "$_sr_swc" in
+    ''|*[!0-9]*) abk_show "SwapCached" "absent" ;;
+    *) abk_show "SwapCached" "$_sr_swc kB" ;;
+  esac
+  abk_show "kcompressd monitor" \
+    "interval=$(abk_cfg kcompressd.monitor_interval_sec 600)s swapcached_warn=$(abk_cfg kcompressd.swapcached_warn_mb 256)MiB"
+  abk_show_or_absent "swap.vma_ra_enabled" \
+    "$ABK_SYS_ROOT/kernel/mm/swap/vma_ra_enabled"
+
+  echo "-- swap-in readahead (namespace readahead) --"
+  for _sr_ra_par in swapin_window_enable swapin_boost_enable \
+      swapin_boost_pages swapin_shrink_enable swapin_shrink_pages \
+      swapin_window_background_only swapin_vma_ra; do
+    abk_show_or_absent "$_sr_ra_par" \
+      "$ABK_SYS_ROOT/module/readahead/parameters/$_sr_ra_par"
+  done
+  echo "-- fault-around (namespace memory) --"
+  for _sr_mem_par in fault_around_enable fault_around_sys_uid \
+      fault_around_app_only fault_around_app; do
+    abk_show_or_absent "$_sr_mem_par" \
+      "$ABK_SYS_ROOT/module/memory/parameters/$_sr_mem_par"
+  done
 
   # Per-cgroup PSI: what the policy is meant to do, and what the tree says it
   # did.  The second is the honest one -- a refused write leaves the first a
