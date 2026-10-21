@@ -6788,7 +6788,7 @@ def test_batch72_kcompressd_swapcache_drop():
         check("the parking adds no wait",
               "wait_on_page_writeback" not in park)
 
-        # 3) one re-scan, pre-filtered, latched, and before the demote retry.
+        # 3) one re-scan, latched, and before the demote retry.
         tail = text[text.index("\t/* 'page_list' is always empty here */"):]
         check("the retry block is anchored after the empty-page_list comment",
               tail.index("sailboat_kcompressd_swapcache_drop")
@@ -6801,15 +6801,18 @@ def test_batch72_kcompressd_swapcache_drop():
                              "&wb_retry_pages, lru)")
               < tail.index(b72.WAIT_PIN))
         check("the wait is guarded by PageWriteback",
-              "if (PageWriteback(page))\n\t\t\t\twait_on_page_writeback(page);" in tail)
+              "if (!PageWriteback(page))\n\t\t\t\tcontinue;" in tail)
+        check("the drain context falls back to the ret_pages pre-filter",
+              b72.DRAIN_GUARD in tail and "PF_SWAPWRITE" in tail
+              and "list_move(&page->lru, &ret_pages);" in tail)
         check("the remaining pages are spliced onto page_list",
               b72.SPLICE in tail)
         check("do_demote_pass is cleared before the retry",
               tail.index(b72.SPLICE)
-              < tail.index("\t\tdo_demote_pass = false;")
-              < tail.index("\t\tgoto retry;"))
+              < tail.index("\t\t\tdo_demote_pass = false;")
+              < tail.index("\t\t\tgoto retry;"))
         check("the retry precedes the demotion retry",
-              tail.index("\t\tgoto retry;")
+              tail.index("\t\t\tgoto retry;")
               < tail.index("list_splice_init(&demote_pages, page_list);"))
         check("both halves are bounded by the one-shot latch",
               tail.count("!wb_retry_done && !list_empty(&wb_retry_pages)") == 1
