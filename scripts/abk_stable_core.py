@@ -6684,7 +6684,6 @@ PATCH_GROUPS = PATCH_GROUPS + [
 # five anchors are byte-identical pristine text with no per-baseline
 # variance, and device-private / device-exclusive entries keep the direct
 # call because their contract is not PageLocked.
-# ============================================================================
 import batch70_core_smaps_migration_guard as _b70_smaps  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b70_smaps.build_groups(PatchGroup)
@@ -6700,25 +6699,18 @@ PATCH_GROUPS = PATCH_GROUPS + _b70_smaps.build_groups(PatchGroup)
 # at enqueue, end_page_writeback once the drain holds the lock.  Registered
 # after vm_kcompressd_swapout, refuses when that engine is absent.  mm/page_io.c
 # is otherwise untouched by any other group, so no further ordering applies.
-# ============================================================================
 import batch71_core_kcompressd_wb_pin as _b71_wb  # noqa: E402
 
 PATCH_GROUPS = PATCH_GROUPS + _b71_wb.build_groups(PatchGroup)
 
-# ============================================================================
-# ============================================================================
 import batch72_core_kcompressd_swapcache_drop as _b72_scd
 
 PATCH_GROUPS = PATCH_GROUPS + _b72_scd.build_groups(PatchGroup)
 
-# ============================================================================
-# ============================================================================
 import batch73_core_swapin_window as _b73_swapin
 
 PATCH_GROUPS = PATCH_GROUPS + _b73_swapin.build_groups(PatchGroup)
 
-# ============================================================================
-# ============================================================================
 import batch74_core_fault_around_app_policy as _b74_fa
 
 PATCH_GROUPS = PATCH_GROUPS + _b74_fa.build_groups(PatchGroup)
