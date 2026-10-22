@@ -403,6 +403,21 @@ them (`cfr.enable`, `lru_gen.enable`, and the kernel's own `abk_lp_enable` node
 plus `iorap.watch`); `lru_gen` and `iorap` also do not start on a kernel that
 does not carry their graft, so "not running" there is the intended state.
 
+**Process names.** `ps` names a process after its `argv[0]`, so `service.sh` is not
+a useful answer to "what is this `sh` doing". Each spawn therefore creates
+`run/<long name> -> /system/bin/sh` once (idempotently) and starts
+`service.sh <arg>` through it: `ps -o NAME` then reads
+`Sailboat_zram_supervisor`, `Sailboat_cfr_supervisor`,
+`Sailboat_psi_supervisor`, `Sailboat_lrugen_supervisor` and
+`Sailboat_iorap_supervisor`. The same process overwrites `/proc/self/comm` with a
+short alias (`Sail_zram`, `Sail_cfr`, `Sail_psi`, `Sail_lrugen`,
+`Sail_iorap`) because comm is a 15-byte field and cannot hold the long name.
+`$0`, `$@`, the pid files and `pkill -9 -f "service.sh <arg>"` are unaffected --
+the cmdline still carries `service.sh <arg>` -- and a link that cannot be created
+falls back to the old `setsid sh service.sh <arg>` with a WARN. The module's own
+kernel threads follow the same rule in the only form the kernel allows:
+`[Sail_kcompd0]` and `[Sail_recompd]` (`TASK_COMM_LEN` is 16 bytes).
+
 ## Notes, limits and testing seams
 
 * The PSI pass has seams so its decision table is testable without a device:

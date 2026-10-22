@@ -30,6 +30,7 @@ ABK_ZRAM_NODE="${ABK_ZRAM_NODE:-/dev/block/zram0}"
 ABK_ZRAM_WB_DIR="${ABK_ZRAM_WB_DIR:-/data/per_boot/zram}"
 ABK_ZRAM_WB_FILE="${ABK_ZRAM_WB_FILE:-$ABK_ZRAM_WB_DIR/zram_swap}"
 ABK_STDOUT="${ABK_STDOUT:-0}"
+ABK_SHELL="${ABK_SHELL:-/system/bin/sh}"
 
 MODDIR="${MODDIR:-${0%/*}}"
 ABK_STATE_DIR="${ABK_STATE_DIR:-$MODDIR/state}"
@@ -306,6 +307,35 @@ abk_pid_live() {
 abk_pid_write() {
   mkdir -p "$ABK_STATE_DIR" 2>/dev/null || true
   abk_state_set "$1.pid" "$2"
+}
+
+# ps NAME is the exec'd argv[0] basename; comm is TASK_COMM_LEN-1 bytes and
+# takes the first byte only, so the long name lives in a symlink and comm short.
+abk_supervisor_long_name() {
+  case "$1" in
+    zram) printf 'Sailboat_zram_supervisor\n' ;;
+    cfr) printf 'Sailboat_cfr_supervisor\n' ;;
+    psi) printf 'Sailboat_psi_supervisor\n' ;;
+    lru_gen) printf 'Sailboat_lrugen_supervisor\n' ;;
+    iorap-watch) printf 'Sailboat_iorap_supervisor\n' ;;
+  esac
+}
+
+abk_supervisor_comm() {
+  case "$1" in
+    zram) printf 'Sail_zram\n' ;;
+    cfr) printf 'Sail_cfr\n' ;;
+    psi) printf 'Sail_psi\n' ;;
+    lru_gen) printf 'Sail_lrugen\n' ;;
+    iorap-watch) printf 'Sail_iorap\n' ;;
+  esac
+}
+
+abk_set_comm() {
+  [ -n "${1:-}" ] || return 0
+  # echo without -n writes a newline, and comm takes the first byte of that.
+  echo -n "$1" > "/proc/$$/comm" 2>/dev/null || true
+  return 0
 }
 
 abk_getprop() {
