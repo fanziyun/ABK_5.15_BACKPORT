@@ -1440,7 +1440,10 @@ def test_batch10_zram_async_recompress():
         check("async node and engine text landed in the driver",
               "recompress_async" in text
               and "abk_zram_recomp_enqueue" in text
-              and "kthread_create_worker(0, \"zram_recompd\")" in text)
+              and "kthread_create_worker(0, \"Sail_recompd\")" in text)
+        check("the recompress worker carries the product's short name",
+              "zram_recompd" not in text
+              and len("Sail_recompd") <= 15)
         check("sysfs list entry is guarded",
               "#ifdef CONFIG_ZRAM_MULTI_COMP\n"
               "\t&dev_attr_recompress_async.attr,\n"
@@ -2970,7 +2973,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.75.0", "0.75.0"], _versions)
+          _versions == ["0.76.0", "0.76.0"], _versions)
 
     rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
     rule_statements = [line.strip() for line in rule.splitlines()
@@ -3234,14 +3237,22 @@ def test_runtime_tunables_module():
               and re.search(r"(?m)^\s*" + re.escape(key) + r"=", tunables) is not None)
 
     ro_path = re.compile(r"/(?:vendor|odm|product)\b|(?<!/devices)/system\b")
+    # The shell a supervisor is exec'd through is the one legal mention: it is a
+    # read of a read-only mount, never a write to one.
+    ro_refs = []
     for script in sorted(module_dir.glob("*.sh")) + [module_dir / "sepolicy.rule"]:
         body = script.read_text(encoding="utf-8")
         code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
-        check(f"{script.name} never touches a read-only partition",
-              ro_path.search(code) is None,
-              ro_path.search(code).group(0) if ro_path.search(code) else "")
+        hits = [m.group(0) for m in ro_path.finditer(code)
+                if not (m.group(0) == "/system"
+                        and code.startswith("/bin/sh", m.end()))]
+        check(f"{script.name} never touches a read-only partition", not hits, hits)
         check(f"{script.name} never relaxes SELinux",
               "setenforce" not in code and "permissive" not in code.lower())
+        ro_refs += [ln.strip() for ln in body.splitlines()
+                    if "/system" in ln and not ln.lstrip().startswith("#")]
+    check("the only read-only path in the shipped scripts is the shell default",
+          ro_refs == ['ABK_SHELL="${ABK_SHELL:-/system/bin/sh}"'], ro_refs)
 
     service_source = (module_dir / "service.sh").read_text(encoding="utf-8")
     readme_source = (module_dir / "README.md").read_text(encoding="utf-8")
@@ -3293,6 +3304,73 @@ def test_runtime_tunables_module():
           all(f'abk_supervisor_state {_n} ' in action_source for _n in _spawns),
           [_n for _n in _spawns
            if f'abk_supervisor_state {_n} ' not in action_source])
+
+    # Process naming: ps NAME is argv[0], so each supervisor is exec'd through a
+    # <long name> -> $ABK_SHELL link, and comm (TASK_COMM_LEN-1 bytes) gets the
+    # short alias.  Both tables live in common.sh, one case arm per supervisor.
+    _expected_long = {
+        "zram": "Sailboat_zram_supervisor",
+        "cfr": "Sailboat_cfr_supervisor",
+        "psi": "Sailboat_psi_supervisor",
+        "lru_gen": "Sailboat_lrugen_supervisor",
+        "iorap-watch": "Sailboat_iorap_supervisor",
+    }
+    _expected_comm = {
+        "zram": "Sail_zram",
+        "cfr": "Sail_cfr",
+        "psi": "Sail_psi",
+        "lru_gen": "Sail_lrugen",
+        "iorap-watch": "Sail_iorap",
+    }
+    _long_fn = common_sh[common_sh.index("abk_supervisor_long_name() {"):
+                         common_sh.index("abk_supervisor_comm() {")]
+    _comm_fn = common_sh[common_sh.index("abk_supervisor_comm() {"):
+                         common_sh.index("abk_set_comm() {")]
+    for _key, _name in _expected_long.items():
+        check(f"the {_key} supervisor shows {_name} in ps",
+              f"{_key}) printf '{_name}\\n' ;;" in _long_fn, _long_fn)
+    for _key, _name in _expected_comm.items():
+        check(f"the {_key} supervisor carries comm {_name}",
+              f"{_key}) printf '{_name}\\n' ;;" in _comm_fn, _comm_fn)
+    check("every comm fits the 15-byte comm field",
+          all(len(_n) <= 15 for _n in _expected_comm.values()), _expected_comm)
+    check("every long name is longer than comm allows, which is why it is a link",
+          all(len(_n) > 15 for _n in _expected_long.values()), _expected_long)
+    check("every spawned supervisor has both names",
+          set(_expected_long) == set(_expected_comm) == set(_spawns),
+          (sorted(_expected_long), sorted(_spawns)))
+    check("comm is written without the trailing newline echo would add",
+          'echo -n "$1" > "/proc/$$/comm" 2>/dev/null' in common_sh)
+    check("a refused comm write is silent, never a WARN",
+          '|| true' in common_sh[common_sh.index("abk_set_comm() {"):
+                                 common_sh.index("abk_getprop() {")])
+    for _arg, _key, _main in (
+            ("--supervise-zram", "zram", "abk_zram_supervisor_main"),
+            ("--supervise-cfr", "cfr", "abk_cfr_supervisor_main"),
+            ("--supervise-psi", "psi", "abk_psi_supervisor_main"),
+            ("--supervise-lru-gen", "lru_gen", "abk_lru_gen_supervisor_main"),
+            ("--supervise-iorap", "iorap-watch", "abk_iorap_main")):
+        _line = next((ln for ln in service_sh.splitlines()
+                      if ln.strip().startswith(_arg + ")")), "")
+        check(f"{_arg} sets comm before the supervisor body runs",
+              f'abk_set_comm "$(abk_supervisor_comm {_key})"' in _line
+              and _line.index("abk_set_comm") < _line.index(_main), _line)
+    check("the spawn execs the long-name link instead of a bare sh",
+          'setsid "$_sp_link" "$MODDIR/service.sh" "$_sp_arg"' in service_sh)
+    check("the link is reused when it already points at the shell",
+          'readlink "$_sp_link"' in service_sh
+          and service_sh.index('readlink "$_sp_link"')
+          < service_sh.index('ln -s "$ABK_SHELL" "$_sp_link"'))
+    check("a link that cannot be created falls back to the old launch with a WARN",
+          'setsid sh "$MODDIR/service.sh" "$_sp_arg"' in service_sh
+          and "falling back to sh" in service_sh)
+    check("the link target is a read-only reference, not a write",
+          'ABK_SHELL="${ABK_SHELL:-/system/bin/sh}"' in common_sh)
+    check("the README documents both names and the two kernel threads",
+          all(_n in readme_source for _n in _expected_long.values())
+          and all(_n in readme_source for _n in _expected_comm.values())
+          and "[Sail_kcompd0]" in readme_source
+          and "[Sail_recompd]" in readme_source)
 
     sys.path.insert(0, str(repo / "scripts"))
     import ak3_bundle_ksu_module as ak3  # noqa: E402
@@ -5281,8 +5359,16 @@ def test_batch41_kcompressd_offload():
                   offload_block is not None
                   and "unlock_page(page);" in offload_block.group(1),
                   offload_block.group(1) if offload_block else "(no block)")
-            check(f"{label} shape: the thread is named kcompressd%d",
-                  '"kcompressd%d", nid);' in text)
+            check(f"{label} shape: the thread is named Sail_kcompd%d",
+                  '"Sail_kcompd%d", nid);' in text
+                  and '"kcompressd%d", nid);' not in text)
+            # nid is bounded by arm64's NODES_SHIFT 4 (MAX_NUMNODES 16), so the
+            # rendered comm is at most 13 bytes and survives TASK_COMM_LEN-1.
+            check(f"{label} shape: the rendered thread name fits comm",
+                  len("Sail_kcompd15") <= 15)
+            check(f"{label} shape: the sysctl name and log prefix keep their identifiers",
+                  '.procname\t= "kcompressd",' in text
+                  and 'pr_err("kcompressd: node %d failed to start' in text)
             check(f"{label} shape: per-node state is private",
                   "static struct abk_kcompressd_node "
                   "abk_kcompressd_nodes[MAX_NUMNODES];" in text,
