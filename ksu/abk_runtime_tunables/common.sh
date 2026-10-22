@@ -309,26 +309,22 @@ abk_pid_write() {
   abk_state_set "$1.pid" "$2"
 }
 
-# ps NAME is the exec'd argv[0] basename; comm is TASK_COMM_LEN-1 bytes and
-# takes the first byte only, so the long name lives in a symlink and comm short.
-abk_supervisor_long_name() {
+# ps NAME is the exec'd argv[0] basename; comm is TASK_COMM_LEN-1 bytes, so the
+# long name lives in a symlink and comm carries the short alias.
+abk_supervisor_name() {
   case "$1" in
-    zram) printf 'Sailboat_zram_supervisor\n' ;;
-    cfr) printf 'Sailboat_cfr_supervisor\n' ;;
-    psi) printf 'Sailboat_psi_supervisor\n' ;;
-    lru_gen) printf 'Sailboat_lrugen_supervisor\n' ;;
-    iorap-watch) printf 'Sailboat_iorap_supervisor\n' ;;
+    zram) _sn_long=Sailboat_zram_supervisor; _sn_comm=Sail_zram ;;
+    cfr) _sn_long=Sailboat_cfr_supervisor; _sn_comm=Sail_cfr ;;
+    psi) _sn_long=Sailboat_psi_supervisor; _sn_comm=Sail_psi ;;
+    lru_gen) _sn_long=Sailboat_lrugen_supervisor; _sn_comm=Sail_lrugen ;;
+    iorap-watch) _sn_long=Sailboat_iorap_supervisor; _sn_comm=Sail_iorap ;;
+    *) return 1 ;;
   esac
-}
-
-abk_supervisor_comm() {
-  case "$1" in
-    zram) printf 'Sail_zram\n' ;;
-    cfr) printf 'Sail_cfr\n' ;;
-    psi) printf 'Sail_psi\n' ;;
-    lru_gen) printf 'Sail_lrugen\n' ;;
-    iorap-watch) printf 'Sail_iorap\n' ;;
-  esac
+  if [ "${2:-long}" = "comm" ]; then
+    printf '%s\n' "$_sn_comm"
+  else
+    printf '%s\n' "$_sn_long"
+  fi
 }
 
 abk_set_comm() {

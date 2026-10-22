@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 ABK_TAG="ABK-Sched"
-ABK_VERSION="v0.1.0"
+ABK_VERSION="v0.2.0"
 
 ABK_SYS_ROOT="${ABK_SYS_ROOT:-/sys}"
 ABK_FAS_NODE="${ABK_FAS_NODE:-/proc/fas}"
@@ -11,6 +11,7 @@ ABK_STATE_DIR="${ABK_STATE_DIR:-$MODDIR/state}"
 ABK_RUN_DIR="${ABK_RUN_DIR:-$MODDIR/run}"
 ABK_CONF="${ABK_CONF:-$MODDIR/tunables.conf}"
 ABK_STDOUT="${ABK_STDOUT:-0}"
+ABK_SHELL="${ABK_SHELL:-/system/bin/sh}"
 
 abk_report_stdout() {
   if [ "$ABK_STDOUT" = "1" ]; then
@@ -216,6 +217,27 @@ abk_pid_live() {
 abk_pid_write() {
   mkdir -p "$ABK_STATE_DIR" 2>/dev/null || true
   printf '%s\n' "$2" > "$(abk_state_path "$1.pid")" 2>/dev/null || true
+}
+
+# ps NAME is the exec'd argv[0] basename; comm is TASK_COMM_LEN-1 bytes, so the
+# long name lives in a symlink and comm carries the short alias.
+abk_supervisor_name() {
+  case "$1" in
+    gov) _sn_long=Sailboat_gov_supervisor; _sn_comm=Sail_gov ;;
+    *) return 1 ;;
+  esac
+  if [ "${2:-long}" = "comm" ]; then
+    printf '%s\n' "$_sn_comm"
+  else
+    printf '%s\n' "$_sn_long"
+  fi
+}
+
+abk_set_comm() {
+  [ -n "${1:-}" ] || return 0
+  # echo without -n writes a newline, and comm takes the first byte of that.
+  echo -n "$1" > "/proc/$$/comm" 2>/dev/null || true
+  return 0
 }
 
 

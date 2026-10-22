@@ -363,13 +363,15 @@ alias 到 `/system/bin/printf`，500 次 6.3 s，每次名义唤醒 `fork+exec` 
 `<长名> -> /system/bin/sh` 软链（`readlink` 已经是目标就不重建），再用它 exec
 `service.sh <arg>`：`ps -o NAME` 读到 `Sailboat_zram_supervisor`、`Sailboat_cfr_supervisor`、
 `Sailboat_psi_supervisor`、`Sailboat_lrugen_supervisor`、`Sailboat_iorap_supervisor`。
-同一进程在 `--supervise-*` 分发处先写 `/proc/$$/comm`；comm 是 15 字节字段
-（`TASK_COMM_LEN`），所以那里只能是短名 `Sail_zram` / `Sail_cfr` / `Sail_psi` /
-`Sail_lrugen` / `Sail_iorap`。三条不变式是实测钉住的：长名只改 `argv[0]`（`$0` 仍是
+同一进程在 `--supervise-*` 分发处先写 `/proc/$$/comm`；`TASK_COMM_LEN` 是 16 字节、可用
+15 字节，所以那里只能是短名 `Sail_zram` / `Sail_cfr` / `Sail_psi` /
+`Sail_lrugen` / `Sail_iorap`（长名与短名在同一张表 `abk_supervisor_name` 里，一个 supervisor
+一条 case 臂）。三条不变式是实测钉住的：长名只改 `argv[0]`（`$0` 仍是
 `service.sh`、`$@` 仍是 `<arg>`）、cmdline 仍含 `service.sh <arg>`（`pkill -9 -f` 的
 清理模式照旧命中）、comm 必须用 `echo -n` 写入（普通 echo 把换行写进 comm，而 comm 取首字节）。
-软链建不出来时回退原来的 `setsid sh service.sh <arg>` 并记一条 WARN。`/system/bin/sh` 在
-只读挂载上只是**读**引用（exec 目标），不是写入目标，单测把这一点钉成唯一合法例外。
+软链建不出来时回退原来的 `setsid sh service.sh <arg>` 并记一条 WARN（只有「查到了长名但建链
+失败」才记；未知名字静默回退）。`/system/bin/sh` 在只读挂载上只是**读**引用（exec 目标），不是
+写入目标，单测先剔除唯一合法的 `ABK_SHELL` 默认值行再扫全文，并把该行精确钉成唯一例外。
 
 **内核线程**：comm 的 15 字节上限是内核硬限制（`TASK_COMM_LEN` = 16），长名放不进去，所以只换短名：
 Batch 41 的 `kthread_create_on_node(..., "kcompressd%d", nid)` → `"Sail_kcompd%d"`
@@ -381,14 +383,24 @@ Batch 41 的 `kthread_create_on_node(..., "kcompressd%d", nid)` → `"Sail_kcomp
 `zram_recompd` 是**改名前的名字**，按历史记录保留原样。
 
 **伴生模块**：`module.prop` v0.23.0 → **v0.24.0**（versionCode 28 → 29）；README 新增
-"Process names" 段，记录 ps 长名 / comm 短名 / 内核线程名三条规则与回退路径。内核 graft 的 C 文本
-变了，`module.conf` 按批次惯例 0.75.0 → **0.76.0**；`tests/sublevel_matrix.py` 的
+"Process names" 段，记录 ps 长名 / comm 短名 / 内核线程名三条规则与回退路径。附加模块（二）同批
+处理它的 governor supervisor：`Sailboat_gov_supervisor` / `Sail_gov`，`module.prop` v0.1.0 →
+**v0.2.0**（versionCode 2），README 的 governor 一节补同样一段。内核 graft 的 C 文本变了，
+`module.conf` 按批次惯例 0.75.0 → **0.76.0**；`tests/sublevel_matrix.py` 的
 `GROUP_COUNTS` / `PRE_APPLIED` 不变（无新组，也没有组被基线吸收）。
 
-**验证**：`py_compile`；`bash -n` 全过，另有设备侧 mksh `sh -n` 对 `service.sh` /
-`common.sh` 两个改动文件通过；`stable_5_15_test.py` 全套 **1725 项**全绿（1694 → 1725，新增 31 项：五对
-长名/短名的逐条 case 臂、comm ≤ 15 字节且长名必须超过 15 字节、每个 `--supervise-*` 分支先设
-comm 再进函数体、软链幂等复用与回退 WARN、README 与两个内核线程名、软链目标只读不写）；
+**升级路径**：组级 `already_present` 探针是引擎形状、不含线程名——`zram_async_recompress` 看
+`RECOMPRESS_ASYNC_STORE`，`vm_kcompressd_swapout` 看 `swap_writepage()` 里的
+`frontswap_store()` 形状（Batch 71 另有 `sailboat_kcompressd_wb_pin` 后继探针）。所以
+v0.76.0 之前已经 graft 过的树原地再跑会报 `already_present` 并**保留旧线程名**；ABK CI 每次
+从 pristine 树构建，不受影响。
+
+**验证**：`py_compile`；`bash -n` 全过，另有设备侧 mksh `sh -n` 对两个模块的 `service.sh` /
+`common.sh` 全部改动文件通过；`stable_5_15_test.py` 全套 **1742 项**全绿（main 基线 1694，新增
+48 项：一张映射表的逐条 case 臂且两个名字全局只写一次、comm ≤ 15 字节且长名必须超过 15 字节、
+每个 `--supervise-*` 分支先设 comm 再进函数体、软链幂等复用、"查到长名才记 WARN"与"未知名字静默"
+两条、README 与两个内核线程名、软链目标只读不写（先剔除合法行再扫）、以及附加模块（二）的
+governor 长名/短名/回退/只读守卫；两个内核线程名的长度断言改为从被测文本里取名字再量）；
 参考树 `build/abk-trees/220` 上 `step_audit`（core 393 步 / perf 169 步 / display 2 步）、
 `implementation_audit`、`smoke`（两遍 78/24/1 组全 `already_present`，`mm/page_io.c` 等
 回滚逐字节一致）全绿。**真机实测**（SM8550 / 5.15.220；`/data/local/tmp` 临时脚本 + 软链，
@@ -8260,7 +8272,7 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 `ksu/*/module.prop`（先例 `a50df6e`，Batch 25 同），否则单测里钉的内核版本对不上号。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）在本文件正文按 Batch 倒序排列；本附录里每个已落地批次只保留一行索引。
 
-### Sailboat 进程命名(v0.76.0 / companion v0.24.0,无新增组:用户态 supervisor 用 <长名> -> /system/bin/sh 软链拿到 ps 长名、comm 写 15 字节短名,内核线程 kcompressd%d / zram_recompd 改短名 Sail_kcompd%d / Sail_recompd;已落地,单测 1725 项与 step_audit/implementation_audit/smoke 三道树级审计全绿,真机 /data/local/tmp 机制实测通过、完整重启链路未验证) → 详见 [CHANGELOG.md](#sailboat-process-naming) — 主题「让本模块的常驻进程有可读名字」。ps 的 NAME 取 argv[0] 的 basename ⇒ abk_spawn 在 run/ 幂等建 <长名> -> /system/bin/sh 软链再 exec service.sh <arg>,ps -o NAME 读到 Sailboat_{zram,cfr,psi,lrugen,iorap}_supervisor;comm 只有 15 字节(TASK_COMM_LEN-1),--supervise-* 分发处先 echo -n 写 /proc/$$/comm 为 Sail_{zram,cfr,psi,lrugen,iorap}。行为零变化:$0/$@、pid 文件、pkill -9 -f "service.sh <arg>" 全部照旧,软链建不出来回退 setsid sh 并记 WARN。内核线程只换短名(Sail_kcompd%d 最长 13 字节 / Sail_recompd 12 字节),/proc/sys/vm/kcompressd* 标识符、dmesg 前缀、组名、hook 名与 GROUP_COUNTS(78/24/1) 一律不动。真机实测 ps -A -o PID,NAME,ARGS 与 /proc/<pid>/comm 与 pkill -f 三项均符合预期。
+### Sailboat 进程命名(v0.76.0 / companion v0.24.0 / 附加模块（二）v0.2.0,无新增组:用户态 supervisor 用 <长名> -> /system/bin/sh 软链拿到 ps 长名、comm 写 15 字节短名,内核线程 kcompressd%d / zram_recompd 改短名 Sail_kcompd%d / Sail_recompd;已落地,单测 1742 项与 step_audit/implementation_audit/smoke 三道树级审计全绿,真机 /data/local/tmp 机制实测通过、完整重启链路未验证) → 详见 [CHANGELOG.md](#sailboat-process-naming) — 主题「让本模块的常驻进程有可读名字」。ps 的 NAME 取 argv[0] 的 basename ⇒ abk_spawn 在 run/ 幂等建 <长名> -> /system/bin/sh 软链再 exec service.sh <arg>,ps -o NAME 读到 Sailboat_{zram,cfr,psi,lrugen,iorap}_supervisor;comm 只有 15 字节(TASK_COMM_LEN-1),--supervise-* 分发处先 echo -n 写 /proc/$$/comm 为 Sail_{zram,cfr,psi,lrugen,iorap}。行为零变化:$0/$@、pid 文件、pkill -9 -f "service.sh <arg>" 全部照旧,软链建不出来回退 setsid sh 并记 WARN。内核线程只换短名(Sail_kcompd%d 最长 13 字节 / Sail_recompd 12 字节),/proc/sys/vm/kcompressd* 标识符、dmesg 前缀、组名、hook 名与 GROUP_COUNTS(78/24/1) 一律不动。附加模块（二）的 governor supervisor 同批取名 Sailboat_gov_supervisor / Sail_gov(module.prop v0.1.0 → v0.2.0)。长名与短名在同一张映射表里(一个 supervisor 一条 case 臂),回退 WARN 只在「查到长名但建链失败」时记。真机实测 ps -A -o PID,NAME,ARGS 与 /proc/<pid>/comm 与 pkill -f 三项均符合预期。
 
 ### Batch 72-74(v0.75.0:swap 缓存积压收敛 + 换入预读窗口 + fault-around uid 策略;core 75 → 78 组;已落地,六门禁全绿,本地构建 REBUILD_EXIT=0,真机 1h soak 峰值 60 MB、655,360 页 verify_swap 0 corrupt) → 详见 [CHANGELOG.md](#batch-72-74) — 主题「把延迟换出造成的 swap cache 积压收敛到 MB 级,并把换入预读与 fault-around 的策略面补成可调」。三组各自独立注册:① `kcompressd_swapcache_drop`(core)在 `PAGE_SUCCESS` 把仍 writeback 的同步换出页挂起,循环后在 drain 上下文之外 `wait_on_page_writeback()` 并 `goto retry` 摘除,drain 自身回收退回旧 prefilter 以免自等待;② `swapin_readahead_window`(core)给窗口加boost/shrink 两侧 clamp 与 `vma_ra` 第二句柄,boost 是地板(默认 8)、shrink 只作用于后台;③ `fault_around_app_policy`(core)在 vendor hook 之后按 uid 收紧 fault-around(90k 位图,默认只关系统 uid)。伴生模块 v0.23.0 增加 kcompressd 三计数/深度观测与两条不变量告警,并接管 `fault_around.*`/`swapin.*` 共 12 个键(周期重断言,Y/N 归一)。真机:8 GB fill 峰值3.0-3.3 GB → 7 MB、1h soak 60 MB、16/24 GB 压力存活、32 GB 超容量重启与 offload 开关无关(无 kernel panic)、verify_swap 655,360 页 0 corrupt;设计/参数/复现见 [docs/swap_cache_backlog.md](docs/swap_cache_backlog.md)。
 

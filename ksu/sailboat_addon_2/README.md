@@ -29,6 +29,14 @@ The supervisor stops itself after three consecutive rounds in which **every** po
 
 **Reverting:** `sched.abk_governor=` (empty) stops the supervisor and leaves the ROM's own choice alone; nothing else in the module depends on the governor being held.
 
+**Process name.** `service.sh` starts the supervisor through
+`run/Sailboat_gov_supervisor -> /system/bin/sh` (created once, reused after that),
+so `ps -o NAME` reads `Sailboat_gov_supervisor` instead of an anonymous `sh`. The
+link only changes `argv[0]`: `$0`, `$@` and the `pkill -9 -f "service.sh --supervise-gov"`
+cleanup are unchanged. `comm` is a 15-byte field, so `/proc/<pid>/comm` carries
+`Sail_gov`; a link that cannot be created falls back to the old
+`setsid sh service.sh --supervise-gov` with a WARN.
+
 ## The band
 
 `floor_pct` is a floor: while any CPU of a policy has been at ≥90% of its capacity for 300 ms, `resolve_freq` raises the target to at least `floor_pct` of `cpuinfo.max_freq`. `cap_pct` is a ceiling: above it the target is clamped, unless requests have stayed above it for 300 ms. Together they are a `[floor_pct, cap_pct]` band that demand moves freely inside, with the floor catching dips during sustained load and the cap catching peaks above it.
