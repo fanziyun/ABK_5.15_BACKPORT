@@ -732,8 +732,8 @@ fi
 # conditionally below, because a call to a vendor hook the tree does not
 # declare would not compile on 167/178/194.
 PAGE_IO="$KERNEL_ROOT/common/mm/page_io.c"
-grep -q '"kcompressd%d", nid);' "$PAGE_IO" \
-  || fail "the drain thread is not named kcompressd per node"
+grep -q '"Sail_kcompd%d", nid);' "$PAGE_IO" \
+  || fail "the drain thread is not named Sail_kcompd per node"
 grep -q "static void abk_kcompressd_do_swapout(struct page \*page)" "$PAGE_IO" \
   || fail "do_swapout() is missing, so nothing drains the queue"
 grep -q "static bool abk_kcompressd_enqueue(struct abk_kcompressd_node \*kcd," "$PAGE_IO" \

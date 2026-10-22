@@ -61,7 +61,7 @@ _ATTR_NEW = (
 
 _ENGINE = _tabs(r"""
 /* ABK stable_515_backport: Batch 10-1 async recompress engine (plan A).
- * Per-device "zram_recompd" kthread_worker drained by abk_zram_recomp_drain()
+ * Per-device "Sail_recompd" kthread_worker drained by abk_zram_recomp_drain()
  * from zram_reset_device() before comps/table teardown.  Slots are
  * revalidated under the slot lock in the worker, exactly like the
  * synchronous path.
@@ -147,7 +147,7 @@ static int abk_zram_recomp_enqueue(struct zram *zram, u32 index,
     if (!found) {
         entry = kmalloc(sizeof(*entry), GFP_KERNEL);
         if (entry) {
-            entry->worker = kthread_create_worker(0, "zram_recompd");
+            entry->worker = kthread_create_worker(0, "Sail_recompd");
             if (IS_ERR(entry->worker)) {
                 int err = PTR_ERR(entry->worker);
 

@@ -249,7 +249,7 @@ REQUIRED_CONTENT = {
     "core:zram_async_recompress": [
         "Batch 10-1 async recompress engine (plan A)",
         "abk_zram_recomp_enqueue",
-        "kthread_create_worker(0, \"zram_recompd\")",
+        "kthread_create_worker(0, \"Sail_recompd\")",
         "recompress_async",
         "dev_attr_recompress_async.attr",
         "abk_zram_recomp_drain(zram);",
@@ -667,7 +667,7 @@ REQUIRED_CONTENT = {
         "bitmap_zero(abk_fa_app_bitmap, 90000);",
     ],
     "core:vm_kcompressd_swapout": [
-        "kcompressd%d",
+        "Sail_kcompd%d",
         "abk_kcompressd_store",
         "abk_kcompressd_do_swapout",
         "static int abk_kcompressd_threshold = 24;",

@@ -674,7 +674,7 @@ static void abk_kcompressd_add_node(int nid)
     spin_unlock_irq(&kcd->lock);
 
     task = kthread_create_on_node(abk_kcompressd, (void *)(long)nid, nid,
-                      "kcompressd%d", nid);
+                      "Sail_kcompd%d", nid);
     if (IS_ERR(task)) {
         pr_err("kcompressd: node %d failed to start (%ld), node stays synchronous\n",
                nid, PTR_ERR(task));

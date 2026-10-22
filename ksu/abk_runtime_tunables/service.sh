@@ -7,11 +7,11 @@ MODDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 . "$MODDIR/iorap-watch.sh"
 
 case "${1:-}" in
-  --supervise-zram) abk_zram_supervisor_main; exit 0 ;;
-  --supervise-cfr) abk_cfr_supervisor_main; exit 0 ;;
-  --supervise-psi) abk_psi_supervisor_main; exit 0 ;;
-  --supervise-lru-gen) abk_lru_gen_supervisor_main; exit 0 ;;
-  --supervise-iorap) abk_iorap_main; exit 0 ;;
+  --supervise-zram) abk_set_comm "$(abk_supervisor_name zram comm)"; abk_zram_supervisor_main; exit 0 ;;
+  --supervise-cfr) abk_set_comm "$(abk_supervisor_name cfr comm)"; abk_cfr_supervisor_main; exit 0 ;;
+  --supervise-psi) abk_set_comm "$(abk_supervisor_name psi comm)"; abk_psi_supervisor_main; exit 0 ;;
+  --supervise-lru-gen) abk_set_comm "$(abk_supervisor_name lru_gen comm)"; abk_lru_gen_supervisor_main; exit 0 ;;
+  --supervise-iorap) abk_set_comm "$(abk_supervisor_name iorap-watch comm)"; abk_iorap_main; exit 0 ;;
 esac
 
 mkdir -p "$ABK_STATE_DIR" "$ABK_RUN_DIR" 2>/dev/null || true
@@ -29,7 +29,29 @@ abk_spawn() {
     return 0
   fi
 
-  setsid sh "$MODDIR/service.sh" "$_sp_arg" >/dev/null 2>&1 &
+  # ps NAME is argv[0]; pkill matches the cmdline, which still carries
+  # "service.sh <arg>", so only the display name changes here.
+  _sp_link=""
+  _sp_long="$(abk_supervisor_name "$_sp_name")"
+  if [ -n "$_sp_long" ]; then
+    if [ -x "$ABK_SHELL" ]; then
+      mkdir -p "$ABK_RUN_DIR" 2>/dev/null || true
+      _sp_link="$ABK_RUN_DIR/$_sp_long"
+      if [ "$(readlink "$_sp_link" 2>/dev/null)" != "$ABK_SHELL" ]; then
+        rm -f "$_sp_link" 2>/dev/null || true
+        ln -s "$ABK_SHELL" "$_sp_link" 2>/dev/null || true
+      fi
+      [ -x "$_sp_link" ] && [ ! -d "$_sp_link" ] || _sp_link=""
+    fi
+    [ -n "$_sp_link" ] \
+      || abk_warn "$_sp_name supervisor: no long-name link in $ABK_RUN_DIR; falling back to sh"
+  fi
+
+  if [ -n "$_sp_link" ]; then
+    setsid "$_sp_link" "$MODDIR/service.sh" "$_sp_arg" >/dev/null 2>&1 &
+  else
+    setsid sh "$MODDIR/service.sh" "$_sp_arg" >/dev/null 2>&1 &
+  fi
   _sp_n=0
   while [ "$_sp_n" -lt 10 ]; do
     abk_pid_live "$_sp_name" && break
