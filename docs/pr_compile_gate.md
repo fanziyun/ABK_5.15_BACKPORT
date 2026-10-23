@@ -35,8 +35,11 @@
 1. `Resolve PR and gate`：API 读 PR 的 `state`/`draft`/`head.sha`/`head.repo`/改动文件 → 判定跑或跳过；
    要跑就先写 `pending`；顺手在这里卡一次 `ABK_CI_TOKEN` 是否存在（缺了就红，见第 4 节）。
 2. `Build dispatch payload`：按 PR head sha 取 `module.conf`，解析 `ABK_MODULE_SET_ITEMS` 的 child，拼
-   `custom_external_modules`；每个 child 的第三字段是 `;ref=refs/pull/<N>/head`。版本名固定为
-   `<ABK_CI_VERSION_BASE>-pr<N>-<sha7>`，下文叫 **marker**；同时写下 `expected_ref.txt` 供取证比对。
+   `custom_external_modules`；每个 child 的第三字段是 `;ref=refs/pull/<N>/head`。版本名拼成
+   `<内核>.<真实子版本>-<ABK_CI_VERSION_LABEL>-<UTC+8日期>-pr<N>-<sha7>`
+   （例 `5.15.206-Sailboat-20261022-pr51-399a6d4`），末尾的 `pr<N>-<sha7>` 下文叫 **marker**；
+   同时写下 `expected_ref.txt` 供取证比对。子版本取自 ABK 的 LTS 数据文件（读不到就回退 `X`，
+   由 ABK 侧用 Makefile 的 SUBLEVEL 校正），日期在派发这一刻按 UTC+8 现算 —— **不要**再把日期写死成常量。
 3. `Cancel superseded run for this PR`：取消 ABK 里同一 PR 尚未完成的旧 run。
 4. `Dispatch ABK build`：先验「目标 ref 上的 `kernel-custom.yml` 认识 `;ref=`」（run-name 那一行不是
    以 `ABK-CI` 起头就立刻红，不去白等 90 分钟），再 `workflow_dispatch`。
@@ -115,7 +118,9 @@
    （等 PR #5 合进 `dev` 后删掉）—— 但那样这张 PAT 就是整仓接管能力，见上一条。
 3. **var `ABK_CI_EXTRA_MODULES`**（可选）—— 与出厂构建同形的其它模块描述符，换行分隔，留空＝只注入本仓库 child
    （**留空不等于出厂组合**，见第 9 节）。
-4. **var `ABK_CI_VERSION_BASE` / `ABK_CI_BUILD_TIME`**（可选）—— 版本名前缀（默认 `-202609202-FanZiyun`）与固定构建时间。
+4. **var `ABK_CI_VERSION_LABEL` / `ABK_CI_BUILD_TIME`**（可选）—— 版本名里的标签段（默认 `Sailboat`）与固定构建时间。
+   `ABK_CI_BUILD_TIME` 留空＝用派发当时的真实 UTC 时间；别钉死一个过去的常量，那会让 boot 镜像的
+   UTS 时间永远停在那个日期。
 5. **label `ci:compile`** —— fork PR 重跑用；本仓库目前**没有**这个标签，需要建。
 6. **合并到默认分支 `main`** —— `pull_request_target` 只在**默认分支上存在该工作流文件**时触发，
    在此之前任何 PR 的 Checks 里都不会出现这两条检查。

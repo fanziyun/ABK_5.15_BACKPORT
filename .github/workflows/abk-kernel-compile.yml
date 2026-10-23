@@ -19,8 +19,8 @@ name: ABK kernel compile gate
 #   var    ABK_CI_REPO           派发目标仓库，默认 fanziyun/ABK；推荐填自己的一次性 fork
 #   var    ABK_CI_EXTRA_MODULES  与出厂构建同形的其它模块描述符，换行分隔（留空=只注入本仓库 child）
 #   var    ABK_CI_WORKFLOW_REF   ABK 侧工作流 ref，默认 dev
-#   var    ABK_CI_VERSION_BASE   版本名前缀，默认 -202609202-FanZiyun
-#   var    ABK_CI_BUILD_TIME     固定构建时间，默认 Sun Dec 01 08:10:00 UTC 2024
+#   var    ABK_CI_VERSION_LABEL  版本名标签段，默认 Sailboat（产物名 <内核>.<子版本>-<标签>-<UTC+8日期>-<marker>）
+#   var    ABK_CI_BUILD_TIME     固定构建时间；留空=用派发时的真实 UTC 时间
 #
 # 触发策略：同仓库分支 PR 自动；fork PR 需维护者打 ci:compile 标签。
 
@@ -59,8 +59,12 @@ jobs:
       ABK_WORKFLOW: kernel-custom.yml
       ABK_WORKFLOW_REF: ${{ inputs.abk_ref || vars.ABK_CI_WORKFLOW_REF || 'dev' }}
       ABK_EXTRA_MODULES: ${{ vars.ABK_CI_EXTRA_MODULES }}
-      ABK_BUILD_TIME: ${{ vars.ABK_CI_BUILD_TIME || 'Sun Dec 01 08:10:00 UTC 2024' }}
-      ABK_VERSION_BASE: ${{ vars.ABK_CI_VERSION_BASE || '-202609202-FanZiyun' }}
+      # 构建时间：默认留空，让 ABK 的 build.yml 用派发当时的真实 UTC 时间，
+      # 不再钉死一个 2024-12-01 的常量（那会让 boot 镜像的 UTS 时间永远停在过去）。
+      ABK_BUILD_TIME: ${{ vars.ABK_CI_BUILD_TIME || '' }}
+      # 版本名标签段。以前这里写死 '-202609202-FanZiyun'：既是个 9 位、不是合法
+      # YYYYMMDD 的"假日期"，又会一直过期。日期由 ABK 侧 runner 按 UTC+8 现算。
+      ABK_VERSION_LABEL: ${{ vars.ABK_CI_VERSION_LABEL || 'Sailboat' }}
       STATUS_CONTEXT: ABK kernel compile (android13-5.15-lts)
       # ABK run 里内核构建 job 的名字前缀 = <kernel>.<sub_level>-<android>-<os_patch>，
       # 用来把「编译挂了」和「同 run 别的 job 挂了」分开（见 docs/pr_compile_gate.md 第 9 节）。
@@ -186,7 +190,7 @@ jobs:
           fi
 
           python3 - <<'PY'
-          import json, os, re, sys
+          import json, os, pathlib, re, sys
 
           raw = open("module.conf.head", encoding="utf-8").read()
           # module.conf 是 shell 赋值文件（ABK 自己也用 shell 读它），这里按同一种语法抓它：
@@ -215,6 +219,43 @@ jobs:
           marker = "pr" + pr + "-" + head_sha[:7]
           repo_url = "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
 
+          # 版本名 = <内核>.<真实子版本>-<标签>-<UTC+8日期>-<marker>
+          # 例如 5.15.220-Sailboat-20261022-pr48-test
+          #
+          # 子版本必须是真的：payload 里 sub_level="X" 表示"跟随 LTS"，那是给
+          # ABK 用的，不能直接当版本名的一段。这里读本仓库的 LTS 数据文件取真实值，
+          # 读不到就退回 X（ABK 侧还会用 Makefile 的 SUBLEVEL 再校正）。
+          kernel_version = "5.15"
+          version_label = os.environ.get("ABK_VERSION_LABEL") or "Sailboat"
+          try:
+              from datetime import datetime, timedelta, timezone
+              utc8 = timezone(timedelta(hours=8))
+              version_date = datetime.now(utc8).strftime("%Y%m%d")
+          except Exception:
+              version_date = ""
+
+          # LTS 真实子版本：本仓库没有 ABK 的 data/，所以走 raw CDN 读 ABK 侧
+          # 的 LTS 数据（和下面 run-name 契约预检同一套路：匿名、只读、失败不致命）。
+          sub_level = "X"
+          lts_url = (
+              "https://raw.githubusercontent.com/" + os.environ["ABK_REPO"]
+              + "/refs/heads/" + os.environ["ABK_WORKFLOW_REF"]
+              + "/data/android13/5.15.json"
+          )
+          try:
+              import urllib.request
+              with urllib.request.urlopen(lts_url, timeout=30) as resp:
+                  lts = json.loads(resp.read().decode("utf-8")).get("lts", "")
+              # lts 形如 "5.15.206"
+              if lts.startswith(kernel_version + "."):
+                  sub_level = lts.rsplit(".", 1)[-1]
+              else:
+                  print("::warning::LTS 数据里的版本与 " + kernel_version + " 不符: " + repr(lts))
+          except Exception as exc:  # 网络抖动不该让门禁红掉
+              print("::warning::读取 " + lts_url + " 失败，子版本回退 X: " + str(exc))
+          version_name = f"{kernel_version}.{sub_level}-{version_label}-{version_date}-{marker}"
+          print("version_name=" + version_name)
+
           blocks = []
           extra = os.environ.get("ABK_EXTRA_MODULES", "").strip()
           if extra:
@@ -233,7 +274,13 @@ jobs:
                   "kernelsu_variant": "None",
                   "kernelsu_branch": "Stable(标准)",
                   "custom_ref": "",
-                  "version": os.environ["ABK_VERSION_BASE"] + "-" + marker,
+                  # 版本名在这里就拼成目标形状：
+                  #   <内核>.<子版本>-<标签>-<UTC+8日期>-<marker>
+                  # 例如 5.15.220-Sailboat-20261022-pr48-test
+                  # 子版本用 LTS 数据里的真实值（不是 "X"），日期用派发这一刻的
+                  # UTC+8 日期（不是写死的常量）。ABK 侧 build.yml 还会用实测
+                  # SUBLEVEL 再校正一次，两边不会漂。
+                  "version": version_name,
                   "build_time": os.environ["ABK_BUILD_TIME"],
                   "virtualization_support": "678",
                   "use_zram": True,
