@@ -589,6 +589,23 @@ grep -q "handle_reclaim_writeback(nr_taken, sc, &stat, file);" \
 grep -A1 "skip_retry = true;" "$KERNEL_ROOT/common/mm/vmscan.c" \
      | grep -q "isolated = 0;" \
   || fail "the evict retry does not reset isolated (v7.2-final 14/14 missing)"
+# The fix for the captured wedge: the direct-reclaim yield must sit between
+# the shared writeback tail and the putback loop -- without it the loop worker
+# rescans a fully-writeback batch and starves the loop I/O it is waiting for.
+grep -q "sailboat_mglru_direct_reclaim_wb_yield" "$KERNEL_ROOT/common/mm/vmscan.c"   || fail "the direct-reclaim wb-yield group did not land"
+grep -q "io_schedule_timeout(msecs_to_jiffies(20));" "$KERNEL_ROOT/common/mm/vmscan.c"   || fail "the wb-yield sleep is missing"
+if ! "$python_bin" - "$KERNEL_ROOT/common/mm/vmscan.c" <<'PY'
+import sys
+text = open(sys.argv[1]).read()
+call = text.index("handle_reclaim_writeback(isolated, sc, &stat,")
+yield_ = text.index("io_schedule_timeout(msecs_to_jiffies(20));")
+putback = text.index("list_for_each_entry_safe_reverse(page, next, &list, lru)", call)
+sys.exit(0 if call < yield_ < putback else 1)
+PY
+then
+  fail "the wb-yield is not between the shared tail and the putback loop"
+fi
+
 
 # Batch 35: the write source buffer is prefaulted where the copy made no
 # progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves

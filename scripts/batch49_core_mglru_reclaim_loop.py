@@ -13,6 +13,7 @@ LOOP_PROBE = "static unsigned long lruvec_evictable_size(struct lruvec *lruvec, 
 DIRTY_PROBE = "if (stat.nr_unqueued_dirty == isolated) {"
 PLACEMENT_PROBE = "sailboat_mglru_prefault_accessed_placement"
 UNIFY_PROBE = "sailboat_mglru_unify_writeback_throttle"
+YIELD_PROBE = "sailboat_mglru_direct_reclaim_wb_yield"
 
 
 _LOOP_STEPS = [
@@ -1016,6 +1017,43 @@ def mglru_unify_writeback_throttle_apply(ctx):
     return status, detail
 
 
+_YIELD_STEPS = [
+    (VMSCAN_C,
+     "\thandle_reclaim_writeback(isolated, sc, &stat,\n"
+     "\t\t\t\t type == LRU_GEN_FILE);\n"
+     "\n"
+     "\tlist_for_each_entry_safe_reverse(page, next, &list, lru) {\n",
+     "\thandle_reclaim_writeback(isolated, sc, &stat,\n"
+     "\t\t\t\t type == LRU_GEN_FILE);\n"
+     "\n"
+     "\t/*\n"
+     "\t * sailboat_mglru_direct_reclaim_wb_yield: a direct reclaimer whose\n"
+     "\t * whole batch sits under writeback must yield, not rescan -- the\n"
+     "\t * writeback can queue behind this very worker (loop/dm-backed\n"
+     "\t * filesystems), and rescanning starves it.\n"
+     "\t */\n"
+     "\tif (!current_is_kswapd() && isolated && !reclaimed &&\n"
+     "\t    stat.nr_dirty + stat.nr_writeback >= isolated)\n"
+     "\t\tio_schedule_timeout(msecs_to_jiffies(20));\n"
+     "\n"
+     "\tlist_for_each_entry_safe_reverse(page, next, &list, lru) {\n",
+     T),
+]
+
+
+def mglru_direct_reclaim_wb_yield_apply(ctx):
+    try:
+        probe = ctx.read(VMSCAN_C)
+    except FileNotFoundError:
+        probe = ""
+    if YIELD_PROBE in probe:
+        return "already_present", "the wb-yield group is already in vmscan.c"
+    status, _results, detail = apply_steps(ctx, _YIELD_STEPS)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 def build_groups(patch_group_cls):
     return [
         patch_group_cls(
@@ -1057,5 +1095,17 @@ def build_groups(patch_group_cls):
              "throttling)"],
             [VMSCAN_C],
             mglru_unify_writeback_throttle_apply,
+        ),
+        patch_group_cls(
+            "mglru_direct_reclaim_wb_yield",
+            "MGLRU: a direct reclaimer whose whole isolated batch is dirty or "
+            "under writeback yields (io_schedule_timeout) instead of rescanning "
+            "-- on loop/dm-backed filesystems the writeback it needs can queue "
+            "behind the reclaiming worker itself; stops the captured evict_pages "
+            "spin wedge",
+            ["5.15-native carrier of the v4-14 VMSCAN_THROTTLE_WRITEBACK "
+             "semantics for direct reclaim"],
+            [VMSCAN_C],
+            mglru_direct_reclaim_wb_yield_apply,
         ),
     ]

@@ -736,6 +736,11 @@ REQUIRED_CONTENT = {
         "static int page_inc_gen(struct lruvec *lruvec, struct page *page)",
         "/* for shrink_page_list(); PG_reclaim is left to the common routine */",
     ],
+    "core:mglru_direct_reclaim_wb_yield": [
+        "sailboat_mglru_direct_reclaim_wb_yield",
+        ["mm/vmscan.c", "io_schedule_timeout(msecs_to_jiffies(20));"],
+        ["mm/vmscan.c", "stat.nr_dirty + stat.nr_writeback >= isolated"],
+    ],
     "core:mglru_unify_writeback_throttle": [
         "sailboat_mglru_unify_writeback_throttle",
         "static void handle_reclaim_writeback(unsigned long nr_taken,",
@@ -1570,6 +1575,13 @@ REQUIRED_IN_FUNCTION = {
         ("mm/vmscan.c", "isolate_page",
          ["\tClearPageReferenced(page);"],
          ["ClearPageReclaim"]),
+    ],
+    "core:mglru_direct_reclaim_wb_yield": [
+        ("mm/vmscan.c", "evict_pages",
+         ["if (!current_is_kswapd() && isolated && !reclaimed &&",
+          "stat.nr_dirty + stat.nr_writeback >= isolated",
+          "io_schedule_timeout(msecs_to_jiffies(20));"],
+         []),
     ],
     "core:mglru_unify_writeback_throttle": [
         ("mm/vmscan.c", "handle_reclaim_writeback",

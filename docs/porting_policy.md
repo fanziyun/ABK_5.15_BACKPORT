@@ -435,6 +435,12 @@ absent its evict-side anchor misses and the transactional step engine leaves
 the file untouched (`blocked_by_shape`) -- a tree must not grow the shared
 tail without the loop that calls it.
 
+The fifth group `mglru_direct_reclaim_wb_yield` (v0.78.0) extends the same
+chain: it inserts the yield block after the text the unify group generated,
+so it registers after it and needs no successor probe on its predecessor --
+the unify group's probe (the marker in `handle_reclaim_writeback()`'s
+comment) survives the insertion untouched.
+
 Batch 8's `rcu_nocb_cpu_default_all` is a three-file source graft:
 `kernel/rcu/Kconfig` adds the configuration symbol with a `default n` of its
 own, the kernel-parameter documentation records explicit-mask precedence, and

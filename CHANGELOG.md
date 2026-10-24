@@ -1636,6 +1636,33 @@ core 78 → 79);`step_audit` core 397 步、二遍幂等;`implementation_audit`
 
 > **【复现器终局(同日晚)】**hogio 工具链(驻留内存猪 + loop 镜像随机小 IO)把复现压到分钟级:无 OOM 免死 ×3/3 冻死(2-5 分钟);OOM 免死 ×1 稳定;**对照轮(MGLRU 关、同负载)同样死亡**但阈值更高、形态不同(压力走 zram 换出,IO 停顿≈0)。终局归因:致死负载形态(OOM 撕碎 10GB+ 进程善后风暴 + 低水位 + loop 页 churn)对两套回收器均致命,MGLRU 重写栈显著降低致死阈值并改变失效形态;修复面为直回收写回让步 + 策略侧(lmkd 善后风暴叠加 IO 高压的)防线。
 
+
+### 增补(v0.78.0,core 79 → 80 组):第 5 组 `mglru_direct_reclaim_wb_yield`(卡死修复)
+
+针对 wedge#2 栈级证据的修复:直回收者在 `evict_pages()` 里拿到"整批脏/
+写回占位、零回收"的批次时,当前实现立即重扫——在 loop/dm 背书的文件系统
+上,这些页的写回排队可能正排在**回收者自己所在的 worker** 后面,重扫即
+自锁(实测:4 个 loop worker R 态自旋于 `evict_pages`,kswapd 同路径
+`wait_on_page_writeback` 睡眠,环形饿死,2-5 分钟确定性整机冻死)。
+
+修复:在共享写回尾(`handle_reclaim_writeback()`)之后、putback 循环之前
+插入让步:
+
+```c
+if (!current_is_kswapd() && isolated && !reclaimed &&
+    stat.nr_dirty + stat.nr_writeback >= isolated)
+        io_schedule_timeout(msecs_to_jiffies(20));
+```
+
+即 v4-14 `VMSCAN_THROTTLE_WRITEBACK` 语义的 5.15 载体(无条件可携的
+`io_schedule_timeout` 替代缺失的 `reclaim_throttle`):只命中"直回收 ×
+整批写回占位 × 零进展"的活锁签名,kswapd 与正常回收不受影响。trap-5:
+本组插入于 unify 组生成文本之后、注册在其后,unify 探针(helper 注释里的
+标记)不受触碰。
+
+验证:七道本地门禁;WSL 构建;真机 hogio 复现器验收(修前:开 MGLRU
+无免死负载 3/3 于 2-5 分钟冻死)。验收实况:构建刷入以 build-id `62f6a24f…` 逐字核验;hogio 全配方验收于 ~3 分钟处网络失联中断——该配方对两套回收器皆致死(对照轮同配方亦亡),不构成存活判据;修复的特定声明(消除直回收在 evict_pages 的 R 态自旋死形)以死形判据与自然使用观察跟进。MGLRU 维持默认关。
+
 <a id="companion-v0200"></a>
 
 ## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
