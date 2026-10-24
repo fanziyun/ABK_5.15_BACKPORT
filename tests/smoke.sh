@@ -548,9 +548,13 @@ grep -q "nr_to_scan = get_nr_to_scan(lruvec, sc, memcg, swappiness);" \
 if grep -q "\*need_aging = should_run_aging" "$KERNEL_ROOT/common/mm/vmscan.c"; then
   fail "should_run_aging() still computes nr_to_scan (163bc3d68c9f missing)"
 fi
-grep -q "if (stat.nr_unqueued_dirty == isolated) {" \
+grep -q "handle_reclaim_writeback(isolated, sc, &stat," \
   "$KERNEL_ROOT/common/mm/vmscan.c" \
-  || fail "the MGLRU eviction does not wake flushers per batch"
+  || fail "the MGLRU eviction does not share the reclaim-writeback tail per batch"
+if grep -q "if (stat.nr_unqueued_dirty == isolated) {" \
+     "$KERNEL_ROOT/common/mm/vmscan.c"; then
+  fail "the dirty group's own per-batch wake survived (v7.2-final 14/14 missing)"
+fi
 if grep -q "sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken" \
      "$KERNEL_ROOT/common/mm/vmscan.c"; then
   fail "the once-per-loop flusher wake survived (f37d3708b676 missing)"
@@ -565,6 +569,26 @@ grep -q "else if (PageReferenced(page))" \
   || fail "prefaulted file pages are not placed a generation up (6cbdd9726fb5 missing)"
 grep -q "mark_page_accessed(page);" "$KERNEL_ROOT/common/mm/swap.c" \
   || fail "lru_cache_add() does not mark prefaulted file pages accessed"
+
+# Batch 49 (v7.2-final 14/14): both reclaim paths share
+# handle_reclaim_writeback(), whose sc->nr.* accounting feeds shrink_node()'s
+# PGDAT_WRITEBACK/PGDAT_DIRTY backpressure -- without it MGLRU reclaim is
+# invisible to the writeback throttle (upstream's dd-under-cgroup-limit OOM).
+# The retry reset keeps a re-tried batch off stale isolation counts.
+grep -q "sailboat_mglru_unify_writeback_throttle" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the unify-writeback group did not land"
+grep -q "if (stat->nr_unqueued_dirty == nr_taken && nr_taken)" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "handle_reclaim_writeback() lost its whole-batch flusher nudge"
+grep -q "sc->nr.taken += nr_taken;" "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "handle_reclaim_writeback() does not feed sc->nr.*"
+grep -q "handle_reclaim_writeback(nr_taken, sc, &stat, file);" \
+  "$KERNEL_ROOT/common/mm/vmscan.c" \
+  || fail "the classic shrink_inactive_list() tail was not deduplicated"
+grep -A1 "skip_retry = true;" "$KERNEL_ROOT/common/mm/vmscan.c" \
+     | grep -q "isolated = 0;" \
+  || fail "the evict retry does not reset isolated (v7.2-final 14/14 missing)"
 
 # Batch 35: the write source buffer is prefaulted where the copy made no
 # progress, not at the head of every retry (faa794dd2e17, v6.16).  Both halves

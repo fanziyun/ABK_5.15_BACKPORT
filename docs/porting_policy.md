@@ -423,6 +423,18 @@ not be half-patched.  That dependency runs the other way too, which is why Batch
 `already_present`): without it, Batch 41's second pass finds its offload-branch
 and drain anchors rewritten and reports `partial` on a tree Batch 71 already touched.
 
+Batch 49's fourth group `mglru_unify_writeback_throttle` (the v7.2-final
+14/14 commit, added in v0.77.0) is the same trap-5 shape: it deletes the
+per-batch flusher wake that `mglru_dirty_reclaim_rework` generated and the
+comment `mglru_wake_flushers` probes on, replacing both with the shared
+`handle_reclaim_writeback()` tail. Both earlier groups gained the successor
+probe (seeing `sailboat_mglru_unify_writeback_throttle` means
+`already_present`). The superseding group itself needs no refusal branch: it
+registers last in the batch49 chain, so on a tree where the loop rework is
+absent its evict-side anchor misses and the transactional step engine leaves
+the file untouched (`blocked_by_shape`) -- a tree must not grow the shared
+tail without the loop that calls it.
+
 Batch 8's `rcu_nocb_cpu_default_all` is a three-file source graft:
 `kernel/rcu/Kconfig` adds the configuration symbol with a `default n` of its
 own, the kernel-parameter documentation records explicit-mask precedence, and
