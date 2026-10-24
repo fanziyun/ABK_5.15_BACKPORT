@@ -1623,6 +1623,17 @@ core 78 → 79);`step_audit` core 397 步、二遍幂等;`implementation_audit`
 规则不引用设备收益数字;`memory.reclaim` 强制回收按量取页,策略的 aging/
 选择智能在该形态下没有表达空间。记录 `research/mglru_phase0_20261024/REPORT_R4.md`。
 
+> **【soak 更正(2026-10-24 晚)】**真机 soak(MGLRU 常开日常使用)复现了
+> Batch 70/71 原案的卡死类,并首次取得栈级证据:4 个 loop 设备 worker 以 R 态
+> 卡在 `evict_pages -> lru_gen_shrink_lruvec -> __alloc_pages_direct_reclaim`
+>(在自身 I/O 上下文里直回收、驱逐又依赖 loop I/O 完成,环形饿死),`kswapd0`
+> 同路径等页写回;此前记录的 sock_diag 互斥锁堆积为次生放大器。合成负载
+>(含 8 路并发把 MemAvailable 压到 2.4GB)不能确定性触发——需要真实应用
+> 常驻低水位与 loop 分配时机相交。据此:MGLRU 维持默认关(回退决定被追认),
+> companion `lru_gen.enable` 已复位 0;修复立项待做——直回收上下文的真写回
+> 等待/让步(v4-14 `reclaim_throttle` 语义的 5.15 载体)或 vendor loop.c 分配
+> 隔离。全量证据 `research/mglru_phase0_20261024/REPORT_SOAK_INCIDENT1.md`。
+
 <a id="companion-v0200"></a>
 
 ## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
