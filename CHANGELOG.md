@@ -2,7 +2,7 @@
 
 本文件是唯一的批次档案：每个已落地 Batch 的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）按 Batch 倒序排列；原 `plan.md` 的批次索引行、候选、延后项、排除记录与禁区清单已于 2026-10-22 逐字并入文末的 [附录](#appendix-plan)，`plan.md` 已清空停用。最前面另有一节 [交付日志总览：九项优化](#overview-nine)：把清单式的九项功能（内存分配 hook、线程调度 hook、空实现修复、低内存立刻碎片回收、EEVDF、async_depth、zram writeback、bio batching、重压缩）按顺序重排，逐项给出批次/组/证据并与下面的 Batch 小节互链；第 10 项往下续写：记本轮 `8a73e95` → HEAD 的四个提交（Batch 25 companion v0.9.0 → Batch 26 core v0.30.0 → companion v0.9.2 → v0.9.3），也就是「前九项在这台设备上能不能用、数据可不可信」。
 
-**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。103 个移植组（core 78 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
+**分工**：`README.md`（中文）/ `README_en.md`（英文）是面向用户的总览——做什么、怎么注入、刷入后有什么；**本文件是技术细节的权威出处**：某个移植组为什么这么落、锚点形态怎么选、KMI 槽位怎么处理、真机实测数据是多少、当时排除了什么及其证据。想知道「细节」就先查本文件顶部的总览表，再进对应 Batch 小节；移植政策与红线在 `docs/porting_policy.md`，锚点机制与验证顺序在 `AGENTS.md`。104 个移植组（core 79 / perf 24 / display 1）的逐批清单分布在各小节里，运行时权威计数以 `tests/sublevel_matrix.py` 的 `GROUP_COUNTS` 为准（单测断言它与注册表一致）。
 
 <a id="overview-nine"></a>
 
@@ -1579,6 +1579,50 @@ dirty-tail 的 memcg OOM/长停顿风险进一步下降(与既有 `mglru_wake_fl
 各 2 轮无显著性判断),不是本系列的目标负载,既不能证明收益也不能证明回归。
 目标负载(文件缓存压力下的切换/重启)的配对 A/B 与判读规则(≥15% refault 下降
 为明确改善,OOM/panic 信号即回退)在真机闸门一并执行,实测多少写多少。
+### 增补(v0.77.0,core 78 → 79 组):第 4 组 `mglru_unify_writeback_throttle`(系列终版 14/14)
+
+上游系列并入 7.2 的终版(v4)共 14 条,已移植快照与其在 1–11 号上几乎逐行
+相同,真缺口只有第 14 条 `mm/vmscan: unify writeback reclaim statistic and
+throttling`(归档 `research/upstream-5.15.y/patches-72-final/`):把经典
+`shrink_inactive_list()` 尾部的 flusher 唤醒 + `sc->nr.*` 记账抽成
+`handle_reclaim_writeback()`,MGLRU 的 evict 路径每批调用。上游动机原话:
+MGLRU "基本无视写回收节流",`dd` + cgroup 限额 + 慢设备下 MGLRU 开启即
+OOM;修复后 "no more spin on LRU or premature OOM"。
+
+5.15 形态(有意偏差入档):
+
+- **节流本体 = 喂计数,不搬 `reclaim_throttle`**:5.15 无
+  `VMSCAN_THROTTLE_WRITEBACK`(grep=0),但 `shrink_node()` 自带
+  `sc->nr.writeback == sc->nr.taken → PGDAT_WRITEBACK`、
+  `sc->nr.unqueued_dirty == sc->nr.file_taken → PGDAT_DIRTY` 背压门——
+  经典路径一直喂它们,MGLRU 路径从未喂过。helper 把 5.15 经典尾部的七行
+  记账逐行搬进 MGLRU 路径,门自动生效;helper 因此也不带上游的 `pgdat`
+  参数(唯一用途是缺载体的 `reclaim_throttle`)。
+- 终版 12/13 号(`remove sc->file_taken` / `unqueued_dirty`)**不追**:
+  5.15 的 `PGDAT_DIRTY` 门正消费这两个字段,追删是破坏。
+- `evict_pages()` 的 `goto retry` 前补 `isolated = 0;`(重试批次不再拿
+  旧计数复判唤醒谓词,上游同款)。
+- trap-5:本组删除 `mglru_wake_flushers` 探针锚定的注释与
+  `mglru_dirty_reclaim_rework` 的 `DIRTY_PROBE` 行,两组各补后继识别
+  (见到 `sailboat_mglru_unify_writeback_throttle` 即 `already_present`);
+  本组自锚 `sailboat_mglru_unify_writeback_throttle` 标记,注册在
+  batch49 链末,前置组缺席时 evict 侧锚失配、事务性拒写。
+
+验证:`py_compile` / `bash -n` 过;`stable_5_15_test` 1742 项全绿(矩阵
+core 78 → 79);`step_audit` core 397 步、二遍幂等;`implementation_audit`
+过——注意其按组序即时检查,`mglru_dirty_reclaim_rework` 的 evict 针脚钉
+"G2 时刻"的旧唤醒形态,终态(helper 调用 + 旧块清场)由本组条目钉;
+`smoke` 两遍幂等 + `mm/vmscan.c` 回滚逐字节一致。`config_gate_audit` 已对
+本次 WSL 构建的 `.config` 通过;真机验收(设备 notes 与 vmlinux build-id
+逐字节一致)全绿:探针窗判别签名在案(budget:evict 一次预算/分批、flush
+逐批经 helper)、dd+硬限额秒级推进(failcnt 8.1 万全消化)、三轮 stress
+校验和=锚点、持续压 + root 级回收零 panic 类信号、bilibili ×20 回归哨兵
+零增量;`handle_reclaim_writeback` 被 ThinLTO 完全内联(vmlinux 符号表 0,
+按二进制确认降级)。开/关 A/B(文件工作集保护负载,OFF/ON 各 3 轮,运行时
+切换):热/冷集 pgpgin、refault、吞吐全部 ±0.5% 内,无可测差异,按 ≥15%
+规则不引用设备收益数字;`memory.reclaim` 强制回收按量取页,策略的 aging/
+选择智能在该形态下没有表达空间。记录 `research/mglru_phase0_20261024/REPORT_R4.md`。
+
 <a id="companion-v0200"></a>
 
 ## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
@@ -8303,7 +8347,7 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 ### Batch 50（v0.53.0：iorap2 后台预读抑制 Stage 1，core 71 → 72 组；已落地，本地七门全绿，真机 A/B 全过：后台 IO −35%（两轮复现）、启动中性、suspend/resume ×8 零告警，r3c 连同 Batch 51 永久刷入 boot_a）→ 详见 [CHANGELOG.md](#batch-50) — 主题「把小米 launch-boost 模块 `iorap2.ko`（`mi_lb_*` 家族，driver v3.0.0，modko 反编译）六条 vendor hook 里**不依赖用户态契约的常驻半边**转写成新 C 落地」。四个 handler 挂到树里已在位的 ACK hook（`should_fault_around`/`do_async_mmap_readahead`/`ra_tuning_max_page`/`tune_mmap_readaround`）：background cpuset cgroup 内且 `nvcsw > abk_bg_ra_nvcsw_min`（默认 99，年轻任务豁免——启动突发正是预读机制该干的事）的进程被跳过 fault-around/async mmap readahead、`ondemand_readahead` 窗口上限减半、mmap read-around 收窄（start `pgoff-ra/4`、size `ra/2`、async `ra/8`），让后台任务停止驱逐前台页缓存。反编译偏移逐个对本树解析：cgroup 判定 = `task_css(cpuset)->cgroup->kn->name`（真机实证 cpuset 挂 v1 `/dev/cpuset` 且有字面 `background` 目录，cgroup v2 `apps/uid/pid` 层级无命名子组）、年龄判定 = `task->nvcsw`、上限 = `ractl->ra->ra_pages`。**有意不移植**：上游经 `/dev/iorap` ioctl 由 iorapd 喂的 per-UID 豁免表（本模块无用户态契约；真机证据链：iorapd fork 69 KB 无 perfetto、引 `/dev/iorap_dev`、设备节点缺失时静默 `exit(1)` 循环、`persist.sys.stability.PrereadEnable=false` 门控关闭）与 collect/compile/preread 半边（Stage 2 候选，需先逆向 daemon 握手协议）。双旋钮 `module_param` 同名形式落 `/sys/module/filemap/parameters/abk_bg_ra_{suppress,nvcsw_min}`（r1 易失启动实证 `core_param` 会剥掉模块前缀、把旋钮埋进 `/sys/module/kernel/parameters/`，已改）。trap-7 防线：载荷整体在 `#ifdef CONFIG_CPUSETS` 内，`implementation_audit.py` 新增 `mm/filemap.c` 的 `CONFIG_GATED_REFERENCES` 表项机械强制；trap-6：`module_param` 两处同名形式进 `REQUIRED_CONTENT`。验证：`py_compile`/`bash -n`/`stable_5_15_test`（发布版本触点同步 0.53.0）/`step_audit`（97 组、两遍幂等）/`implementation_audit`（15 条针脚全过）/`smoke`（回滚字节一致）全绿；dry-run `bg_readahead_tune: applied`；本地构建见 CHANGELOG。
 
 
-### Batch 49（v0.52.0：MGLRU v7.2 回收循环重写，core 68 → 71 组；已落地，本地七门全绿、构建阶梯 R0–R3 完成、ABK CI 编译门禁已过；真机 R1–R3 窗口待跑）→ 详见 [CHANGELOG.md](#batch-49) — 主题「把 `docs/survey_7_2_mm_reclaim.md` §1 判为 not portable 的 Kairui Song 系列（cover `0491e9f75c15`，12 条）按该节自己的 honest route 落地」。12 条是一条线性 diff 链（23 个 hunk 全部归档记账），按链自然段拆 **3 个原子组**：① `mglru_reclaim_loop_rework`（`790d3abeca09`+`aa6ef5b159dc`+`163bc3d68c9f`+`6e9be217a3ce`+`3a72e078b4a3`+`16b475d2ac3c`+`12316f7902f8`）：`should_run_aging()` 4 参纯谓词 + `lruvec_evictable_size()` 抽出、`get_nr_to_scan()` 只算预算、主循环预算入环一次算好/aging 显式化/批次钳 `MIN_LRU_BATCH`、隔离侧精确计数（`*isolatedp`、跨 type `total_scanned`、`try_to_inc_min_seq` void 双 flush、删防活锁与 min-GENS hack）；② `mglru_dirty_reclaim_rework`（`75d4c3f5fb98`+`acd22fbb9f47`+`f37d3708b676`+`32d87083ee97`）：dirty/writeback 页改走公共 `shrink_page_list()` 重新激活、flusher 唤醒逐批判据（收益主角，上游单条 `f37d3708b676` 实测 workingset_refault_file **−43%**/pgpgin −30%/吞吐 +29%，服务器口径、不主张设备数字）、`page_inc_gen()` 去 PG_reclaim dance；③ `mglru_prefault_accessed_placement`（`6cbdd9726fb5`）：prefault 文件页 `mark_page_accessed()` 落第二老一带、WORKINGSET_ACTIVATE 只记真正 activate。**trap-5 全碰撞处置**：三组整链改写 `mglru_wake_flushers` 全部五处生成文本及 aging_feedback/type_selection 的部分生成文本，被改写方各补组级探针（`evictable_min_seq` 宏、2 参 `get_type_to_scan` 签名、被搬移的 flusher 注释），两遍实测 pass1 62+9 / pass2 71 全 `already_present` 无二次追加；trap-1 教训入档（纯删行步骤的 new 是纯净树子串 → 整函数单步化）。**5.15 偏差入档**：kswapd aging 延后保留（`lru_gen_age_node` 拥有 min_ttl/OOM 政策）、`may_writepage && __GFP_IO` 守卫保留（`acd22fbb9f47` 为 no-op）、`reclaim_throttle(VMSCAN_THROTTLE_WRITEBACK)` 无载体裁剪、`isolate_scanned`/`lru_gen_set_refs` hunk 不搬、`need_rotate` 丢弃、`isolate_page()` 导出签名冻结。**顺带 roll 维护**：矩阵行 re-key `217`→`220`（`vmscan_tasks_rcu_qs` 被 5.15.220 吸收迁入 `PRE_APPLIED`，关闭 Batch 48 记录的「re-key 另行处理」欠账）、三处文件清单补 `include/linux/mm_inline.h`。验证：`py_compile`/`bash -n`/`stable_5_15_test`/`step_audit`（core 371 步）/`implementation_audit`（三组针脚全双向）/`smoke` 全绿，`config_gate_audit` 对 R3 构建 `.config` 通过（七门收口；顺带补 Batch 39 取反 HIGHMEM 守卫的 DARK_GATES 记录）；构建阶梯 R0–R3 完成（R1/R2/R3 `REBUILD_EXIT=0`，产物 `/mnt/d/Kernel/b49-r*`）；真机 R0 对照窗口部分完成（四判别签名在案、校验和全对；refault 计量缺口已定位为 `lru_gen_refault()` 的 `memcg_id` 匹配门对跨 memcg 重读静默丢计，harness 修订为同 memcg 窗口 + T0–T3 采样，读数待补），压测第 3 轮中途设备从网络层整体失联——发生在对照内核上、非本批回归信号，机制待 dmesg/pstore 归因（`research/mglru_reclaim_loop_device_20261003/REPORT.md`）；R1–R3 开机窗口（逐组 go/no-go + 收益实测，判读规则 ≥15% refault 改善、OOM/panic 即回退）待跑；ABK CI 编译门禁已过（PR #37 / ABK run `37074017039` `success`，三重自证 + 96 组全落地）。
+### Batch 49（v0.52.0：MGLRU v7.2 回收循环重写，core 68 → 71 组；已落地，本地七门全绿、构建阶梯 R0–R3 完成、ABK CI 编译门禁已过；真机 R1–R3 窗口待跑）→ 详见 [CHANGELOG.md](#batch-49) — 主题「把 `docs/survey_7_2_mm_reclaim.md` §1 判为 not portable 的 Kairui Song 系列（cover `0491e9f75c15`，12 条）按该节自己的 honest route 落地」。12 条是一条线性 diff 链（23 个 hunk 全部归档记账），按链自然段拆 **3 个原子组**：① `mglru_reclaim_loop_rework`（`790d3abeca09`+`aa6ef5b159dc`+`163bc3d68c9f`+`6e9be217a3ce`+`3a72e078b4a3`+`16b475d2ac3c`+`12316f7902f8`）：`should_run_aging()` 4 参纯谓词 + `lruvec_evictable_size()` 抽出、`get_nr_to_scan()` 只算预算、主循环预算入环一次算好/aging 显式化/批次钳 `MIN_LRU_BATCH`、隔离侧精确计数（`*isolatedp`、跨 type `total_scanned`、`try_to_inc_min_seq` void 双 flush、删防活锁与 min-GENS hack）；② `mglru_dirty_reclaim_rework`（`75d4c3f5fb98`+`acd22fbb9f47`+`f37d3708b676`+`32d87083ee97`）：dirty/writeback 页改走公共 `shrink_page_list()` 重新激活、flusher 唤醒逐批判据（收益主角，上游单条 `f37d3708b676` 实测 workingset_refault_file **−43%**/pgpgin −30%/吞吐 +29%，服务器口径、不主张设备数字）、`page_inc_gen()` 去 PG_reclaim dance；③ `mglru_prefault_accessed_placement`（`6cbdd9726fb5`）：prefault 文件页 `mark_page_accessed()` 落第二老一带、WORKINGSET_ACTIVATE 只记真正 activate。**trap-5 全碰撞处置**：三组整链改写 `mglru_wake_flushers` 全部五处生成文本及 aging_feedback/type_selection 的部分生成文本，被改写方各补组级探针（`evictable_min_seq` 宏、2 参 `get_type_to_scan` 签名、被搬移的 flusher 注释），两遍实测 pass1 62+9 / pass2 71 全 `already_present` 无二次追加；trap-1 教训入档（纯删行步骤的 new 是纯净树子串 → 整函数单步化）。**5.15 偏差入档**：kswapd aging 延后保留（`lru_gen_age_node` 拥有 min_ttl/OOM 政策）、`may_writepage && __GFP_IO` 守卫保留（`acd22fbb9f47` 为 no-op）、`reclaim_throttle(VMSCAN_THROTTLE_WRITEBACK)` 无载体裁剪、`isolate_scanned`/`lru_gen_set_refs` hunk 不搬、`need_rotate` 丢弃、`isolate_page()` 导出签名冻结。**顺带 roll 维护**：矩阵行 re-key `217`→`220`（`vmscan_tasks_rcu_qs` 被 5.15.220 吸收迁入 `PRE_APPLIED`，关闭 Batch 48 记录的「re-key 另行处理」欠账）、三处文件清单补 `include/linux/mm_inline.h`。验证：`py_compile`/`bash -n`/`stable_5_15_test`/`step_audit`（core 371 步）/`implementation_audit`（三组针脚全双向）/`smoke` 全绿，`config_gate_audit` 对 R3 构建 `.config` 通过（七门收口；顺带补 Batch 39 取反 HIGHMEM 守卫的 DARK_GATES 记录）；构建阶梯 R0–R3 完成（R1/R2/R3 `REBUILD_EXIT=0`，产物 `/mnt/d/Kernel/b49-r*`）；真机 R0 对照窗口部分完成（四判别签名在案、校验和全对；refault 计量缺口已定位为 `lru_gen_refault()` 的 `memcg_id` 匹配门对跨 memcg 重读静默丢计，harness 修订为同 memcg 窗口 + T0–T3 采样，读数待补），压测第 3 轮中途设备从网络层整体失联——发生在对照内核上、非本批回归信号，机制待 dmesg/pstore 归因（`research/mglru_reclaim_loop_device_20261003/REPORT.md`）；R1–R3 开机窗口（逐组 go/no-go + 收益实测，判读规则 ≥15% refault 改善、OOM/panic 即回退）待跑；ABK CI 编译门禁已过（PR #37 / ABK run `37074017039` `success`，三重自证 + 96 组全落地）。**【v0.77.0 增补】**系列终版（v4 并入 7.2 的第 14 条）落为第 4 组 `mglru_unify_writeback_throttle`：经典尾块抽成 `handle_reclaim_writeback()` 供两路共享、MGLRU evict 每批调用、retry 前 `isolated = 0`；节流本体 = 喂 `sc->nr.*` 进 5.15 自带的 PGDAT_WRITEBACK/PGDAT_DIRTY 门（`reclaim_throttle` 无载体不搬）。core 78 → 79，七门全绿，真机验收 GO、开/关 A/B 无可测差异，详见正文增补节。
 
 ### Batch 48（v0.74.0：内存审查修复——二压 OOM 空指针与 MGLRU may_swap 回归，无新增组、core 组数不变；#38 回退后按 cherry-pick 重新落地于当前 main；本地 `py_compile`/`bash -n`/`stable_5_15_test` 全绿，`step_audit`/`implementation_audit`/`smoke`/`config_gate_audit` 需参考树待复跑）→ 详见 [CHANGELOG.md](#batch-48) — 主题「审查抓出的两个 P1」。① `zram_recompression`：移植自 6.6 的 `zram_recompress()` 用 `IS_ERR_VALUE(handle_new)` 判分配失败是 6.x 合同；5.15 的 `zs_malloc` 三条失败路径全部 `return 0`（lts 5.15.220 逐行核对），检查恒假 ⇒ 失败后 `zs_map_object(pool, 0, ...)`，而该树 `handle_to_obj()` 即 `*(unsigned long *)handle` ⇒ 空指针解引用；修复为 `if (!handle_new) → -ENOMEM`。② `mglru_rework_aging_feedback`：该组删掉的 may_swap dance 是基线 MGLRU 路径唯一的 may_swap 门，基线 `get_swappiness()` 无 guard、`410abb20acae`/`68cd9050d871` 也不含 may_swap hunk——不补则 memsw 限额与 `memory.reclaim noswap=1` 以完整 swappiness 换出 anon；同组新增一步按上游 v6.11 形状补 `if (!sc->may_swap) return 0;`，与 dance 删除同组、事务性保证同落同缺。③ `vmscan_tasks_rcu_qs` 组描述更正。**与当前 main 共存已核验**：may_swap 步在 `mglru_rework_aging_feedback` 组、注册早于 Batch 49 的回收循环重写，第一遍即落在纯净 `get_swappiness()` 上，两组两遍幂等由单测验证。
 

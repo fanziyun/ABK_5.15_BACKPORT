@@ -12,6 +12,7 @@ T = True
 LOOP_PROBE = "static unsigned long lruvec_evictable_size(struct lruvec *lruvec, int swappiness)"
 DIRTY_PROBE = "if (stat.nr_unqueued_dirty == isolated) {"
 PLACEMENT_PROBE = "sailboat_mglru_prefault_accessed_placement"
+UNIFY_PROBE = "sailboat_mglru_unify_writeback_throttle"
 
 
 _LOOP_STEPS = [
@@ -789,8 +790,11 @@ def mglru_dirty_reclaim_rework_apply(ctx):
         probe = ctx.read(VMSCAN_C)
     except FileNotFoundError:
         probe = ""
-    if DIRTY_PROBE in probe:
-        return "already_present", "the dirty-reclaim rework is already in vmscan.c"
+    if DIRTY_PROBE in probe or UNIFY_PROBE in probe:
+        return "already_present", (
+            "the dirty-reclaim rework is already in vmscan.c "
+            "(or superseded by the unify-writeback group)"
+        )
     status, _results, detail = apply_steps(ctx, _DIRTY_STEPS)
     if status is None:
         return "blocked_by_shape", detail
@@ -910,6 +914,108 @@ def mglru_prefault_accessed_placement_apply(ctx):
     return status, detail
 
 
+_UNIFY_STEPS = [
+    (VMSCAN_C,
+     "static int current_may_throttle(void)\n"
+     "{\n"
+     "\treturn !(current->flags & PF_LOCAL_THROTTLE) ||\n"
+     "\t\tcurrent->backing_dev_info == NULL ||\n"
+     "\t\tbdi_write_congested(current->backing_dev_info);\n"
+     "}\n",
+     "static int current_may_throttle(void)\n"
+     "{\n"
+     "\treturn !(current->flags & PF_LOCAL_THROTTLE) ||\n"
+     "\t\tcurrent->backing_dev_info == NULL ||\n"
+     "\t\tbdi_write_congested(current->backing_dev_info);\n"
+     "}\n"
+     "\n"
+     "/*\n"
+     " * sailboat_mglru_unify_writeback_throttle: v7.2 final 14/14 -- the\n"
+     " * MGLRU evict path shares the classic reclaim tail: nudge flushers\n"
+     " * when a whole batch came back unqueued dirty, and feed sc->nr.* so\n"
+     " * shrink_node()'s PGDAT_WRITEBACK/PGDAT_DIRTY backpressure sees MGLRU\n"
+     " * reclaim.  No reclaim_throttle(VMSCAN_THROTTLE_WRITEBACK) here (5.15\n"
+     " * has no carrier); the counter-fed gates are the throttle, hence no\n"
+     " * pgdat parameter either.\n"
+     " */\n"
+     "static void handle_reclaim_writeback(unsigned long nr_taken,\n"
+     "\t\t\t\t     struct scan_control *sc,\n"
+     "\t\t\t\t     struct reclaim_stat *stat,\n"
+     "\t\t\t\t     bool file)\n"
+     "{\n"
+     "\tif (stat->nr_unqueued_dirty == nr_taken && nr_taken)\n"
+     "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n"
+     "\n"
+     "\tsc->nr.dirty += stat->nr_dirty;\n"
+     "\tsc->nr.congested += stat->nr_congested;\n"
+     "\tsc->nr.unqueued_dirty += stat->nr_unqueued_dirty;\n"
+     "\tsc->nr.writeback += stat->nr_writeback;\n"
+     "\tsc->nr.immediate += stat->nr_immediate;\n"
+     "\tsc->nr.taken += nr_taken;\n"
+     "\tif (file)\n"
+     "\t\tsc->nr.file_taken += nr_taken;\n"
+     "}\n",
+     T),
+    (VMSCAN_C,
+     "\tif (stat.nr_unqueued_dirty == nr_taken)\n"
+     "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n"
+     "\n"
+     "\tsc->nr.dirty += stat.nr_dirty;\n"
+     "\tsc->nr.congested += stat.nr_congested;\n"
+     "\tsc->nr.unqueued_dirty += stat.nr_unqueued_dirty;\n"
+     "\tsc->nr.writeback += stat.nr_writeback;\n"
+     "\tsc->nr.immediate += stat.nr_immediate;\n"
+     "\tsc->nr.taken += nr_taken;\n"
+     "\tif (file)\n"
+     "\t\tsc->nr.file_taken += nr_taken;\n",
+     "\thandle_reclaim_writeback(nr_taken, sc, &stat, file);\n",
+     T),
+    (VMSCAN_C,
+     "\tsc->nr_reclaimed += reclaimed;\n"
+     "\n"
+     "\t/*\n"
+     "\t * If too many file cache in the coldest generation can't be evicted\n"
+     "\t * due to being dirty, wake up the flusher.\n"
+     "\t */\n"
+     "\tif (stat.nr_unqueued_dirty == isolated) {\n"
+     "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n"
+     "\t}\n"
+     "\n"
+     "\tlist_for_each_entry_safe_reverse(page, next, &list, lru) {\n",
+     "\tsc->nr_reclaimed += reclaimed;\n"
+     "\n"
+     "\thandle_reclaim_writeback(isolated, sc, &stat,\n"
+     "\t\t\t\t type == LRU_GEN_FILE);\n"
+     "\n"
+     "\tlist_for_each_entry_safe_reverse(page, next, &list, lru) {\n",
+     T),
+    (VMSCAN_C,
+     "\tif (!list_empty(&list)) {\n"
+     "\t\tskip_retry = true;\n"
+     "\t\tgoto retry;\n"
+     "\t}\n",
+     "\tif (!list_empty(&list)) {\n"
+     "\t\tskip_retry = true;\n"
+     "\t\tisolated = 0;\n"
+     "\t\tgoto retry;\n"
+     "\t}\n",
+     T),
+]
+
+
+def mglru_unify_writeback_throttle_apply(ctx):
+    try:
+        probe = ctx.read(VMSCAN_C)
+    except FileNotFoundError:
+        probe = ""
+    if UNIFY_PROBE in probe:
+        return "already_present", "the unify-writeback group is already in vmscan.c"
+    status, _results, detail = apply_steps(ctx, _UNIFY_STEPS)
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
 def build_groups(patch_group_cls):
     return [
         patch_group_cls(
@@ -939,5 +1045,17 @@ def build_groups(patch_group_cls):
             ["6cbdd9726fb5 (v7.2)"],
             [MM_INLINE_H, SWAP_C, WORKINGSET_C],
             mglru_prefault_accessed_placement_apply,
+        ),
+        patch_group_cls(
+            "mglru_unify_writeback_throttle",
+            "MGLRU v7.2 final: the classic reclaim tail (flusher nudge + sc->nr.* "
+            "accounting) is extracted into handle_reclaim_writeback() and called "
+            "per batch by evict_pages(), so MGLRU feeds 5.15's "
+            "PGDAT_WRITEBACK/PGDAT_DIRTY backpressure; retry resets isolated "
+            "(series-final 14/14)",
+            ["v4-final 14/14 (mm/vmscan: unify writeback reclaim statistic and "
+             "throttling)"],
+            [VMSCAN_C],
+            mglru_unify_writeback_throttle_apply,
         ),
     ]

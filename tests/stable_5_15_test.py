@@ -2975,7 +2975,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.76.0", "0.76.0"], _versions)
+          _versions == ["0.77.0", "0.77.0"], _versions)
 
     rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
     rule_statements = [line.strip() for line in rule.splitlines()

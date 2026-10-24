@@ -2219,6 +2219,10 @@ def _mglru_wake_flushers_apply(ctx):
         _probe = ""
     if _MGLRU_WAKE_FLUSHERS_PROBE in _probe:
         return "already_present", "the wake-flushers graft is already in vmscan.c"
+    if _b49_mglru.UNIFY_PROBE in _probe:
+        return "already_present", (
+            "superseded by the unify-writeback group (v7.2 final 14/14)"
+        )
     steps = [
         ("mm/vmscan.c",
          "static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_control *sc,\n"

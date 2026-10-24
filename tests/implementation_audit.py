@@ -732,11 +732,19 @@ REQUIRED_CONTENT = {
         "nr_batch = min_t(unsigned long, nr_to_reclaim - sc->nr_reclaimed,",
     ],
     "core:mglru_dirty_reclaim_rework": [
-        "if (stat.nr_unqueued_dirty == isolated) {\n"
-        "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n\t}",
         "sailboat_mglru_dirty_reclaim_rework",
         "static int page_inc_gen(struct lruvec *lruvec, struct page *page)",
         "/* for shrink_page_list(); PG_reclaim is left to the common routine */",
+    ],
+    "core:mglru_unify_writeback_throttle": [
+        "sailboat_mglru_unify_writeback_throttle",
+        "static void handle_reclaim_writeback(unsigned long nr_taken,",
+        "if (stat->nr_unqueued_dirty == nr_taken && nr_taken)",
+        "sc->nr.taken += nr_taken;",
+        ["mm/vmscan.c", "handle_reclaim_writeback(nr_taken, sc, &stat, file);"],
+        ["mm/vmscan.c", "handle_reclaim_writeback(isolated, sc, &stat,"],
+        ["mm/vmscan.c",
+         "\t\tskip_retry = true;\n\t\tisolated = 0;\n\t\tgoto retry;"],
     ],
     "core:mglru_prefault_accessed_placement": [
         "sailboat_mglru_prefault_accessed_placement",
@@ -993,6 +1001,12 @@ REQUIRED_ABSENT = {
         ["mm/vmscan.c", "page_inc_gen(lruvec, page, false)"],
         ["mm/vmscan.c", "\t/* for shrink_page_list() */\n\tClearPageReclaim(page);"],
         ["mm/vmscan.c", "/* for end_page_writeback() */"],
+    ],
+    "core:mglru_unify_writeback_throttle": [
+        ["mm/vmscan.c",
+         "if (stat.nr_unqueued_dirty == nr_taken)\n"
+         "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);"],
+        ["mm/vmscan.c", "if (stat.nr_unqueued_dirty == isolated) {"],
     ],
     "core:mglru_prefault_accessed_placement": [
         ["mm/workingset.c",
@@ -1541,6 +1555,8 @@ REQUIRED_IN_FUNCTION = {
          ["&nr_to_scan"]),
     ],
     "core:mglru_dirty_reclaim_rework": [
+        # Checked at this group's apply point: the v7.2-final 14/14 group
+        # supersedes this wake text later in the sequence.
         ("mm/vmscan.c", "evict_pages",
          ["if (stat.nr_unqueued_dirty == isolated) {",
           "\t\twakeup_flusher_threads(WB_REASON_VMSCAN);\n\t}"],
@@ -1554,6 +1570,24 @@ REQUIRED_IN_FUNCTION = {
         ("mm/vmscan.c", "isolate_page",
          ["\tClearPageReferenced(page);"],
          ["ClearPageReclaim"]),
+    ],
+    "core:mglru_unify_writeback_throttle": [
+        ("mm/vmscan.c", "handle_reclaim_writeback",
+         ["wakeup_flusher_threads(WB_REASON_VMSCAN);",
+          "sc->nr.dirty += stat->nr_dirty;",
+          "sc->nr.unqueued_dirty += stat->nr_unqueued_dirty;",
+          "sc->nr.taken += nr_taken;",
+          "if (file)\n\t\tsc->nr.file_taken += nr_taken;"],
+         []),
+        ("mm/vmscan.c", "evict_pages",
+         ["handle_reclaim_writeback(isolated, sc, &stat,",
+          "\t\t\t\t type == LRU_GEN_FILE);",
+          "\t\tskip_retry = true;\n\t\tisolated = 0;\n\t\tgoto retry;"],
+         ["if (stat.nr_unqueued_dirty == isolated) {",
+          "wakeup_flusher_threads"]),
+        ("mm/vmscan.c", "shrink_inactive_list",
+         ["handle_reclaim_writeback(nr_taken, sc, &stat, file);"],
+         ["sc->nr.dirty += stat.nr_dirty;"]),
     ],
     "core:mglru_prefault_accessed_placement": [
         ("mm/swap.c", "lru_cache_add",

@@ -49,7 +49,7 @@
 | `stable_perf_backport` | 调度 / PSI / 块设备 / 调频策略 | 24 |
 | `stable_display_fix` | drm 黑屏修复 | 1 |
 
-共 **103 个移植组**（core 78 / perf 24 / display 1），同一串注入在 `android13-5.15-lts` 上使用。
+共 **104 个移植组**（core 79 / perf 24 / display 1），同一串注入在 `android13-5.15-lts` 上使用。
 
 支持基线：**`android13-5.15-lts`（滚动分支，矩阵键为当前 Makefile `SUBLEVEL`，2026-09 为 220）**。
 Batch 44 起不再支持 `5.15.167 / .178 / .194` 三个发布基线 —— 本仓库从来只按锚点门控，

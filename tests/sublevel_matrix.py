@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 GROUP_COUNTS = {
-    "stable_backport_core": 78,
+    "stable_backport_core": 79,
     "stable_perf_backport": 24,
     "stable_display_fix": 1,
 }
