@@ -1634,6 +1634,8 @@ core 78 → 79);`step_audit` core 397 步、二遍幂等;`implementation_audit`
 > 等待/让步(v4-14 `reclaim_throttle` 语义的 5.15 载体)或 vendor loop.c 分配
 > 隔离。全量证据 `research/mglru_phase0_20261024/REPORT_SOAK_INCIDENT1.md`。
 
+> **【复现器终局(同日晚)】**hogio 工具链(驻留内存猪 + loop 镜像随机小 IO)把复现压到分钟级:无 OOM 免死 ×3/3 冻死(2-5 分钟);OOM 免死 ×1 稳定;**对照轮(MGLRU 关、同负载)同样死亡**但阈值更高、形态不同(压力走 zram 换出,IO 停顿≈0)。终局归因:致死负载形态(OOM 撕碎 10GB+ 进程善后风暴 + 低水位 + loop 页 churn)对两套回收器均致命,MGLRU 重写栈显著降低致死阈值并改变失效形态;修复面为直回收写回让步 + 策略侧(lmkd 善后风暴叠加 IO 高压的)防线。
+
 <a id="companion-v0200"></a>
 
 ## companion v0.20.0(二压 mark 时钟 3h → 1h;companion-only,单测全绿)
