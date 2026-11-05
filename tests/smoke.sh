@@ -104,6 +104,9 @@ SMOKE_FILES=(
   # The of/address.c ranges-parser overlay runs for every baseline and
   # requires the target file to exist before it reads its gate.
   drivers/of/address.c
+  # The moon_kmsg payload appends its obj-y line to this Makefile, so the
+  # fixture must carry the pristine file for the append and rollback checks.
+  drivers/input/Makefile
   include/linux/blkdev.h
   block/blk-core.c
   block/blk-mq-sched.c
@@ -865,6 +868,12 @@ if grep -q "if (!trylock_page(page)) {" "$PAGE_IO"; then
   fail "the superseded trylock-skip survived in the drain"
 fi
 
+# The moon_kmsg payload installs a new driver file and appends its obj-y line.
+[ -f "$KERNEL_ROOT/common/drivers/input/moon_kmsg.c" ] \
+  || fail "moon_kmsg payload file missing"
+grep -qF "obj-y += moon_kmsg.o" "$KERNEL_ROOT/common/drivers/input/Makefile" \
+  || fail "moon_kmsg Makefile line missing"
+
 # rollback must restore the pristine tree
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --list >/dev/null
 bash "$MODULE_DIR/scripts/abk_rollback.sh" "$KERNEL_ROOT/common" --apply >/dev/null
@@ -939,6 +948,15 @@ if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
    && diff -q "$SOURCE_TREE/fs/proc/task_mmu.c" \
         "$KERNEL_ROOT/common/fs/proc/task_mmu.c" >/dev/null 2>&1; then
   echo "rollback verified byte-identical for fs/proc/task_mmu.c"
+fi
+# The moon_kmsg payload is a module-created file: rollback has to delete it and
+# restore the Makefile it appended to.
+[ ! -e "$KERNEL_ROOT/common/drivers/input/moon_kmsg.c" ] \
+  || fail "rollback left the module-created moon_kmsg.c behind"
+if git -C "$SOURCE_TREE" rev-parse >/dev/null 2>&1 \
+   && diff -q "$SOURCE_TREE/drivers/input/Makefile" \
+        "$KERNEL_ROOT/common/drivers/input/Makefile" >/dev/null 2>&1; then
+  echo "rollback verified byte-identical for drivers/input/Makefile"
 fi
 
 echo "SMOKE OK"

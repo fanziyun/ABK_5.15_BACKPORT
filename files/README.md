@@ -1,7 +1,14 @@
 File payloads overlaid into the kernel tree by `scripts/stable_backport.sh`.
 
-Most of this module is a Python graft registry (no file payloads); the one
-exception lives here:
+Most of this module is a Python graft registry (no file payloads). Two whole
+files are overlaid because neither shape can be expressed as an anchor:
+
+- `drivers/input/moon_kmsg.c` — the power-key kernel-log dump handler.  It is a
+  new driver file (`abk_stable_backport_overlay_moon_kmsg()`), so the function
+  also appends `obj-y += moon_kmsg.o` to `drivers/input/Makefile`.  A new file
+  cannot be snapshotted, so its `.abk-orig` sidecar carries a sentinel that
+  `scripts/abk_rollback.sh` turns into a delete; the Makefile gets a normal
+  snapshot and restores byte-identically.
 
 - `drivers/of/address.c` — the pre-rework devicetree `ranges`
   flags parser, carrying 5.15.216's unrelated `__of_get_dma_parent`

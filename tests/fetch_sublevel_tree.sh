@@ -119,6 +119,7 @@ FETCH_FILES=(
   # Python graft, so no group declares it and step_audit's fixture-coverage
   # check cannot see the gap.
   drivers/of/address.c
+  drivers/input/Makefile
   # Batch 15 (ABK_ABI_PATCH_SUITE absorption): the files the absorbed
   # optimization groups anchor in.  Note io_uring/io_uring.c is the 5.15
   # monolith (~11k lines) -- 6.1 split it into 56 files, so the suite's

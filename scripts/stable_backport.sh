@@ -14,6 +14,10 @@
 
 ABK_515_BACKPORT_PUBLIC_CHILDREN="stable_backport_core stable_perf_backport stable_display_fix"
 
+# Sidecar content that marks a .abk-orig snapshot as "this path was created by
+# the module", so abk_rollback.sh deletes it instead of restoring it.
+ABK_MOON_KMSG_NEWFILE_SENTINEL="sailboat_moon_kmsg: new file created by the module; delete on rollback"
+
 abk_stable_backport_common_dir() {
   printf '%s\n' "$(abk_common_dir)"
 }
@@ -143,6 +147,42 @@ abk_stable_backport_overlay_of_address() {
   abk_log "of/address.c: overlaid pre-rework ranges parser (reverts the 5.15.213 rework; WLAN BAR0 fix)"
 }
 
+# moon_kmsg power-key kernel-log dump (file payload, not a Python graft).
+#
+# The handler is a whole new driver file, a shape no anchor step can express, so
+# it ships as files/drivers/input/moon_kmsg.c and the matching Makefile line is
+# appended here.  A new file cannot be snapshotted, so its .abk-orig sidecar
+# carries a sentinel that abk_rollback.sh turns into a delete.
+abk_stable_backport_overlay_moon_kmsg() {
+  local common_dir target overlay makefile marker
+  common_dir="$(abk_stable_backport_common_dir)"
+  target="$common_dir/drivers/input/moon_kmsg.c"
+  overlay="$MODULE_DIR/files/drivers/input/moon_kmsg.c"
+  makefile="$common_dir/drivers/input/Makefile"
+  marker="# sailboat_moon_kmsg: power-key kernel log dump"
+
+  abk_require_file "$overlay"
+  abk_require_file "$makefile"
+
+  if [ ! -f "$target" ]; then
+    cp -a "$overlay" "$target"
+    printf '%s\n' "$ABK_MOON_KMSG_NEWFILE_SENTINEL" > "$target.abk-orig"
+    abk_log "moon_kmsg: installed power-key kernel log dump (new file)"
+  elif ! cmp -s "$overlay" "$target"; then
+    [ -f "$target.abk-orig" ] || cp -a "$target" "$target.abk-orig"
+    cp -a "$overlay" "$target"
+    abk_log "moon_kmsg: refreshed power-key kernel log dump"
+  else
+    abk_log "moon_kmsg: already in place"
+  fi
+
+  if ! grep -qF "$marker" "$makefile"; then
+    [ -f "$makefile.abk-orig" ] || cp -a "$makefile" "$makefile.abk-orig"
+    printf '\n%s\nobj-y += moon_kmsg.o\n' "$marker" >> "$makefile"
+    abk_log "moon_kmsg: added moon_kmsg.o to drivers/input/Makefile"
+  fi
+}
+
 # The runtime companion (ksu/abk_runtime_tunables) is a distribution asset, not
 # a graft: it registers no PatchGroup and never writes into the kernel tree.  It
 # rides inside the AnyKernel3 zip so that flashing a kernel also installs the
@@ -228,6 +268,11 @@ abk_stable_backport_apply_selected() {
     if [ "$child_id" = "stable_backport_core" ]; then
       abk_stable_backport_overlay_of_address
     fi
+    # The moon_kmsg payload is a misc input feature; it rides with the perf
+    # child so a per-child invocation still installs it exactly once.
+    if [ "$child_id" = "stable_perf_backport" ]; then
+      abk_stable_backport_overlay_moon_kmsg
+    fi
     return 0
   fi
 
@@ -242,4 +287,5 @@ abk_stable_backport_apply_selected() {
   done
   # Overlay the pre-rework of/address.c once, after the Python children.
   abk_stable_backport_overlay_of_address
+  abk_stable_backport_overlay_moon_kmsg
 }

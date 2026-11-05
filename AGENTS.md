@@ -11,8 +11,9 @@ source tree** — it is a Python registry that rewrites one.
 
 The Python registry **is** the patch set. There are **no `.patch` payloads** and
 `patches/` is empty: add a `PatchGroup` record to the correct child script instead.
-The single exception to "no payload files" is `files/drivers/of/address.c` — see
-"File payloads" below. Every edit is otherwise a group of ordered
+The exception to "no payload files" is `files/`, which now carries two whole
+files (the of/address.c revert and the new moon_kmsg.c driver) — see
+"File payloads" below. Every other edit is a group of ordered
 `replace_once(ctx, old, new, required)` steps in `scripts/abk_stable_core.py`
 (fs/mm/cgroup), `scripts/abk_stable_perf.py` (sched/net/locking/block), or
 `scripts/abk_stable_display.py` (the single drm revert).
@@ -400,10 +401,20 @@ Distribution assets live outside the graft: `tools/` (device-facing CLIs, shippe
 into the companion module by `ksu/abk_runtime_tunables/embed.conf` so there is one
 implementation) and `ksu/` (the KernelSU module source). `patches/` stays empty.
 
-### File payloads (the one exception)
+### File payloads (the exception)
 
-`files/drivers/of/address.c` is the **only** payload file, and it exists for a
-reason no anchor graft can express: it is a whole-file *revert* of the upstream
+`files/` carries whole files no anchor step can express. There are two:
+
+`files/drivers/input/moon_kmsg.c` is a **new** driver file (power-key kernel-log
+dump). `scripts/stable_backport.sh`'s
+`abk_stable_backport_overlay_moon_kmsg()` copies it in and appends
+`obj-y += moon_kmsg.o` to `drivers/input/Makefile`. A file that did not exist
+cannot be snapshotted, so its `.abk-orig` sidecar carries a sentinel
+(`sailboat_moon_kmsg: new file created by the module; delete on rollback`) that
+`scripts/abk_rollback.sh` turns into a delete; the Makefile itself gets a normal
+snapshot.
+
+`files/drivers/of/address.c` is a whole-file *revert* of the upstream
 `ranges` flags parser rework. `scripts/stable_backport.sh`'s
 `abk_stable_backport_overlay_of_address()` copies it over the tree **only** when
 the target still carries the 5.15.213 rework (`flag_cells` /
@@ -411,7 +422,7 @@ the target still carries the 5.15.213 rework (`flag_cells` /
 pre-rework form. It restores the single contiguous MMIO window whose split left
 the Qualcomm SM8550 PCIe WLAN endpoint's 2 MB BAR0 unplaceable (dead `wlan0`).
 The rationale, the marker gate, and the `.abk-orig` snapshot/rollback convention
-are documented in `files/README.md`. Adding a second payload file needs the same
+are documented in `files/README.md`. Any further payload file needs the same
 justification — a shape an anchor can express belongs in a `PatchGroup`, not here.
 
 What the repo **publishes** is only what the module needs: the registry
