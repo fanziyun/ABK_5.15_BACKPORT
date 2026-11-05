@@ -1318,15 +1318,6 @@ DARK_GATES,无本组新增)。
 验证:`py_compile`、`bash -n`、`stable_5_15_test`、参考树 `smoke`
 (moon_kmsg 断言 + Makefile 回退)全绿；C 侧以 ABK CI 编译为准。
 
-真机(SM8550 / 5.15.223-Sailboat-20261105):`/proc/bus/input/handlers` 出现
-`moon_powerkey_handler`，注入 `pmic_pwrkey` 按下 4 秒后 worker 执行，但 SELinux
-以 `avc: denied { write } ... scontext=u:r:kernel:s0
-tcontext=u:object_r:metadata_file:s0 tclass=dir` 拒绝创建文件。伴生模块
-`sepolicy.rule` 增加 `allow kernel metadata_file dir { write add_name remove_name
-search }` 与 `allow kernel metadata_file file { create open write getattr setattr }`
-(v0.25.0)，热加载后同一按键序列生成 2.28 MB / 19014 行的
-`/metadata/moom_kernel_kmsg.txt`。
-
 <a id="batch-72-74"></a>
 
 ## Batch 72-74(swap 缓存积压收敛 + 换入预读窗口 + fault-around uid 策略,v0.75.0,core 75 → 78 组)

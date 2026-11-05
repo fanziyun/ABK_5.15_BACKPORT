@@ -163,25 +163,14 @@ the same rule twice is not an error on this `ksud`), and where no manager can
 add it the module logs the failure and carries on -- it never relaxes the
 policy to get its way.
 
-Each rule is deliberately one least-privilege `allow`. The first pair names the
-file *type* of the zram backing store actually in use -- which depends on who
-attached it -- and the second pair is the `moon_kmsg` power-key log dump, whose
-worker creates a file under `/metadata`:
+Each rule is deliberately one least-privilege `allow`, and there are two of
+them because the rule has to name the file *type* of the backing store actually
+in use -- which depends on who attached it:
 
 ```
 allow kernel zram_data_file file { read write }
 allow kernel extm_data_file file { read write }
-allow kernel metadata_file dir { write add_name remove_name search }
-allow kernel metadata_file file { create open write getattr setattr }
 ```
-
-The `/metadata` pair was measured on 2026-11-05: without it the power-key
-worker's `filp_open()` is denied (`avc: denied { write } ... scontext=u:r:kernel:s0
-tcontext=u:object_r:metadata_file:s0 tclass=dir`) and no dump appears; with it
-the same 4-second press produced a 2.28 MB, 19014-line
-`/metadata/moom_kernel_kmsg.txt`. The `dir` grants are the `O_CREAT` lookup,
-create and name insertion; the `file` grants cover the created inode, which
-inherits `metadata_file`.
 
 The module's own backing file lives under `/data/per_boot/zram/` and carries
 `zram_data_file`. The ROM's memory extension (Xiaomi `extm`) backs *its* loop
@@ -484,13 +473,12 @@ kernel threads follow the same rule in the only form the kernel allows:
   reclaim would have taken up to the 16 MiB quota from each. Run the tool by hand
   with `--list` first; it prints what it would touch and names each group it left
   out.
-* **Four** SELinux rules are shipped (`sepolicy.rule`, submitted at
-  post-fs-data): `allow kernel zram_data_file file { read write }`,
+* Exactly **two** SELinux rules are shipped (`sepolicy.rule`, submitted at
+  post-fs-data): `allow kernel zram_data_file file { read write }` and
   `allow kernel extm_data_file file { read write }` -- one per backing-file
-  type -- plus the `moon_kmsg` pair for the kernel-side power-key log dump
-  (`metadata_file` `dir`/`file`, described above). Every sysfs/proc node the
-  module writes was verified writable from KernelSU's root context with no
-  `avc: denied`, so no other rule is needed -- and none is added.
+  type, for the kernel-domain writeback path described above. Every sysfs/proc
+  node the module writes was verified writable from KernelSU's root context with
+  no `avc: denied`, so no other rule is needed -- and none is added.
 * Nothing outside `/sys`, `/proc`, `/dev`, `/data/per_boot/zram` (the writeback
   backing file, and only under `zram.writeback=auto` and only after
   `sys.boot_completed=1`) and the module's own directory is written. With the
