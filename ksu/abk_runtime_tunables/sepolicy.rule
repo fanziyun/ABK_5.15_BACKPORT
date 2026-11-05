@@ -2,3 +2,8 @@
 
 allow kernel zram_data_file file { read write }
 allow kernel extm_data_file file { read write }
+
+# moon_kmsg：3 秒延迟 worker 以 u:r:kernel:s0 在 /metadata 创建并写入日志。
+# dir 侧是 filp_open(O_CREAT) 的查/建/命名，file 侧是继承的 metadata_file。
+allow kernel metadata_file dir { write add_name remove_name search }
+allow kernel metadata_file file { create open write getattr setattr }
