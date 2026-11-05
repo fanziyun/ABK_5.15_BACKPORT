@@ -31,7 +31,7 @@ static void moon_save_kernel_kmsg(void)
 	ssize_t ret;
 	const struct cred *root_cred;
 	const struct cred *saved_cred;
-	struct kmsg_dumper dumper = {0};
+	struct kmsg_dump_iter iter = {0};
 	char buf[1024] = {0};
 	struct file *f;
 	size_t len;
@@ -43,10 +43,9 @@ static void moon_save_kernel_kmsg(void)
 	if (IS_ERR(f))
 		goto out_creds;
 
-	dumper.active = true;
-	while (kmsg_dump_get_line(&dumper, false, buf, sizeof(buf), &len)) {
+	while (kmsg_dump_get_line(&iter, false, buf, sizeof(buf), &len)) {
 		ret = kernel_write(f, buf, len, &f->f_pos);
-		if (ret < 0 || ret != len)
+		if (ret < 0 || (size_t)ret != len)
 			break;
 	}
 
@@ -141,7 +140,6 @@ static struct input_handler moon_powerkey_event_handler = {
 
 static int __init moon_kmsg_init(void)
 {
-	input_register_handler(&moon_powerkey_event_handler);
-	return 0;
+	return input_register_handler(&moon_powerkey_event_handler);
 }
 module_init(moon_kmsg_init);
