@@ -1310,6 +1310,11 @@ DARK_GATES,无本组新增)。
 `abk_rollback.sh` 据此删除；`drivers/input/Makefile` 走正常快照、逐字节恢复。
 该载荷随 `stable_perf_backport` 子模块注入，单子模块调用也只安装一次。
 
+落盘用该树的 `kmsg_dump_iter` 迭代 API：android13-5.15-lts 已带入 printk
+重构，`struct kmsg_dumper` 没有 `active` 字段，`kmsg_dump_get_line()` 的第一个
+参数是 `struct kmsg_dump_iter *`。`moon_kmsg_init()` 返回
+`input_register_handler()` 的结果（该函数标了 `warn_unused_result`）。
+
 验证:`py_compile`、`bash -n`、`stable_5_15_test`、参考树 `smoke`
 (moon_kmsg 断言 + Makefile 回退)全绿；C 侧以 ABK CI 编译为准。
 
