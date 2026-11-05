@@ -1288,6 +1288,31 @@ MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)�
 都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
 载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
 DARK_GATES,无本组新增)。
+<a id="batch-75"></a>
+
+## Batch 75(moon_kmsg 长按电源键内核日志落盘,v0.77.0,文件载荷 +1)
+
+目标:长按电源键 3 秒，把当前内核日志写入
+`/metadata/moom_kernel_kmsg.txt`，重启前无需 adb。
+
+形态:新增文件 `files/drivers/input/moon_kmsg.c`，由
+`abk_stable_backport_overlay_moon_kmsg()` 复制进树并追加
+`obj-y += moon_kmsg.o` 到 `drivers/input/Makefile`。驱动注册一个匹配
+`KEY_POWER` 的 `input_handler`：按下置位 `moon_key_down` 并入队 3 秒延迟工作，
+松开清位，worker 仅在仍按下时落盘。不在 `event` 回调里
+`cancel_delayed_work()`——该回调持 `dev->event_lock` 自旋锁，
+`__cancel_work_timer()` 的 `might_sleep()` 会报 sleeping-in-atomic。落盘前用
+`prepare_kernel_cred(NULL)`/`override_creds()` 取得 root 凭据，`filp_open()`
+失败时直接返回。
+
+回退:新文件无法快照，其 `.abk-orig` 侧车写入哨兵
+`sailboat_moon_kmsg: new file created by the module; delete on rollback`，
+`abk_rollback.sh` 据此删除；`drivers/input/Makefile` 走正常快照、逐字节恢复。
+该载荷随 `stable_perf_backport` 子模块注入，单子模块调用也只安装一次。
+
+验证:`py_compile`、`bash -n`、`stable_5_15_test`、参考树 `smoke`
+(moon_kmsg 断言 + Makefile 回退)全绿；C 侧以 ABK CI 编译为准。
+
 <a id="batch-72-74"></a>
 
 ## Batch 72-74(swap 缓存积压收敛 + 换入预读窗口 + fault-around uid 策略,v0.75.0,core 75 → 78 组)
