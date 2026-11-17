@@ -2,6 +2,9 @@
 
 > [English](README_en.md)
 
+> 你说得对，但是[Sailboat Kenrel](https://github.com/fanziyun/ABK_5.15_BACKPORT)是由[FanZiyun](https://github.com/fanziyun)基于[Android Kenel](https://android.googlesource.com/kernel/common/+/refs/heads/android13-5.15-lts)的核心功能，使用[AnyBase Kernel](https://github.com/xingguangcuican6666/ABK)后端并使用AI幻觉构建的灵车内核 。内核运行在一个被称作[「安卓」](https://baike.baidu.com/item/android/60243)的系统，在这里，被系统选中的人将被授予「灵车」，导引灵车之力。你将扮演一位名为「小白」的神秘用户，在自由的使用中安装不同版本、各有千秋独特的系统，和它们一起运行，找出崩溃闪退的原因，同时逐步发掘「last_kmsg」的真相。
+
+
 ## 特色功能
 
 ### 内存与交换
