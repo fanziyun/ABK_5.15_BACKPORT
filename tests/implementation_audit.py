@@ -254,6 +254,13 @@ REQUIRED_CONTENT = {
         "dev_attr_recompress_async.attr",
         "abk_zram_recomp_drain(zram);",
     ],
+    "core:zram_disksize_1to1": [
+        "sailboat_zram_disksize_1to1",
+        "abk_zram_disksize_1to1",
+        "module_param_named(abk_disksize_1to1, abk_zram_disksize_1to1, bool, 0444);",
+        "u64 abk_ram = (u64)totalram_pages() << PAGE_SHIFT;",
+        "disksize = abk_ram;",
+    ],
     "perf:schedutil_smart_policy": [
         "Batch 10-4 sched smart-freq policy (PELT)",
         "abk_sf_enable",

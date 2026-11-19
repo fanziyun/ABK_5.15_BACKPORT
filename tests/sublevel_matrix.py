@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 GROUP_COUNTS = {
-    "stable_backport_core": 78,
+    "stable_backport_core": 79,
     "stable_perf_backport": 24,
     "stable_display_fix": 1,
 }
 
 PRE_APPLIED = {
-    "220": {
+    "225": {
         "stable_backport_core": {
             "fdtable_alloc_conventions",
             "fdtable_replace_fd_errno",
@@ -39,7 +39,7 @@ KNOWN_DEBT = {}
 
 SUPPORTED = tuple(PRE_APPLIED)
 
-DEFAULT_SUB_LEVEL = "220"
+DEFAULT_SUB_LEVEL = "225"
 
 
 def pre_applied(sub_level, child):

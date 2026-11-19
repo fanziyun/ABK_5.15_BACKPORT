@@ -4727,6 +4727,29 @@ PATCH_GROUPS = PATCH_GROUPS + [
     ),
 ]
 
+import batch76_core_zram_size_1to1 as _b76_zram_size  # noqa: E402
+
+
+def _zram_disksize_1to1_apply(ctx):
+    status, _results, detail = apply_steps(ctx, _b76_zram_size.build_steps())
+    if status is None:
+        return "blocked_by_shape", detail
+    return status, detail
+
+
+PATCH_GROUPS = PATCH_GROUPS + [
+    PatchGroup(
+        "zram_disksize_1to1",
+        "zram disksize fixed at 1:1 with physical RAM: every disksize write is overridden to totalram (zram.abk_disksize_1to1, read-only 0444)",
+        [
+            "ABK on-device requirement: zram size must equal physical RAM",
+            "Batch 76 semantics (CHANGELOG.md#batch-76)",
+        ],
+        ["drivers/block/zram/zram_drv.c"],
+        _zram_disksize_1to1_apply,
+    ),
+]
+
 import batch13_core_gfp_customize_vh as _b13_gfp  # noqa: E402
 
 
