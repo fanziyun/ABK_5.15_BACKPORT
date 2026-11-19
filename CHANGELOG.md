@@ -1288,6 +1288,37 @@ MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)�
 都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
 载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
 DARK_GATES,无本组新增)。
+<a id="batch-76"></a>
+
+## Batch 76(物理内存 1:1 的 zram disksize 由内核固定,v0.78.0,core 78 → 79 组)
+
+目标:zram 交换区容量恒等于可用物理内存(1:1),不随 ROM init / `fs_mgr` / 伴生模块
+写入的值变化。
+
+形态:在 `drivers/block/zram/zram_drv.c` 的 `disksize_store()` 解析请求值之后、
+`init_lock` 之前,用 `totalram_pages() << PAGE_SHIFT` 覆盖请求值,再交给原有的
+`PAGE_ALIGN()` 与 `zram_meta_alloc()`。页面大小无关:该表达式在任何页大小下都是
+字节数。新增只读参数 `zram.abk_disksize_1to1`(bool,默认 `true`,权限 `0444`),
+仅开机 cmdline 可关闭;变量名 `abk_zram_disksize_1to1` 与参数名 `abk_disksize_1to1`
+不同,故必须用 `module_param_named()`(trap 6)。请求值被覆盖时打印一行 `pr_info`,
+同时给出请求值与实际值。
+
+覆盖范围:ROM 自己的 bring-up(AOSP `fs_mgr_swapon_all()` 写 `disksize`)、伴生模块
+的 takeover 重写、root 手动写入,全部经过同一个 `disksize_store()`。代价是
+`zram->table` 按覆盖后的页数分配:12 GiB / 4K 页约 25 MiB,在写入 `disksize` 时一次性
+`vzalloc()`,此后不再增长。本组只改 `disksize`(交换区容量),不动伴生模块的
+`mem_limit`(实际压缩内存占用上限,仍为 25% RAM)。
+
+顺带把 `tests/sublevel_matrix.py` 的滚动行从 220 重键到 225:本次取树
+`android13-5.15-lts` 的 `SUBLEVEL=225`,原 9 个 core + 8 个 perf `PRE_APPLIED`
+在 225 树上逐组复核仍成立(无新增吸收),四道树级门禁按 225 行全部通过。
+
+验证:`py_compile` / `bash -n` / `stable_5_15_test`(全套 **1742 项**)/
+`step_audit`(5.15.225,core 395 步,9 组 already_present,两遍幂等)/
+`implementation_audit`(本组 5 个针脚全过)/ `smoke`(两遍 79 组全
+`already_present`,回滚字节一致)全绿。未跑 `config_gate_audit`:本组不新增 CONFIG
+门,且本机没有当前档位的构建 `.config`。**未验证**:真机与全量编译,以 ABK CI 为准。
+
 <a id="batch-75"></a>
 
 ## Batch 75(moon_kmsg 长按电源键内核日志落盘,v0.77.0,文件载荷 +1)
@@ -8305,6 +8336,8 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。**只有 companion 的批次例外**：只 bump
 `ksu/*/module.prop`（先例 `a50df6e`，Batch 25 同），否则单测里钉的内核版本对不上号。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）在本文件正文按 Batch 倒序排列；本附录里每个已落地批次只保留一行索引。
+
+### Batch 76(v0.78.0:zram 交换区容量由内核固定为物理内存的 1:1;core 78 → 79 组;已落地,单测 1742 项与 step_audit/implementation_audit/smoke 全绿;真机与全量编译未验证) → 详见 [CHANGELOG.md](#batch-76) — 主题「zram 大小不再由用户态决定」。`disksize_store()` 在解析请求值后、`init_lock` 前用 `totalram_pages() << PAGE_SHIFT` 覆盖,ROM bring-up、伴生 takeover 与 root 手写走同一路径;新增只读 `zram.abk_disksize_1to1`(默认开,`0444`,仅 cmdline 可关),`module_param_named()` 双名形态按 trap 6 处理。只改交换区容量,伴生 `mem_limit`(25% RAM)不动。同批把 `android13-5.15-lts` 矩阵行从 220 重键到 225,原 PRE_APPLIED 集合在 225 树上复核无新增吸收。
 
 ### Sailboat 进程命名(v0.76.0 / companion v0.24.0 / 附加模块（二）v0.2.0,无新增组:用户态 supervisor 用 <长名> -> /system/bin/sh 软链拿到 ps 长名、comm 写 15 字节短名,内核线程 kcompressd%d / zram_recompd 改短名 Sail_kcompd%d / Sail_recompd;已落地,单测 1742 项与 step_audit/implementation_audit/smoke 三道树级审计全绿,真机 /data/local/tmp 机制实测通过、完整重启链路未验证) → 详见 [CHANGELOG.md](#sailboat-process-naming) — 主题「让本模块的常驻进程有可读名字」。ps 的 NAME 取 argv[0] 的 basename ⇒ abk_spawn 在 run/ 幂等建 <长名> -> /system/bin/sh 软链再 exec service.sh <arg>,ps -o NAME 读到 Sailboat_{zram,cfr,psi,lrugen,iorap}_supervisor;comm 只有 15 字节(TASK_COMM_LEN-1),--supervise-* 分发处先 echo -n 写 /proc/$$/comm 为 Sail_{zram,cfr,psi,lrugen,iorap}。行为零变化:$0/$@、pid 文件、pkill -9 -f "service.sh <arg>" 全部照旧,软链建不出来回退 setsid sh 并记 WARN。内核线程只换短名(Sail_kcompd%d 最长 13 字节 / Sail_recompd 12 字节),/proc/sys/vm/kcompressd* 标识符、dmesg 前缀、组名、hook 名与 GROUP_COUNTS(78/24/1) 一律不动。附加模块（二）的 governor supervisor 同批取名 Sailboat_gov_supervisor / Sail_gov(module.prop v0.1.0 → v0.2.0)。长名与短名在同一张映射表里(一个 supervisor 一条 case 臂),回退 WARN 只在「查到长名但建链失败」时记。真机实测 ps -A -o PID,NAME,ARGS 与 /proc/<pid>/comm 与 pkill -f 三项均符合预期。
 
