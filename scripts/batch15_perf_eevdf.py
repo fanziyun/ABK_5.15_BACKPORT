@@ -244,7 +244,7 @@ _FEATURES_TAIL_NEW = (
     " * request than current may preempt it, which is what makes short-slice\n"
     " * latency-sensitive tasks responsive.\n"
     " */\n"
-    "SCHED_FEAT(EEVDF, true)\n"
+    "SCHED_FEAT(EEVDF, false)\n"
     "SCHED_FEAT(RUN_TO_PARITY, true)\n"
     "SCHED_FEAT(PREEMPT_SHORT, true)\n"
 )
