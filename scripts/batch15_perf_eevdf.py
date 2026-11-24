@@ -1109,7 +1109,7 @@ _FAIR_PICK_EEVDF_NEW = (
     "\tif (sched_feat(EEVDF)) {\n"
     "\t\tse = abk_pick_eevdf(cfs_rq, curr);\n"
     "\t\t/* ABK stable_515_backport: 5.15's caller dereferences the result\n"
-    "\t\t * through group_cfs_rq(); never hand it NULL. */\n"
+    "\t\t * through group_cfs_rq(); fall back before it can be NULL. */\n"
     "\t\tif (!se)\n"
     "\t\t\tse = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);\n"
     "\t\treturn se;\n"

@@ -1288,6 +1288,9 @@ MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)�
 都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
 载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
 DARK_GATES,无本组新增)。
+
+<a id="batch-77"></a>
+
 ## Batch 77(EEVDF 选择结果非空兜底,v0.79.0,无新增组)
 
 目标:消除 5.15 `pick_next_task_fair()` 快路径把 `pick_next_entity()` 的返回值
@@ -8371,6 +8374,8 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。**只有 companion 的批次例外**：只 bump
 `ksu/*/module.prop`（先例 `a50df6e`，Batch 25 同），否则单测里钉的内核版本对不上号。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）在本文件正文按 Batch 倒序排列；本附录里每个已落地批次只保留一行索引。
+
+### Batch 77(v0.79.0:EEVDF 选择结果非空兜底;无新增组;已落地,单测 1748 项与 step_audit/implementation_audit/smoke 全绿;真机与全量编译未验证) → 详见 [CHANGELOG.md](#batch-77) — 主题「选择器返回 NULL 时不再把空指针交给 `group_cfs_rq()`」。`pick_next_entity()` 的 EEVDF 分支先取结果,为空回落仍在 rq 的 `curr`,再退 `__pick_first_entity()`;旧版 Batch 28 已应用的树只重写分支,干净树整块替换,第二遍幂等。这是 5.15 调用点契约修复,不证明选择器账目失衡的根因已找到。
 
 ### Batch 76(v0.78.0:zram 交换区容量由内核固定为物理内存的 1:1;core 78 → 79 组;已落地,单测 1742 项与 step_audit/implementation_audit/smoke 全绿;真机与全量编译未验证) → 详见 [CHANGELOG.md](#batch-76) — 主题「zram 大小不再由用户态决定」。`disksize_store()` 在解析请求值后、`init_lock` 前用 `totalram_pages() << PAGE_SHIFT` 覆盖,ROM bring-up、伴生 takeover 与 root 手写走同一路径;新增只读 `zram.abk_disksize_1to1`(默认开,`0444`,仅 cmdline 可关),`module_param_named()` 双名形态按 trap 6 处理。只改交换区容量,伴生 `mem_limit`(25% RAM)不动。同批把 `android13-5.15-lts` 矩阵行从 220 重键到 225,原 PRE_APPLIED 集合在 225 树上复核无新增吸收。
 
