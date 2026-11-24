@@ -636,7 +636,7 @@ then
   grep -q "ANDROID_KABI_USE(4, u64 slice);" \
     "$KERNEL_ROOT/common/include/linux/sched.h" \
     || fail "EEVDF did not re-claim sched_entity slot 4 as u64 slice"
-  grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
+  grep -q "se = abk_pick_eevdf(cfs_rq, curr);" \
     "$KERNEL_ROOT/common/kernel/sched/fair.c" \
     || fail "EEVDF selector is not wired into pick_next_entity"
   # The Batch 28 rebuild: accumulators in, quadratic scans out.
@@ -652,9 +652,9 @@ then
   grep -q "SCHED_FEAT(RUN_TO_PARITY, true)" \
     "$KERNEL_ROOT/common/kernel/sched/features.h" \
     || fail "RUN_TO_PARITY is not declared"
-  grep -q "return abk_pick_eevdf(cfs_rq, curr);" \
+  grep -q "se = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);" \
     "$KERNEL_ROOT/common/kernel/sched/fair.c" \
-    || fail "EEVDF selector is not wired into pick_next_entity"
+    || fail "EEVDF branch can hand pick_next_task_fair() a NULL entity"
 fi
 if "$python_bin" - "$MODULE_DIR/tests" "$SUB_LEVEL" <<'PY'
 import sys

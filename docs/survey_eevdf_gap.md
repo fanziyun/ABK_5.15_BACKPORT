@@ -630,11 +630,15 @@ fallback exists, so the guarantee this patch is about could have been deleted si
 the same class of gap Batch 28 found elsewhere. It is now pinned in
 `tests/implementation_audit.py` (`perf:sched_eevdf_pick_logic`).
 
-One residual, left honest: the guarantee is that the selector never returns NULL *when it
-finds no eligible entity*. If the rb-tree is genuinely empty **and** `curr` is NULL, the
-fallback returns NULL — as does upstream's, which cannot fall back to a non-existent
-entity. On 5.15 that state is unreachable from `pick_next_entity()`: `nr_running > 0` is
-established before the pick, and with no delayed dequeue every on-rq entity is in the tree.
+One residual, left honest: the selector's own fallback covers "found no eligible
+entity". The 5.15 call site in `pick_next_entity()` now wraps the call and restores
+`curr` (or the leftmost entity) if it still returns NULL, because a 5.15
+`pick_next_task_fair()` dereferences that result through `group_cfs_rq()` without a
+check. (`check_preempt_wakeup()` only compares the pointer, so it needs no guard.)
+This is a contract guard, not a proof that the selector cannot lose track of the
+tree; a state that makes the accumulator and the rb-tree disagree is still a bug to
+find, and would now surface as stale `curr` service rather than as a NULL
+dereference.
 
 ---
 

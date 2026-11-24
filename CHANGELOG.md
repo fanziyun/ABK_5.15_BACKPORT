@@ -1288,6 +1288,44 @@ MGLRU 压缩触发频率;后台抑制的收益(前台页缓存/IO 带宽保护)�
 都真实编入,不是死代码),构建 `.config` 给出 `CONFIG_CPUSETS=y`(门控开,
 载荷为活代码),`config_gate_audit.py` 对该 `.config` 通过(仅已记录的
 DARK_GATES,无本组新增)。
+
+<a id="batch-77"></a>
+
+## Batch 77(EEVDF 选择结果非空兜底,v0.79.0,无新增组)
+
+目标:消除 5.15 `pick_next_task_fair()` 快路径把 `pick_next_entity()` 的返回值
+直接交给 `group_cfs_rq()` 时的空指针风险。既往前述日志已把故障签名定位到该
+快路径,但未证明选择器为何会返回 NULL。
+
+形态:`pick_next_entity()` 的 `sched_feat(EEVDF)` 分支不再直接
+`return abk_pick_eevdf(...)`,而是先取结果,为空时回落到仍在 rq 的 `curr`,
+再退回 `__pick_first_entity()`。这是恢复 5.15 调用点的非空契约,不是对选择器
+正确性的证明:累加器与 rbtree 失配仍是待查缺陷,只是此后表现为继续服务陈旧
+`curr`,而不是把 NULL 传进 `group_cfs_rq()`。`check_preempt_tick()` 的调用点
+原本就在调用后检查 `se`,`check_preempt_wakeup()` 只比较指针,都不需要改。
+
+升级路径:本批把分支抽成 `_FAIR_PICK_EEVDF_OLD` / `_FAIR_PICK_EEVDF_NEW` 两个
+常量。已应用旧版 Batch 28 的树命中前者,只重写分支;干净树仍整块替换
+`pick_next_entity()`;已应用新版的树第二遍幂等。
+
+审计:`implementation_audit.py` 的 `perf:sched_eevdf_pick_logic` 把原来的
+“调用存在”针脚换成兜底的 `if (!se)` 三行存在性检查;`_FAIR_LANDED_PROBES`
+同步改用 `se = abk_pick_eevdf(...)`,避免第二遍幂等把已应用组装误判为未应用。
+`smoke.sh` 里两处仍钉 `return abk_pick_eevdf(...)` 的断言改为钉新调用与兜底
+行,否则止血后的树会在 smoke 的标记检查上误报未接线。
+`docs/survey_eevdf_gap.md` §7.1 的残差段同步改写。
+
+验证:`py_compile`、shell 语法门、`stable_5_15_test.py`(1748 项)全绿,其中
+新增的选择步骤形态检查给出三种输入各自的预期步骤:干净树整块重写、v0.78 树
+只重写分支、v0.79 树是空操作。用 `tests/fetch_sublevel_tree.sh
+android13-5.15-lts` 取回 5.15.225 参考树后,`step_audit.py`(104 组、两遍
+幂等)、`implementation_audit.py`(三个 EEVDF 组 `applied`)与 `smoke.sh`
+(两遍 + 回滚字节一致)全绿。旧版到新版的过渡路径不在任何树级审计的覆盖内
+(参考树是干净上游),另行验证:先用 v0.78 模块对同一棵树打补丁,再换本版本
+重跑,第一遍 `sched_eevdf_pick_logic: applied`、core/modern 两组
+`already_present`,第二遍全 `already_present` 且 `fair.c` 字节一致。
+未做真机验证:此前短时调度压力未触发原 panic,不能据此声称修复已复现验证。
+
 <a id="batch-76"></a>
 
 ## Batch 76(物理内存 1:1 的 zram disksize 由内核固定,v0.78.0,core 78 → 79 组)
@@ -8336,6 +8374,8 @@ suite 已覆盖的热点路径（fdtable/close_range/pid/slab/hugepage/io_uring/
 每批次落地后在 `module.conf` 递增 `ABK_MODULE_VERSION`。**只有 companion 的批次例外**：只 bump
 `ksu/*/module.prop`（先例 `a50df6e`，Batch 25 同），否则单测里钉的内核版本对不上号。
 已落地批次的完整原文（政策变更说明、落地明细表、调试/试错记录、验证结果、审计基线）在本文件正文按 Batch 倒序排列；本附录里每个已落地批次只保留一行索引。
+
+### Batch 77(v0.79.0:EEVDF 选择结果非空兜底;无新增组;已落地,单测 1748 项与 step_audit/implementation_audit/smoke 全绿;真机与全量编译未验证) → 详见 [CHANGELOG.md](#batch-77) — 主题「选择器返回 NULL 时不再把空指针交给 `group_cfs_rq()`」。`pick_next_entity()` 的 EEVDF 分支先取结果,为空回落仍在 rq 的 `curr`,再退 `__pick_first_entity()`;旧版 Batch 28 已应用的树只重写分支,干净树整块替换,第二遍幂等。这是 5.15 调用点契约修复,不证明选择器账目失衡的根因已找到。
 
 ### Batch 76(v0.78.0:zram 交换区容量由内核固定为物理内存的 1:1;core 78 → 79 组;已落地,单测 1742 项与 step_audit/implementation_audit/smoke 全绿;真机与全量编译未验证) → 详见 [CHANGELOG.md](#batch-76) — 主题「zram 大小不再由用户态决定」。`disksize_store()` 在解析请求值后、`init_lock` 前用 `totalram_pages() << PAGE_SHIFT` 覆盖,ROM bring-up、伴生 takeover 与 root 手写走同一路径;新增只读 `zram.abk_disksize_1to1`(默认开,`0444`,仅 cmdline 可关),`module_param_named()` 双名形态按 trap 6 处理。只改交换区容量,伴生 `mem_limit`(25% RAM)不动。同批把 `android13-5.15-lts` 矩阵行从 220 重键到 225,原 PRE_APPLIED 集合在 225 树上复核无新增吸收。
 

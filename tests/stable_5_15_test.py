@@ -2975,7 +2975,7 @@ def test_runtime_tunables_module():
     check("both module.conf versions move together",
           len(_versions) == 2 and _versions[0] == _versions[1], _versions)
     check("module.conf carries the released version",
-          _versions == ["0.78.0", "0.78.0"], _versions)
+          _versions == ["0.79.0", "0.79.0"], _versions)
 
     rule = (module_dir / "sepolicy.rule").read_text(encoding="utf-8")
     rule_statements = [line.strip() for line in rule.splitlines()
@@ -6566,6 +6566,42 @@ def test_port_review_regressions():
           "e - s - y" not in text)
 
 
+def test_eevdf_pick_null_guard():
+    print("EEVDF pick branch never hands 5.15's caller NULL")
+    import batch15_perf_eevdf as eevdf
+
+    def pick_step(text):
+        cand = [s for s in eevdf.build_pick_logic_steps(text)
+                if s[1] in (eevdf._FAIR_PICK, eevdf._FAIR_PICK_EEVDF_OLD,
+                            eevdf._FAIR_PICK_EEVDF_NEW)]
+        return cand[0] if len(cand) == 1 else None
+
+    s = pick_step("pristine\n")
+    check("pristine tree rewrites the whole pick_next_entity() body",
+          s is not None and s[1] == eevdf._FAIR_PICK
+          and s[2] == eevdf._FAIR_PICK_NEW, s and s[1][:40])
+
+    s = pick_step("x\n" + eevdf._FAIR_PICK_EEVDF_OLD)
+    check("v0.78 tree rewrites only the EEVDF branch",
+          s is not None and s[1] == eevdf._FAIR_PICK_EEVDF_OLD
+          and s[2] == eevdf._FAIR_PICK_EEVDF_NEW, s and s[1][:40])
+
+    s = pick_step("x\n" + eevdf._FAIR_PICK_EEVDF_NEW)
+    check("v0.79 tree keeps the branch as a no-op step",
+          s is not None and s[1] == eevdf._FAIR_PICK_EEVDF_NEW
+          and s[2] == eevdf._FAIR_PICK_EEVDF_NEW, s and s[1][:40])
+
+    new = eevdf._FAIR_PICK_EEVDF_NEW
+    check("guard restores curr before the leftmost fallback",
+          "if (!se)\n\t\t\tse = curr && curr->on_rq ? curr : "
+          "__pick_first_entity(cfs_rq);" in new)
+    check("guard replaces the bare return of the selector",
+          "return abk_pick_eevdf" not in new and "return se;" in new)
+    check("full rewrite embeds the guarded branch",
+          new in eevdf._FAIR_PICK_NEW
+          and eevdf._FAIR_PICK_EEVDF_OLD not in eevdf._FAIR_PICK_NEW)
+
+
 def main():
     test_replace_once_eol()
     test_apply_steps_transactional()
@@ -6609,6 +6645,7 @@ def main():
     test_sublevel_matrix()
     test_batch21_psi_cgroup_pressure_switch()
     test_batch22_psi_oncpu_state_mask()
+    test_eevdf_pick_null_guard()
     test_batch23_zram_writeback_guard()
     test_batch24_zram_max_pages()
     test_batch47_zram_recomp_best_prio_skip()
