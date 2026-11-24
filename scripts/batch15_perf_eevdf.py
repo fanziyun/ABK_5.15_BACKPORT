@@ -20,7 +20,7 @@ _FAIR_LANDED_PROBES = (
     "abk_eevdf_refresh_deadline(cfs_rq, curr);",
     "abk_eevdf_place_entity(cfs_rq, se, initial);",
     "if (sched_feat(EEVDF))",
-    "return abk_pick_eevdf(cfs_rq, curr);",
+    "se = abk_pick_eevdf(cfs_rq, curr);",
     "cfs_rq->abk_pick_deadline = se->deadline;",
     "if (!se->slice)",
     "!abk_eevdf_eligible(curr, avruntime)",
@@ -1100,6 +1100,22 @@ _FAIR_PICK = (
     "}\n"
 )
 
+_FAIR_PICK_EEVDF_OLD = (
+    "\tif (sched_feat(EEVDF))\n"
+    "\t\treturn abk_pick_eevdf(cfs_rq, curr);\n"
+)
+
+_FAIR_PICK_EEVDF_NEW = (
+    "\tif (sched_feat(EEVDF)) {\n"
+    "\t\tse = abk_pick_eevdf(cfs_rq, curr);\n"
+    "\t\t/* ABK stable_515_backport: 5.15's caller dereferences the result\n"
+    "\t\t * through group_cfs_rq(); never hand it NULL. */\n"
+    "\t\tif (!se)\n"
+    "\t\t\tse = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);\n"
+    "\t\treturn se;\n"
+    "\t}\n"
+)
+
 _FAIR_PICK_NEW = (
     "static struct sched_entity *\n"
     "pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)\n"
@@ -1117,8 +1133,7 @@ _FAIR_PICK_NEW = (
     "\tif (se)\n"
     "\t\treturn se;\n"
     "\n"
-    "\tif (sched_feat(EEVDF))\n"
-    "\t\treturn abk_pick_eevdf(cfs_rq, curr);\n"
+    + _FAIR_PICK_EEVDF_NEW +
     "\n"
     "\tleft = __pick_first_entity(cfs_rq);\n"
     "\n"
@@ -1336,7 +1351,13 @@ _FAIR_ANCHORS = (
 )
 
 
-def build_pick_logic_steps():
+def build_pick_logic_steps(text=None):
+    if text is not None and _FAIR_PICK_EEVDF_NEW in text:
+        pick = (FAIR_C, _FAIR_PICK_EEVDF_NEW, _FAIR_PICK_EEVDF_NEW, T)
+    elif text is not None and _FAIR_PICK_EEVDF_OLD in text:
+        pick = (FAIR_C, _FAIR_PICK_EEVDF_OLD, _FAIR_PICK_EEVDF_NEW, T)
+    else:
+        pick = (FAIR_C, _FAIR_PICK, _FAIR_PICK_NEW, T)
     return [
         (FAIR_C, _FAIR_ENTITY_BEFORE, _FAIR_ENTITY_BEFORE_NEW, T),
         (FAIR_C, _FAIR_MIN_VRUNTIME, _FAIR_MIN_VRUNTIME_NEW, T),
@@ -1352,7 +1373,7 @@ def build_pick_logic_steps():
         (FAIR_C, _FAIR_PLACE_TAIL, _FAIR_PLACE_TAIL_NEW, T),
         (FAIR_C, _FAIR_PREEMPT, _FAIR_PREEMPT_NEW, T),
         (FAIR_C, _FAIR_SET_NEXT, _FAIR_SET_NEXT_NEW, T),
-        (FAIR_C, _FAIR_PICK, _FAIR_PICK_NEW, T),
+        pick,
         (FAIR_C, _FAIR_WAKEUP_PREEMPT, _FAIR_WAKEUP_PREEMPT_NEW, T),
         (FAIR_C, _FAIR_YIELD, _FAIR_YIELD_NEW, T),
     ]
@@ -1442,7 +1463,7 @@ def _sched_eevdf_pick_logic_apply(ctx):
             + ", ".join(f"{label} x{count}" for label, count in ambiguous)
         )
 
-    status, _results, detail = apply_steps(ctx, build_pick_logic_steps())
+    status, _results, detail = apply_steps(ctx, build_pick_logic_steps(text))
     if status is None:
         return "blocked_by_shape", detail
     return status, detail

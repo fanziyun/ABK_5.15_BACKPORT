@@ -173,7 +173,7 @@ REQUIRED_CONTENT = {
         "abk_eevdf_lag_limit",
         "abk_avg_vruntime_add(cfs_rq, se);",
         "abk_eevdf_refresh_deadline(cfs_rq, curr);",
-        "return abk_pick_eevdf(cfs_rq, curr);",
+        "if (!se)\n\t\t\tse = curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);",
         "abk_eevdf_place_entity(cfs_rq, se, initial);",
         "cfs_rq->abk_pick_deadline = se->deadline;",
         "EEVDF runtime-state graft (Batch 28 shape)",
@@ -1020,7 +1020,7 @@ REQUIRED_PAIRING = {
          "branch, so turning it off changes nothing"),
         ("kernel/sched/features.h", "SCHED_FEAT(EEVDF, true)",
          "kernel/sched/fair.c",
-         "if (sched_feat(EEVDF))\n\t\treturn abk_pick_eevdf(cfs_rq, curr);",
+         "if (sched_feat(EEVDF)) {\n\t\tse = abk_pick_eevdf(cfs_rq, curr);",
          "same: the selector needs its legacy half too"),
     ],
 }
